@@ -8,8 +8,8 @@ use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use netlink_packet_route::route::{
-    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol as NlRouteProtocol, RouteScope,
-    RouteType,
+    RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol as NlRouteProtocol,
+    RouteScope, RouteType,
 };
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
@@ -243,6 +243,24 @@ fn route_metric(msg: &RouteMessage) -> u32 {
         .unwrap_or(0)
 }
 
+/// Rejects a gateway whose address family differs from the route's prefix
+/// (RFC 5549-style cross-AF nexthops are not supported yet).
+fn check_same_af(entry: &RouteEntry, gateway: &RouteAddress) -> Result<(), DataplaneError> {
+    let same = match (entry.prefix, gateway) {
+        (IpPrefix::V4(_), RouteAddress::Inet(_)) | (IpPrefix::V6(_), RouteAddress::Inet6(_)) => {
+            true
+        }
+        _ => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(DataplaneError::Unsupported(
+            "cross-AF nexthop (RFC 5549) not supported yet",
+        ))
+    }
+}
+
 /// Maps Rouster's route protocol to an RTPROT_* value.
 fn nl_protocol(entry: &RouteEntry) -> NlRouteProtocol {
     use common::RouteProtocol as P;
@@ -261,8 +279,11 @@ fn nl_protocol(entry: &RouteEntry) -> NlRouteProtocol {
 
 /// Builds the netlink route message shared by RTM_NEWROUTE and RTM_DELROUTE.
 ///
-/// Phase 0 limitation: only the first nexthop is programmed; ECMP via
-/// RTA_MULTIPATH / nexthop objects is the immediate follow-up.
+/// Nexthop mapping: a group of ≥2 hops is programmed as `RTA_MULTIPATH`
+/// (one `rtnexthop` per hop: gateway attribute + ifindex, weight byte from
+/// the group's weight); single-hop groups and blackholes use direct
+/// `RTA_GATEWAY`/`RTA_OIF` attributes. Nexthop *objects* (`RTA_NH_ID`) are
+/// a documented follow-up.
 fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
     let mut msg = RouteMessage::default();
 
@@ -287,12 +308,47 @@ fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
     msg.header.kind = RouteType::Unicast;
     msg.attributes.push(RouteAttribute::Priority(entry.metric));
 
-    let hop = entry
-        .nexthops
-        .hops()
-        .first()
-        .map(|(h, _)| *h)
-        .unwrap_or(Nexthop::Blackhole);
+    let hops = entry.nexthops.hops();
+    if hops.len() >= 2 {
+        // ECMP: RTA_MULTIPATH. Hops must be in resolved programming form
+        // (each carries an ifindex); the RIB's reconcile guarantees that,
+        // and the kernel needs an ifindex per rtnexthop anyway.
+        let mut multipath = Vec::with_capacity(hops.len());
+        for &(hop, weight) in hops {
+            let (gateway, ifindex) = match hop {
+                Nexthop::Ipv4If(gw, ix) => (Some(RouteAddress::Inet(gw)), ix),
+                Nexthop::Ipv6If(gw, ix) => (Some(RouteAddress::Inet6(gw)), ix),
+                Nexthop::IfIndex(ix) => (None, ix),
+                Nexthop::Ipv4(_) | Nexthop::Ipv6(_) => {
+                    return Err(DataplaneError::Unsupported(
+                        "unresolved gateway in ECMP group; resolution must precede programming",
+                    ));
+                }
+                Nexthop::Blackhole => {
+                    return Err(DataplaneError::Unsupported(
+                        "blackhole cannot be part of an ECMP group",
+                    ));
+                }
+            };
+            if let Some(addr) = &gateway {
+                check_same_af(entry, addr)?;
+            }
+            // RTNH weight byte: stored as weight - 1 (equal weights → 0),
+            // matching iproute2. (`RouteNextHop` is `#[non_exhaustive]`,
+            // so it is built from `default()` + field writes.)
+            let mut nexthop = RouteNextHop::default();
+            nexthop.hops = weight.saturating_sub(1);
+            nexthop.interface_index = ifindex;
+            if let Some(addr) = gateway {
+                nexthop.attributes.push(RouteAttribute::Gateway(addr));
+            }
+            multipath.push(nexthop);
+        }
+        msg.attributes.push(RouteAttribute::MultiPath(multipath));
+        return Ok(msg);
+    }
+
+    let hop = hops.first().map(|(h, _)| *h).unwrap_or(Nexthop::Blackhole);
 
     match hop {
         Nexthop::Ipv4(gw) => msg
