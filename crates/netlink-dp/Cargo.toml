@@ -1,0 +1,19 @@
+[package]
+name = "netlink-dp"
+description = "Rouster dataplane backend: Linux kernel via rtnetlink"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# rtnetlink is Linux-only. On other platforms this crate compiles to a stub
+# that reports Unsupported at runtime, so the workspace stays buildable on
+# macOS dev machines (real dataplane testing happens in Linux netns /
+# Containerlab topologies).
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink.workspace = true
+futures.workspace = true

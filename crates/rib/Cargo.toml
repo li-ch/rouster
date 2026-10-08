@@ -1,0 +1,10 @@
+[package]
+name = "rib"
+description = "Rouster RIB: BIRD-style typed multi-table routing information base"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

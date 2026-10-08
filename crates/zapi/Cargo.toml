@@ -1,0 +1,12 @@
+[package]
+name = "zapi"
+description = "Rouster ZAPI codec and server: FRR zebra-protocol interop edge"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "rousterd"
+description = "Rouster main daemon"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common.workspace = true
+rib.workspace = true
+netlink-dp.workspace = true
+zapi.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

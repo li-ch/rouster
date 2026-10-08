@@ -1,0 +1,8 @@
+[package]
+name = "common"
+description = "Rouster shared types: prefixes, nexthops, route entries, dataplane trait"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
