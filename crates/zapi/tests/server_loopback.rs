@@ -122,6 +122,24 @@ async fn two_concurrent_sessions_share_one_command_queue() {
     c1.handshake().await;
     c2.handshake().await;
 
+    // Each accepted connection attaches its push channel first (Z3B):
+    // two attach commands carry the same distinct owner ids the session
+    // commands below use. The senders are held so the sessions' push
+    // channels stay open for the rest of the test.
+    let mut attached = Vec::new();
+    let mut _push_senders = Vec::new();
+    for _ in 0..2 {
+        match rx.recv().await.expect("attach command") {
+            RibCommand::AttachSession { owner, push } => {
+                attached.push(owner);
+                _push_senders.push(push);
+            }
+            other => panic!("expected AttachSession, got {other:?}"),
+        }
+    }
+    attached.sort_unstable();
+    assert_eq!(attached, vec![1u64, 2], "one attach per accepted session");
+
     // Both sessions emit route adds; both arrive on the one queue, each
     // tagged with its session's owner id (1 and 2 in accept order).
     let route = ZapiMessage::RouteAdd(zapi::ZapiRoute {

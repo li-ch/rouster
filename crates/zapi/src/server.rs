@@ -12,6 +12,15 @@
 //! happens at this edge — `rib`/`common` never see ZAPI types (repo
 //! AGENTS.md invariant #1).
 //!
+//! The reverse direction is [`SessionPush`]: on attach every session hands
+//! the driver a push channel (Z3B), and the driver fans event-driven
+//! updates down it — NEXTHOP_UPDATE when a registered nexthop's resolution
+//! flips on a dataplane event, REDISTRIBUTE_ROUTE_ADD when a best route
+//! changes and the session registered interest in its type. Pushes are
+//! never dropped silently by this side: the session interleaves them with
+//! request replies through one writer, so frame order on the wire is the
+//! order the session produced it in.
+//!
 //! Wire-behavior pins: reply to HELLO by echoing the client's body
 //! (pinned doc, operational finding 2); answer LABEL_MANAGER_CONNECT with
 //! proto+instance+result or bgpd's label-manager client stalls
@@ -23,21 +32,34 @@ use std::io;
 use std::path::Path;
 
 use common::{IpPrefix, Nexthop, RouteEntry, RouteProtocol, TableId};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use crate::client::route_type_from;
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN, ZAPI_VERSION};
 use crate::message::{
     blackhole_type, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
-    ZapiNexthopUpdate,
+    ZapiNexthopUpdate, ZapiRoute,
 };
 
 /// The table all default-VRF client routes land in tonight (RT_TABLE_MAIN).
 /// The message's vrf_id selects it: 0 (default VRF) → 254; non-zero VRFs are
 /// out of scope for tonight and dropped with a warning.
 pub const DEFAULT_TABLE: TableId = 254;
+
+/// ZEBRA_FLAG_SELECTED (frr-10.2.2 `lib/zclient.h`): every route this
+/// server pushes via REDISTRIBUTE_ROUTE_ADD is by construction the
+/// selected (best) path, and `zsend_redistribute_route` passes `re->flags`
+/// through with exactly this bit set in that case (pinned doc, Z2B).
+const ZEBRA_FLAG_SELECTED: u32 = 0x08;
+
+/// Per-session push queue depth. Bounded so a daemon that stops reading
+/// its socket cannot grow rousterd's memory without bound; the driver
+/// drops (with a warning) when full — a genuinely stuck client re-syncs
+/// on its next registration or reconnect.
+const SESSION_PUSH_QUEUE: usize = 64;
 
 /// A request from a ZAPI session to the RIB owner (rousterd's main loop).
 ///
@@ -47,6 +69,16 @@ pub const DEFAULT_TABLE: TableId = 254;
 /// session can continue (interface dump, NHT lookup).
 #[derive(Debug)]
 pub enum RibCommand {
+    /// Session attach (sent by [`serve`] at accept time, before the session
+    /// task starts): hands the RIB owner the push channel for `owner`.
+    /// FIFO ordering through the command channel guarantees the driver has
+    /// this sender before it can see any other command from the session —
+    /// so a push triggered by a later command never races a missing
+    /// registration.
+    AttachSession {
+        owner: u64,
+        push: mpsc::Sender<SessionPush>,
+    },
     AddRoute(RouteEntry),
     DeleteRoute {
         table: TableId,
@@ -111,6 +143,27 @@ pub struct NhtRegistration {
     pub connected: bool,
 }
 
+/// An event-driven push from the RIB owner (rousterd's main loop) to one
+/// ZAPI session — the driver-side counterpart of [`RibCommand`]. Internal
+/// types only: the session maps them onto wire bodies at this edge
+/// ([`ZapiSession::handle_push`]).
+#[derive(Debug)]
+pub enum SessionPush {
+    /// A registered nexthop's resolution flipped (dataplane event); the
+    /// session answers with NEXTHOP_UPDATE. `None` = now unresolved.
+    NexthopResolution {
+        prefix: IpPrefix,
+        resolution: Option<Nexthop>,
+    },
+    /// The best route for a prefix changed and this session registered
+    /// REDISTRIBUTE interest in its type; answered as
+    /// REDISTRIBUTE_ROUTE_ADD. Nexthops are in push form — gateway hops
+    /// resolved to ifindex-carrying form where the RIB can resolve them
+    /// (gateway-form otherwise, exactly what an NHT-tracking client
+    /// expects).
+    RedistributeRouteAdd(RouteEntry),
+}
+
 /// Per-connection session state, established by the HELLO handshake.
 ///
 /// `id` is the server-assigned connection counter and the owner key for
@@ -156,8 +209,25 @@ pub async fn serve(socket_path: &Path, commands: mpsc::Sender<RibCommand>) -> io
                 next_id += 1;
                 let id = next_id;
                 let commands = commands.clone();
+                let (push_tx, push_rx) = mpsc::channel(SESSION_PUSH_QUEUE);
+                // Attach before the session runs: the driver must hold the
+                // push sender by the time it processes anything else from
+                // this connection. A closed command channel means no RIB
+                // owner — drop the connection rather than run a session
+                // that can never touch the RIB.
+                if commands
+                    .send(RibCommand::AttachSession {
+                        owner: id,
+                        push: push_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    warn!(id, "zapi: no RIB owner; dropping connection");
+                    continue;
+                }
                 tokio::spawn(async move {
-                    match run_session(stream, id, commands).await {
+                    match run_session(stream, id, commands, push_rx).await {
                         Ok(session) => {
                             info!(id, protocol = session.protocol, "zapi: session closed");
                         }
@@ -177,37 +247,117 @@ pub async fn serve(socket_path: &Path, commands: mpsc::Sender<RibCommand>) -> io
 /// the header-level contract is broken (malformed header, unsupported
 /// version) — the connection is closed in both cases.
 ///
-/// `IO` is generic so tests can drive the loop over `tokio::io::duplex`.
+/// Structured as a framing reader task plus a handler loop so the session
+/// can serve two directions at once: client requests (via the reader) and
+/// event-driven pushes from the RIB owner (via `pushes`). `read_exact` is
+/// not cancel-safe — partial reads must never be discarded — so the reader
+/// runs as its own task and the handler receives whole frames on a
+/// channel; both directions serialize through the single writer the
+/// handler owns, keeping wire order well-defined.
+///
+/// `IO` is generic so tests can drive the loop over `tokio::io::duplex`;
+/// `Send + 'static` because the reader half moves into its task.
 pub async fn run_session<IO>(
     io: IO,
     id: u64,
     commands: mpsc::Sender<RibCommand>,
+    mut pushes: mpsc::Receiver<SessionPush>,
 ) -> io::Result<ZapiSession>
 where
-    IO: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut io = io;
     let mut session = ZapiSession {
         id,
         ..ZapiSession::default()
     };
-    let mut header_buf = [0u8; ZAPI_HEADER_LEN];
+    let (reader, mut writer) = tokio::io::split(io);
+    let (frames_tx, mut frames_rx) = mpsc::channel::<Result<(ZapiHeader, Vec<u8>), io::Error>>(8);
+    let reading = tokio::spawn(read_frames(id, reader, frames_tx));
+    // A closed push channel downgrades the session to request/reply (the
+    // RIB owner dropped this session's push sender — e.g. at driver
+    // shutdown); it does not end the connection.
+    let mut pushes_open = true;
+    let result = loop {
+        tokio::select! {
+            frame = frames_rx.recv() => match frame {
+                // Reader ended at a clean boundary (or mid-body): the peer
+                // went away; this is a normal close.
+                None => break Ok(session),
+                Some(Err(err)) => break Err(err),
+                Some(Ok((header, body))) => {
+                    let message = match ZapiMessage::decode(header.command, &body) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            // One bad body does not lose framing
+                            // (length-delimited): skip the message, keep
+                            // the connection.
+                            warn!(
+                                id,
+                                command = header.command,
+                                %err,
+                                "zapi: malformed body, skipping message"
+                            );
+                            continue;
+                        }
+                    };
+                    if !session.established {
+                        debug!(id, command = header.command, "zapi: message before HELLO");
+                    }
+                    if let Err(err) =
+                        session.handle(message, header.vrf_id, &commands, &mut writer).await
+                    {
+                        break Err(err);
+                    }
+                }
+            },
+            push = pushes.recv(), if pushes_open => match push {
+                None => pushes_open = false,
+                Some(push) => {
+                    if let Err(err) = session.handle_push(push, &mut writer).await {
+                        break Err(err);
+                    }
+                }
+            },
+        }
+    };
+    reading.abort();
+    result
+}
+
+/// The framing half of a session: reads exactly one 10-byte header, then
+/// exactly `length - header` body bytes, and forwards whole frames to the
+/// session handler. FRR clients always send whole frames, so `read_exact`
+/// framing is exact (no resync needed on clean peers). Header-level
+/// garbage loses framing — resync is not worth it for a versioned
+/// protocol — so it is reported as an error and the connection closes.
+async fn read_frames<IO>(
+    id: u64,
+    mut io: ReadHalf<IO>,
+    frames: mpsc::Sender<Result<(ZapiHeader, Vec<u8>), io::Error>>,
+) where
+    IO: AsyncRead + Unpin,
+{
     loop {
-        // Read exactly one framed message per iteration: header first,
-        // then `length` body bytes. FRR clients always send whole frames,
-        // so read_exact framing is exact (no resync needed on clean peers).
+        let mut header_buf = [0u8; ZAPI_HEADER_LEN];
         match io.read_exact(&mut header_buf).await {
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(session),
-            Err(err) => return Err(err),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return,
+            Err(err) => {
+                let _ = frames.send(Err(err)).await;
+                return;
+            }
         }
         let header = match ZapiHeader::decode(&header_buf) {
             Ok(header) => header,
             Err(err) => {
-                // Header-level garbage: framing is lost. Resync is not
-                // worth it for a versioned protocol — close.
                 warn!(id, %err, "zapi: malformed header, closing connection");
-                return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+                let _ = frames
+                    .send(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        err.to_string(),
+                    )))
+                    .await;
+                return;
             }
         };
         if header.version != ZAPI_VERSION {
@@ -217,38 +367,26 @@ where
                 expected = ZAPI_VERSION,
                 "zapi: unsupported ZAPI version, closing connection"
             );
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported ZAPI version {}", header.version),
-            ));
+            let _ = frames
+                .send(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported ZAPI version {}", header.version),
+                )))
+                .await;
+            return;
         }
         let mut body = vec![0u8; header.length as usize - ZAPI_HEADER_LEN];
         match io.read_exact(&mut body).await {
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(session),
-            Err(err) => return Err(err),
-        }
-
-        let message = match ZapiMessage::decode(header.command, &body) {
-            Ok(message) => message,
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return,
             Err(err) => {
-                // One bad body does not lose framing (length-delimited):
-                // skip the message, keep the connection.
-                warn!(
-                    id,
-                    command = header.command,
-                    %err,
-                    "zapi: malformed body, skipping message"
-                );
-                continue;
+                let _ = frames.send(Err(err)).await;
+                return;
             }
-        };
-        if !session.established {
-            debug!(id, command = header.command, "zapi: message before HELLO");
         }
-        session
-            .handle(message, header.vrf_id, &commands, &mut io)
-            .await?;
+        if frames.send(Ok((header, body))).await.is_err() {
+            return; // session handler gone
+        }
     }
 }
 
@@ -275,15 +413,15 @@ fn channel_closed() -> io::Error {
 impl ZapiSession {
     /// Dispatches one decoded message: mutate session state, queue
     /// [`RibCommand`]s, write replies. ZAPI↔internal mapping happens here.
-    async fn handle<IO>(
+    async fn handle<W>(
         &mut self,
         message: ZapiMessage,
         vrf_id: u32,
         commands: &mpsc::Sender<RibCommand>,
-        io: &mut IO,
+        io: &mut W,
     ) -> io::Result<()>
     where
-        IO: AsyncWrite + Unpin,
+        W: AsyncWrite + Unpin,
     {
         match message {
             ZapiMessage::Hello(hello) => {
@@ -518,6 +656,78 @@ impl ZapiSession {
             }
         }
     }
+
+    /// Encodes one event-driven [`SessionPush`] onto the wire. The session's
+    /// own registration metadata completes the picture (the NHT safi); a
+    /// push for a prefix the session no longer tracks is dropped — the
+    /// driver pruned its registration, so the client withdrew interest.
+    async fn handle_push<W>(&mut self, push: SessionPush, io: &mut W) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        match push {
+            SessionPush::NexthopResolution { prefix, resolution } => {
+                let Some(registration) = self.nht.get(&prefix) else {
+                    debug!(
+                        id = self.id,
+                        %prefix,
+                        "zapi: NHT push for unregistered prefix dropped"
+                    );
+                    return Ok(());
+                };
+                let safi = registration.safi;
+                let update = match resolution.map(zapi_nexthop_from) {
+                    Some(hop) => ZapiNexthopUpdate::resolved(
+                        prefix,
+                        safi,
+                        route_type::CONNECT,
+                        0,
+                        0,
+                        vec![hop],
+                    ),
+                    None => ZapiNexthopUpdate::unresolved(prefix, safi),
+                };
+                info!(
+                    id = self.id,
+                    %prefix,
+                    resolved = update.is_resolved(),
+                    "zapi: pushing NEXTHOP_UPDATE"
+                );
+                let frame = ZapiMessage::NexthopUpdate(update)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::RedistributeRouteAdd(entry) => {
+                let route = ZapiRoute::redistribute_push(
+                    route_type_from(entry.protocol),
+                    0,
+                    ZEBRA_FLAG_SELECTED,
+                    entry.prefix,
+                    entry
+                        .nexthops
+                        .hops()
+                        .iter()
+                        .map(|&(hop, _)| ZapiNexthop::from_common(hop))
+                        .collect(),
+                    entry.protocol.admin_distance(),
+                    entry.metric,
+                    0,
+                    0,
+                );
+                info!(
+                    id = self.id,
+                    prefix = %entry.prefix,
+                    "zapi: pushing REDISTRIBUTE_ROUTE_ADD"
+                );
+                let frame = ZapiMessage::RedistributeRouteAdd(route)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +755,7 @@ mod tests {
     /// is this summary, not the original command).
     #[derive(Debug)]
     enum Seen {
+        Attach,
         Add(RouteEntry),
         Del {
             table: TableId,
@@ -571,6 +782,7 @@ mod tests {
 
     fn describe(cmd: &RibCommand) -> String {
         match cmd {
+            RibCommand::AttachSession { .. } => "attach".to_string(),
             RibCommand::AddRoute(entry) => format!("add {} {:?}", entry.prefix, entry.protocol),
             RibCommand::DeleteRoute { prefix, .. } => format!("del {prefix}"),
             RibCommand::RegisterNexthop { owner, prefix, .. } => format!("nht+ {owner} {prefix}"),
@@ -592,6 +804,7 @@ mod tests {
         /// senders) and reports what was observed.
         fn answer(&self, cmd: RibCommand) -> Seen {
             match cmd {
+                RibCommand::AttachSession { .. } => Seen::Attach,
                 RibCommand::AddRoute(entry) => Seen::Add(entry),
                 RibCommand::DeleteRoute {
                     table,
@@ -669,18 +882,22 @@ mod tests {
         }
     }
 
-    /// Spawns a session (owner id 1) over one end of a duplex pair.
+    /// Spawns a session (owner id 1) over one end of a duplex pair, plus
+    /// the push sender the driver side would hold.
+    #[allow(clippy::type_complexity)]
     fn spawn_session(
         capacity: usize,
     ) -> (
         Client,
         mpsc::Receiver<RibCommand>,
+        mpsc::Sender<SessionPush>,
         tokio::task::JoinHandle<io::Result<ZapiSession>>,
     ) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (tx, rx) = mpsc::channel(capacity);
-        let task = tokio::spawn(run_session(server_io, 1, tx));
-        (Client { io: client_io }, rx, task)
+        let (push_tx, push_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_session(server_io, 1, tx, push_rx));
+        (Client { io: client_io }, rx, push_tx, task)
     }
 
     fn staticd_hello() -> ZapiMessage {
@@ -757,7 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn hello_echo_reply_records_session() {
-        let (mut client, mut rx, task) = spawn_session(16);
+        let (mut client, mut rx, _push, task) = spawn_session(16);
         let driver = Driver::default();
         client.send(&staticd_hello(), 0).await;
         let (header, body) = client.read_frame().await;
@@ -780,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn bgpd_label_client_hello_recorded() {
-        let (mut client, mut rx, task) = spawn_session(16);
+        let (mut client, mut rx, _push, task) = spawn_session(16);
         client.send(&bgpd_label_hello(), 0).await;
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 19);
@@ -793,7 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_add_emits_add_route_command() {
-        let (mut client, mut rx, task) = spawn_session(16);
+        let (mut client, mut rx, _push, task) = spawn_session(16);
         let driver = Driver::default();
         client.send(&staticd_route_add(), 0).await;
         match driver.recv(&mut rx).await {
@@ -815,7 +1032,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_delete_emits_delete_route_command() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         let driver = Driver::default();
         client.send(&staticd_route_delete(), 0).await;
         match driver.recv(&mut rx).await {
@@ -848,14 +1065,14 @@ mod tests {
 
     #[tokio::test]
     async fn route_add_in_nonzero_vrf_dropped() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         client.send(&staticd_route_add(), 7).await;
         assert_no_command_after(&mut client, &mut rx).await;
     }
 
     #[tokio::test]
     async fn route_add_with_unmapped_type_ignored() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         let mut route = match staticd_route_add() {
             ZapiMessage::RouteAdd(route) => route,
             _ => unreachable!(),
@@ -873,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn nht_register_resolved_answer_carries_hop() {
-        let (mut client, mut rx, task) = spawn_session(16);
+        let (mut client, mut rx, _push, task) = spawn_session(16);
         let driver = driver_with_resolution(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             Nexthop::Ipv4If(Ipv4Addr::new(192, 0, 2, 1), 2),
@@ -903,7 +1120,7 @@ mod tests {
 
     #[tokio::test]
     async fn nht_register_unresolved_answer_zeroed_tail() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         let driver = Driver::default();
         client.send(&nht_register("10.9.9.9/32"), 0).await;
         driver.recv(&mut rx).await;
@@ -926,7 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn nht_unregister_removes_registration() {
-        let (mut client, mut rx, task) = spawn_session(16);
+        let (mut client, mut rx, _push, task) = spawn_session(16);
         let driver = Driver::default();
         client.send(&nht_register("192.0.2.1/32"), 0).await;
         driver.recv(&mut rx).await;
@@ -956,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn redistribute_add_delete_recorded_and_forwarded() {
-        let (mut client, mut rx, task) = spawn_session(16);
+        let (mut client, mut rx, _push, task) = spawn_session(16);
         let driver = Driver::default();
         let redist = ZapiRedistribute {
             afi: 1,
@@ -982,9 +1199,171 @@ mod tests {
         assert!(session.redistributes.is_empty(), "tonight: store only");
     }
 
+    // --- Event-driven pushes (Z3B) ---
+
+    /// Registers a nexthop and consumes the session's immediate answer, so
+    /// the next frame the client reads is unambiguous.
+    async fn register_and_drain_answer(
+        client: &mut Client,
+        rx: &mut mpsc::Receiver<RibCommand>,
+        driver: &Driver,
+        prefix: &str,
+    ) {
+        client.send(&nht_register(prefix), 0).await;
+        driver.recv(rx).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 23, "the immediate NEXTHOP_UPDATE");
+    }
+
+    #[tokio::test]
+    async fn nht_flip_push_writes_resolved_update() {
+        let (mut client, mut rx, push, _task) = spawn_session(16);
+        let driver = Driver::default();
+        register_and_drain_answer(&mut client, &mut rx, &driver, "10.9.9.9/32").await;
+
+        // The dataplane grew a covering subnet: the driver re-evaluated and
+        // the resolution flipped to ifindex-carrying form.
+        push.send(SessionPush::NexthopResolution {
+            prefix: "10.9.9.9/32".parse().unwrap(),
+            resolution: Some(Nexthop::Ipv4If(Ipv4Addr::new(10, 9, 9, 9), 2)),
+        })
+        .await
+        .expect("session alive");
+
+        let (header, body) = client.read_frame().await;
+        assert_eq!(header.command, 23, "flip pushes NEXTHOP_UPDATE");
+        let update = ZapiNexthopUpdate::decode(&body).expect("update decodes");
+        assert!(update.is_resolved());
+        assert_eq!(update.registered_prefix, "10.9.9.9/32".parse().unwrap());
+        assert_eq!(update.nexthops.len(), 1);
+        assert_eq!(update.nexthops[0].ifindex, 2);
+        assert_eq!(
+            update.nexthops[0].nh_type,
+            crate::nexthop_type::IPV4_IFINDEX
+        );
+    }
+
+    #[tokio::test]
+    async fn nht_flip_push_unresolved_writes_zeroed_tail() {
+        let (mut client, mut rx, push, _task) = spawn_session(16);
+        let driver = driver_with_resolution(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+            Nexthop::Ipv4If(Ipv4Addr::new(192, 0, 2, 9), 2),
+        );
+        register_and_drain_answer(&mut client, &mut rx, &driver, "192.0.2.9/32").await;
+
+        // The carrying address went away: flip to unresolved.
+        push.send(SessionPush::NexthopResolution {
+            prefix: "192.0.2.9/32".parse().unwrap(),
+            resolution: None,
+        })
+        .await
+        .expect("session alive");
+
+        let (_header, body) = client.read_frame().await;
+        // The same zeroed-tail shape as the immediate unresolved answer
+        // (byte-pinned in nht_register_unresolved_answer_zeroed_tail).
+        let expected: Vec<u8> = vec![
+            0, 0, 0, 0, // message
+            0, 1, // safi
+            0, 2, 32, 192, 0, 2, 9, // registered 192.0.2.9/32
+            0, 2, 32, 192, 0, 2, 9, // resolved (echoed)
+            0, // route type
+            0, 0, // instance
+            0, // distance
+            0, 0, 0, 0, // metric
+            0, // nexthop count
+        ];
+        assert_eq!(body, expected, "unresolve pushes the zeroed-tail form");
+    }
+
+    /// A push for a prefix the session no longer tracks must write nothing
+    /// (and not error): proven by handing the writer one push and then
+    /// reading the client side to EOF — read_to_end collects any bytes the
+    /// push did write, so empty means none.
+    #[tokio::test]
+    async fn nht_push_for_unregistered_prefix_writes_nothing() {
+        let mut session = ZapiSession {
+            id: 7,
+            ..ZapiSession::default()
+        };
+        let (mut client_io, mut server_io) = tokio::io::duplex(1024);
+        session
+            .handle_push(
+                SessionPush::NexthopResolution {
+                    prefix: "10.9.9.9/32".parse().unwrap(),
+                    resolution: None,
+                },
+                &mut server_io,
+            )
+            .await
+            .expect("push for unregistered prefix is a no-op, not an error");
+        drop(server_io);
+        let mut written = Vec::new();
+        use tokio::io::AsyncReadExt;
+        client_io.read_to_end(&mut written).await.expect("eof");
+        assert!(written.is_empty(), "no frame for an unregistered prefix");
+    }
+
+    /// The redistribute push encodes as command 31 with the
+    /// zsend_redistribute_route bit policy (Z2B): SELECTED flag, DISTANCE +
+    /// METRIC + MTU always present, nexthops in push form.
+    #[tokio::test]
+    async fn redistribute_push_encodes_command_31() {
+        let mut session = ZapiSession {
+            id: 3,
+            ..ZapiSession::default()
+        };
+        let (mut client_io, mut server_io) = tokio::io::duplex(1024);
+        let mut entry = RouteEntry::new(
+            "203.0.113.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            common::NexthopGroup::single(Nexthop::Blackhole),
+            20,
+        );
+        entry.table = DEFAULT_TABLE;
+        session
+            .handle_push(SessionPush::RedistributeRouteAdd(entry), &mut server_io)
+            .await
+            .expect("push encodes");
+        drop(server_io);
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        client_io.read_to_end(&mut bytes).await.expect("eof");
+
+        let header = ZapiHeader::decode(&bytes[..ZAPI_HEADER_LEN]).unwrap();
+        assert_eq!(header.command, 31);
+        assert_eq!(
+            header.length as usize,
+            bytes.len(),
+            "exactly one framed message"
+        );
+        let body = bytes[ZAPI_HEADER_LEN..].to_vec();
+        match ZapiMessage::decode(31, &body).unwrap() {
+            ZapiMessage::RedistributeRouteAdd(route) => {
+                assert_eq!(route.route_type, route_type::STATIC);
+                assert_eq!(route.flags, 0x08, "ZEBRA_FLAG_SELECTED");
+                assert_eq!(
+                    route.message,
+                    message_flag::NEXTHOP
+                        | message_flag::DISTANCE
+                        | message_flag::METRIC
+                        | message_flag::MTU
+                );
+                assert_eq!(route.prefix, "203.0.113.0/24".parse().unwrap());
+                assert_eq!(route.distance, Some(1), "static admin distance");
+                assert_eq!(route.metric, Some(20));
+                assert_eq!(route.nexthops.len(), 1);
+                assert_eq!(route.nexthops[0].nh_type, crate::nexthop_type::BLACKHOLE);
+                assert_eq!(route.nexthops[0].gate, None);
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn label_manager_connect_replied_with_result_zero() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         client
             .send(
                 &ZapiMessage::LabelManagerConnect {
@@ -1002,7 +1381,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_body_skips_message_and_keeps_connection() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         client.send(&staticd_hello(), 0).await;
         let _ = client.read_frame().await;
 
@@ -1019,7 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_header_closes_connection() {
-        let (mut client, rx, task) = spawn_session(16);
+        let (mut client, rx, _push, task) = spawn_session(16);
         // length field 4 (< header length): BadLength at header level.
         let mut frame = staticd_hello().encode_frame(0).unwrap().to_vec();
         frame[0] = 0;
@@ -1032,7 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_version_closes_connection() {
-        let (mut client, rx, task) = spawn_session(16);
+        let (mut client, rx, _push, task) = spawn_session(16);
         let mut frame = staticd_hello().encode_frame(0).unwrap().to_vec();
         frame[3] = 5; // version 5
         client.io.write_all(&frame).await.expect("send v5 header");
@@ -1042,7 +1421,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_command_ignored_connection_alive() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         client
             .send(
                 &ZapiMessage::Unknown {
@@ -1057,7 +1436,7 @@ mod tests {
 
     #[tokio::test]
     async fn interface_add_request_streams_mirror() {
-        let (mut client, mut rx, _task) = spawn_session(16);
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
         let driver = Driver {
             interfaces: vec![InterfaceMirror {
                 ifindex: 2,
@@ -1094,7 +1473,7 @@ mod tests {
             .join("tests/fixtures/staticd-10.2.2.log");
         let text = std::fs::read_to_string(fixture).expect("fixture present");
 
-        let (mut client, rx, task) = spawn_session(256);
+        let (mut client, rx, _push, task) = spawn_session(256);
         let driver = std::sync::Arc::new(Driver::default());
         let mut frames = 0usize;
         // Only HELLO (echo) and NEXTHOP_REGISTER (update) produce replies;

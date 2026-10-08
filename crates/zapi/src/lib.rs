@@ -20,5 +20,6 @@ pub use message::{
     ZapiNexthopRegister, ZapiNexthopUpdate, ZapiRedistribute, ZapiRoute, ZapiRouterIdUpdate,
 };
 pub use server::{
-    run_session, serve, InterfaceMirror, NhtRegistration, RibCommand, ZapiSession, DEFAULT_TABLE,
+    run_session, serve, InterfaceMirror, NhtRegistration, RibCommand, SessionPush, ZapiSession,
+    DEFAULT_TABLE,
 };
