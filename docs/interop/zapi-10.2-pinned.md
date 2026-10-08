@@ -355,6 +355,19 @@ fetched by Z2 — and are implemented + synthetic-round-trip-tested in
   (`zapi_nexthop_encode` shape). Unresolved updates zero the tail fields.
 - **ZEBRA_ROUTER_ID_UPDATE (18)**: family u8 | address bytes | prefixlen
   u8 (after the address).
+- **ZEBRA_REDISTRIBUTE_ROUTE_ADD/DEL (31/32)** (`zsend_redistribute_route`,
+  `zebra/zapi_msg.c` — reached by Z2B where Z2 could not): a plain
+  `zapi_route_encode` body — the SAME shape as client→zebra ROUTE_ADD (9).
+  Bit policy: safi always 1 (SAFI_UNICAST); DISTANCE, METRIC and MTU
+  message bits ALWAYS set (fields present even when zero); TAG bit only
+  when tag != 0; NEXTHOP bit + list only when the route has >= 1 ACTIVE
+  nexthop (no bit at all for zero — unlike staticd's ROUTE_ADD delete,
+  which kept the bit with count 0); SRCPFX iff srcdest. The pushed route
+  type is the ORIGINAL route's (static=4 to a client that ran
+  `redistribute static`); flags are `re->flags` passed through (e.g.
+  SELECTED 0x08 for the best path). Table-direct routes rewrite type to
+  ZEBRA_ROUTE_TABLE_DIRECT and instance to the table id (number still
+  unpinned — `route_types.h` unreachable).
 - **LABEL_MANAGER_CONNECT reply** (client→zebra cmd 49 answered by zebra):
   proto u8 + instance u16 + result u8 — Z3 must answer this or bgpd hangs
   (operational finding 3).
@@ -435,3 +448,21 @@ Still open (for Z3/Z5):
 - `lib/route_types.h` full table (route types other than static/BGP remain
   shift-inferred: kernel 2, connected 3, rip 5, ripng 6, ospf 7, ospf6 8,
   isis 9).
+
+## Z2B addendum (2026-10-08, stage Z2 continuation ladder)
+
+Z2B (encode REDISTRIBUTE_ROUTE_ADD for Z3's redistribute support) retrieved
+the previously unreachable `zebra/zapi_msg.c` — frr-10.2.2 tag via
+raw.githubusercontent through the alternate web reader (the jsdelivr
+package-size refusal and Z1's mirror 404s both bypassed) — and pinned
+`zsend_redistribute_route`: command 31 (and 32) carry a plain
+`zapi_route_encode` body with the bit policy recorded in the zebra→client
+list above. Implemented as `ZapiMessage::RedistributeRouteAdd` +
+`ZapiRoute::redistribute_push` in `crates/zapi/src/message.rs` (SPEC:
+source-verified, not yet wire-captured — Z5's proxy sniff should confirm;
+command 31 decode is now modeled and errors loudly on drift). DEL (32)
+shares the exact body shape but stayed outside Z2B's scope (still
+`Unknown` passthrough). This is an extension, not a correction: no fixture
+contradicted the doc (the fixtures are client→zebra and cannot carry 31).
+Z2's open item "wire-capture the zebra→client side" now covers this
+layout too.

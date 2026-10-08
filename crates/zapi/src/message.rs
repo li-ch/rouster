@@ -1331,6 +1331,55 @@ impl ZapiRoute {
             self.metric.unwrap_or(0),
         ))
     }
+
+    /// Builds the route body zebra pushes for
+    /// ZEBRA_REDISTRIBUTE_ROUTE_ADD (31), mirroring
+    /// `zsend_redistribute_route` (frr-10.2.2 `zebra/zapi_msg.c`):
+    /// SAFI is always unicast; the DISTANCE, METRIC and MTU message bits
+    /// are always set (fields included even when zero); the TAG bit is set
+    /// only for a non-zero tag; the NEXTHOP bit and list are present only
+    /// when the route has at least one (active) nexthop. `flags` carries
+    /// the route's ZEBRA_FLAG_* bits (zebra passes `re->flags` through,
+    /// e.g. SELECTED for the best path). SPEC: source-verified, not yet
+    /// wire-captured.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redistribute_push(
+        route_type: u8,
+        instance: u16,
+        flags: u32,
+        prefix: IpPrefix,
+        nexthops: Vec<ZapiNexthop>,
+        distance: u8,
+        metric: u32,
+        tag: u32,
+        mtu: u32,
+    ) -> Self {
+        let mut message = message_flag::DISTANCE | message_flag::METRIC | message_flag::MTU;
+        if !nexthops.is_empty() {
+            message |= message_flag::NEXTHOP;
+        }
+        if tag != 0 {
+            message |= message_flag::TAG;
+        }
+        Self {
+            route_type,
+            instance,
+            flags,
+            message,
+            safi: 1, // SAFI_UNICAST — zsend_redistribute_route hardcodes it
+            prefix,
+            src_prefix: None,
+            nhg_id: 0,
+            nexthops,
+            backup_nexthops: Vec::new(),
+            distance: Some(distance),
+            metric: Some(metric),
+            tag: (tag != 0).then_some(tag),
+            mtu: Some(mtu),
+            tableid: None,
+            opaque: None,
+        }
+    }
 }
 
 /// Reads a u16-counted nexthop list; `message` is the enclosing
@@ -1788,6 +1837,15 @@ pub enum ZapiMessage {
     RedistributeAdd(ZapiRedistribute),
     /// ZEBRA_REDISTRIBUTE_DELETE (13). SPEC (same shape as add).
     RedistributeDelete(ZapiRedistribute),
+    /// ZEBRA_REDISTRIBUTE_ROUTE_ADD (31), zebra→client: zebra pushes a
+    /// route to a client that registered redistribution for its type
+    /// (bgpd's `redistribute static` etc.). The body is the SAME
+    /// `zapi_route_encode` shape as ROUTE_ADD (9): `zsend_redistribute_route`
+    /// (frr-10.2.2 `zebra/zapi_msg.c`) fills a `struct zapi_route` and calls
+    /// the shared encoder. Build with [`ZapiRoute::redistribute_push`] to
+    /// mirror zebra's message-bit policy. SPEC: source-verified, not yet
+    /// wire-captured (the masquerade sees only client→zebra traffic).
+    RedistributeRouteAdd(ZapiRoute),
     /// ZEBRA_BFD_CLIENT_REGISTER (36): u32 pid. E: matches bgpd's pid.
     BfdClientRegister {
         pid: u32,
@@ -1861,6 +1919,9 @@ impl ZapiMessage {
             ZapiCommand::RedistributeDelete => {
                 Ok(Self::RedistributeDelete(ZapiRedistribute::decode(body)?))
             }
+            ZapiCommand::RedistributeRouteAdd => {
+                Ok(Self::RedistributeRouteAdd(ZapiRoute::decode(body)?))
+            }
             ZapiCommand::BfdClientRegister => {
                 let mut b = body;
                 let pid = take_be_u32(&mut b)?;
@@ -1918,6 +1979,7 @@ impl ZapiMessage {
             Self::RouteDelete(_) => 10,
             Self::RedistributeAdd(_) => 12,
             Self::RedistributeDelete(_) => 13,
+            Self::RedistributeRouteAdd(_) => 31,
             Self::BfdClientRegister { .. } => 36,
             Self::LabelManagerConnect { .. } => 49,
             Self::LabelManagerConnectResult { .. } => 49,
@@ -1960,6 +2022,10 @@ impl ZapiMessage {
                 Ok(())
             }
             Self::RedistributeAdd(r) | Self::RedistributeDelete(r) => {
+                r.encode(buf);
+                Ok(())
+            }
+            Self::RedistributeRouteAdd(r) => {
                 r.encode(buf);
                 Ok(())
             }
@@ -2188,6 +2254,162 @@ mod tests {
             del,
             "redistribute delete round-trip"
         );
+    }
+
+    #[test]
+    fn redistribute_route_add_encodes_zebra_shape() {
+        // A connected route pushed to a client that redistributed connected:
+        // hand-derived from zsend_redistribute_route + zapi_route_encode.
+        // message 0x17 = NEXTHOP | DISTANCE | METRIC | MTU (the three
+        // attribute bits are ALWAYS set; NEXTHOP because the route has an
+        // active nexthop).
+        let route = ZapiRoute::redistribute_push(
+            route_type::CONNECT,
+            0,
+            0,
+            "192.0.2.0/24".parse().unwrap(),
+            vec![ZapiNexthop::new_ifindex(0, 2)],
+            0,
+            0,
+            0,
+            0,
+        );
+        let msg = ZapiMessage::RedistributeRouteAdd(route);
+        assert_eq!(msg.command(), 31);
+        let wire = roundtrip(&msg);
+        assert_eq!(
+            wire,
+            hex(concat!(
+                "03 0000 00000000 00000017 01 02 18 c00002",
+                " 0001 00000000 01 00 00000002",
+                " 00 00000000 00000000"
+            ))
+        );
+        // Complete frame: 10-byte header, command 31, length incl. header.
+        let frame = msg.encode_frame(0).unwrap();
+        assert_eq!(frame.len(), ZAPI_HEADER_LEN + wire.len());
+        let header = ZapiHeader::decode(&frame).unwrap();
+        assert_eq!(header.command, 31);
+        assert_eq!(header.marker, 254);
+        assert_eq!(header.version, 6);
+        assert_eq!(header.length as usize, frame.len());
+        assert_eq!(&frame[ZAPI_HEADER_LEN..], &wire[..]);
+    }
+
+    #[test]
+    fn redistribute_route_add_tag_bit_only_when_nonzero() {
+        // Static push with a tag: message 0x1e = DISTANCE | METRIC | TAG |
+        // MTU. No active nexthops => no NEXTHOP bit at all (zebra gates the
+        // bit on the active-nexthop count, unlike staticd's ROUTE_ADD
+        // delete which kept the bit with count 0).
+        let route = ZapiRoute::redistribute_push(
+            route_type::STATIC,
+            5,
+            0x41,
+            "203.0.113.0/24".parse().unwrap(),
+            Vec::new(),
+            1,
+            20,
+            100,
+            1500,
+        );
+        assert_eq!(route.tag, Some(100));
+        let msg = ZapiMessage::RedistributeRouteAdd(route);
+        assert_eq!(
+            roundtrip(&msg),
+            hex(concat!(
+                "04 0005 00000041 0000001e 01 02 18 cb0071",
+                " 01 00000014 00000064 000005dc"
+            ))
+        );
+        // Zero tag stays structurally absent, not Some(0).
+        let untagged = ZapiRoute::redistribute_push(
+            route_type::STATIC,
+            0,
+            0,
+            "203.0.113.0/24".parse().unwrap(),
+            Vec::new(),
+            1,
+            20,
+            0,
+            1500,
+        );
+        assert_eq!(untagged.tag, None);
+        assert_eq!(untagged.message & message_flag::TAG, 0);
+    }
+
+    #[test]
+    fn redistribute_route_add_shares_the_route_add_body() {
+        // zsend_redistribute_route calls the SAME zapi_route_encode as
+        // ROUTE_ADD: the identical bytes must decode as a ROUTE_ADD body.
+        let mut nh = ZapiNexthop::new_ipv6(0, "2001:db8::1".parse().unwrap());
+        nh.set_weight(0x0102_0304_0506_0708);
+        let route = ZapiRoute::redistribute_push(
+            route_type::BGP,
+            7,
+            0x08, // ZEBRA_FLAG_SELECTED — the pushed path IS the best path
+            "2001:db8:1::/48".parse().unwrap(),
+            vec![nh],
+            200,
+            500,
+            0,
+            0,
+        );
+        let msg = ZapiMessage::RedistributeRouteAdd(route.clone());
+        let wire = roundtrip(&msg);
+        assert_eq!(ZapiMessage::decode(31, &wire).unwrap(), msg);
+        assert_eq!(
+            ZapiMessage::decode(9, &wire).unwrap(),
+            ZapiMessage::RouteAdd(route),
+            "31 and 9 share the zapi_route_encode body byte-for-byte"
+        );
+        // The pushed route still maps onto the internal model.
+        let ZapiMessage::RedistributeRouteAdd(back) = ZapiMessage::decode(31, &wire).unwrap()
+        else {
+            panic!("re-decode");
+        };
+        assert_eq!(back.to_route_entry().unwrap().protocol, RouteProtocol::Bgp);
+    }
+
+    #[test]
+    fn redistribute_route_add_decode_never_panics_on_truncation() {
+        let wire = hex(concat!(
+            "03 0000 00000000 00000017 01 02 18 c00002",
+            " 0001 00000000 01 00 00000002",
+            " 00 00000000 00000000"
+        ));
+        for cut in 0..wire.len() {
+            let result = ZapiMessage::decode(31, &wire[..cut]);
+            assert!(result.is_err(), "cut at {cut} must error, not panic");
+        }
+        let mut extended = wire;
+        extended.push(0);
+        assert_eq!(
+            ZapiMessage::decode(31, &extended),
+            Err(ZapiCodecError::TrailingBytes(1))
+        );
+    }
+
+    #[test]
+    fn redistribute_route_add_modeled_and_del_still_passthrough() {
+        // 31 is now a modeled body: garbage errors loudly instead of
+        // silently passing through as Unknown.
+        assert_eq!(
+            ZapiMessage::decode(31, &[]),
+            Err(ZapiCodecError::Truncated { need: 1 })
+        );
+        // 32 (REDISTRIBUTE_ROUTE_DEL) shares the body shape per the source
+        // but is outside tonight's scope: still Unknown passthrough, number
+        // and body preserved byte-for-byte.
+        let del = ZapiMessage::decode(32, &hex("deadbeef")).unwrap();
+        assert_eq!(
+            del,
+            ZapiMessage::Unknown {
+                command: 32,
+                body: hex("deadbeef")
+            }
+        );
+        assert_eq!(roundtrip(&del), hex("deadbeef"));
     }
 
     #[test]
