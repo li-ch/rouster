@@ -121,14 +121,16 @@ async fn main() -> std::io::Result<()> {
     driver.rib.reconcile(&dp).await;
 
     // Initial mirror of kernel interface and route state; afterwards track
-    // link/address/route changes as they arrive.
+    // link/address/route changes as they arrive. Routed through the driver
+    // so link/address events also re-evaluate registered ZAPI nexthops
+    // (Z3B); no sessions exist yet at this point, so nothing is pushed.
     let mut dp = dp;
     for ev in dp
         .dump_state()
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
     {
-        driver.rib.apply_event(&ev);
+        driver.apply_event(&ev);
     }
     info!(
         interfaces = driver.rib.interfaces().len(),
@@ -174,7 +176,10 @@ async fn main() -> std::io::Result<()> {
             ev = dp.next_event() => {
                 match ev {
                     Some(ev) => {
-                        driver.rib.apply_event(&ev);
+                        // Through the driver: link/address events re-evaluate
+                        // registered ZAPI nexthops and push NEXTHOP_UPDATE
+                        // on resolution flips (Z3B).
+                        driver.apply_event(&ev);
                         info!(%ev, interfaces = driver.rib.interfaces().len(), "dataplane event");
                         // Route events invalidate programmed-set belief
                         // (external deletions); reconcile reinstalls.

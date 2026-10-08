@@ -5,24 +5,37 @@
 //! Factored out of `main` (Z4) so the staticd end-to-end test can drive
 //! the exact main-loop behavior in-process against a mock dataplane —
 //! `main` itself runs this against netlink inside its `tokio::select!`.
+//!
+//! Z3B adds the event-driven direction: the driver holds each attached
+//! session's push channel and fans updates out on RIB activity —
+//! NEXTHOP_UPDATE when a registered nexthop's resolution flips on a
+//! dataplane event ([`RibDriver::apply_event`]), REDISTRIBUTE_ROUTE_ADD
+//! when a ZAPI route command changes the best route for a prefix and a
+//! session registered REDISTRIBUTE interest in its type.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::IpAddr;
 
-use common::{Dataplane, IpPrefix};
+use common::{Dataplane, DataplaneEvent, IpPrefix, Nexthop, NexthopGroup, RouteEntry, TableId};
 use rib::Rib;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use zapi::{InterfaceMirror, RibCommand};
+use zapi::{route_type_from, InterfaceMirror, RibCommand, SessionPush};
 
 /// RIB plus the driver-side registration state ZAPI sessions feed.
 pub struct RibDriver {
     pub rib: Rib,
-    /// NEXTHOP_REGISTER interests per owner (server-assigned connection
-    /// id); Z3B re-evaluates these on dataplane events.
-    nht_registrations: HashMap<u64, BTreeSet<IpPrefix>>,
-    /// REDISTRIBUTE_ADD interests per owner; Z3B pushes route updates to
-    /// these.
+    /// Push channel per attached session, keyed by the server-assigned
+    /// owner id. Attached at accept time (`RibCommand::AttachSession`);
+    /// pruned when a push finds the session gone.
+    sessions: HashMap<u64, mpsc::Sender<SessionPush>>,
+    /// NEXTHOP_REGISTER interests per owner, with the last resolution the
+    /// owner was told (the answer to its register). A dataplane event that
+    /// changes a resolution pushes an update only when it differs from
+    /// this — no flip, no push.
+    nht_registrations: HashMap<u64, BTreeMap<IpPrefix, Option<Nexthop>>>,
+    /// REDISTRIBUTE_ADD interests per owner: (afi, route_type, instance).
     redistributes: HashMap<u64, BTreeSet<(u8, u8, u16)>>,
 }
 
@@ -32,10 +45,26 @@ impl Default for RibDriver {
     }
 }
 
+/// ZAPI AFI values (frr `lib/prefix.h`): AFI_IP / AFI_IP6.
+fn afi_of(prefix: &IpPrefix) -> u8 {
+    match prefix {
+        IpPrefix::V4(_) => 1,
+        IpPrefix::V6(_) => 2,
+    }
+}
+
+fn prefix_addr(prefix: &IpPrefix) -> IpAddr {
+    match prefix {
+        IpPrefix::V4(p) => IpAddr::V4(p.addr()),
+        IpPrefix::V6(p) => IpAddr::V6(p.addr()),
+    }
+}
+
 impl RibDriver {
     pub fn new() -> Self {
         Self {
             rib: Rib::new(),
+            sessions: HashMap::new(),
             nht_registrations: HashMap::new(),
             redistributes: HashMap::new(),
         }
@@ -43,12 +72,22 @@ impl RibDriver {
 
     /// Applies one ZAPI session command to the RIB and the driver-side
     /// registries. Returns whether the protocol tables changed (the
-    /// caller reconciles on change).
+    /// caller reconciles on change). Route mutations that change a
+    /// prefix's best route also fan REDISTRIBUTE_ROUTE_ADD pushes out to
+    /// interested sessions.
     pub fn apply(&mut self, command: RibCommand) -> bool {
         match command {
+            RibCommand::AttachSession { owner, push } => {
+                self.sessions.insert(owner, push);
+                debug!(owner, "zapi: session attached (push channel open)");
+                false
+            }
             RibCommand::AddRoute(entry) => {
                 info!(prefix = %entry.prefix, protocol = ?entry.protocol, "zapi: route add");
+                let (table, prefix) = (entry.table, entry.prefix);
+                let before = self.best_of(table, prefix);
                 self.rib.add_route(entry);
+                self.push_best_change(table, prefix, before);
                 true
             }
             RibCommand::DeleteRoute {
@@ -56,27 +95,28 @@ impl RibDriver {
                 prefix,
                 protocol,
             } => {
+                let before = self.best_of(table, prefix);
                 let removed = self.rib.table_mut(table).remove(&prefix, protocol);
                 if removed {
                     info!(prefix = %prefix, ?protocol, "zapi: route delete");
+                    self.push_best_change(table, prefix, before);
                 } else {
                     debug!(prefix = %prefix, ?protocol, "zapi: route delete for absent route");
                 }
                 removed
             }
             // Answer immediately from the RIB's current resolution; the
-            // registration itself is Z3B's input (event-driven
-            // re-evaluation).
+            // stored value is the flip baseline for apply_event.
             RibCommand::RegisterNexthop {
                 owner,
                 prefix,
                 reply,
             } => {
+                let resolution = self.rib.lookup_nexthop(prefix_addr(&prefix));
                 self.nht_registrations
                     .entry(owner)
                     .or_default()
-                    .insert(prefix);
-                let resolution = self.rib.lookup_nexthop(prefix_addr(&prefix));
+                    .insert(prefix, resolution);
                 let _ = reply.send(resolution);
                 false
             }
@@ -89,7 +129,6 @@ impl RibDriver {
                 }
                 false
             }
-            // Tonight: store only (REDISTRIBUTE_ROUTE_ADD push is Z3B).
             RibCommand::RegisterRedistribute {
                 owner,
                 afi,
@@ -101,6 +140,10 @@ impl RibDriver {
                     .or_default()
                     .insert((afi, route_type, instance));
                 debug!(owner, afi, route_type, instance, "zapi: redistribute add");
+                // FRR zebra also replays existing routes of the type on
+                // registration; that initial dump is not implemented yet
+                // (disclosed) — pushes start from the next best-route
+                // change.
                 false
             }
             RibCommand::UnregisterRedistribute {
@@ -131,6 +174,135 @@ impl RibDriver {
                     .collect();
                 let _ = reply.send(mirror);
                 false
+            }
+        }
+    }
+
+    /// Applies one dataplane event to the RIB mirror and re-evaluates
+    /// every registered nexthop through the RIB's resolution query
+    /// (P0B): link and address events can flip a gateway between
+    /// resolved and unresolved, and each flip pushes a NEXTHOP_UPDATE to
+    /// the owning session. Route events cannot change (direct)
+    /// resolution, so they skip the pass.
+    pub fn apply_event(&mut self, ev: &DataplaneEvent) {
+        let flips_resolution = matches!(
+            ev,
+            DataplaneEvent::LinkNew { .. }
+                | DataplaneEvent::LinkDel { .. }
+                | DataplaneEvent::AddressNew { .. }
+                | DataplaneEvent::AddressDel { .. }
+        );
+        self.rib.apply_event(ev);
+        if flips_resolution {
+            self.reevaluate_nht();
+        }
+    }
+
+    /// The resolution table every registered interest is re-checked
+    /// against; only actual flips produce pushes.
+    fn reevaluate_nht(&mut self) {
+        let rib = &self.rib;
+        let mut flips: Vec<(u64, IpPrefix, Option<Nexthop>)> = Vec::new();
+        for (&owner, registrations) in &mut self.nht_registrations {
+            for (prefix, last_told) in registrations {
+                let resolution = rib.lookup_nexthop(prefix_addr(prefix));
+                if *last_told != resolution {
+                    flips.push((owner, *prefix, resolution));
+                    *last_told = resolution;
+                }
+            }
+        }
+        for (owner, prefix, resolution) in flips {
+            info!(owner, %prefix, resolved = resolution.is_some(), "zapi: NHT flip");
+            self.push(owner, SessionPush::NexthopResolution { prefix, resolution });
+        }
+    }
+
+    fn best_of(&self, table: TableId, prefix: IpPrefix) -> Option<RouteEntry> {
+        self.rib.table(table).and_then(|t| t.best(&prefix)).cloned()
+    }
+
+    /// Fans a REDISTRIBUTE_ROUTE_ADD out to the sessions registered for
+    /// the new best route's (afi, type) when `before` differs from the
+    /// current best. A best route that vanished has no modeled push
+    /// (ZEBRA_REDISTRIBUTE_ROUTE_DEL 32 is still passthrough — Z2B cut).
+    fn push_best_change(&mut self, table: TableId, prefix: IpPrefix, before: Option<RouteEntry>) {
+        let after = self.best_of(table, prefix);
+        if after == before {
+            return;
+        }
+        let Some(best) = after else {
+            debug!(%prefix, table, "zapi: best route withdrawn; no redistribute push (DEL unmodeled)");
+            return;
+        };
+        let afi = afi_of(&best.prefix);
+        let route_type = route_type_from(best.protocol);
+        // RouteEntry carries no instance, so registration instances are
+        // matched on (afi, type) only.
+        let owners: Vec<u64> = self
+            .redistributes
+            .iter()
+            .filter(|(_, keys)| keys.iter().any(|k| k.0 == afi && k.1 == route_type))
+            .map(|(&owner, _)| owner)
+            .collect();
+        if owners.is_empty() {
+            return;
+        }
+        let entry = self.push_form(&best);
+        info!(
+            %prefix,
+            table,
+            route_type,
+            sessions = owners.len(),
+            "zapi: best route changed; pushing REDISTRIBUTE_ROUTE_ADD"
+        );
+        for owner in owners {
+            self.push(owner, SessionPush::RedistributeRouteAdd(entry.clone()));
+        }
+    }
+
+    /// The wire-facing form of a route: gateway hops rewritten to their
+    /// resolved (ifindex-carrying) form where the RIB can resolve them —
+    /// unresolved gateways keep their gateway form, which is exactly the
+    /// shape an NHT-tracking client knows how to consume.
+    fn push_form(&self, entry: &RouteEntry) -> RouteEntry {
+        let mut form = entry.clone();
+        let mut hops = NexthopGroup::new();
+        for &(hop, weight) in entry.nexthops.hops() {
+            let hop = match hop {
+                Nexthop::Ipv4(gate) => self.rib.lookup_nexthop(IpAddr::V4(gate)).unwrap_or(hop),
+                Nexthop::Ipv6(gate) => self.rib.lookup_nexthop(IpAddr::V6(gate)).unwrap_or(hop),
+                Nexthop::Blackhole
+                | Nexthop::IfIndex(_)
+                | Nexthop::Ipv4If(..)
+                | Nexthop::Ipv6If(..) => hop,
+            };
+            hops.add(hop, weight);
+        }
+        form.nexthops = hops;
+        form
+    }
+
+    /// Queues one push to one session. Bounded and non-blocking: the main
+    /// loop must never stall on a slow daemon. A full queue drops the
+    /// update with a warning (a stuck client re-syncs on re-registration
+    /// or reconnect); a closed channel means the session is gone and
+    /// prunes every registration it left behind.
+    fn push(&mut self, owner: u64, item: SessionPush) {
+        let Some(session) = self.sessions.get(&owner) else {
+            debug!(owner, "zapi: push for unattached session dropped");
+            return;
+        };
+        match session.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(owner, "zapi: session push queue full; update dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.sessions.remove(&owner);
+                self.nht_registrations.remove(&owner);
+                self.redistributes.remove(&owner);
+                debug!(owner, "zapi: session gone; registries pruned");
             }
         }
     }
@@ -174,9 +346,355 @@ impl RibDriver {
     }
 }
 
-fn prefix_addr(prefix: &IpPrefix) -> std::net::IpAddr {
-    match prefix {
-        IpPrefix::V4(p) => std::net::IpAddr::V4(p.addr()),
-        IpPrefix::V6(p) => std::net::IpAddr::V6(p.addr()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::{NexthopGroup, RouteProtocol};
+    use zapi::route_type;
+
+    /// Attaches a fake session and returns its push receiver.
+    fn attach(driver: &mut RibDriver, owner: u64) -> mpsc::Receiver<SessionPush> {
+        let (tx, rx) = mpsc::channel(16);
+        driver.apply(RibCommand::AttachSession { owner, push: tx });
+        rx
+    }
+
+    fn register_nht(driver: &mut RibDriver, owner: u64, prefix: &str) -> Option<Nexthop> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        driver.apply(RibCommand::RegisterNexthop {
+            owner,
+            prefix: prefix.parse().unwrap(),
+            reply: tx,
+        });
+        rx.blocking_recv().expect("answer")
+    }
+
+    fn static_entry(prefix: &str, hop: Nexthop, metric: u32) -> RouteEntry {
+        RouteEntry::new(
+            prefix.parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(hop),
+            metric,
+        )
+    }
+
+    fn link_up(ifindex: u32) -> DataplaneEvent {
+        DataplaneEvent::LinkNew {
+            ifindex,
+            name: format!("eth{ifindex}"),
+            is_up: true,
+        }
+    }
+
+    fn link_down(ifindex: u32) -> DataplaneEvent {
+        DataplaneEvent::LinkNew {
+            ifindex,
+            name: format!("eth{ifindex}"),
+            is_up: false,
+        }
+    }
+
+    fn addr_new(ifindex: u32, prefix: &str) -> DataplaneEvent {
+        DataplaneEvent::AddressNew {
+            ifindex,
+            prefix: prefix.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn attach_session_records_push_sender() {
+        let mut driver = RibDriver::new();
+        let rx = attach(&mut driver, 1);
+        assert!(driver.sessions.contains_key(&1));
+        drop(rx);
+    }
+
+    /// The core Z3B flip: a registered-but-unresolved gateway resolves
+    /// when a covering address appears, and ONLY the flip pushes.
+    #[test]
+    fn nht_flip_on_address_add_pushes_resolution() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+
+        let answer = register_nht(&mut driver, 1, "10.9.9.9/32");
+        assert_eq!(answer, None, "no mirror yet: unresolved");
+
+        driver.apply_event(&link_up(2));
+        assert!(
+            pushes.try_recv().is_err(),
+            "link alone covers nothing: no flip, no push"
+        );
+
+        driver.apply_event(&addr_new(2, "10.9.9.1/24"));
+        match pushes.try_recv().expect("flip pushed") {
+            SessionPush::NexthopResolution { prefix, resolution } => {
+                assert_eq!(prefix, "10.9.9.9/32".parse().unwrap());
+                assert_eq!(
+                    resolution,
+                    Some(Nexthop::Ipv4If("10.9.9.9".parse().unwrap(), 2))
+                );
+            }
+            other => panic!("expected NexthopResolution, got {other:?}"),
+        }
+        assert!(
+            pushes.try_recv().is_err(),
+            "the duplicate event below must not re-push"
+        );
+        driver.apply_event(&addr_new(2, "10.9.9.1/24")); // duplicate: idempotent
+        assert!(pushes.try_recv().is_err(), "no flip, no push");
+    }
+
+    /// Both directions: resolution disappears when the link goes down and
+    /// comes back when it returns.
+    #[test]
+    fn nht_flip_on_link_down_and_back_pushes_both_ways() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply_event(&link_up(3));
+        driver.apply_event(&addr_new(3, "192.0.2.1/24"));
+
+        let answer = register_nht(&mut driver, 1, "192.0.2.9/32");
+        assert_eq!(
+            answer,
+            Some(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 3)),
+            "resolved at registration time"
+        );
+        assert!(pushes.try_recv().is_err(), "registration answers directly");
+
+        driver.apply_event(&link_down(3));
+        match pushes.try_recv().expect("unresolve pushed") {
+            SessionPush::NexthopResolution { resolution, .. } => {
+                assert_eq!(resolution, None);
+            }
+            other => panic!("expected NexthopResolution, got {other:?}"),
+        }
+
+        driver.apply_event(&link_up(3));
+        match pushes.try_recv().expect("re-resolve pushed") {
+            SessionPush::NexthopResolution { resolution, .. } => {
+                assert_eq!(
+                    resolution,
+                    Some(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 3))
+                );
+            }
+            other => panic!("expected NexthopResolution, got {other:?}"),
+        }
+    }
+
+    /// Route events never re-run resolution (direct resolution depends
+    /// only on the interface mirror).
+    #[test]
+    fn route_events_do_not_re_evaluate_nht() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        assert_eq!(register_nht(&mut driver, 1, "10.9.9.9/32"), None);
+        driver.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix: "10.9.9.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+        assert!(
+            pushes.try_recv().is_err(),
+            "a kernel route event is not a resolution flip"
+        );
+    }
+
+    /// A route add that becomes the best route pushes to the session that
+    /// registered REDISTRIBUTE for its type — in push form (gateway hops
+    /// resolved).
+    #[test]
+    fn best_route_change_pushes_redistribute() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 7);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 7,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
+            5,
+        )));
+        match pushes.try_recv().expect("push on best change") {
+            SessionPush::RedistributeRouteAdd(entry) => {
+                assert_eq!(entry.prefix, "198.51.100.0/24".parse().unwrap());
+                assert_eq!(entry.metric, 5);
+                assert_eq!(
+                    entry.nexthops.hops(),
+                    &[(Nexthop::Ipv4If("203.0.113.9".parse().unwrap(), 2), 1)],
+                    "gateway hop resolved to ifindex form for the push"
+                );
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+        assert!(pushes.try_recv().is_err(), "one push per change");
+    }
+
+    /// Adding a candidate that does NOT change the best route pushes
+    /// nothing; replacing the best with a better same-protocol route
+    /// pushes the new best; withdrawing the best pushes nothing (DEL 32
+    /// unmodeled — pinned here so the cut is visible).
+    #[test]
+    fn redistribute_push_gates_on_actual_best_change() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::IfIndex(2),
+            20,
+        )));
+        assert!(matches!(
+            pushes.try_recv().expect("new best pushes"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+
+        // A worse candidate from another protocol: best unchanged.
+        let mut ospf = static_entry("198.51.100.0/24", Nexthop::IfIndex(3), 0);
+        ospf.protocol = RouteProtocol::Ospf;
+        driver.apply(RibCommand::AddRoute(ospf));
+        assert!(pushes.try_recv().is_err(), "best unchanged: no push");
+
+        // A better static replaces the best (same protocol, lower metric).
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::IfIndex(2),
+            10,
+        )));
+        match pushes.try_recv().expect("new best pushes") {
+            SessionPush::RedistributeRouteAdd(entry) => assert_eq!(entry.metric, 10),
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+
+        // Withdrawing a non-best candidate: best unchanged.
+        driver.apply(RibCommand::DeleteRoute {
+            table: 254,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Ospf,
+        });
+        assert!(pushes.try_recv().is_err(), "best still static: no push");
+
+        // Withdrawing the best itself (last candidate): best gone, no
+        // modeled push — REDISTRIBUTE_ROUTE_DEL is the Z2B cut, pinned
+        // here so the gap stays visible.
+        driver.apply(RibCommand::DeleteRoute {
+            table: 254,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Static,
+        });
+        assert!(
+            pushes.try_recv().is_err(),
+            "best withdrawn: REDISTRIBUTE_ROUTE_DEL is unmodeled (Z2B cut)"
+        );
+    }
+
+    /// The fan-out filters on both AFI and route type.
+    #[test]
+    fn redistribute_fan_out_respects_afi_and_type() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 2, // IPv6 only
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Blackhole,
+            0,
+        )));
+        assert!(
+            pushes.try_recv().is_err(),
+            "v6-registered session gets no v4 push"
+        );
+
+        let mut v6 = static_entry("2001:db8::/32", Nexthop::Blackhole, 0);
+        driver.apply(RibCommand::AddRoute(v6.clone()));
+        v6.protocol = RouteProtocol::Ospf;
+        assert!(matches!(
+            pushes.try_recv().expect("v6 static pushes"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+
+        // Wrong type: an OSPF route does not reach a static-only session.
+        driver.apply(RibCommand::AddRoute(v6));
+        assert!(pushes.try_recv().is_err(), "type filter holds");
+    }
+
+    /// A dead session is pruned on the first push attempt, and its
+    /// registrations go with it (Z3 disclosure 4 resolved).
+    #[test]
+    fn dead_session_pruned_with_its_registrations() {
+        let mut driver = RibDriver::new();
+        let pushes = attach(&mut driver, 9);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 9,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        assert_eq!(register_nht(&mut driver, 9, "10.9.9.9/32"), None);
+        drop(pushes); // session gone
+
+        // The push attempt discovers the closed channel and prunes.
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Blackhole,
+            0,
+        )));
+        assert!(!driver.sessions.contains_key(&9));
+        assert!(!driver.nht_registrations.contains_key(&9));
+        assert!(!driver.redistributes.contains_key(&9));
+
+        // A re-attached owner works cleanly afterwards (with a fresh
+        // registration — the prune took the old one, as asserted above).
+        let mut fresh = attach(&mut driver, 9);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 9,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "203.0.113.0/24",
+            Nexthop::Blackhole,
+            0,
+        )));
+        assert!(matches!(
+            fresh.try_recv().expect("re-attached session pushes"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+    }
+
+    /// Pushes for owners that never attached (e.g. commands racing the
+    /// attach) are dropped, not fatal.
+    #[test]
+    fn push_without_attach_is_dropped() {
+        let mut driver = RibDriver::new();
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 42,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Blackhole,
+            0,
+        )));
+        assert!(driver.sessions.is_empty());
     }
 }
