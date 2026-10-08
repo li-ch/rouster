@@ -123,6 +123,10 @@ impl NetlinkDataplane {
     }
 }
 
+/// `RT_TABLE_COMPAT` — header marker for routing tables addressed by
+/// `RTA_TABLE` (ids > 255).
+const RT_TABLE_COMPAT: u8 = 252;
+
 /// Maps a kernel link message to a `LinkNew` event (name resolution included).
 fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
     let name = msg.attributes.iter().find_map(|a| match a {
@@ -302,7 +306,16 @@ fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
         }
     }
 
-    msg.header.table = entry.table as u8; // TODO(phase-0): RTA_TABLE for ids > 255
+    // rtm_table is 8 bits. Ids > 255 follow the kernel/iproute2 convention:
+    // the header carries RT_TABLE_COMPAT and RTA_TABLE the real id (the
+    // kernel prefers RTA_TABLE whenever present; the mirror-read side
+    // already decodes both).
+    if entry.table > 255 {
+        msg.header.table = RT_TABLE_COMPAT;
+        msg.attributes.push(RouteAttribute::Table(entry.table));
+    } else {
+        msg.header.table = entry.table as u8;
+    }
     msg.header.protocol = nl_protocol(entry);
     msg.header.scope = RouteScope::Universe;
     msg.header.kind = RouteType::Unicast;
