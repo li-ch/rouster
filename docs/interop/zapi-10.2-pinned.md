@@ -1,12 +1,17 @@
 # ZAPI pinned against FRR 10.2.2
 
-Empirical wire capture + binary extraction, 2026-10-08 (Z1). This document
-pins the Zebra Protocol (ZAPI) command numbers and observed body formats for
-**FRR 10.2.2** (`zebra version 10.2.2`, docker image `frr-testbed:10.2.2`,
-linux/arm64). It replaces the "fill in during Phase 1" TODO in
-`crates/zapi/src/message.rs` with concrete numbers and becomes the golden
-reference for the Z2 codec; captured fixtures live in
-`crates/zapi/tests/fixtures/{staticd,bgpd}-10.2.2.log`.
+Empirical wire capture + binary extraction, 2026-10-08 (Z1); body layouts
+decoded, source-verified and corrected 2026-10-08 (Z2 — see "Z2 codec
+findings" below). This document pins the Zebra Protocol (ZAPI) command
+numbers and observed body formats for **FRR 10.2.2** (`zebra version
+10.2.2`, docker image `frr-testbed:10.2.2`, linux/arm64). It replaces the
+"fill in during Phase 1" TODO in `crates/zapi/src/message.rs` with concrete
+numbers and becomes the golden reference for the Z2 codec; captured
+fixtures live in `crates/zapi/tests/fixtures/{staticd,bgpd}-10.2.2.log`.
+Z2 also retrieved the real 10.2.2 sources (`lib/zclient.h`, `lib/zclient.c`,
+`zebra/zebra_rnh.c`, `lib/zebra.h`) through an alternate reader after Z1's
+mirror 404s — corrections are marked **Z2-fix** inline and listed in the Z2
+section.
 
 ## Header (confirmed on every captured message)
 
@@ -40,11 +45,12 @@ mirror), and the FRR dev guide's Zebra chapter documents no message bodies
 if source access returns, diff this table against `zapi_msg.h` — expect zero
 differences for indices that are not holes.
 
-## Command number table (0–154)
+## Command number table (0–146)
 
 Evidence per entry: **E** = EMPIRICAL (wire-captured tonight, fixture-cited),
-**B** = BINARY (extracted from the build's own table), holes marked `reserved
-(unknown)`. Wire-confirmed entries carry the observing daemon.
+**B** = BINARY (extracted from the build's own table), **SRC** = verified
+against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
+`reserved (unknown)`. Wire-confirmed entries carry the observing daemon.
 
 | # | Name | Ev | Notes |
 |---|------|----|-------|
@@ -55,7 +61,7 @@ Evidence per entry: **E** = EMPIRICAL (wire-captured tonight, fixture-cited),
 | 4 | ZEBRA_INTERFACE_UP | B | |
 | 5 | ZEBRA_INTERFACE_DOWN | B | |
 | 6 | ZEBRA_INTERFACE_SET_MASTER | B | |
-| 7 | *reserved (hole in build's table)* | B | |
+| 7 | ZEBRA_INTERFACE_SET_ARP | B, SRC | **Z2-fix**: NOT a hole — `zebra_message_types_t` has SET_ARP here (zclient.h); the binary extraction missed it |
 | 8 | ZEBRA_INTERFACE_SET_PROTODOWN | B | |
 | 9 | ZEBRA_ROUTE_ADD | E | staticd, carries prefix (below) |
 | 10 | ZEBRA_ROUTE_DELETE | E | staticd, on reconnect |
@@ -194,19 +200,21 @@ Evidence per entry: **E** = EMPIRICAL (wire-captured tonight, fixture-cited),
 | 143 | ZEBRA_TC_FILTER_ADD | B | |
 | 144 | ZEBRA_TC_FILTER_DELETE | B | |
 | 145 | ZEBRA_OPAQUE_NOTIFY | B | |
-| 146 | ZEBRA_SRV6_SID_NOTIFY | B | |
-| 147–149 | *reserved (holes in build's table)* | B | |
-| 150 | ZEBRA_CLIENT_GR_CAPABILITIES | B | |
-| 151 | ZEBRA_CLIENT_ROUTE_UPDATE_COMPLETE | B | |
-| 152 | ZEBRA_CLIENT_ROUTE_UPDATE_PENDING | B | |
-| 153 | ZEBRA_CLIENT_GR_DISABLE | B | |
-| 154 | ZEBRA_CLIENT_RIB_STALE_TIME | B | |
+| 146 | ZEBRA_SRV6_SID_NOTIFY | B | **Z2-fix**: `zebra_message_types_t` ENDS here (147 entries, 0..=146) |
+| 147–149 | *not part of the message enum* | SRC | **Z2-fix**: no such commands; the extractor overran the table |
+| 150 | ~~ZEBRA_CLIENT_GR_CAPABILITIES~~ | | **Z2-fix**: member of `enum zserv_client_capabilities` (values 1..), NOT a zserv command — misattributed by the binary extraction |
+| 151 | ~~ZEBRA_CLIENT_ROUTE_UPDATE_COMPLETE~~ | | same misattribution |
+| 152 | ~~ZEBRA_CLIENT_ROUTE_UPDATE_PENDING~~ | | same misattribution |
+| 153 | ~~ZEBRA_CLIENT_GR_DISABLE~~ | | same misattribution |
+| 154 | ~~ZEBRA_CLIENT_RIB_STALE_TIME~~ | | same misattribution |
 
 Route-type numbers seen inside bodies (EMPIRICAL): static = 4 (ROUTE_ADD of
 staticd, REDISTRIBUTE_ADD of static type, staticd HELLO byte 0), BGP = 10
-(bgpd HELLO byte 0, LABEL_MANAGER_CONNECT byte 0). Note this is +1 vs the
-classic FRR `ZEBRA_ROUTE_*` numbering (static 3, BGP 9) — Z2 must pin the
-full route-type enum the same way before encoding types.
+(bgpd HELLO byte 0, LABEL_MANAGER_CONNECT byte 0). **Z2**: confirmed by
+`lib/zebra.h` — the 10.2.2 numbering starts `ZEBRA_ROUTE_SYSTEM = 1`
+(+1 vs the classic table where SYSTEM=0); `lib/route_types.h` itself stayed
+unreachable, so types other than static/BGP are SRC-inferred from that
+shift: kernel=2, connected=3, rip=5, ripng=6, ospf=7, ospf6=8, isis=9.
 
 ## Observed client→zebra bodies (EMPIRICAL, from fixtures)
 
@@ -220,16 +228,17 @@ verbatim fixture content.
 | staticd | `04 00000000 000000` | first msg on connect |
 | bgpd main zclient | `0a 00000000 000000` | |
 | bgpd 2nd zclient | `12 00000000 000000` | |
-| bgpd label-mgr zclient | `0a 00000000 000101` | |
+| bgpd label-mgr zclient | `0a 00000000 0001 01` | |
 
-Byte 0 matches the daemon's protocol number (static=4, bgp=10) on three of
-four (the `12` on bgpd's second client is unexplained — possibly proto+flags
-or a client-id). Trailing `0101` on the label-manager connection only.
-Exact field semantics (session_id? instance? redist_default?) unresolved —
-Z2 must decode against `zclient_send_hello` in lib/zclient.c. Zebra's log
-line "client 17 says hello and bids fair to announce only static routes"
-confirms the message announces the daemon's route type; the 17 is the
-client's file descriptor, not a wire field.
+**Z2 decoded** (`zclient_send_hello`): `redist_default` u8 | `instance`
+u16 | `session_id` u32 | `synchronous` u8. Byte 0 = the client's announced
+route type (static=4, BGP=10; the `12` on bgpd's auxiliary client is its
+`redist_default` — which proto that is remains open, but the field is
+certain). The label-manager client's trailing `0101` = session_id 1 +
+synchronous 1 (it runs with `zclient_options_sync`). Zebra's log line
+"client 17 says hello and bids fair to announce only static routes"
+confirms byte 0 announces the daemon's route type; the 17 is the client's
+file descriptor, not a wire field.
 
 ### ZEBRA_INTERFACE_ADD (0) as registration request — empty body
 
@@ -241,40 +250,57 @@ masquerade never answers).
 ### ZEBRA_ROUTE_ADD (9) — staticd, blackhole route `203.0.113.0/24` (27-byte body)
 
 ```
-04 0000 00000041 0000 0003 01 02 18 cb007100 01000000 0006 0001 01
-|  |    |        |         |     |  |
-|  |    |        |         |     |  prefixlen=0x18 (24)
-|  |    |        |         |     +-- prefix follows (2 = ?)
-|  |    |        |         +-- afi/safi region: 03 01 02 undecoded
-|  |    |        +-- message bitmask / length region: 0000 0003 01 partially undecoded
-|  |    +-- flags u32 = 0x00000041 = INTERNAL|STATIC (per zebra.h bit names)
+04 0000 00000041 00000003 01 02 18 cb0071 0001 00000000 06 00 01 01
+|  |    |        |        |  |  |  |      |    |         |  |  |  |
+|  |    |        |        |  |  |  |      |    |         |  |  |  distance=1 (message bit 0x02)
+|  |    |        |        |  |  |  |      |    |         |  |  bh_type=1 (REJECT)
+|  |    |        |        |  |  |  |      |    |         |  nh flags=0
+|  |    |        |        |  |  |  |      |    |         type=6 BLACKHOLE
+|  |    |        |        |  |  |  |      |    vrf_id u32=0 (nexthop)
+|  |    |        |        |  |  |  |      nexthop count u16=1
+|  |    |        |        |  |  |  PSIZE(24)=3 address bytes = 203.0.113
+|  |    |        |        |  |  prefixlen 24
+|  |    |        |        |  family=2 (AF_INET)
+|  |    |        |        safi=1 (SAFI_UNICAST)
+|  |    |        message u32 = 0x03 = NEXTHOP|DISTANCE
+|  |    flags u32 = 0x41 = ALLOW_RECURSION|RR_USE_DISTANCE (Z2-fix, see below)
 +-- type = 4 (static)
 ```
-Confirmed fields: type byte at offset 0; flags 0x41 at offsets 3–6
-(INTERNAL|STATIC — SPEC-assisted read); prefixlen 0x18 at offset 13; prefix
-`cb007100` = 203.0.113.0 at offsets 14–17; tail `01000000 0006 0001 01`
-contains the blackhole nexthop (undecoded). Route fields between flags and
-prefix remain for Z2 to pin against `zapi_route_encode` (lib/zapi_route.c).
+
+**Z2 decoded** (`zapi_route_encode`): `type` u8 | `instance` u16 | `flags`
+u32 | `message` u32 | `safi` u8 | prefix {family u8, prefixlen u8,
+**PSIZE(prefixlen)** address bytes — 3 for a /24, not 4} | then fields
+gated by `message` bits, in order: SRCPFX (plen + PSIZE bytes), NHG (u32),
+NEXTHOPs (count **u16**, each `vrf_id` u32 + `type` u8 + `flags` u8 +
+type-specific + gated extras), BACKUP_NEXTHOPs (count u16), DISTANCE u8,
+METRIC u32, TAG u32, MTU u32, TABLEID u32, OPAQUE (len u16 + bytes).
+Nexthop types: 1 IFINDEX, 2 IPV4, 3 IPV4_IFINDEX, 4 IPV6, 5 IPV6_IFINDEX,
+6 BLACKHOLE (bh_type: 0 NULL, 1 REJECT). The address of a blackhole or
+gateway nexthop is always followed by ifindex u32 for types 2-5.
+**Z2-fix on flags**: 0x41 is NOT classic "INTERNAL|STATIC" — 10.2.2's
+`ZEBRA_FLAG_*` are ALLOW_RECURSION 0x01, SELFROUTE 0x02, IBGP 0x04,
+SELECTED 0x08, FIB_OVERRIDE 0x10, EVPN_ROUTE 0x20, RR_USE_DISTANCE 0x40, ...
 
 ### ZEBRA_ROUTE_DELETE (10) — staticd, on reconnect, `198.51.100.0/24` (20-byte body)
 
-`04 0000 00000041 0000 0003 01 02 18 c6336400 0001` — same skeleton:
-type=4, flags 0x41, prefixlen 24 at offset 13, prefix `c6336400` =
-198.51.100.0 at 14–17. Emitted during the post-reconnect re-registration
-(gateway route was in NHT-wait; staticd deletes it before re-adding the
-blackhole one).
+`04 0000 00000041 00000003 01 02 18 c63364 0000 01` — same skeleton;
+**Z2 decoded** tail: nexthop count u16 = 0 (a delete carries no nexthops
+but keeps the NEXTHOP message bit) + distance u8 = 1. Emitted during the
+post-reconnect re-registration (gateway route was in NHT-wait; staticd
+deletes it before re-adding the blackhole one).
 
 ### ZEBRA_NEXTHOP_REGISTER (21) — 11-byte body, two samples
 
-| sender | body | decoded tail |
+| sender | body | decoded |
 |---|---|---|
-| staticd (gateway 192.0.2.1) | `00 0000 01 0002 20 c0000201` | plen=32, 192.0.2.1 |
-| bgpd (neighbor 10.9.9.9) | `01 0000 01 0002 20 0a090909` | plen=32, 10.9.9.9 |
+| staticd (gateway 192.0.2.1) | `00 00 0001 0002 20 c0000201` | connected=0, safi=1, 192.0.2.1/32 |
+| bgpd (neighbor 10.9.9.9) | `01 00 0001 0002 20 0a090909` | connected=1, safi=1, 10.9.9.9/32 |
 
-Layout: byte0 differs (0 staticd / 1 bgpd — likely a flags/connected byte),
-`01 0002` region constant (afi/safi?), `20` = prefixlen 32, then the 4-byte
-IPv4 address. Exactly one REGISTER per tracked prefix, sent when the prefix
-becomes interesting (static route gateway configured / BGP neighbor created).
+**Z2 decoded** (`zclient_send_rnh`): `connected` u8 | `resolve_via_default`
+u8 | `safi` u16 | prefix {family **u16**, prefixlen u8, full 4/16 address
+bytes}. Exactly one REGISTER per tracked prefix, sent when the prefix
+becomes interesting (static route gateway configured / BGP neighbor
+created).
 
 ### ZEBRA_REDISTRIBUTE_ADD (12) — bgpd `redistribute static`, 4-byte body
 
@@ -285,7 +311,8 @@ issuing the delete, or defers it; unvalidated either way.
 
 ### ZEBRA_ROUTER_ID_ADD (16) — 2-byte body `0001`
 
-Sent by staticd and bgpd in the connect burst (u16, value 1).
+**Z2 decoded** (`zclient_send_router_id_update`): `afi` u16 — value 1 =
+AFI_IP. Sent by staticd and bgpd in the connect burst.
 
 ### ZEBRA_BFD_CLIENT_REGISTER (36) — 4-byte body = u32 pid
 
@@ -300,25 +327,37 @@ bgpd's third zclient connection at startup: proto 10 (BGP) + u16 0.
 
 staticd connect burst (wants route-owner status notifications).
 
-## Zebra→client bodies — SPEC-REFERENCE, unvalidated tonight
+## Zebra→client bodies — SRC-VERIFIED layouts, still not wire-captured
 
-The masquerade captures only client→zebra traffic. The three the ZAPI server
-must emit first are (encoders in lib/zapi_msg.c; layouts not verifiable from
-the dev guide, which documents none of them):
+The masquerade captures only client→zebra traffic, so these layouts come
+from the 10.2.2 source read side (`zebra_interface_state_read`,
+`zebra_interface_address_read`, `zebra_send_rnh_update`,
+`zebra_router_id_update_read` in `lib/zclient.c` / `zebra/zebra_rnh.c`) —
+fetched by Z2 — and are implemented + synthetic-round-trip-tested in
+`crates/zapi/src/message.rs` (`SPEC` tags). Still worth capturing for real
+(Z5) by extending zapi-sniff into a responding proxy:
 
-- **ZEBRA_INTERFACE_ADD (0)** — `zsend_interface_add`/`zebra_interface_add`
-  encoding (ifname, ifindex, status, MAC, MTU, speed... plus per-address
-  INTERFACE_ADDRESS_ADD messages). Oracle run shows a fresh client gets
-  VRF_ADD x1, Connected x4, Intf Addr x2, then INTERFACE_LINK_PARAMS (41)
-  last (`show zebra client` counters) — the reply stream shape is known even
-  though bytes weren't captured.
-- **ZEBRA_NEXTHOP_UPDATE (23)** — `zsend_nexthop_update` (prefix, vrf id,
-  flags, nexthop list with type/gateway/ifindex/metric/weight).
-- **ZEBRA_ROUTER_ID_UPDATE (18)** — `zsend_router_id_update` (afi + address).
-
-Z2 should capture these by extending zapi-sniff into a responding proxy
-(relay between daemon and real zebra, logging both directions) or by
-speaking enough client-side ZAPI to solicit them.
+- **ZEBRA_INTERFACE_ADD/DELETE (0/1)**: ifname exactly 20 bytes (IFNAMSIZ,
+  NUL padded) | ifindex u32 | status u8 | flags u64 | ptm_enable u8 |
+  ptm_status u8 | metric u32 | speed u32 | txqlen u32 | mtu u32 | mtu6 u32
+  | bandwidth u32 | link_ifindex u32 | ll_type u32 | hw_addr_len u32 +
+  min(len,20) bytes | link_params_status u8 [+ link-params blob]. Note the
+  layout diagram inside `zclient.c`'s comment block is STALE — the code
+  above is what 10.2.2 parses. Oracle run shows a fresh client gets VRF_ADD
+  x1, Connected x4, Intf Addr x2, then INTERFACE_LINK_PARAMS (41) last.
+- **ZEBRA_INTERFACE_ADDRESS_ADD/DELETE (2/3)**: ifindex u32 | flags u8 |
+  family u8 | address bytes (4/16) | prefixlen u8 (AFTER the address) |
+  destination bytes (all-zero = none).
+- **ZEBRA_NEXTHOP_UPDATE (23)** (`zebra_send_rnh_update`): message u32 |
+  safi u16 | registered prefix {family u16, plen u8, addr} | resolved
+  prefix {same} | [srte_color u32 if SRTE bit] | route type u8 | instance
+  u16 | distance u8 | metric u32 | nexthop count **u8** | nexthops
+  (`zapi_nexthop_encode` shape). Unresolved updates zero the tail fields.
+- **ZEBRA_ROUTER_ID_UPDATE (18)**: family u8 | address bytes | prefixlen
+  u8 (after the address).
+- **LABEL_MANAGER_CONNECT reply** (client→zebra cmd 49 answered by zebra):
+  proto u8 + instance u16 + result u8 — Z3 must answer this or bgpd hangs
+  (operational finding 3).
 
 ## Operational findings (relevant to the ZAPI server)
 
@@ -352,13 +391,47 @@ speaking enough client-side ZAPI to solicit them.
    (privs_init fails and exits otherwise) — affects any test harness that
    runs the real zebra.
 
-## Open questions for Z2
+## Z2 codec findings (2026-10-08, stage Z2)
 
-- Exact HELLO field semantics (byte 0 = protocol; the `0x12` variant; the
-  `0101` tail on the label-manager connection).
-- Full route-type enum (observed static=4, bgp=10 — likely +1 vs classic
-  numbering; needs the same pinning treatment).
-- Undecoded regions of ROUTE_ADD (message bitmask, afi/safi block, nexthop
-  list encoding for blackhole and gateway forms).
-- The reserved holes 7, 147–149 and REDISTRIBUTE_DELETE conditions.
-- All zebra→client bodies (see SPEC-REFERENCE section).
+The codec lives in `crates/zapi/src/message.rs` (code) and
+`crates/zapi/tests/golden.rs` (fixture goldens). Method: Z1's WebFetch
+mirror 404s did not reproduce through the alternate web reader — Z2
+retrieved the real frr-10.2.2 `lib/zclient.h`, `lib/zclient.c`,
+`zebra/zebra_rnh.c` and `lib/zebra.h` (jsdelivr/raw through webReader;
+`lib/route_types.h` and `zebra/zapi_msg.c` stayed unreachable). Every
+layout below is the source's own encode/decode order, and every fixture
+body (all 38 messages) decodes exactly and re-encodes byte-identically.
+
+Corrections to Z1's table (all disclosed, none silent):
+
+1. **Command 7 is ZEBRA_INTERFACE_SET_ARP**, not a hole — the binary
+   extraction missed one entry. The enum is `0..=146` (147 members).
+2. **150–154 were misattributed**: those names belong to
+   `enum zserv_client_capabilities`, not `zebra_message_types_t`. There are
+   no zserv commands above 146; the codec maps 147+ to `Unknown`.
+3. **ROUTE flags 0x41 ≠ INTERNAL|STATIC**: 10.2.2's `ZEBRA_FLAG_*` are
+   ALLOW_RECURSION=0x01 ... RR_USE_DISTANCE=0x40; 0x41 is that pair. The
+   Z1 reading applied classic pre-renumbering values.
+4. **ROUTE_ADD prefix address bytes are PSIZE(plen)-sized** (3 for a /24) —
+   Z1's annotation assumed a full 4-byte word, which made the tail look
+   undecodable. With PSIZE the whole 27-byte body parses exactly:
+   count u16=1 + nh{vrf 0, BLACKHOLE, flags 0, bh_type 1} + distance 1.
+
+Resolved Z1 open questions: HELLO field semantics (redist_default u8,
+instance u16, session_id u32, synchronous u8 — the label-mgr `0101` tail is
+session 1 + synchronous 1); route-type numbering (+1 shift confirmed,
+SYSTEM=1 base, per `lib/zebra.h`'s include of route_types.h); the ROUTE_ADD
+middle region (`message` u32 at [7..11], `safi` u8 at [11]); the nexthop
+list encoding; NEXTHOP_REGISTER widths; ROUTER_ID_ADD = afi u16.
+
+Still open (for Z3/Z5):
+
+- Which protocol bgpd's auxiliary zclient announces (`redist_default`
+  0x12 = 18 — field certain, value's meaning not).
+- `resolve_via_default`/`connected` semantics beyond the observed bits.
+- Wire-capturing the zebra→client side (proxy zapi-sniff) to validate the
+  SRC-VERIFIED layouts against real bytes.
+- REDISTRIBUTE_DELETE emission conditions (Z1 never caught one on the wire).
+- `lib/route_types.h` full table (route types other than static/BGP remain
+  shift-inferred: kernel 2, connected 3, rip 5, ripng 6, ospf 7, ospf6 8,
+  isis 9).
