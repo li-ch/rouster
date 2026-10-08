@@ -26,18 +26,47 @@ pub enum DataplaneError {
 /// resolution and interface tracking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataplaneEvent {
-    LinkNew { ifindex: u32, name: String },
-    LinkDel { ifindex: u32 },
-    // TODO(phase-0): address/neighbour events.
+    LinkNew {
+        ifindex: u32,
+        name: String,
+        is_up: bool,
+    },
+    LinkDel {
+        ifindex: u32,
+    },
+    /// An address was configured on an interface (host prefix, e.g.
+    /// 10.0.0.1/24 on eth0).
+    AddressNew {
+        ifindex: u32,
+        prefix: crate::prefix::IpPrefix,
+    },
+    AddressDel {
+        ifindex: u32,
+        prefix: crate::prefix::IpPrefix,
+    },
+    // TODO(phase-1): neighbour events; route-originated events for FIB
+    // reconciliation.
 }
 
 impl fmt::Display for DataplaneEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DataplaneEvent::LinkNew { ifindex, name } => {
-                write!(f, "link new: {name} (ifindex {ifindex})")
-            }
+            DataplaneEvent::LinkNew {
+                ifindex,
+                name,
+                is_up,
+            } => write!(
+                f,
+                "link new: {name} (ifindex {ifindex}, {})",
+                if *is_up { "up" } else { "down" }
+            ),
             DataplaneEvent::LinkDel { ifindex } => write!(f, "link del: ifindex {ifindex}"),
+            DataplaneEvent::AddressNew { ifindex, prefix } => {
+                write!(f, "addr new: {prefix} on ifindex {ifindex}")
+            }
+            DataplaneEvent::AddressDel { ifindex, prefix } => {
+                write!(f, "addr del: {prefix} on ifindex {ifindex}")
+            }
         }
     }
 }

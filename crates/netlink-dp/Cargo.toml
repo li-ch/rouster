@@ -18,3 +18,4 @@ tracing.workspace = true
 rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 futures.workspace = true
+libc.workspace = true

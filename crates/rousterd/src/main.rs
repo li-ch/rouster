@@ -86,9 +86,37 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // TODO(phase-0): subscribe to dataplane events, stay resident.
+    // Resident mode: initial mirror of kernel interface state, then track
+    // link/address changes as they arrive.
+    let mut dp = dp;
+    for ev in dp
+        .dump_state()
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    {
+        rib.apply_event(&ev);
+    }
+    info!(
+        interfaces = rib.interfaces().len(),
+        "initial interface state mirrored"
+    );
+
     // TODO(phase-1): spawn zapi::server::serve().
-    tokio::signal::ctrl_c().await?;
+    loop {
+        tokio::select! {
+            ev = dp.next_event() => {
+                match ev {
+                    Some(ev) => {
+                        rib.apply_event(&ev);
+                        info!(%ev, interfaces = rib.interfaces().len(), "dataplane event");
+                    }
+                    // Netlink connection closed; nothing left to do.
+                    None => break,
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
     info!("shutdown");
     Ok(())
 }

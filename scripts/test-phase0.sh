@@ -66,4 +66,26 @@ docker exec "$NAME" ip -4 route show 198.51.100.0/24 | grep -q 'blackhole'
 docker exec "$NAME" ip -4 route show 203.0.113.0/24 | grep -q "via $GW"
 docker exec "$NAME" ip -6 route show 2001:db8:dead::/48 | grep -q 'blackhole'
 
+echo "==> running rousterd resident (event stream)"
+docker exec -d "$NAME" sh -c \
+    'rousterd --config /etc/rouster.conf > /var/log/rousterd.log 2>&1'
+
+# Wait until the initial mirror is done before injecting kernel changes.
+for _ in $(seq 1 20); do
+    if docker exec "$NAME" grep -q 'initial interface state mirrored' /var/log/rousterd.log 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+docker exec "$NAME" grep -q 'initial interface state mirrored' /var/log/rousterd.log
+
+echo "==> injecting address add/del on eth0"
+docker exec "$NAME" ip addr add 10.99.0.1/32 dev eth0
+sleep 1
+docker exec "$NAME" grep -q 'addr new: 10.99.0.1/32' /var/log/rousterd.log
+
+docker exec "$NAME" ip addr del 10.99.0.1/32 dev eth0
+sleep 1
+docker exec "$NAME" grep -q 'addr del: 10.99.0.1/32' /var/log/rousterd.log
+
 echo "phase0 smoke test: PASS"

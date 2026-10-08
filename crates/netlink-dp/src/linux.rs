@@ -1,33 +1,83 @@
 //! Real rtnetlink-backed dataplane (Linux only).
 
-use common::{Dataplane, DataplaneError, Nexthop, RouteEntry};
+use common::{
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, Nexthop,
+    RouteEntry,
+};
 use futures::TryStreamExt;
+use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteProtocol as NlRouteProtocol, RouteScope,
     RouteType,
 };
-use netlink_packet_route::AddressFamily;
+use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
+use rtnetlink::sys::{protocols::NETLINK_ROUTE, AsyncSocket, SocketAddr, TokioSocket};
 use tracing::{debug, instrument};
 
 /// Netlink-backed dataplane handle.
+///
+/// Owns the multicast event receiver; `next_event` drives the kernel→RIB
+/// direction of the mirror.
 pub struct NetlinkDataplane {
     handle: rtnetlink::Handle,
+    messages: futures::channel::mpsc::UnboundedReceiver<(
+        NetlinkMessage<RouteNetlinkMessage>,
+        SocketAddr,
+    )>,
 }
 
 impl NetlinkDataplane {
-    /// Opens the netlink connection. The returned future is the connection
-    /// driver; spawn it on the runtime (e.g. `tokio::spawn(conn)`).
+    /// Opens the netlink connection, subscribed to link/address/route
+    /// multicast groups so kernel changes arrive as events.
+    ///
+    /// The returned future is the connection driver; spawn it on the runtime
+    /// (e.g. `tokio::spawn(conn)`).
+    #[allow(clippy::type_complexity)]
     pub fn new() -> std::io::Result<(Self, impl std::future::Future<Output = ()> + Send)> {
-        let (connection, handle, _messages) = rtnetlink::new_connection()?;
-        Ok((Self { handle }, connection))
+        let mut socket = TokioSocket::new(NETLINK_ROUTE)?;
+        let groups = libc::RTMGRP_LINK
+            | libc::RTMGRP_IPV4_IFADDR
+            | libc::RTMGRP_IPV6_IFADDR
+            | libc::RTMGRP_IPV4_ROUTE
+            | libc::RTMGRP_IPV6_ROUTE;
+        socket
+            .socket_mut()
+            .bind(&SocketAddr::new(0, groups as u32))?;
+
+        let (connection, handle, messages) = rtnetlink::from_socket(socket);
+        Ok((Self { handle, messages }, connection))
     }
 
     pub fn handle(&self) -> &rtnetlink::Handle {
         &self.handle
     }
 
+    /// Initial mirror: dumps kernel links and addresses as synthetic
+    /// `LinkNew`/`AddressNew` events, in an order the RIB can apply directly.
+    pub async fn dump_state(&self) -> Result<Vec<DataplaneEvent>, DataplaneError> {
+        let mut events = Vec::new();
+
+        let mut links = self.handle.link().get().execute();
+        while let Some(msg) = links.try_next().await.map_err(nl_err)? {
+            if let Some(ev) = link_event(&msg, true) {
+                events.push(ev);
+            }
+        }
+
+        let mut addrs = self.handle.address().get().execute();
+        while let Some(msg) = addrs.try_next().await.map_err(nl_err)? {
+            if let Some(ev) = address_event(&msg, true) {
+                events.push(ev);
+            }
+        }
+
+        Ok(events)
+    }
+
     /// Counts routes currently in the kernel. Phase 0 uses this as a minimal
-    /// "mirror" sanity check; full RIB sync comes with the event stream work.
+    /// "mirror" sanity check; full route reconciliation comes later.
     pub async fn dump_route_count(&self) -> Result<usize, DataplaneError> {
         let mut dump = self.handle.route().get(RouteMessage::default()).execute();
         let mut count = 0usize;
@@ -36,6 +86,68 @@ impl NetlinkDataplane {
         }
         Ok(count)
     }
+
+    /// Next kernel event, mapped to a [`DataplaneEvent`]. Returns `None` when
+    /// the connection is closed. Unmapped message kinds are skipped.
+    pub async fn next_event(&mut self) -> Option<DataplaneEvent> {
+        use futures::StreamExt;
+        loop {
+            let (msg, _addr) = self.messages.next().await?;
+            let NetlinkPayload::InnerMessage(inner) = msg.payload else {
+                continue;
+            };
+            let ev = match inner {
+                RouteNetlinkMessage::NewLink(m) => link_event(&m, true),
+                RouteNetlinkMessage::DelLink(m) => Some(DataplaneEvent::LinkDel {
+                    ifindex: m.header.index,
+                }),
+                RouteNetlinkMessage::NewAddress(m) => address_event(&m, true),
+                RouteNetlinkMessage::DelAddress(m) => address_event(&m, false),
+                // Route notifications: FIB reconciliation lands with the
+                // nexthop-tracking work; skipped for now.
+                _ => None,
+            };
+            if ev.is_some() {
+                return ev;
+            }
+        }
+    }
+}
+
+/// Maps a kernel link message to a `LinkNew` event (name resolution included).
+fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
+    let name = msg.attributes.iter().find_map(|a| match a {
+        LinkAttribute::IfName(n) => Some(n.clone()),
+        _ => None,
+    })?;
+    Some(DataplaneEvent::LinkNew {
+        ifindex: msg.header.index,
+        name,
+        is_up: msg.header.flags.contains(LinkFlags::Up),
+    })
+}
+
+/// Maps a kernel address message to an `AddressNew`/`AddressDel` event.
+fn address_event(msg: &AddressMessage, is_new: bool) -> Option<DataplaneEvent> {
+    let addr = msg.attributes.iter().find_map(|a| match a {
+        AddressAttribute::Address(ip) => Some(*ip),
+        _ => None,
+    })?;
+    let prefix: IpPrefix = match addr {
+        std::net::IpAddr::V4(a) => Ipv4Prefix::new(a, msg.header.prefix_len).ok()?.into(),
+        std::net::IpAddr::V6(a) => Ipv6Prefix::new(a, msg.header.prefix_len).ok()?.into(),
+    };
+    Some(if is_new {
+        DataplaneEvent::AddressNew {
+            ifindex: msg.header.index,
+            prefix,
+        }
+    } else {
+        DataplaneEvent::AddressDel {
+            ifindex: msg.header.index,
+            prefix,
+        }
+    })
 }
 
 fn nl_err(e: rtnetlink::Error) -> DataplaneError {
@@ -50,8 +162,7 @@ fn nl_protocol(entry: &RouteEntry) -> NlRouteProtocol {
         P::Connected => NlRouteProtocol::Kernel, // connected routes are kernel-owned
         P::Static => NlRouteProtocol::Static,
         P::Bgp => NlRouteProtocol::Bgp,
-        // The kernel has no RTPROT_ISIS; use OSPF-class "other IGP" values
-        // only where they exist, otherwise fall back to Static.
+        // The kernel has no RTPROT_ISIS; fall back to Static.
         P::Ospf => NlRouteProtocol::Ospf,
         P::IsIs => NlRouteProtocol::Static,
         P::Rip => NlRouteProtocol::Rip,
@@ -67,13 +178,13 @@ fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
     let mut msg = RouteMessage::default();
 
     match entry.prefix {
-        common::IpPrefix::V4(p) => {
+        IpPrefix::V4(p) => {
             msg.header.address_family = AddressFamily::Inet;
             msg.header.destination_prefix_length = p.prefix_len();
             msg.attributes
                 .push(RouteAttribute::Destination(RouteAddress::Inet(p.addr())));
         }
-        common::IpPrefix::V6(p) => {
+        IpPrefix::V6(p) => {
             msg.header.address_family = AddressFamily::Inet6;
             msg.header.destination_prefix_length = p.prefix_len();
             msg.attributes
@@ -104,25 +215,24 @@ fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
                 .push(RouteAttribute::Gateway(RouteAddress::Inet(gw)));
             msg.attributes.push(RouteAttribute::Oif(ix));
         }
-        // An IPv6 nexthop on an IPv4 route (or vice versa) is the extended
-        // nexthop case (RFC 5549); out of Phase 0 scope.
-        Nexthop::Ipv6(_) | Nexthop::Ipv6If(..) => {
-            if matches!(entry.prefix, common::IpPrefix::V4(_)) {
+        Nexthop::Ipv6(gw) => {
+            if matches!(entry.prefix, IpPrefix::V4(_)) {
                 return Err(DataplaneError::Unsupported(
                     "cross-AF nexthop (RFC 5549) not supported yet",
                 ));
             }
-            match hop {
-                Nexthop::Ipv6(gw) => msg
-                    .attributes
-                    .push(RouteAttribute::Gateway(RouteAddress::Inet6(gw))),
-                Nexthop::Ipv6If(gw, ix) => {
-                    msg.attributes
-                        .push(RouteAttribute::Gateway(RouteAddress::Inet6(gw)));
-                    msg.attributes.push(RouteAttribute::Oif(ix));
-                }
-                _ => unreachable!(),
+            msg.attributes
+                .push(RouteAttribute::Gateway(RouteAddress::Inet6(gw)));
+        }
+        Nexthop::Ipv6If(gw, ix) => {
+            if matches!(entry.prefix, IpPrefix::V4(_)) {
+                return Err(DataplaneError::Unsupported(
+                    "cross-AF nexthop (RFC 5549) not supported yet",
+                ));
             }
+            msg.attributes
+                .push(RouteAttribute::Gateway(RouteAddress::Inet6(gw)));
+            msg.attributes.push(RouteAttribute::Oif(ix));
         }
         Nexthop::Blackhole => {
             msg.header.kind = RouteType::BlackHole;

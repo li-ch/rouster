@@ -97,6 +97,18 @@ pub enum IpPrefix {
     V6(Ipv6Prefix),
 }
 
+impl From<Ipv4Prefix> for IpPrefix {
+    fn from(p: Ipv4Prefix) -> Self {
+        IpPrefix::V4(p)
+    }
+}
+
+impl From<Ipv6Prefix> for IpPrefix {
+    fn from(p: Ipv6Prefix) -> Self {
+        IpPrefix::V6(p)
+    }
+}
+
 impl fmt::Display for IpPrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -6,8 +6,17 @@
 
 use std::collections::BTreeMap;
 
-use common::{Dataplane, DataplaneError, IpPrefix, RouteEntry, TableId};
+use common::{Dataplane, DataplaneError, DataplaneEvent, IpPrefix, RouteEntry, TableId};
 use tracing::{debug, instrument};
+
+/// Observed state of one network interface, mirrored from the dataplane.
+#[derive(Debug, Clone, Default)]
+pub struct InterfaceState {
+    pub name: String,
+    pub is_up: bool,
+    /// Addresses configured on the interface (as host prefixes).
+    pub addresses: Vec<IpPrefix>,
+}
 
 /// One routing table. `TableId` follows Linux numbering (254 = main).
 #[derive(Debug, Default)]
@@ -54,13 +63,15 @@ impl Table {
     }
 }
 
-/// The RIB: a set of typed routing tables.
+/// The RIB: a set of typed routing tables plus mirrored interface state.
 ///
 /// TODO(phase-0): nexthop resolution/tracking, redistribution channels
 /// between tables (BIRD-style), FIB diffing against the dataplane.
 #[derive(Debug, Default)]
 pub struct Rib {
     tables: BTreeMap<TableId, Table>,
+    /// Interface state mirrored from dataplane events, keyed by ifindex.
+    interfaces: BTreeMap<u32, InterfaceState>,
 }
 
 impl Rib {
@@ -74,6 +85,44 @@ impl Rib {
 
     pub fn table(&self, id: TableId) -> Option<&Table> {
         self.tables.get(&id)
+    }
+
+    /// Mirrored interface state (ifindex → state).
+    pub fn interfaces(&self) -> &BTreeMap<u32, InterfaceState> {
+        &self.interfaces
+    }
+
+    /// Apply one dataplane event to the mirrored interface state.
+    ///
+    /// Address events for an interface we have not seen yet create a
+    /// placeholder entry: kernel notification order is not guaranteed to
+    /// put RTM_NEWLINK before RTM_NEWADDR.
+    pub fn apply_event(&mut self, ev: &DataplaneEvent) {
+        match ev {
+            DataplaneEvent::LinkNew {
+                ifindex,
+                name,
+                is_up,
+            } => {
+                let iface = self.interfaces.entry(*ifindex).or_default();
+                iface.name = name.clone();
+                iface.is_up = *is_up;
+            }
+            DataplaneEvent::LinkDel { ifindex } => {
+                self.interfaces.remove(ifindex);
+            }
+            DataplaneEvent::AddressNew { ifindex, prefix } => {
+                let iface = self.interfaces.entry(*ifindex).or_default();
+                if !iface.addresses.contains(prefix) {
+                    iface.addresses.push(*prefix);
+                }
+            }
+            DataplaneEvent::AddressDel { ifindex, prefix } => {
+                if let Some(iface) = self.interfaces.get_mut(ifindex) {
+                    iface.addresses.retain(|p| p != prefix);
+                }
+            }
+        }
     }
 
     /// Offer a route and return whether the best route for its prefix changed.
@@ -142,5 +191,68 @@ mod tests {
             table.best(&"10.0.0.0/8".parse().unwrap()).unwrap().protocol,
             RouteProtocol::Ospf
         );
+    }
+
+    #[test]
+    fn interface_events_update_state() {
+        let mut rib = Rib::new();
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 2,
+            name: "eth0".into(),
+            is_up: true,
+        });
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 2,
+            prefix: "10.0.0.1/24".parse().unwrap(),
+        });
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 2,
+            prefix: "2001:db8::1/64".parse().unwrap(),
+        });
+
+        let iface = rib.interfaces().get(&2).unwrap();
+        assert_eq!(iface.name, "eth0");
+        assert!(iface.is_up);
+        assert_eq!(iface.addresses.len(), 2);
+
+        // Duplicate address notification is idempotent.
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 2,
+            prefix: "10.0.0.1/24".parse().unwrap(),
+        });
+        assert_eq!(rib.interfaces().get(&2).unwrap().addresses.len(), 2);
+
+        rib.apply_event(&DataplaneEvent::AddressDel {
+            ifindex: 2,
+            prefix: "10.0.0.1/24".parse().unwrap(),
+        });
+        let iface = rib.interfaces().get(&2).unwrap();
+        assert_eq!(iface.addresses.len(), 1);
+        assert_eq!(iface.addresses[0], "2001:db8::1/64".parse().unwrap());
+
+        rib.apply_event(&DataplaneEvent::LinkDel { ifindex: 2 });
+        assert!(rib.interfaces().get(&2).is_none());
+    }
+
+    #[test]
+    fn address_before_link_creates_placeholder() {
+        let mut rib = Rib::new();
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 5,
+            prefix: "10.0.0.1/24".parse().unwrap(),
+        });
+        let iface = rib.interfaces().get(&5).unwrap();
+        assert_eq!(iface.name, "");
+        assert!(!iface.is_up);
+        assert_eq!(iface.addresses.len(), 1);
+
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 5,
+            name: "eth1".into(),
+            is_up: true,
+        });
+        let iface = rib.interfaces().get(&5).unwrap();
+        assert_eq!(iface.name, "eth1");
+        assert_eq!(iface.addresses.len(), 1);
     }
 }

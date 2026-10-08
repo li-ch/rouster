@@ -20,5 +20,5 @@ pub use linux::NetlinkDataplane;
 #[cfg(not(target_os = "linux"))]
 pub use stub::NetlinkDataplane;
 
-// TODO(phase-0): initial dump of links/addresses/routes, event stream
-// mapped to common::DataplaneEvent, VRF/netns awareness.
+// TODO(phase-1): route/neighbour dumps and events for FIB reconciliation,
+// nexthop-group objects, VRF/netns awareness.

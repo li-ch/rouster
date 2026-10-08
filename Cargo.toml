@@ -21,6 +21,7 @@ zapi = { path = "crates/zapi" }
 bytes = "1"
 futures = "0.3"
 ipnet = "2"
+libc = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 tracing = "0.1"

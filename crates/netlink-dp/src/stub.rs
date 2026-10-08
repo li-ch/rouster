@@ -3,7 +3,7 @@
 //! Any attempt to construct the dataplane fails with
 //! [`DataplaneError::Unsupported`]; route operations never succeed here.
 
-use common::{Dataplane, DataplaneError, RouteEntry};
+use common::{Dataplane, DataplaneError, DataplaneEvent, RouteEntry};
 
 /// Stub dataplane for non-Linux platforms.
 pub struct NetlinkDataplane {
@@ -22,6 +22,16 @@ impl NetlinkDataplane {
         Err(DataplaneError::Unsupported(
             "netlink dataplane is only available on Linux",
         ))
+    }
+
+    pub async fn dump_state(&self) -> Result<Vec<DataplaneEvent>, DataplaneError> {
+        Err(DataplaneError::Unsupported(
+            "netlink dataplane is only available on Linux",
+        ))
+    }
+
+    pub async fn next_event(&mut self) -> Option<DataplaneEvent> {
+        None
     }
 }
 

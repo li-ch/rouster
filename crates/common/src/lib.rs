@@ -8,7 +8,7 @@ pub mod nexthop;
 pub mod prefix;
 pub mod route;
 
-pub use dataplane::{Dataplane, DataplaneError};
+pub use dataplane::{Dataplane, DataplaneError, DataplaneEvent};
 pub use nexthop::{Nexthop, NexthopGroup};
 pub use prefix::{IpPrefix, Ipv4Prefix, Ipv6Prefix, PrefixError};
 pub use route::{RouteEntry, RouteProtocol, TableId};
