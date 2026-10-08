@@ -1,0 +1,21 @@
+ts=2026-10-08T12:53:44.289957Z event=START socket=/var/run/frr/zserv.api respond_hello=true hello_cmd=19
+ts=2026-10-08T12:53:47.473688Z conn=1 event=CONNECT
+ts=2026-10-08T12:53:47.473721Z conn=1 msg=1 cmd=19 len=18 marker=254 version=6 vrf=0 hdr=0012fe06000000000013 body=0400000000000000 decode=ZapiHeader { length: 18, marker: 254, version: 6, vrf_id: 0, command: 19 }
+ts=2026-10-08T12:53:47.473754Z conn=1 event=REPLY cmd=19 len=18 body=0400000000000000
+ts=2026-10-08T12:53:47.473764Z conn=1 msg=2 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-08T12:53:47.473770Z conn=1 msg=3 cmd=126 len=11 marker=254 version=6 vrf=0 hdr=000bfe0600000000007e body=01 decode=ZapiHeader { length: 11, marker: 254, version: 6, vrf_id: 0, command: 126 }
+ts=2026-10-08T12:53:47.473921Z conn=1 msg=4 cmd=16 len=12 marker=254 version=6 vrf=0 hdr=000cfe06000000000010 body=0001 decode=ZapiHeader { length: 12, marker: 254, version: 6, vrf_id: 0, command: 16 }
+ts=2026-10-08T12:53:47.473930Z conn=1 msg=5 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-08T12:53:57.511927Z conn=1 msg=6 cmd=9 len=37 marker=254 version=6 vrf=0 hdr=0025fe06000000000009 body=0400000000004100000003010218cb007100010000000006000101 decode=ZapiHeader { length: 37, marker: 254, version: 6, vrf_id: 0, command: 9 }
+ts=2026-10-08T12:53:57.520135Z conn=1 msg=7 cmd=21 len=21 marker=254 version=6 vrf=0 hdr=0015fe06000000000015 body=00000001000220c0000201 decode=ZapiHeader { length: 21, marker: 254, version: 6, vrf_id: 0, command: 21 }
+ts=2026-10-08T12:54:36.335721Z event=START socket=/var/run/frr/zserv.api respond_hello=true hello_cmd=19
+ts=2026-10-08T12:54:40.270030Z conn=1 event=CONNECT
+ts=2026-10-08T12:54:40.270107Z conn=1 msg=1 cmd=19 len=18 marker=254 version=6 vrf=0 hdr=0012fe06000000000013 body=0400000000000000 decode=ZapiHeader { length: 18, marker: 254, version: 6, vrf_id: 0, command: 19 }
+ts=2026-10-08T12:54:40.270132Z conn=1 event=REPLY cmd=19 len=18 body=0400000000000000
+ts=2026-10-08T12:54:40.270176Z conn=1 msg=2 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-08T12:54:40.270186Z conn=1 msg=3 cmd=126 len=11 marker=254 version=6 vrf=0 hdr=000bfe0600000000007e body=01 decode=ZapiHeader { length: 11, marker: 254, version: 6, vrf_id: 0, command: 126 }
+ts=2026-10-08T12:54:40.270195Z conn=1 msg=4 cmd=16 len=12 marker=254 version=6 vrf=0 hdr=000cfe06000000000010 body=0001 decode=ZapiHeader { length: 12, marker: 254, version: 6, vrf_id: 0, command: 16 }
+ts=2026-10-08T12:54:40.270203Z conn=1 msg=5 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-08T12:54:40.270211Z conn=1 msg=6 cmd=9 len=37 marker=254 version=6 vrf=0 hdr=0025fe06000000000009 body=0400000000004100000003010218cb007100010000000006000101 decode=ZapiHeader { length: 37, marker: 254, version: 6, vrf_id: 0, command: 9 }
+ts=2026-10-08T12:54:40.270228Z conn=1 msg=7 cmd=10 len=30 marker=254 version=6 vrf=0 hdr=001efe0600000000000a body=0400000000004100000003010218c63364000001 decode=ZapiHeader { length: 30, marker: 254, version: 6, vrf_id: 0, command: 10 }
+ts=2026-10-08T12:54:40.270240Z conn=1 msg=8 cmd=9 len=37 marker=254 version=6 vrf=0 hdr=0025fe06000000000009 body=0400000000004100000003010218cb007100010000000006000101 decode=ZapiHeader { length: 37, marker: 254, version: 6, vrf_id: 0, command: 9 }

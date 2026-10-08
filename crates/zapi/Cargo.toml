@@ -8,5 +8,7 @@ version.workspace = true
 common.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# io-util (AsyncReadExt/AsyncWriteExt) is additive on top of the workspace
+# feature set; needed by the zapi-sniff debug binary's socket loop.
+tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
