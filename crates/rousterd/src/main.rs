@@ -15,20 +15,22 @@
 //! server accepts FRR daemon connections; their ROUTE_ADD/DELETE and NHT
 //! requests arrive as [`zapi::RibCommand`]s on a queue this main loop drains
 //! into the RIB, reconciling after each batch. Default off.
+//!
+//! Static-route provenance (Z4): the canonical path is the separate
+//! `staticd` binary (config → ZAPI client of this daemon — the FRR shape).
+//! rousterd's direct config load is LEGACY: `--once` (CI smoke) and resident
+//! mode without a `zapi socket` line keep it for now.
 
-mod config;
-
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use common::IpPrefix;
 use netlink_dp::NetlinkDataplane;
-use rib::Rib;
+use rousterd::config::Config;
+use rousterd::driver::RibDriver;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
-use zapi::{InterfaceMirror, RibCommand};
+use tracing::{error, info, warn};
+use zapi::RibCommand;
 
 /// Safety net for missed dataplane events: reconcile is diff-based, so an
 /// extra pass with no drift programs nothing.
@@ -69,9 +71,9 @@ fn parse_args() -> Result<Args, String> {
 
 /// Re-reads and re-parses the config file. Errors keep the running config
 /// (soft reconfiguration semantics).
-fn reload_config(path: &Path) -> Result<config::Config, String> {
+fn reload_config(path: &std::path::Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    config::parse_config(&text).map_err(|e| e.to_string())
+    rousterd::config::parse_config(&text).map_err(|e| e.to_string())
 }
 
 /// Spawns the ZAPI edge server task (the exact code path `main` uses when
@@ -88,107 +90,6 @@ fn spawn_zapi_server(
     })
 }
 
-/// Applies one ZAPI session command to the RIB and the driver-side
-/// registries. Returns whether the protocol tables changed (the caller
-/// reconciles on change).
-fn apply_rib_command(
-    rib: &mut Rib,
-    nht_registrations: &mut HashMap<u64, BTreeSet<IpPrefix>>,
-    redistributes: &mut HashMap<u64, BTreeSet<(u8, u8, u16)>>,
-    command: RibCommand,
-) -> bool {
-    match command {
-        RibCommand::AddRoute(entry) => {
-            info!(prefix = %entry.prefix, protocol = ?entry.protocol, "zapi: route add");
-            rib.add_route(entry);
-            true
-        }
-        RibCommand::DeleteRoute {
-            table,
-            prefix,
-            protocol,
-        } => {
-            let removed = rib.table_mut(table).remove(&prefix, protocol);
-            if removed {
-                info!(prefix = %prefix, ?protocol, "zapi: route delete");
-            } else {
-                debug!(prefix = %prefix, ?protocol, "zapi: route delete for absent route");
-            }
-            removed
-        }
-        // Answer immediately from the RIB's current resolution; the
-        // registration itself is Z3B's input (event-driven re-evaluation).
-        RibCommand::RegisterNexthop {
-            owner,
-            prefix,
-            reply,
-        } => {
-            nht_registrations.entry(owner).or_default().insert(prefix);
-            let resolution = rib.lookup_nexthop(prefix_addr(&prefix));
-            let _ = reply.send(resolution);
-            false
-        }
-        RibCommand::UnregisterNexthop { owner, prefix } => {
-            if let Some(set) = nht_registrations.get_mut(&owner) {
-                set.remove(&prefix);
-                if set.is_empty() {
-                    nht_registrations.remove(&owner);
-                }
-            }
-            false
-        }
-        // Tonight: store only (REDISTRIBUTE_ROUTE_ADD push is Z3B).
-        RibCommand::RegisterRedistribute {
-            owner,
-            afi,
-            route_type,
-            instance,
-        } => {
-            redistributes
-                .entry(owner)
-                .or_default()
-                .insert((afi, route_type, instance));
-            debug!(owner, afi, route_type, instance, "zapi: redistribute add");
-            false
-        }
-        RibCommand::UnregisterRedistribute {
-            owner,
-            afi,
-            route_type,
-            instance,
-        } => {
-            if let Some(set) = redistributes.get_mut(&owner) {
-                set.remove(&(afi, route_type, instance));
-                if set.is_empty() {
-                    redistributes.remove(&owner);
-                }
-            }
-            false
-        }
-        RibCommand::RequestInterfaces { reply } => {
-            let mirror: Vec<InterfaceMirror> = rib
-                .interfaces()
-                .iter()
-                .map(|(&ifindex, iface)| InterfaceMirror {
-                    ifindex,
-                    name: iface.name.clone(),
-                    is_up: iface.is_up,
-                    addresses: iface.addresses.clone(),
-                })
-                .collect();
-            let _ = reply.send(mirror);
-            false
-        }
-    }
-}
-
-fn prefix_addr(prefix: &IpPrefix) -> std::net::IpAddr {
-    match prefix {
-        IpPrefix::V4(p) => std::net::IpAddr::V4(p.addr()),
-        IpPrefix::V6(p) => std::net::IpAddr::V6(p.addr()),
-    }
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt::init();
@@ -203,20 +104,21 @@ async fn main() -> std::io::Result<()> {
     let (dp, conn) = NetlinkDataplane::new()?;
     tokio::spawn(conn);
 
-    // Static routes → RIB → kernel.
+    // Static routes → RIB → kernel. Legacy path (see module docs): the
+    // canonical static-route source is the staticd binary speaking ZAPI.
     let text = std::fs::read_to_string(&args.config)?;
-    let config = config::parse_config(&text).map_err(|e| {
+    let config = rousterd::config::parse_config(&text).map_err(|e| {
         error!(%e, "config parse failed");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
     let routes = &config.static_routes;
     info!(count = routes.len(), path = %args.config.display(), "loaded static routes");
 
-    let mut rib = Rib::new();
+    let mut driver = RibDriver::new();
     for route in routes {
-        rib.add_route(route.clone());
+        driver.rib.add_route(route.clone());
     }
-    rib.reconcile(&dp).await;
+    driver.rib.reconcile(&dp).await;
 
     // Initial mirror of kernel interface and route state; afterwards track
     // link/address/route changes as they arrive.
@@ -226,20 +128,20 @@ async fn main() -> std::io::Result<()> {
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
     {
-        rib.apply_event(&ev);
+        driver.rib.apply_event(&ev);
     }
     info!(
-        interfaces = rib.interfaces().len(),
+        interfaces = driver.rib.interfaces().len(),
         "initial interface state mirrored"
     );
     info!(
-        kernel_routes = rib.kernel_route_count(),
+        kernel_routes = driver.rib.kernel_route_count(),
         "initial kernel route mirror"
     );
     // Mirrored connected prefixes may resolve gateway nexthops that the
     // first pass above had to skip (unresolved gateways are not
     // programmed); re-run the diff before serving or exiting.
-    rib.reconcile(&dp).await;
+    driver.rib.reconcile(&dp).await;
 
     let kernel_routes = dp
         .dump_route_count()
@@ -263,9 +165,6 @@ async fn main() -> std::io::Result<()> {
         info!(path = %socket.display(), "zapi: starting server");
         spawn_zapi_server(socket, zapi_tx.clone());
     }
-    // Driver-side registries fed by RibCommands (Z3B consumes them).
-    let mut nht_registrations: HashMap<u64, BTreeSet<IpPrefix>> = HashMap::new();
-    let mut redistributes: HashMap<u64, BTreeSet<(u8, u8, u16)>> = HashMap::new();
 
     let mut hangup = signal(SignalKind::hangup())?;
     let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
@@ -275,11 +174,11 @@ async fn main() -> std::io::Result<()> {
             ev = dp.next_event() => {
                 match ev {
                     Some(ev) => {
-                        rib.apply_event(&ev);
-                        info!(%ev, interfaces = rib.interfaces().len(), "dataplane event");
+                        driver.rib.apply_event(&ev);
+                        info!(%ev, interfaces = driver.rib.interfaces().len(), "dataplane event");
                         // Route events invalidate programmed-set belief
                         // (external deletions); reconcile reinstalls.
-                        rib.reconcile(&dp).await;
+                        driver.rib.reconcile(&dp).await;
                     }
                     // Netlink connection closed; nothing left to do.
                     None => break,
@@ -292,36 +191,21 @@ async fn main() -> std::io::Result<()> {
                         if new_config.zapi_socket != config.zapi_socket {
                             warn!("zapi socket change requires a restart; keeping running socket");
                         }
-                        rib.reload_static(&new_config.static_routes);
+                        driver.rib.reload_static(&new_config.static_routes);
                         info!(count = new_config.static_routes.len(), "config reloaded");
                     }
                     Err(e) => error!(%e, "config reload failed; keeping running config"),
                 }
-                rib.reconcile(&dp).await;
+                driver.rib.reconcile(&dp).await;
             }
             _ = reconcile_tick.tick() => {
-                rib.reconcile(&dp).await;
+                driver.rib.reconcile(&dp).await;
             }
             Some(command) = zapi_rx.recv() => {
-                let mut changed = apply_rib_command(
-                    &mut rib,
-                    &mut nht_registrations,
-                    &mut redistributes,
-                    command,
-                );
-                // Drain whatever else arrived with it (a daemon often
-                // bursts), then reconcile once for the whole batch.
-                while let Ok(command) = zapi_rx.try_recv() {
-                    changed |= apply_rib_command(
-                        &mut rib,
-                        &mut nht_registrations,
-                        &mut redistributes,
-                        command,
-                    );
-                }
-                if changed {
-                    rib.reconcile(&dp).await;
-                }
+                // Apply the batch that arrived with this command, then
+                // reconcile once for the whole batch (inside drive()).
+                let _ = driver.apply(command);
+                let _ = driver.drain(&mut zapi_rx, &dp).await;
             }
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -332,10 +216,12 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rousterd::config;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use zapi::{ZapiCommand, ZapiHello, ZapiMessage, ZAPI_HEADER_LEN};
+
+    use super::*;
 
     /// WIRED: a config carrying a `zapi socket` line, run through the same
     /// spawn path `main` uses, accepts a client and answers its HELLO.
@@ -351,11 +237,11 @@ mod tests {
             "ip route 203.0.113.0/24 blackhole\nzapi socket {}\n",
             socket.display()
         );
-        let config = config::parse_config(&text).expect("config parses");
-        assert_eq!(config.zapi_socket, Some(socket.clone()));
+        let parsed = config::parse_config(&text).expect("config parses");
+        assert_eq!(parsed.zapi_socket, Some(socket.clone()));
 
         let (tx, mut rx) = mpsc::channel::<RibCommand>(16);
-        let server = match config.zapi_socket.clone() {
+        let server = match parsed.zapi_socket.clone() {
             Some(socket) => spawn_zapi_server(socket, tx),
             None => panic!("expected a socket path"),
         };
