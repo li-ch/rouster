@@ -353,12 +353,22 @@ impl Dataplane for NetlinkDataplane {
     #[instrument(skip(self), fields(prefix = %entry.prefix))]
     async fn route_delete(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
-        self.handle
-            .route()
-            .del(msg)
-            .execute()
-            .await
-            .map_err(nl_err)?;
+        if let Err(e) = self.handle.route().del(msg).execute().await {
+            // ESRCH: the kernel no longer holds this route. That is the
+            // goal state of a delete, so it is success — notably when a
+            // link-down flushed the route without a DELROUTE notification
+            // (the RIB must be able to drop its belief, or a later
+            // re-resolve would wrongly look already-programmed).
+            let already_absent = matches!(
+                &e,
+                rtnetlink::Error::NetlinkError(m)
+                    if m.code == std::num::NonZeroI32::new(-(libc::ESRCH as i32))
+            );
+            if !already_absent {
+                return Err(nl_err(e));
+            }
+            debug!("route already absent (ESRCH); delete is idempotent");
+        }
         debug!("route deleted");
         Ok(())
     }
