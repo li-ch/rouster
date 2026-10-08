@@ -4,9 +4,14 @@
 //! routes — interface add/update/delete, router-id, route add/delete, nexthop
 //! tracking, redistribute. Everything else decodes as `Unknown` and is logged.
 //!
-//! NOTE: command numbering follows FRR's `zapi_msg` / `zebra_message_types_t`;
-//! exact values are pinned per supported FRR release (see implementation plan,
-//! risk "ZAPI drift"). Fill in during Phase 1 against a pinned FRR version.
+//! NOTE: command numbering follows FRR's `zapi_msg` / `zebra_message_types_t`.
+//! Values for FRR 10.2.2 (ZAPI v6) are PINNED in
+//! `docs/interop/zapi-10.2-pinned.md` — captured empirically against the real
+//! release (wire fixtures in `tests/fixtures/`) and cross-checked against the
+//! build's own message table. Highlights: INTERFACE_ADD=0, ROUTE_ADD=9,
+//! ROUTE_DELETE=10, REDISTRIBUTE_ADD=12, ROUTER_ID_ADD=16, HELLO=19,
+//! NEXTHOP_REGISTER=21, BFD_CLIENT_REGISTER=36, LABEL_MANAGER_CONNECT=49,
+//! ROUTE_NOTIFY_REQUEST=126. Z2 turns these into this enum's discriminants.
 
 use common::RouteEntry;
 
