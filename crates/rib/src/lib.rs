@@ -7,10 +7,9 @@
 use std::collections::BTreeMap;
 
 use common::{
-    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, NexthopGroup, RouteEntry, RouteProtocol,
-    TableId,
+    Dataplane, DataplaneEvent, IpPrefix, NexthopGroup, RouteEntry, RouteProtocol, TableId,
 };
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Observed state of one network interface, mirrored from the dataplane.
 #[derive(Debug, Clone, Default)]
@@ -78,6 +77,9 @@ pub struct Rib {
     /// (the ones Rouster did not program). Kept separate from `tables` so
     /// best-path selection never mixes observed state with protocol state.
     kernel_mirror: BTreeMap<TableId, Table>,
+    /// What this RIB last programmed into the dataplane, keyed by
+    /// (table, prefix). Reconcile diffs desired state against this.
+    programmed: BTreeMap<(TableId, IpPrefix), RouteEntry>,
     /// Interface state mirrored from dataplane events, keyed by ifindex.
     interfaces: BTreeMap<u32, InterfaceState>,
 }
@@ -166,6 +168,10 @@ impl Rib {
                 if let Some(mirror) = self.kernel_mirror.get_mut(table) {
                     mirror.remove(prefix, RouteProtocol::Kernel);
                 }
+                // The kernel no longer has this route, whoever removed it.
+                // Drop our programmed-set belief so a still-desired route
+                // is reinstalled on the next reconcile pass.
+                self.programmed.remove(&(*table, *prefix));
             }
         }
     }
@@ -176,27 +182,119 @@ impl Rib {
         self.table_mut(table_id).add(entry);
     }
 
-    /// Program all current best routes into the dataplane.
+    /// Replaces the static-protocol routes derived from configuration.
     ///
-    /// Phase 0 brings up a naive full-sync; FIB diffing comes right after.
+    /// Prefixes present before and absent now are withdrawn; new prefixes
+    /// are added; unchanged ones keep their candidate state (soft
+    /// reconfiguration — nothing bounces). A subsequent reconcile pass
+    /// removes vanished prefixes from the kernel.
+    pub fn reload_static(&mut self, routes: &[RouteEntry]) {
+        let fresh: std::collections::BTreeSet<(TableId, IpPrefix)> =
+            routes.iter().map(|r| (r.table, r.prefix)).collect();
+        let vanished: Vec<(TableId, IpPrefix)> = self
+            .tables
+            .iter()
+            .flat_map(|(&table_id, table)| {
+                table
+                    .iter()
+                    .filter(|(_, candidates)| {
+                        candidates
+                            .iter()
+                            .any(|e| e.protocol == RouteProtocol::Static)
+                    })
+                    .map(move |(prefix, _)| (table_id, *prefix))
+            })
+            .filter(|key| !fresh.contains(key))
+            .collect();
+        for (table_id, prefix) in vanished {
+            if let Some(table) = self.tables.get_mut(&table_id) {
+                table.remove(&prefix, RouteProtocol::Static);
+            }
+        }
+        for route in routes {
+            self.add_route(route.clone());
+        }
+    }
+
+    /// Program the desired forwarding state into the dataplane, diff-based.
+    ///
+    /// Desired = best route per prefix across the protocol tables (never
+    /// the kernel mirror). The diff runs against what this RIB last
+    /// programmed: missing or changed routes are installed, stale ones are
+    /// withdrawn, unchanged ones are left alone. Per-route errors are
+    /// logged, not fatal — reconcile is periodic, so a failed route is
+    /// retried on the next pass.
     #[instrument(skip(self, dp))]
-    pub async fn sync_dataplane<D: Dataplane>(&self, dp: &D) -> Result<(), DataplaneError> {
-        for (table_id, table) in &self.tables {
+    pub async fn reconcile<D: Dataplane>(&mut self, dp: &D) {
+        let mut desired: BTreeMap<(TableId, IpPrefix), RouteEntry> = BTreeMap::new();
+        for (&table_id, table) in &self.tables {
             for (prefix, _) in table.iter() {
                 if let Some(best) = table.best(prefix) {
-                    debug!(%prefix, table_id, "installing best route");
-                    dp.route_replace(best).await?;
+                    desired.insert((table_id, *prefix), best.clone());
                 }
             }
         }
-        Ok(())
+
+        let mut installed = 0usize;
+        let mut unchanged = 0usize;
+        for (key, best) in &desired {
+            if self.programmed.get(key) == Some(best) {
+                unchanged += 1;
+                continue;
+            }
+            match dp.route_replace(best).await {
+                Ok(()) => {
+                    debug!(prefix = %best.prefix, table_id = best.table, "installed best route");
+                    self.programmed.insert(*key, best.clone());
+                    installed += 1;
+                }
+                Err(e) => {
+                    warn!(prefix = %best.prefix, table_id = best.table, %e, "route install failed; will retry")
+                }
+            }
+        }
+
+        let mut withdrawn = 0usize;
+        let stale: Vec<(TableId, IpPrefix)> = self
+            .programmed
+            .keys()
+            .filter(|key| !desired.contains_key(key))
+            .copied()
+            .collect();
+        for key in stale {
+            let Some(entry) = self.programmed.remove(&key) else {
+                continue;
+            };
+            match dp.route_delete(&entry).await {
+                Ok(()) => {
+                    debug!(prefix = %entry.prefix, table_id = entry.table, "withdrawn stale route");
+                    withdrawn += 1;
+                }
+                Err(e) => {
+                    // The kernel most likely still holds the route; keep the
+                    // belief so the next pass tries the withdrawal again.
+                    warn!(prefix = %entry.prefix, table_id = entry.table, %e, "route withdrawal failed; will retry");
+                    self.programmed.insert(key, entry);
+                }
+            }
+        }
+
+        if installed + withdrawn > 0 {
+            info!(
+                installed,
+                withdrawn, unchanged, "reconcile programmed dataplane"
+            );
+        } else {
+            debug!(unchanged, "reconcile: dataplane already in sync");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{Nexthop, NexthopGroup, RouteProtocol};
+    use common::{DataplaneError, Nexthop, NexthopGroup, RouteProtocol};
+    use std::future::Future;
 
     fn entry(prefix: &str, proto: RouteProtocol, metric: u32) -> RouteEntry {
         RouteEntry::new(
@@ -205,6 +303,186 @@ mod tests {
             NexthopGroup::single(Nexthop::IfIndex(2)),
             metric,
         )
+    }
+
+    /// Dataplane mock that records installs and withdrawals. Its futures are
+    /// `Ready`, so `block_on` below drives `reconcile` in a single poll.
+    #[derive(Default)]
+    struct MockDp {
+        installed: std::sync::Mutex<Vec<RouteEntry>>,
+        removed: std::sync::Mutex<Vec<RouteEntry>>,
+    }
+
+    impl MockDp {
+        fn installed_prefixes(&self) -> Vec<IpPrefix> {
+            self.installed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.prefix)
+                .collect()
+        }
+
+        fn removed_prefixes(&self) -> Vec<IpPrefix> {
+            self.removed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.prefix)
+                .collect()
+        }
+    }
+
+    impl Dataplane for MockDp {
+        fn route_replace(
+            &self,
+            entry: &RouteEntry,
+        ) -> impl Future<Output = Result<(), DataplaneError>> + Send {
+            self.installed.lock().unwrap().push(entry.clone());
+            std::future::ready(Ok(()))
+        }
+
+        fn route_delete(
+            &self,
+            entry: &RouteEntry,
+        ) -> impl Future<Output = Result<(), DataplaneError>> + Send {
+            self.removed.lock().unwrap().push(entry.clone());
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// Minimal executor for tests: nothing in the mock ever returns `Pending`
+    /// for long, so a polling spin on a no-op waker is enough.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_installs_desired_routes() {
+        let mut rib = Rib::new();
+        rib.add_route(entry("10.0.0.0/8", RouteProtocol::Static, 0));
+        rib.add_route(entry("2001:db8::/32", RouteProtocol::Static, 0));
+        // Kernel-mirror state must not widen the programmed set.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix: "198.18.0.0/15".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+
+        let mut got = dp.installed_prefixes();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap()
+            ]
+        );
+        assert!(dp.removed_prefixes().is_empty());
+    }
+
+    #[test]
+    fn reconcile_withdraws_stale_and_keeps_unchanged() {
+        let mut rib = Rib::new();
+        rib.add_route(entry("10.0.0.0/8", RouteProtocol::Static, 0));
+        rib.add_route(entry("192.0.2.0/24", RouteProtocol::Static, 0));
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.installed_prefixes().len(), 2);
+
+        // Withdraw one prefix at the RIB level; the other is unchanged and
+        // must not be re-sent.
+        rib.table_mut(254)
+            .remove(&"10.0.0.0/8".parse().unwrap(), RouteProtocol::Static);
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.removed_prefixes(), vec!["10.0.0.0/8".parse().unwrap()]);
+        assert_eq!(dp.installed_prefixes().len(), 2);
+
+        // A pass with no RIB change programs nothing.
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.installed_prefixes().len(), 2);
+        assert_eq!(dp.removed_prefixes().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_replaces_changed_best() {
+        let mut rib = Rib::new();
+        rib.add_route(entry("10.0.0.0/8", RouteProtocol::Ospf, 20));
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+
+        // Same protocol, better metric: the programmed route is stale.
+        rib.add_route(entry("10.0.0.0/8", RouteProtocol::Ospf, 10));
+        block_on(rib.reconcile(&dp));
+
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(installed.len(), 2);
+        assert_eq!(installed[1].metric, 10);
+    }
+
+    #[test]
+    fn reload_withdraws_only_vanished_prefixes() {
+        let mut rib = Rib::new();
+        rib.add_route(entry("10.0.0.0/8", RouteProtocol::Static, 0));
+        rib.add_route(entry("192.0.2.0/24", RouteProtocol::Static, 0));
+        // Not config-owned: reload must leave it alone.
+        rib.add_route(entry("203.0.113.0/24", RouteProtocol::Ospf, 10));
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+
+        rib.reload_static(&[
+            entry("10.0.0.0/8", RouteProtocol::Static, 0),
+            entry("198.51.100.0/24", RouteProtocol::Static, 0),
+        ]);
+
+        let table = rib.table(254).unwrap();
+        assert!(table.best(&"192.0.2.0/24".parse().unwrap()).is_none());
+        assert!(table.best(&"10.0.0.0/8".parse().unwrap()).is_some());
+        assert!(table.best(&"198.51.100.0/24".parse().unwrap()).is_some());
+        assert!(table.best(&"203.0.113.0/24".parse().unwrap()).is_some());
+
+        // The reconcile pass removes exactly the vanished prefix from the
+        // dataplane and installs the new one.
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.removed_prefixes(), vec!["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(dp.installed_prefixes().len(), 4);
+    }
+
+    #[test]
+    fn route_del_drops_programmed_belief_for_reinstall() {
+        let mut rib = Rib::new();
+        rib.add_route(entry("198.51.100.0/24", RouteProtocol::Static, 0));
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+
+        // External deletion: the kernel notifies us the route is gone.
+        rib.apply_event(&DataplaneEvent::RouteDel {
+            table: 254,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+        });
+        block_on(rib.reconcile(&dp));
+
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(
+            installed.len(),
+            2,
+            "still-desired route must be reinstalled after external delete"
+        );
     }
 
     #[test]
