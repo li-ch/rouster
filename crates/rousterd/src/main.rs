@@ -89,19 +89,8 @@ async fn main() -> std::io::Result<()> {
     }
     rib.reconcile(&dp).await;
 
-    let kernel_routes = dp
-        .dump_route_count()
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    info!(kernel_routes, "kernel route mirror check");
-
-    if args.once {
-        info!("--once: routes installed, exiting");
-        return Ok(());
-    }
-
-    // Resident mode: initial mirror of kernel interface and route state,
-    // then track link/address/route changes as they arrive.
+    // Initial mirror of kernel interface and route state; afterwards track
+    // link/address/route changes as they arrive.
     let mut dp = dp;
     for ev in dp
         .dump_state()
@@ -118,6 +107,21 @@ async fn main() -> std::io::Result<()> {
         kernel_routes = rib.kernel_route_count(),
         "initial kernel route mirror"
     );
+    // Mirrored connected prefixes may resolve gateway nexthops that the
+    // first pass above had to skip (unresolved gateways are not
+    // programmed); re-run the diff before serving or exiting.
+    rib.reconcile(&dp).await;
+
+    let kernel_routes = dp
+        .dump_route_count()
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    info!(kernel_routes, "kernel route mirror check");
+
+    if args.once {
+        info!("--once: routes installed, exiting");
+        return Ok(());
+    }
 
     let mut hangup = signal(SignalKind::hangup())?;
     let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
