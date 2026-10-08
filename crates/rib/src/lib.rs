@@ -4,10 +4,11 @@
 //! first-class objects; best-path selection uses administrative distance then
 //! metric; the selected route is what gets programmed into the dataplane.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use common::{
-    Dataplane, DataplaneEvent, IpPrefix, NexthopGroup, RouteEntry, RouteProtocol, TableId,
+    Dataplane, DataplaneEvent, IpPrefix, Nexthop, NexthopGroup, RouteEntry, RouteProtocol, TableId,
 };
 use tracing::{debug, info, instrument, warn};
 
@@ -68,8 +69,8 @@ impl Table {
 /// The RIB: a set of typed routing tables, a mirror of the kernel FIB, and
 /// mirrored interface state.
 ///
-/// TODO(phase-0): nexthop resolution/tracking, redistribution channels
-/// between tables (BIRD-style).
+/// TODO(phase-1): recursive (multi-hop) nexthop resolution; redistribution
+/// channels between tables (BIRD-style).
 #[derive(Debug, Default)]
 pub struct Rib {
     tables: BTreeMap<TableId, Table>,
@@ -78,10 +79,23 @@ pub struct Rib {
     /// best-path selection never mixes observed state with protocol state.
     kernel_mirror: BTreeMap<TableId, Table>,
     /// What this RIB last programmed into the dataplane, keyed by
-    /// (table, prefix). Reconcile diffs desired state against this.
+    /// (table, prefix). Reconcile diffs desired state against this. Values
+    /// are the *resolved programming forms* (gateway hops rewritten to
+    /// ifindex-carrying form), so a resolution change re-replaces the route.
     programmed: BTreeMap<(TableId, IpPrefix), RouteEntry>,
     /// Interface state mirrored from dataplane events, keyed by ifindex.
     interfaces: BTreeMap<u32, InterfaceState>,
+    /// Nexthop-tracking (NHT) table, FRR-zebra-style: every gateway IP
+    /// referenced by a protocol route (unresolved `Ipv4`/`Ipv6` hops) mapped
+    /// to its current resolution — `None` means tracked but currently
+    /// unresolved. This is bookkeeping for the query surface
+    /// ([`Rib::lookup_nexthop`], [`Rib::unresolved_gateways`]); the
+    /// reconcile path resolves fresh from the interface mirror so it is
+    /// never stale. The key set is rebuilt from the protocol tables on
+    /// interface events and config reloads, and extended incrementally by
+    /// [`Rib::add_route`]; routes withdrawn through [`Rib::table_mut`] are
+    /// picked up at the next rebuild.
+    nht: BTreeMap<IpAddr, Option<Nexthop>>,
 }
 
 impl Rib {
@@ -112,11 +126,133 @@ impl Rib {
         self.kernel_mirror.values().map(|t| t.iter().count()).sum()
     }
 
+    /// Resolve a gateway against the connected prefixes derived from the
+    /// interface mirror (direct, single-hop resolution only).
+    ///
+    /// A gateway resolves when some UP interface carries an address whose
+    /// prefix (address + prefix-len as a network) contains the gateway;
+    /// longest prefix wins, ties break to the lowest ifindex (the mirror is
+    /// keyed by ifindex, so this is deterministic). The resolved form
+    /// carries the ifindex: `Ipv4(g) → Ipv4If(g, ix)`. Address families
+    /// must match. `None` means the gateway is not directly reachable —
+    /// routes using it are held in the RIB but not programmed
+    /// (see [`Rib::reconcile`]).
+    ///
+    /// Recursive (multi-hop) resolution is deliberately not implemented
+    /// yet; a gateway only reachable through another route stays `None`.
+    pub fn resolve_nexthop(&self, gw: IpAddr) -> Option<Nexthop> {
+        let mut best: Option<(u8, u32)> = None;
+        for (&ifindex, iface) in &self.interfaces {
+            if !iface.is_up {
+                continue;
+            }
+            for &prefix in &iface.addresses {
+                let matched_len = match (prefix, gw) {
+                    (IpPrefix::V4(p), IpAddr::V4(a)) if p.contains(a) => Some(p.prefix_len()),
+                    (IpPrefix::V6(p), IpAddr::V6(a)) if p.contains(a) => Some(p.prefix_len()),
+                    _ => None,
+                };
+                if let Some(len) = matched_len {
+                    if best.is_none_or(|(best_len, _)| len > best_len) {
+                        best = Some((len, ifindex));
+                    }
+                }
+            }
+        }
+        best.map(|(_, ifindex)| match gw {
+            IpAddr::V4(a) => Nexthop::Ipv4If(a, ifindex),
+            IpAddr::V6(a) => Nexthop::Ipv6If(a, ifindex),
+        })
+    }
+
+    /// NHT query API — the stable surface the ZAPI server answers
+    /// `NEXTHOP_UPDATE` from: the resolved hop for an arbitrary IP (not
+    /// just tracked gateways), computed directly by
+    /// [`Rib::resolve_nexthop`]. `None` = unresolved.
+    pub fn lookup_nexthop(&self, ip: IpAddr) -> Option<Nexthop> {
+        self.resolve_nexthop(ip)
+    }
+
+    /// Gateway IPs currently tracked by nexthop tracking but unresolved.
+    /// ZAPI re-evaluates exactly these when interface events arrive and
+    /// fans the answers out as `NEXTHOP_UPDATE` messages.
+    pub fn unresolved_gateways(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.nht
+            .iter()
+            .filter_map(|(gw, resolution)| resolution.is_none().then_some(*gw))
+    }
+
+    /// Recomputes the NHT table: keys = gateway IPs referenced by protocol
+    /// routes across all tables, values = current resolution. Runs on
+    /// interface events and config reloads.
+    fn rebuild_nht(&mut self) {
+        let gateways: BTreeSet<IpAddr> = self
+            .tables
+            .values()
+            .flat_map(|table| {
+                table.iter().flat_map(|(_, candidates)| {
+                    candidates.iter().flat_map(|e| gateway_ips(&e.nexthops))
+                })
+            })
+            .collect();
+        let nht = gateways
+            .into_iter()
+            .map(|gw| {
+                let resolution = self.resolve_nexthop(gw);
+                (gw, resolution)
+            })
+            .collect();
+        self.nht = nht;
+    }
+
+    /// The programming form of a route: gateway hops rewritten to their
+    /// resolved (ifindex-carrying) form and unresolved gateways dropped;
+    /// `Blackhole`, `IfIndex`, and explicit-if hops are always eligible.
+    /// `None` when no eligible hop remains — the route is held in the RIB
+    /// but must not be programmed (an unresolved gateway handed to netlink
+    /// verbatim gets rejected or misrouted).
+    ///
+    /// ECMP groups program their resolved subset; weights are preserved.
+    fn resolved_programming_form(&self, entry: &RouteEntry) -> Option<RouteEntry> {
+        let mut resolved = NexthopGroup::new();
+        for &(hop, weight) in entry.nexthops.hops() {
+            let hop = match hop {
+                Nexthop::Ipv4(g) => match self.resolve_nexthop(IpAddr::V4(g)) {
+                    Some(resolved_hop) => resolved_hop,
+                    // Unresolved gateway: excluded from the programmed
+                    // subset; if it was the only hop, the group is empty
+                    // and the route is not programmed at all.
+                    None => continue,
+                },
+                Nexthop::Ipv6(g) => match self.resolve_nexthop(IpAddr::V6(g)) {
+                    Some(resolved_hop) => resolved_hop,
+                    None => continue,
+                },
+                Nexthop::Blackhole
+                | Nexthop::IfIndex(_)
+                | Nexthop::Ipv4If(..)
+                | Nexthop::Ipv6If(..) => hop,
+            };
+            resolved.add(hop, weight);
+        }
+        if resolved.is_empty() {
+            return None;
+        }
+        let mut form = entry.clone();
+        form.nexthops = resolved;
+        Some(form)
+    }
+
     /// Apply one dataplane event to the mirrored state.
     ///
     /// Address events for an interface we have not seen yet create a
     /// placeholder entry: kernel notification order is not guaranteed to
     /// put RTM_NEWLINK before RTM_NEWADDR.
+    ///
+    /// Link and address events can change gateway resolution, so each one
+    /// re-runs nexthop tracking over all protocol routes. The caller is
+    /// expected to follow with a reconcile pass (rousterd reconciles on
+    /// every dataplane event).
     pub fn apply_event(&mut self, ev: &DataplaneEvent) {
         match ev {
             DataplaneEvent::LinkNew {
@@ -127,20 +263,24 @@ impl Rib {
                 let iface = self.interfaces.entry(*ifindex).or_default();
                 iface.name = name.clone();
                 iface.is_up = *is_up;
+                self.rebuild_nht();
             }
             DataplaneEvent::LinkDel { ifindex } => {
                 self.interfaces.remove(ifindex);
+                self.rebuild_nht();
             }
             DataplaneEvent::AddressNew { ifindex, prefix } => {
                 let iface = self.interfaces.entry(*ifindex).or_default();
                 if !iface.addresses.contains(prefix) {
                     iface.addresses.push(*prefix);
                 }
+                self.rebuild_nht();
             }
             DataplaneEvent::AddressDel { ifindex, prefix } => {
                 if let Some(iface) = self.interfaces.get_mut(ifindex) {
                     iface.addresses.retain(|p| p != prefix);
                 }
+                self.rebuild_nht();
             }
             DataplaneEvent::RouteNew {
                 table,
@@ -177,8 +317,14 @@ impl Rib {
     }
 
     /// Offer a route and return whether the best route for its prefix changed.
+    ///
+    /// Gateway nexthops of the new route enter nexthop tracking immediately.
     pub fn add_route(&mut self, entry: RouteEntry) {
         let table_id = entry.table;
+        for gw in gateway_ips(&entry.nexthops) {
+            let resolved = self.resolve_nexthop(gw);
+            self.nht.entry(gw).or_insert(resolved);
+        }
         self.table_mut(table_id).add(entry);
     }
 
@@ -214,23 +360,40 @@ impl Rib {
         for route in routes {
             self.add_route(route.clone());
         }
+        // Withdrawn prefixes may leave gateways unreferenced; prune them so
+        // the tracking surface stays exact across reloads.
+        self.rebuild_nht();
     }
 
     /// Program the desired forwarding state into the dataplane, diff-based.
     ///
     /// Desired = best route per prefix across the protocol tables (never
-    /// the kernel mirror). The diff runs against what this RIB last
-    /// programmed: missing or changed routes are installed, stale ones are
-    /// withdrawn, unchanged ones are left alone. Per-route errors are
-    /// logged, not fatal — reconcile is periodic, so a failed route is
-    /// retried on the next pass.
+    /// the kernel mirror), in resolved programming form: gateway hops are
+    /// rewritten to ifindex-carrying form and a best route with no resolved
+    /// hop is NOT desired — it stays in the RIB and is withdrawn from the
+    /// kernel until its gateway re-resolves. The diff runs against what
+    /// this RIB last programmed (also in resolved form, so a resolution
+    /// change re-replaces the route): missing or changed routes are
+    /// installed, stale ones are withdrawn, unchanged ones are left alone.
+    /// Per-route errors are logged, not fatal — reconcile is periodic, so
+    /// a failed route is retried on the next pass.
     #[instrument(skip(self, dp))]
     pub async fn reconcile<D: Dataplane>(&mut self, dp: &D) {
         let mut desired: BTreeMap<(TableId, IpPrefix), RouteEntry> = BTreeMap::new();
         for (&table_id, table) in &self.tables {
             for (prefix, _) in table.iter() {
-                if let Some(best) = table.best(prefix) {
-                    desired.insert((table_id, *prefix), best.clone());
+                let Some(best) = table.best(prefix) else {
+                    continue;
+                };
+                match self.resolved_programming_form(best) {
+                    Some(form) => {
+                        desired.insert((table_id, *prefix), form);
+                    }
+                    None => debug!(
+                        prefix = %best.prefix,
+                        table_id,
+                        "best route has no resolved nexthop; held in RIB, not programmed"
+                    ),
                 }
             }
         }
@@ -288,6 +451,17 @@ impl Rib {
             debug!(unchanged, "reconcile: dataplane already in sync");
         }
     }
+}
+
+/// Gateway IPs referenced by a nexthop group in unresolved form (`Ipv4`/
+/// `Ipv6` hops). Hops that already carry an ifindex, `IfIndex`, and
+/// `Blackhole` need no tracking.
+fn gateway_ips(group: &NexthopGroup) -> impl Iterator<Item = IpAddr> + '_ {
+    group.hops().iter().filter_map(|&(hop, _)| match hop {
+        Nexthop::Ipv4(g) => Some(IpAddr::V4(g)),
+        Nexthop::Ipv6(g) => Some(IpAddr::V6(g)),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -656,5 +830,365 @@ mod tests {
             metric: 0,
         });
         assert_eq!(rib.kernel_route_count(), 1);
+    }
+
+    // --- Nexthop resolution & tracking (P0B) ---
+
+    fn link(ifindex: u32, name: &str, is_up: bool) -> DataplaneEvent {
+        DataplaneEvent::LinkNew {
+            ifindex,
+            name: name.into(),
+            is_up,
+        }
+    }
+
+    fn address(ifindex: u32, prefix: &str, is_new: bool) -> DataplaneEvent {
+        let prefix = prefix.parse().unwrap();
+        if is_new {
+            DataplaneEvent::AddressNew { ifindex, prefix }
+        } else {
+            DataplaneEvent::AddressDel { ifindex, prefix }
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn gw_entry(prefix: &str, gw: &str) -> RouteEntry {
+        let hop = match ip(gw) {
+            IpAddr::V4(a) => Nexthop::Ipv4(a),
+            IpAddr::V6(a) => Nexthop::Ipv6(a),
+        };
+        RouteEntry::new(
+            prefix.parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(hop),
+            0,
+        )
+    }
+
+    #[test]
+    fn resolve_gateway_on_connected_subnet() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.0.0.1/24", true));
+
+        let gw = ip("10.0.0.9");
+        assert_eq!(
+            rib.resolve_nexthop(gw),
+            Some(Nexthop::Ipv4If("10.0.0.9".parse().unwrap(), 2))
+        );
+        // The NHT query API is the same resolution.
+        assert_eq!(rib.lookup_nexthop(gw), rib.resolve_nexthop(gw));
+
+        // Off-subnet and wrong-AF gateways do not resolve.
+        assert_eq!(rib.resolve_nexthop(ip("10.0.1.9")), None);
+        assert_eq!(rib.resolve_nexthop(ip("2001:db8::9")), None);
+    }
+
+    #[test]
+    fn resolve_longest_prefix_wins() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.0.0.1/24", true));
+        rib.apply_event(&link(3, "eth1", true));
+        rib.apply_event(&address(3, "10.0.0.5/30", true));
+
+        // In both the /30 and the /24: the /30 (ifindex 3) wins.
+        assert_eq!(
+            rib.resolve_nexthop(ip("10.0.0.6")),
+            Some(Nexthop::Ipv4If("10.0.0.6".parse().unwrap(), 3))
+        );
+        // Only in the /24.
+        assert_eq!(
+            rib.resolve_nexthop(ip("10.0.0.100")),
+            Some(Nexthop::Ipv4If("10.0.0.100".parse().unwrap(), 2))
+        );
+
+        // Equal length on two interfaces: deterministic lowest ifindex.
+        rib.apply_event(&link(5, "eth2", true));
+        rib.apply_event(&address(5, "10.0.0.2/24", true));
+        assert_eq!(
+            rib.resolve_nexthop(ip("10.0.0.100")),
+            Some(Nexthop::Ipv4If("10.0.0.100".parse().unwrap(), 2))
+        );
+    }
+
+    #[test]
+    fn gateway_on_down_interface_does_not_resolve() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", false));
+        rib.apply_event(&address(2, "10.0.0.1/24", true));
+        assert_eq!(rib.resolve_nexthop(ip("10.0.0.9")), None);
+
+        // A down interface must not contribute even with a longer prefix.
+        rib.apply_event(&link(3, "eth1", true));
+        rib.apply_event(&address(3, "10.0.0.1/24", true));
+        rib.apply_event(&link(4, "eth2", false));
+        rib.apply_event(&address(4, "10.0.0.5/30", true));
+        assert_eq!(
+            rib.resolve_nexthop(ip("10.0.0.6")),
+            Some(Nexthop::Ipv4If("10.0.0.6".parse().unwrap(), 3))
+        );
+
+        // Link down unresolves; link up re-resolves.
+        rib.apply_event(&link(3, "eth1", false));
+        assert_eq!(rib.resolve_nexthop(ip("10.0.0.6")), None);
+        rib.apply_event(&link(3, "eth1", true));
+        assert_eq!(
+            rib.resolve_nexthop(ip("10.0.0.6")),
+            Some(Nexthop::Ipv4If("10.0.0.6".parse().unwrap(), 3))
+        );
+
+        // Link gone entirely: same effect.
+        rib.apply_event(&DataplaneEvent::LinkDel { ifindex: 3 });
+        assert_eq!(rib.resolve_nexthop(ip("10.0.0.6")), None);
+    }
+
+    #[test]
+    fn address_delete_unresolves_and_route_is_withdrawn() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        rib.add_route(gw_entry("198.51.100.0/24", "192.0.2.7"));
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        assert_eq!(
+            dp.installed_prefixes(),
+            vec!["198.51.100.0/24".parse().unwrap()]
+        );
+
+        // Deleting the carrying address unresolves the gateway; the route
+        // is withdrawn from the dataplane but stays in the RIB.
+        rib.apply_event(&address(2, "192.0.2.1/24", false));
+        assert_eq!(
+            rib.unresolved_gateways().collect::<Vec<_>>(),
+            vec![ip("192.0.2.7")]
+        );
+        block_on(rib.reconcile(&dp));
+        assert_eq!(
+            dp.removed_prefixes(),
+            vec!["198.51.100.0/24".parse().unwrap()]
+        );
+        assert!(
+            rib.table(254)
+                .unwrap()
+                .best(&"198.51.100.0/24".parse().unwrap())
+                .is_some(),
+            "unresolved route must stay in the RIB"
+        );
+
+        // Re-adding the address re-resolves and the route is reinstalled,
+        // now in resolved (ifindex-carrying) form.
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        assert_eq!(rib.unresolved_gateways().count(), 0);
+        block_on(rib.reconcile(&dp));
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(installed.len(), 2);
+        assert_eq!(
+            installed[1].nexthops.hops(),
+            &[(Nexthop::Ipv4If("192.0.2.7".parse().unwrap(), 2), 1)]
+        );
+    }
+
+    #[test]
+    fn link_down_withdraws_but_keeps_route_in_rib() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        rib.add_route(gw_entry("198.51.100.0/24", "192.0.2.7"));
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.installed_prefixes().len(), 1);
+
+        rib.apply_event(&link(2, "eth0", false));
+        block_on(rib.reconcile(&dp));
+        assert_eq!(
+            dp.removed_prefixes(),
+            vec!["198.51.100.0/24".parse().unwrap()]
+        );
+        assert!(rib
+            .table(254)
+            .unwrap()
+            .best(&"198.51.100.0/24".parse().unwrap())
+            .is_some());
+
+        // Interface recovery reinstalls without any RIB-level change.
+        rib.apply_event(&link(2, "eth0", true));
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.installed_prefixes().len(), 2);
+    }
+
+    #[test]
+    fn unresolved_gateway_route_not_programmed() {
+        let mut rib = Rib::new();
+        // No interface state at all: the gateway cannot resolve.
+        rib.add_route(gw_entry("198.51.100.0/24", "192.0.2.7"));
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        assert!(dp.installed_prefixes().is_empty());
+        assert!(dp.removed_prefixes().is_empty());
+        assert!(rib
+            .table(254)
+            .unwrap()
+            .best(&"198.51.100.0/24".parse().unwrap())
+            .is_some());
+        // The gateway is tracked for ZAPI as long as it stays unresolved.
+        assert_eq!(
+            rib.unresolved_gateways().collect::<Vec<_>>(),
+            vec![ip("192.0.2.7")]
+        );
+
+        // Resolution via an interface event makes it programmable.
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        assert_eq!(rib.unresolved_gateways().count(), 0);
+        block_on(rib.reconcile(&dp));
+        assert_eq!(
+            dp.installed_prefixes(),
+            vec!["198.51.100.0/24".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn blackhole_and_ifindex_routes_never_blocked() {
+        let mut rib = Rib::new();
+        // No interfaces mirrored: resolution cannot help, and must not need to.
+        rib.add_route(RouteEntry::new(
+            "203.0.113.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(Nexthop::Blackhole),
+            0,
+        ));
+        rib.add_route(RouteEntry::new(
+            "198.51.100.0/24".parse().unwrap(),
+            RouteProtocol::Ospf,
+            NexthopGroup::single(Nexthop::IfIndex(9)),
+            10,
+        ));
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        let mut got = dp.installed_prefixes();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "198.51.100.0/24".parse().unwrap(),
+                "203.0.113.0/24".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_gateway_resolution() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "2001:db8:1::1/64", true));
+        assert_eq!(
+            rib.resolve_nexthop(ip("2001:db8:1::42")),
+            Some(Nexthop::Ipv6If("2001:db8:1::42".parse().unwrap(), 2))
+        );
+        // v4 gateway does not resolve against a v6 prefix (and vice versa).
+        assert_eq!(rib.resolve_nexthop(ip("192.0.2.7")), None);
+
+        rib.add_route(gw_entry("2001:db8:2::/48", "2001:db8:1::42"));
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(
+            installed[0].nexthops.hops(),
+            &[(Nexthop::Ipv6If("2001:db8:1::42".parse().unwrap(), 2), 1)]
+        );
+    }
+
+    #[test]
+    fn ecmp_group_programs_resolved_subset() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.0.0.1/24", true));
+
+        // One resolvable gateway, one unresolvable: the resolved subset is
+        // programmed (all-or-none would refuse the route entirely).
+        let mut group = NexthopGroup::new();
+        group.add(Nexthop::Ipv4("10.0.0.9".parse().unwrap()), 1);
+        group.add(Nexthop::Ipv4("192.0.2.9".parse().unwrap()), 1);
+        rib.add_route(RouteEntry::new(
+            "198.51.100.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            group,
+            0,
+        ));
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        {
+            let installed = dp.installed.lock().unwrap();
+            assert_eq!(
+                installed[0].nexthops.hops(),
+                &[(Nexthop::Ipv4If("10.0.0.9".parse().unwrap(), 2), 1)]
+            );
+        }
+
+        // The second gateway resolving grows the programmed group back.
+        rib.apply_event(&link(3, "eth1", true));
+        rib.apply_event(&address(3, "192.0.2.1/24", true));
+        block_on(rib.reconcile(&dp));
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(installed.len(), 2);
+        assert_eq!(installed[1].nexthops.hops().len(), 2);
+        assert!(dp.removed_prefixes().is_empty(), "replace, not withdraw");
+    }
+
+    #[test]
+    fn resolution_ifindex_change_replaces_programmed_route() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.0.0.1/24", true));
+        rib.add_route(gw_entry("198.51.100.0/24", "10.0.0.6"));
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+
+        // A longer connected prefix on another interface re-resolves the
+        // gateway; reconcile must re-replace, not leave the old oif.
+        rib.apply_event(&link(3, "eth1", true));
+        rib.apply_event(&address(3, "10.0.0.5/30", true));
+        block_on(rib.reconcile(&dp));
+
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(installed.len(), 2);
+        assert_eq!(
+            installed[1].nexthops.hops(),
+            &[(Nexthop::Ipv4If("10.0.0.6".parse().unwrap(), 3), 1)]
+        );
+        assert!(dp.removed_prefixes().is_empty());
+    }
+
+    #[test]
+    fn unresolved_gateways_prune_on_reload() {
+        let mut rib = Rib::new();
+        rib.add_route(gw_entry("198.51.100.0/24", "192.0.2.7"));
+        assert_eq!(rib.unresolved_gateways().count(), 1);
+
+        // Reload without the route: its gateway is no longer referenced.
+        rib.reload_static(&[]);
+        assert_eq!(rib.unresolved_gateways().count(), 0);
+
+        // A resolved gateway is tracked but not reported unresolved.
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        rib.add_route(gw_entry("203.0.113.0/24", "192.0.2.7"));
+        assert_eq!(rib.unresolved_gateways().count(), 0);
+        // Tracked-but-unresolved and resolved gateways coexist.
+        rib.add_route(gw_entry("198.51.100.0/24", "203.0.113.7"));
+        assert_eq!(
+            rib.unresolved_gateways().collect::<Vec<_>>(),
+            vec![ip("203.0.113.7")]
+        );
     }
 }
