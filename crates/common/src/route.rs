@@ -38,6 +38,16 @@ impl RouteProtocol {
             RouteProtocol::Kernel => 255,
         }
     }
+
+    /// True for origins installed by the kernel itself or the boot process —
+    /// routes Rouster did NOT program. Dataplane backends emit
+    /// [`crate::DataplaneEvent::RouteNew`] mirror events only for
+    /// kernel-origin routes; notifications echoing routes Rouster installed
+    /// (static/bgp/ospf/rip/...) are suppressed to avoid feedback loops
+    /// between the RIB and the kernel.
+    pub fn is_kernel_origin(self) -> bool {
+        matches!(self, RouteProtocol::Kernel | RouteProtocol::Connected)
+    }
 }
 
 /// One route offered to, or selected by, the RIB.
@@ -63,6 +73,29 @@ impl RouteEntry {
             metric,
             protocol,
             table: 254, // RT_TABLE_MAIN
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mirror feedback filter: self-originated protocols must not be
+    /// classified as kernel-origin, so their install echoes are suppressed.
+    #[test]
+    fn kernel_origin_classification() {
+        assert!(RouteProtocol::Kernel.is_kernel_origin());
+        assert!(RouteProtocol::Connected.is_kernel_origin());
+        for p in [
+            RouteProtocol::Static,
+            RouteProtocol::Bgp,
+            RouteProtocol::Ospf,
+            RouteProtocol::IsIs,
+            RouteProtocol::Rip,
+            RouteProtocol::Local,
+        ] {
+            assert!(!p.is_kernel_origin(), "{p:?} must not be kernel-origin");
         }
     }
 }

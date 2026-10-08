@@ -6,7 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use common::{Dataplane, DataplaneError, DataplaneEvent, IpPrefix, RouteEntry, TableId};
+use common::{
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, NexthopGroup, RouteEntry, RouteProtocol,
+    TableId,
+};
 use tracing::{debug, instrument};
 
 /// Observed state of one network interface, mirrored from the dataplane.
@@ -63,13 +66,18 @@ impl Table {
     }
 }
 
-/// The RIB: a set of typed routing tables plus mirrored interface state.
+/// The RIB: a set of typed routing tables, a mirror of the kernel FIB, and
+/// mirrored interface state.
 ///
 /// TODO(phase-0): nexthop resolution/tracking, redistribution channels
-/// between tables (BIRD-style), FIB diffing against the dataplane.
+/// between tables (BIRD-style).
 #[derive(Debug, Default)]
 pub struct Rib {
     tables: BTreeMap<TableId, Table>,
+    /// Kernel FIB mirror: kernel-origin routes observed on the dataplane
+    /// (the ones Rouster did not program). Kept separate from `tables` so
+    /// best-path selection never mixes observed state with protocol state.
+    kernel_mirror: BTreeMap<TableId, Table>,
     /// Interface state mirrored from dataplane events, keyed by ifindex.
     interfaces: BTreeMap<u32, InterfaceState>,
 }
@@ -92,7 +100,17 @@ impl Rib {
         &self.interfaces
     }
 
-    /// Apply one dataplane event to the mirrored interface state.
+    /// One mirrored kernel table (observation only; never a reconcile input).
+    pub fn kernel_table(&self, id: TableId) -> Option<&Table> {
+        self.kernel_mirror.get(&id)
+    }
+
+    /// Total number of mirrored kernel routes, across tables.
+    pub fn kernel_route_count(&self) -> usize {
+        self.kernel_mirror.values().map(|t| t.iter().count()).sum()
+    }
+
+    /// Apply one dataplane event to the mirrored state.
     ///
     /// Address events for an interface we have not seen yet create a
     /// placeholder entry: kernel notification order is not guaranteed to
@@ -120,6 +138,33 @@ impl Rib {
             DataplaneEvent::AddressDel { ifindex, prefix } => {
                 if let Some(iface) = self.interfaces.get_mut(ifindex) {
                     iface.addresses.retain(|p| p != prefix);
+                }
+            }
+            DataplaneEvent::RouteNew {
+                table,
+                prefix,
+                protocol,
+                metric,
+            } => {
+                // Backends already filter self-originated notifications;
+                // this is the second half of the feedback-loop defense.
+                if !protocol.is_kernel_origin() {
+                    return;
+                }
+                let mut entry = RouteEntry::new(
+                    *prefix,
+                    RouteProtocol::Kernel,
+                    // Nexthop detail is not carried by the event; mirror
+                    // entries are observed state and never programmed.
+                    NexthopGroup::new(),
+                    *metric,
+                );
+                entry.table = *table;
+                self.kernel_mirror.entry(*table).or_default().add(entry);
+            }
+            DataplaneEvent::RouteDel { table, prefix } => {
+                if let Some(mirror) = self.kernel_mirror.get_mut(table) {
+                    mirror.remove(prefix, RouteProtocol::Kernel);
                 }
             }
         }
@@ -254,5 +299,84 @@ mod tests {
         let iface = rib.interfaces().get(&5).unwrap();
         assert_eq!(iface.name, "eth1");
         assert_eq!(iface.addresses.len(), 1);
+    }
+
+    #[test]
+    fn kernel_route_events_update_mirror() {
+        let prefix: IpPrefix = "198.18.0.0/15".parse().unwrap();
+        let mut rib = Rib::new();
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix,
+            protocol: RouteProtocol::Kernel,
+            metric: 100,
+        });
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 255,
+            prefix: "192.0.2.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+
+        assert_eq!(rib.kernel_route_count(), 2);
+        let mirror = rib.kernel_table(254).unwrap();
+        let best = mirror.best(&prefix).unwrap();
+        assert_eq!(best.protocol, RouteProtocol::Kernel);
+        assert_eq!(best.metric, 100);
+        // Mirror state must stay out of the protocol tables.
+        assert!(rib.table(254).is_none_or(|t| t.best(&prefix).is_none()));
+
+        // A newer notification for the same prefix replaces the old one.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix,
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+        assert_eq!(
+            rib.kernel_table(254).unwrap().best(&prefix).unwrap().metric,
+            0
+        );
+
+        rib.apply_event(&DataplaneEvent::RouteDel { table: 254, prefix });
+        assert!(rib.kernel_table(254).unwrap().best(&prefix).is_none());
+        assert_eq!(rib.kernel_route_count(), 1);
+
+        // Deleting an unknown prefix is a no-op.
+        rib.apply_event(&DataplaneEvent::RouteDel {
+            table: 254,
+            prefix: "203.0.113.0/24".parse().unwrap(),
+        });
+        assert_eq!(rib.kernel_route_count(), 1);
+    }
+
+    #[test]
+    fn mirror_ignores_self_originated_notifications() {
+        let prefix: IpPrefix = "198.51.100.0/24".parse().unwrap();
+        let mut rib = Rib::new();
+        // The install echo of a route Rouster itself programmed must not
+        // enter the mirror.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix,
+            protocol: RouteProtocol::Static,
+            metric: 0,
+        });
+        assert_eq!(rib.kernel_route_count(), 0);
+
+        // Nor may a self-originated echo evict mirrored kernel state.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix,
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix,
+            protocol: RouteProtocol::Ospf,
+            metric: 0,
+        });
+        assert_eq!(rib.kernel_route_count(), 1);
     }
 }

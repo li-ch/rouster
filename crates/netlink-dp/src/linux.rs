@@ -2,7 +2,7 @@
 
 use common::{
     Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, Nexthop,
-    RouteEntry,
+    RouteEntry, RouteProtocol,
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
@@ -54,8 +54,9 @@ impl NetlinkDataplane {
         &self.handle
     }
 
-    /// Initial mirror: dumps kernel links and addresses as synthetic
-    /// `LinkNew`/`AddressNew` events, in an order the RIB can apply directly.
+    /// Initial mirror: dumps kernel links, addresses, and kernel-origin
+    /// routes as synthetic `LinkNew`/`AddressNew`/`RouteNew` events, in an
+    /// order the RIB can apply directly.
     pub async fn dump_state(&self) -> Result<Vec<DataplaneEvent>, DataplaneError> {
         let mut events = Vec::new();
 
@@ -69,6 +70,14 @@ impl NetlinkDataplane {
         let mut addrs = self.handle.address().get().execute();
         while let Some(msg) = addrs.try_next().await.map_err(nl_err)? {
             if let Some(ev) = address_event(&msg, true) {
+                events.push(ev);
+            }
+        }
+
+        // Same filter and mapping as the live route notifications.
+        let mut routes = self.handle.route().get(RouteMessage::default()).execute();
+        while let Some(msg) = routes.try_next().await.map_err(nl_err)? {
+            if let Some(ev) = route_new_event(&msg) {
                 events.push(ev);
             }
         }
@@ -103,8 +112,8 @@ impl NetlinkDataplane {
                 }),
                 RouteNetlinkMessage::NewAddress(m) => address_event(&m, true),
                 RouteNetlinkMessage::DelAddress(m) => address_event(&m, false),
-                // Route notifications: FIB reconciliation lands with the
-                // nexthop-tracking work; skipped for now.
+                RouteNetlinkMessage::NewRoute(m) => route_new_event(&m),
+                RouteNetlinkMessage::DelRoute(m) => route_del_event(&m),
                 _ => None,
             };
             if ev.is_some() {
@@ -152,6 +161,86 @@ fn address_event(msg: &AddressMessage, is_new: bool) -> Option<DataplaneEvent> {
 
 fn nl_err(e: rtnetlink::Error) -> DataplaneError {
     DataplaneError::Other(e.to_string())
+}
+
+/// Maps a kernel NewRoute notification to a mirror event.
+///
+/// Feedback-loop filter: every route Rouster programs echoes back on this
+/// socket, so only kernel-origin routes (`RTPROT_KERNEL`/`RTPROT_BOOT`-class
+/// — administrative additions like `ip route add`) become mirror events;
+/// static/bgp/ospf/rip origins are ours and are skipped.
+fn route_new_event(msg: &RouteMessage) -> Option<DataplaneEvent> {
+    if !matches!(
+        msg.header.protocol,
+        NlRouteProtocol::Kernel | NlRouteProtocol::Boot
+    ) {
+        return None;
+    }
+    Some(DataplaneEvent::RouteNew {
+        table: route_table(msg),
+        prefix: route_prefix(msg)?,
+        protocol: RouteProtocol::Kernel,
+        metric: route_metric(msg),
+    })
+}
+
+/// Maps a kernel DelRoute notification. Forwarded regardless of origin: a
+/// deletion of a route we believed installed means someone else removed it,
+/// and the RIB must drop its belief so reconcile reinstalls what is still
+/// desired. Our own withdrawals echo here too, but replaying them is
+/// idempotent.
+fn route_del_event(msg: &RouteMessage) -> Option<DataplaneEvent> {
+    Some(DataplaneEvent::RouteDel {
+        table: route_table(msg),
+        prefix: route_prefix(msg)?,
+    })
+}
+
+/// Routing table of a route message; `RTA_TABLE` overrides the 8-bit header
+/// field for ids > 255.
+fn route_table(msg: &RouteMessage) -> u32 {
+    msg.attributes
+        .iter()
+        .find_map(|a| match a {
+            RouteAttribute::Table(t) => Some(*t),
+            _ => None,
+        })
+        .unwrap_or(msg.header.table as u32)
+}
+
+/// Destination prefix; a message without `RTA_DST` is the default route of
+/// its address family.
+fn route_prefix(msg: &RouteMessage) -> Option<IpPrefix> {
+    let dst = msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Destination(d) => Some(d.clone()),
+        _ => None,
+    });
+    let len = msg.header.destination_prefix_length;
+    match (msg.header.address_family, dst) {
+        (AddressFamily::Inet, Some(RouteAddress::Inet(a))) => {
+            Ipv4Prefix::new(a, len).ok().map(Into::into)
+        }
+        (AddressFamily::Inet6, Some(RouteAddress::Inet6(a))) => {
+            Ipv6Prefix::new(a, len).ok().map(Into::into)
+        }
+        (AddressFamily::Inet, None) => Ipv4Prefix::new(std::net::Ipv4Addr::UNSPECIFIED, len)
+            .ok()
+            .map(Into::into),
+        (AddressFamily::Inet6, None) => Ipv6Prefix::new(std::net::Ipv6Addr::UNSPECIFIED, len)
+            .ok()
+            .map(Into::into),
+        _ => None,
+    }
+}
+
+fn route_metric(msg: &RouteMessage) -> u32 {
+    msg.attributes
+        .iter()
+        .find_map(|a| match a {
+            RouteAttribute::Priority(m) => Some(*m),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Maps Rouster's route protocol to an RTPROT_* value.

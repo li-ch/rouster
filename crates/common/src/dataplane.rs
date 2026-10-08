@@ -7,7 +7,8 @@
 use std::fmt;
 use std::future::Future;
 
-use crate::route::RouteEntry;
+use crate::prefix::IpPrefix;
+use crate::route::{RouteEntry, RouteProtocol, TableId};
 
 /// Error type for dataplane operations.
 #[derive(Debug, thiserror::Error)]
@@ -20,10 +21,11 @@ pub enum DataplaneError {
     Other(String),
 }
 
-/// Events observed from the forwarding plane (link/address/neighbour changes).
+/// Events observed from the forwarding plane (link, address, and route
+/// changes).
 ///
-/// Phase 0 syncs these from netlink; the RIB consumes them for nexthop
-/// resolution and interface tracking.
+/// The RIB consumes these for nexthop resolution, interface tracking, and
+/// (for the route events) the kernel FIB mirror.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataplaneEvent {
     LinkNew {
@@ -38,14 +40,30 @@ pub enum DataplaneEvent {
     /// 10.0.0.1/24 on eth0).
     AddressNew {
         ifindex: u32,
-        prefix: crate::prefix::IpPrefix,
+        prefix: IpPrefix,
     },
     AddressDel {
         ifindex: u32,
-        prefix: crate::prefix::IpPrefix,
+        prefix: IpPrefix,
     },
-    // TODO(phase-1): neighbour events; route-originated events for FIB
-    // reconciliation.
+    /// A kernel-origin route was observed in the forwarding plane (mirror
+    /// direction: routes we did NOT program ourselves; see
+    /// [`RouteProtocol::is_kernel_origin`]).
+    RouteNew {
+        table: TableId,
+        prefix: IpPrefix,
+        protocol: RouteProtocol,
+        metric: u32,
+    },
+    /// A route left the forwarding plane. Unlike [`DataplaneEvent::RouteNew`]
+    /// this is not filtered by origin: whoever deleted it, the kernel no
+    /// longer has it, and the RIB must drop its programmed-set belief so a
+    /// still-desired route is reinstalled.
+    RouteDel {
+        table: TableId,
+        prefix: IpPrefix,
+    },
+    // TODO(phase-1): neighbour events.
 }
 
 impl fmt::Display for DataplaneEvent {
@@ -66,6 +84,18 @@ impl fmt::Display for DataplaneEvent {
             }
             DataplaneEvent::AddressDel { ifindex, prefix } => {
                 write!(f, "addr del: {prefix} on ifindex {ifindex}")
+            }
+            DataplaneEvent::RouteNew {
+                table,
+                prefix,
+                protocol,
+                metric,
+            } => write!(
+                f,
+                "route new: {prefix} table {table} proto {protocol:?} metric {metric}"
+            ),
+            DataplaneEvent::RouteDel { table, prefix } => {
+                write!(f, "route del: {prefix} table {table}")
             }
         }
     }
