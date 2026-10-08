@@ -1094,6 +1094,21 @@ impl ZapiNexthop {
         };
         Some(hop)
     }
+
+    /// Maps an internal hop onto the wire shape (the inverse of
+    /// [`ZapiNexthop::to_common`]); vrf 0, no extras. A `Blackhole` hop
+    /// becomes the REJECT form — what FRR staticd sends for
+    /// `ip route <pfx> blackhole`.
+    pub fn from_common(hop: CommonNexthop) -> Self {
+        match hop {
+            CommonNexthop::Ipv4(gate) => Self::new_ipv4(0, gate),
+            CommonNexthop::Ipv6(gate) => Self::new_ipv6(0, gate),
+            CommonNexthop::IfIndex(ifindex) => Self::new_ifindex(0, ifindex),
+            CommonNexthop::Ipv4If(gate, ifindex) => Self::new_ipv4_ifindex(0, gate, ifindex),
+            CommonNexthop::Ipv6If(gate, ifindex) => Self::new_ipv6_ifindex(0, gate, ifindex),
+            CommonNexthop::Blackhole => Self::new_blackhole(0, blackhole_type::REJECT),
+        }
+    }
 }
 
 /// ZEBRA_ROUTE_ADD/DELETE (9/10) body — `zapi_route_encode`
