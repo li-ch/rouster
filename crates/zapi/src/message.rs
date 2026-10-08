@@ -1778,10 +1778,21 @@ pub enum ZapiMessage {
         pid: u32,
     },
     /// ZEBRA_LABEL_MANAGER_CONNECT (49): proto u8 + instance u16. E: bgpd
-    /// label-manager client. (Zebra's reply appends a result u8 — Z3.)
+    /// label-manager client.
     LabelManagerConnect {
         proto: u8,
         instance: u16,
+    },
+    /// ZEBRA_LABEL_MANAGER_CONNECT (49) zebra→client reply: the client body
+    /// plus a trailing `result` u8 (0 = success). SPEC per the pinned doc
+    /// ("proto u8 + instance u16 + result u8"); the server must answer or
+    /// bgpd's label-manager client stalls (pinned doc, operational
+    /// finding 3). Distinguished from the client form by body length, the
+    /// same pattern as INTERFACE_ADD request/dump.
+    LabelManagerConnectResult {
+        proto: u8,
+        instance: u16,
+        result: u8,
     },
     /// ZEBRA_ROUTE_NOTIFY_REQUEST (126): u8 flag. E: staticd `01`.
     RouteNotifyRequest {
@@ -1847,10 +1858,18 @@ impl ZapiMessage {
                 let mut b = body;
                 let proto = take_u8(&mut b)?;
                 let instance = take_be_u16(&mut b)?;
+                if b.is_empty() {
+                    return Ok(Self::LabelManagerConnect { proto, instance });
+                }
+                let result = take_u8(&mut b)?;
                 if !b.is_empty() {
                     return Err(ZapiCodecError::TrailingBytes(b.len()));
                 }
-                Ok(Self::LabelManagerConnect { proto, instance })
+                Ok(Self::LabelManagerConnectResult {
+                    proto,
+                    instance,
+                    result,
+                })
             }
             ZapiCommand::RouteNotifyRequest => {
                 let mut b = body;
@@ -1886,6 +1905,7 @@ impl ZapiMessage {
             Self::RedistributeDelete(_) => 13,
             Self::BfdClientRegister { .. } => 36,
             Self::LabelManagerConnect { .. } => 49,
+            Self::LabelManagerConnectResult { .. } => 49,
             Self::RouteNotifyRequest { .. } => 126,
             Self::Unknown { command, .. } => *command,
         }
@@ -1935,6 +1955,16 @@ impl ZapiMessage {
             Self::LabelManagerConnect { proto, instance } => {
                 buf.put_u8(*proto);
                 buf.put_u16(*instance);
+                Ok(())
+            }
+            Self::LabelManagerConnectResult {
+                proto,
+                instance,
+                result,
+            } => {
+                buf.put_u8(*proto);
+                buf.put_u16(*instance);
+                buf.put_u8(*result);
                 Ok(())
             }
             Self::RouteNotifyRequest { flag } => {
@@ -2095,6 +2125,25 @@ mod tests {
             }
         );
         assert_eq!(roundtrip(&msg), hex("0a0000"));
+    }
+
+    #[test]
+    fn label_manager_connect_result_roundtrips() {
+        // Zebra's reply form: client body + trailing result u8 (0 = ok).
+        // Length-sensitive decode, like INTERFACE_ADD request/dump.
+        let msg = ZapiMessage::decode(49, &hex("0a000000")).unwrap();
+        assert_eq!(
+            msg,
+            ZapiMessage::LabelManagerConnectResult {
+                proto: 10,
+                instance: 0,
+                result: 0
+            }
+        );
+        assert_eq!(msg.command(), 49);
+        assert_eq!(roundtrip(&msg), hex("0a000000"));
+        let err = ZapiMessage::decode(49, &hex("0a00000001"));
+        assert_eq!(err, Err(ZapiCodecError::TrailingBytes(1)));
     }
 
     #[test]

@@ -17,3 +17,6 @@ pub use message::{
     ZapiCommand, ZapiHello, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
     ZapiNexthopRegister, ZapiNexthopUpdate, ZapiRedistribute, ZapiRoute, ZapiRouterIdUpdate,
 };
+pub use server::{
+    run_session, serve, InterfaceMirror, NhtRegistration, RibCommand, ZapiSession, DEFAULT_TABLE,
+};
