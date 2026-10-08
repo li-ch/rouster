@@ -27,7 +27,7 @@ macro_rules! impl_prefix {
                 self.addr
             }
 
-            pub fn len(&self) -> u8 {
+            pub fn prefix_len(&self) -> u8 {
                 self.len
             }
 

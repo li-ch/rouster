@@ -1,0 +1,19 @@
+# Phase 0 smoke topology: a single Rouster node.
+#
+# Build the image first:  docker build -t rouster:local -f docker/Dockerfile .
+# Deploy:                 containerlab deploy -t topologies/phase0-static.clab.yml
+# Verify:                 docker exec clab-rouster-phase0-r1 ip route
+
+name: rouster-phase0
+
+topology:
+  nodes:
+    r1:
+      kind: linux
+      image: rouster:local
+
+  # Phase 1: attach a real FRR node to Rouster's ZAPI server, e.g.
+  #   frr1:
+  #     kind: linux
+  #     image: frrouting/frr:latest
+  # and point FRR's daemons at Rouster's ZAPI socket.

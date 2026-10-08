@@ -43,9 +43,10 @@ impl Table {
     /// The selected best route for a prefix: lowest administrative distance,
     /// then lowest metric.
     pub fn best(&self, prefix: &IpPrefix) -> Option<&RouteEntry> {
-        self.entries.get(prefix)?.iter().min_by_key(|e| {
-            (e.protocol.admin_distance(), e.metric)
-        })
+        self.entries
+            .get(prefix)?
+            .iter()
+            .min_by_key(|e| (e.protocol.admin_distance(), e.metric))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IpPrefix, &Vec<RouteEntry>)> {

@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  integration-phase0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin rousterd
+      - name: netns smoke test
+        run: |
+          set -euo pipefail
+          sudo ip netns add rouster-test
+          trap 'sudo ip netns del rouster-test' EXIT
+          sudo ip netns exec rouster-test ip link set lo up
+          printf '%s\n' \
+            'ip route 198.51.100.0/24 blackhole' \
+            'ipv6 route 2001:db8:dead::/48 blackhole' \
+            | sudo tee /tmp/rouster.conf >/dev/null
+          sudo ip netns exec rouster-test ./target/release/rousterd --config /tmp/rouster.conf --once
+          sudo ip netns exec rouster-test ip route show 198.51.100.0/24 | grep -q blackhole
+          sudo ip netns exec rouster-test ip -6 route show 2001:db8:dead::/48 | grep -q blackhole
+      # TODO(phase-1): containerlab job — real FRR bgpd/ospfd against
+      # Rouster's ZAPI server (topologies/phase0-static.clab.yml and beyond).

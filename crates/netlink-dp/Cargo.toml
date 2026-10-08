@@ -16,4 +16,5 @@ tracing.workspace = true
 # Containerlab topologies).
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink.workspace = true
+netlink-packet-route.workspace = true
 futures.workspace = true

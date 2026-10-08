@@ -26,3 +26,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = "0.3"
 rtnetlink = "0.18"
+netlink-packet-route = "0.25"

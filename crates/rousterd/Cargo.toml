@@ -9,6 +9,7 @@ common.workspace = true
 rib.workspace = true
 netlink-dp.workspace = true
 zapi.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -17,6 +17,12 @@ impl NetlinkDataplane {
             "netlink dataplane is only available on Linux",
         ))
     }
+
+    pub async fn dump_route_count(&self) -> Result<usize, DataplaneError> {
+        Err(DataplaneError::Unsupported(
+            "netlink dataplane is only available on Linux",
+        ))
+    }
 }
 
 impl Dataplane for NetlinkDataplane {
