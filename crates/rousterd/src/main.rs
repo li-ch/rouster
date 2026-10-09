@@ -92,7 +92,9 @@ fn spawn_zapi_server(
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    tracing_subscriber::fmt::init();
+    // ANSI color only on a TTY: redirected log files stay plain bytes
+    // (smoke greps, quarantine captures).
+    rousterd::logging::init();
     info!(version = env!("CARGO_PKG_VERSION"), "rousterd starting");
 
     let args = parse_args().map_err(|e| {

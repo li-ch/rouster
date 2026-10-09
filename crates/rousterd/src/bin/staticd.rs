@@ -100,7 +100,8 @@ async fn connect(socket: &Path) -> io::Result<StaticDaemon<tokio::net::UnixStrea
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    tracing_subscriber::fmt::init();
+    // ANSI color only on a TTY (same policy as rousterd).
+    rousterd::logging::init();
     info!(version = env!("CARGO_PKG_VERSION"), "staticd starting");
 
     let args = parse_args().map_err(|e| {
