@@ -253,11 +253,14 @@ tolerated-and-unused by staticd/bgpd):
    tracks only up/down, so the dump's u64 flags word was 0 and ospfd
    reported `eth0 is down` (`if_is_operative` needs IFF_UP|IFF_RUNNING)
    and, without BROADCAST|MULTICAST, would fall back to the
-   non-broadcast network type that never multicasts hellos. The server
-   now synthesizes the classic bits per link kind (loopback names get
-   IFF_LOOPBACK; down links carry none). Real zebra relays the kernel's
-   `ifi_flags`; carrying the real flags through the RIB mirror is future
-   polish.
+   non-broadcast network type that never multicasts hellos. W1B first
+   synthesized the classic bits per link kind (loopback names get
+   IFF_LOOPBACK; down links carry none); A12 retired that synthesis:
+   netlink-dp now relays the kernel's `ifi_flags` word whole through
+   `DataplaneEvent::LinkNew` → `rib::InterfaceState::flags` → the
+   ZAPI mirror, and the server encodes it verbatim — exactly what real
+   zebra does. The same bit retires the driver router-id's `lo`
+   name-prefix convention (IFF_LOOPBACK decides the loopback pool).
 2. **Router-id derivation excludes 127/8** — every Linux `lo` carries
    127.0.0.1, and the derived answer handed exactly that: both ospfds
    came up as `Router ID: 127.0.0.1` and same-id neighbors can never

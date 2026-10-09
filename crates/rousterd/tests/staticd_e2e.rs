@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use common::{
-    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Nexthop, RouteEntry, RouteProtocol,
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, LinkFlags, Nexthop, RouteEntry,
+    RouteProtocol,
 };
 use rousterd::driver::RibDriver;
 use rousterd::staticd::StaticDaemon;
@@ -129,6 +130,7 @@ async fn staticd_e2e_install_nht_filter_and_withdrawal() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });

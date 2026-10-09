@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use common::{
-    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Nexthop, RouteEntry, RouteProtocol,
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, LinkFlags, Nexthop, RouteEntry,
+    RouteProtocol,
 };
 use rib::Rib;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -171,6 +172,7 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
                     ifindex,
                     name: iface.name.clone(),
                     is_up: iface.is_up,
+                    flags: iface.flags,
                     addresses: iface.addresses.clone(),
                 })
                 .collect();
@@ -352,6 +354,7 @@ async fn nht_register_resolved_through_real_rib() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -406,7 +409,8 @@ async fn nht_register_resolved_through_real_rib() {
 }
 
 /// INTERFACE_ADD requests are answered from the RIB's interface mirror —
-/// through the real serve() socket.
+/// through the real serve() socket. A12: the kernel-shaped `ifi_flags`
+/// word (here including an unnamed bit, NOARP) lands on the wire verbatim.
 #[tokio::test]
 async fn interface_dump_answered_from_rib_mirror() {
     let socket = temp_socket("iface");
@@ -419,6 +423,7 @@ async fn interface_dump_answered_from_rib_mirror() {
         ifindex: 7,
         name: "eth7".to_string(),
         is_up: true,
+        flags: LinkFlags::from_bits(LinkFlags::up_broadcast().bits() | 0x80),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -436,6 +441,15 @@ async fn interface_dump_answered_from_rib_mirror() {
     assert_eq!(intf.ifname, "eth7");
     assert_eq!(intf.ifindex, 7);
     assert_eq!(intf.status, 1);
+    assert_eq!(
+        intf.flags,
+        zapi::message::iff::UP
+            | zapi::message::iff::RUNNING
+            | zapi::message::iff::BROADCAST
+            | zapi::message::iff::MULTICAST
+            | 0x80,
+        "kernel ifi_flags word carried RIB mirror → driver → session → wire"
+    );
 
     let (h2, b2) = client.read_frame().await;
     assert_eq!(
@@ -502,6 +516,7 @@ async fn nht_flip_on_address_add_pushed_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -547,6 +562,7 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         ifindex: 3,
         name: "eth3".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -572,6 +588,7 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         ifindex: 3,
         name: "eth3".to_string(),
         is_up: false,
+        flags: LinkFlags::default(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -617,6 +634,7 @@ async fn redistribute_route_add_pushed_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -704,6 +722,7 @@ async fn redistribute_registration_dumps_existing_route_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -801,6 +820,7 @@ async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });
@@ -952,6 +972,7 @@ async fn router_id_change_pushed_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     });

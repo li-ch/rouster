@@ -25,7 +25,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 
-use common::{Dataplane, DataplaneEvent, IpPrefix, Nexthop, NexthopGroup, RouteEntry, TableId};
+use common::{
+    Dataplane, DataplaneEvent, IpPrefix, LinkFlags, Nexthop, NexthopGroup, RouteEntry, TableId,
+};
 use rib::Rib;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -366,6 +368,7 @@ impl RibDriver {
                         ifindex,
                         name: iface.name.clone(),
                         is_up: iface.is_up,
+                        flags: iface.flags,
                         addresses: iface.addresses.clone(),
                     })
                     .collect();
@@ -472,9 +475,11 @@ impl RibDriver {
     /// The router-id rousterd derives for ROUTER_ID_UPDATE (18) answers:
     /// FRR's documented default — the highest IPv4 address on an UP
     /// loopback interface, falling back to the highest IPv4 address on any
-    /// UP interface, `None` when no UP interface carries one. Simplified
-    /// vs FRR: loopbacks are recognized by a `lo` name prefix (the mirror
-    /// has no IFF_LOOPBACK bit) and IPv6 addresses never participate
+    /// UP interface, `None` when no UP interface carries one. Loopbacks
+    /// are recognized by the kernel's IFF_LOOPBACK bit in the mirrored
+    /// link flags (A12 — previously a `lo` name-prefix convention; a
+    /// renamed or nonstandard loopback device now works, and an `lo`-named
+    /// non-loopback no longer wins). IPv6 addresses never participate
     /// (ZAPI's router-id is an IPv4 construct). The 127/8 range is
     /// excluded like zebra does (`IPV4_NET127`, zebra/router-id.c): a
     /// Linux `lo` always carries 127.0.0.1, and answering with it would
@@ -485,7 +490,7 @@ impl RibDriver {
         let mut loopback: Vec<Ipv4Addr> = Vec::new();
         let mut any_up: Vec<Ipv4Addr> = Vec::new();
         for iface in self.rib.interfaces().values().filter(|i| i.is_up) {
-            let pool = if iface.name.starts_with("lo") {
+            let pool = if iface.flags.contains(LinkFlags::LOOPBACK) {
                 &mut loopback
             } else {
                 &mut any_up
@@ -771,10 +776,17 @@ mod tests {
     }
 
     fn link_up(ifindex: u32) -> DataplaneEvent {
+        link_up_named(ifindex, &format!("eth{ifindex}"))
+    }
+
+    /// An UP broadcast link under an explicit name (the A12 router-id test
+    /// needs a nonstandard `lo`-prefixed one that carries NO loopback bit).
+    fn link_up_named(ifindex: u32, name: &str) -> DataplaneEvent {
         DataplaneEvent::LinkNew {
             ifindex,
-            name: format!("eth{ifindex}"),
+            name: name.into(),
             is_up: true,
+            flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
         }
@@ -785,6 +797,7 @@ mod tests {
             ifindex,
             name: format!("eth{ifindex}"),
             is_up: false,
+            flags: LinkFlags::default(),
             vrf_table: None,
             master_ifindex: None,
         }
@@ -794,6 +807,23 @@ mod tests {
         DataplaneEvent::AddressNew {
             ifindex,
             prefix: prefix.parse().unwrap(),
+        }
+    }
+
+    /// A loopback link event: the kernel's IFF_LOOPBACK bit set (what the
+    /// router-id derivation keys on since A12 — not the name).
+    fn lo_link(ifindex: u32, name: &str, is_up: bool) -> DataplaneEvent {
+        let mut flags = LinkFlags::LOOPBACK | LinkFlags::RUNNING;
+        if is_up {
+            flags |= LinkFlags::UP;
+        }
+        DataplaneEvent::LinkNew {
+            ifindex,
+            name: name.into(),
+            is_up,
+            flags,
+            vrf_table: None,
+            master_ifindex: None,
         }
     }
 
@@ -1591,25 +1621,13 @@ mod tests {
 
         // Loopback preferred even though eth0's address is higher.
         driver.apply_event(&link_up(1)); // name eth1 — see link_up()
-        driver.apply_event(&DataplaneEvent::LinkNew {
-            ifindex: 4,
-            name: "lo".into(),
-            is_up: true,
-            vrf_table: None,
-            master_ifindex: None,
-        });
+        driver.apply_event(&lo_link(4, "lo", true));
         driver.apply_event(&addr_new(4, "10.0.0.5/32"));
         // 127/8 never contributes: without the exclusion every Linux lo
         // would answer 127.0.0.1 and same-id OSPF neighbors could never
         // become adjacent (live-observed with ospfd, Z5C).
         driver.apply_event(&addr_new(4, "127.0.0.1/8"));
-        driver.apply_event(&DataplaneEvent::LinkNew {
-            ifindex: 2,
-            name: "eth0".into(),
-            is_up: true,
-            vrf_table: None,
-            master_ifindex: None,
-        });
+        driver.apply_event(&link_up(2));
         driver.apply_event(&addr_new(2, "192.168.1.1/24"));
         assert_eq!(
             driver.router_id(),
@@ -1625,13 +1643,7 @@ mod tests {
         );
 
         // Loopback down: fall back to the highest UP non-loopback address.
-        driver.apply_event(&DataplaneEvent::LinkNew {
-            ifindex: 4,
-            name: "lo".into(),
-            is_up: false,
-            vrf_table: None,
-            master_ifindex: None,
-        });
+        driver.apply_event(&lo_link(4, "lo", false));
         assert_eq!(
             driver.router_id(),
             Some("192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap())
@@ -1639,13 +1651,7 @@ mod tests {
 
         // A higher address on a DOWN interface and IPv6 addresses never
         // contribute.
-        driver.apply_event(&DataplaneEvent::LinkNew {
-            ifindex: 3,
-            name: "eth1".into(),
-            is_up: false,
-            vrf_table: None,
-            master_ifindex: None,
-        });
+        driver.apply_event(&link_down(3));
         driver.apply_event(&addr_new(3, "200.0.0.1/24"));
         assert_eq!(
             driver.router_id(),
@@ -1666,13 +1672,7 @@ mod tests {
     #[test]
     fn router_id_skips_loopback_range_addresses() {
         let mut driver = RibDriver::new();
-        driver.apply_event(&DataplaneEvent::LinkNew {
-            ifindex: 1,
-            name: "lo".into(),
-            is_up: true,
-            vrf_table: None,
-            master_ifindex: None,
-        });
+        driver.apply_event(&lo_link(1, "lo", true));
         driver.apply_event(&addr_new(1, "127.0.0.1/8"));
         assert_eq!(
             driver.router_id(),
@@ -1685,6 +1685,52 @@ mod tests {
             driver.router_id(),
             Some("10.0.0.1".parse::<Ipv4Addr>().unwrap()),
             "whole 127/8 range excluded, not just 127.0.0.1"
+        );
+    }
+
+    /// A12: loopback detection keys on the mirrored IFF_LOOPBACK bit, not
+    /// the interface name. An `lo`-named link WITHOUT the bit lands in the
+    /// any-up pool (so a higher non-loopback address can win), and a
+    /// nonstandard loopback name WITH the bit takes loopback precedence —
+    /// the two cases the retired `lo`-prefix convention got wrong.
+    #[test]
+    fn router_id_loopback_detection_is_flag_based() {
+        let mut driver = RibDriver::new();
+
+        // "lo"-named but no LOOPBACK bit (e.g. a renamed ethernet): NOT a
+        // loopback — its address competes in the any-up pool.
+        driver.apply_event(&link_up_named(2, "lo200"));
+        driver.apply_event(&addr_new(2, "10.0.0.5/32"));
+        assert_eq!(
+            driver.router_id(),
+            Some("10.0.0.5".parse::<Ipv4Addr>().unwrap()),
+            "lo-named non-loopback still derives (any-up pool)"
+        );
+
+        // A real loopback under a nonstandard name, with a LOWER address:
+        // the bit, not the name or the address height, decides the pool.
+        driver.apply_event(&lo_link(4, "loopback-core", true));
+        driver.apply_event(&addr_new(4, "10.0.0.1/32"));
+        assert_eq!(
+            driver.router_id(),
+            Some("10.0.0.1".parse::<Ipv4Addr>().unwrap()),
+            "IFF_LOOPBACK bit wins over the higher any-up address"
+        );
+
+        // And the bit flapping re-pools the same interface (kernel flag
+        // change arrives as a fresh RTM_NEWLINK).
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 4,
+            name: "loopback-core".into(),
+            is_up: true,
+            flags: LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        assert_eq!(
+            driver.router_id(),
+            Some("10.0.0.5".parse::<Ipv4Addr>().unwrap()),
+            "LOOPBACK bit gone: back to the highest any-up address"
         );
     }
 

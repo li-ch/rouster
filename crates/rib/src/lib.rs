@@ -18,6 +18,12 @@ use tracing::{debug, info, instrument, warn};
 pub struct InterfaceState {
     pub name: String,
     pub is_up: bool,
+    /// The kernel's `ifi_flags` word as last reported by the dataplane
+    /// (`common::LinkFlags`: UP, RUNNING, BROADCAST, MULTICAST, LOOPBACK,
+    /// …, unnamed bits retained). `is_up` stays the consumed signal for
+    /// resolution/reconcile; the bits serve consumers that gate on them
+    /// (ZAPI's interface mirror, the driver's loopback detection).
+    pub flags: common::LinkFlags,
     /// Addresses configured on the interface (as host prefixes).
     pub addresses: Vec<IpPrefix>,
     /// Routing table bound to the interface when it is a VRF device (link
@@ -297,15 +303,18 @@ impl Rib {
                 ifindex,
                 name,
                 is_up,
+                flags,
                 vrf_table,
                 master_ifindex,
             } => {
                 let iface = self.interfaces.entry(*ifindex).or_default();
                 iface.name = name.clone();
                 iface.is_up = *is_up;
-                // Each RTM_NEWLINK carries the link's full state: both VRF
-                // fields overwrite unconditionally, so (un)enslaving or
-                // re-binding a device is reflected on the next notification.
+                // Each RTM_NEWLINK carries the link's full state: the VRF
+                // fields and the flags word all overwrite unconditionally,
+                // so (un)enslaving, re-binding a device, or flapping its
+                // bits is reflected on the next notification.
+                iface.flags = *flags;
                 iface.vrf_table = *vrf_table;
                 iface.master_ifindex = *master_ifindex;
                 self.rebuild_nht();
@@ -758,6 +767,7 @@ mod tests {
             ifindex: 2,
             name: "eth0".into(),
             is_up: true,
+            flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
         });
@@ -810,12 +820,69 @@ mod tests {
             ifindex: 5,
             name: "eth1".into(),
             is_up: true,
+            flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
         });
         let iface = rib.interfaces().get(&5).unwrap();
         assert_eq!(iface.name, "eth1");
         assert_eq!(iface.addresses.len(), 1);
+    }
+
+    /// The kernel's `ifi_flags` ride through the mirror whole: named bits
+    /// (LOOPBACK/BROADCAST/MULTICAST/…) and unnamed ones land in
+    /// `InterfaceState.flags` exactly as reported, a later RTM_NEWLINK
+    /// replaces them, and an address event arriving before the link finds
+    /// the placeholder's default (empty) word until the link event fills
+    /// it — the ingress path for the ZAPI mirror's verbatim relay (A12).
+    #[test]
+    fn link_flags_carried_into_mirror() {
+        let mut rib = Rib::new();
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 1,
+            name: "lo".into(),
+            is_up: true,
+            // Kernel lo: UP|RUNNING|LOOPBACK plus the (unnamed) NOARP bit.
+            flags: common::LinkFlags::from_bits(common::LinkFlags::up_loopback().bits() | 0x80),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        let iface = rib.interfaces().get(&1).unwrap();
+        assert_eq!(
+            iface.flags,
+            common::LinkFlags::from_bits(0xC9),
+            "LOOPBACK 0x8 + RUNNING 0x40 + UP 0x1 + NOARP 0x80, unnamed bit retained"
+        );
+        assert!(iface.flags.contains(common::LinkFlags::LOOPBACK));
+
+        // Admin down: the kernel re-reports with UP|RUNNING dropped (the
+        // static capability bits stay); the mirror takes the new word.
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 1,
+            name: "lo".into(),
+            is_up: false,
+            flags: common::LinkFlags::LOOPBACK | common::LinkFlags::from_bits(0x80),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        let iface = rib.interfaces().get(&1).unwrap();
+        assert!(!iface.is_up);
+        assert!(!iface.flags.contains(common::LinkFlags::UP));
+        assert!(iface.flags.contains(common::LinkFlags::LOOPBACK));
+
+        // Placeholder (address before link) starts with the empty word.
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 9,
+            prefix: "192.0.2.1/24".parse().unwrap(),
+        });
+        assert_eq!(rib.interfaces().get(&9).unwrap().flags.bits(), 0);
+        rib.apply_event(&link(9, "eth9", true));
+        assert!(rib
+            .interfaces()
+            .get(&9)
+            .unwrap()
+            .flags
+            .contains(common::LinkFlags::UP));
     }
 
     #[test]
@@ -1042,6 +1109,11 @@ mod tests {
             ifindex,
             name: name.into(),
             is_up,
+            flags: if is_up {
+                common::LinkFlags::up_broadcast()
+            } else {
+                common::LinkFlags::default()
+            },
             vrf_table: None,
             master_ifindex: None,
         }
@@ -1405,6 +1477,7 @@ mod tests {
             ifindex,
             name: name.into(),
             is_up,
+            flags: common::LinkFlags::UP,
             vrf_table: Some(table),
             master_ifindex: None,
         }
@@ -1416,6 +1489,11 @@ mod tests {
             ifindex,
             name: name.into(),
             is_up,
+            flags: if is_up {
+                common::LinkFlags::up_broadcast()
+            } else {
+                common::LinkFlags::default()
+            },
             vrf_table: None,
             master_ifindex: master,
         }

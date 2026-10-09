@@ -11,7 +11,7 @@ use common::{
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{
-    InfoData, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
+    InfoData, InfoVrf, LinkAttribute, LinkFlags as NlLinkFlags, LinkInfo, LinkMessage,
 };
 use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use netlink_packet_route::route::{
@@ -177,8 +177,8 @@ impl NetlinkDataplane {
 /// `RTA_TABLE` (ids > 255).
 const RT_TABLE_COMPAT: u8 = 252;
 
-/// Maps a kernel link message to a `LinkNew` event (name resolution and
-/// VRF awareness included).
+/// Maps a kernel link message to a `LinkNew` event (name resolution, link
+/// flags, and VRF awareness included).
 ///
 /// VRF modeling: a link of kind "vrf" (`IFLA_INFO_KIND`) carries its bound
 /// routing table in `IFLA_VRF_TABLE` — netlink-packet-route parses that
@@ -187,6 +187,12 @@ const RT_TABLE_COMPAT: u8 = 252;
 /// arrives as `IFLA_MASTER` ([`LinkAttribute::Controller`], the master
 /// device's ifindex — a VRF device here, though bridges and bonds share
 /// the attribute).
+///
+/// Flags: the header's `ifi_flags` word passes through whole (raw bits,
+/// unnamed ones included) — `is_up` is derived from `IFF_UP` as before,
+/// and the mirror keeps the rest (LOOPBACK, BROADCAST, MULTICAST,
+/// RUNNING, …) for consumers that gate on them (the ZAPI interface
+/// mirror relays the word verbatim, like zebra).
 fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
     let name = msg.attributes.iter().find_map(|a| match a {
         LinkAttribute::IfName(n) => Some(n.clone()),
@@ -215,7 +221,8 @@ fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
     Some(DataplaneEvent::LinkNew {
         ifindex: msg.header.index,
         name,
-        is_up: msg.header.flags.contains(LinkFlags::Up),
+        is_up: msg.header.flags.contains(NlLinkFlags::Up),
+        flags: common::LinkFlags::from_bits(msg.header.flags.bits()),
         vrf_table,
         master_ifindex,
     })

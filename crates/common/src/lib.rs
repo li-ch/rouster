@@ -10,7 +10,7 @@ pub mod prefix;
 pub mod route;
 
 pub use dataplane::{
-    Dataplane, DataplaneError, DataplaneEvent, SavEnforce, SavMonitorCounts, SavProgram,
+    Dataplane, DataplaneError, DataplaneEvent, LinkFlags, SavEnforce, SavMonitorCounts, SavProgram,
     SavProgramOp, SavUrpf,
 };
 pub use neighbour::{

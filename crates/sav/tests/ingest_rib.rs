@@ -87,6 +87,7 @@ fn link(ifindex: u32, name: &str) -> DataplaneEvent {
         ifindex,
         name: name.into(),
         is_up: true,
+        flags: common::LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
     }

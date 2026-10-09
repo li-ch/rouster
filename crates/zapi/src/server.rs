@@ -40,7 +40,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use common::{IpPrefix, Nexthop, RouteEntry, RouteProtocol, TableId};
+use common::{IpPrefix, LinkFlags, Nexthop, RouteEntry, RouteProtocol, TableId};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -49,7 +49,7 @@ use tracing::{debug, info, warn};
 use crate::client::route_type_from;
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN, ZAPI_VERSION};
 use crate::message::{
-    blackhole_type, iff, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
+    blackhole_type, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
     ZapiNexthopUpdate, ZapiRoute, ZapiRouterIdUpdate,
 };
 
@@ -168,6 +168,11 @@ pub struct InterfaceMirror {
     pub ifindex: u32,
     pub name: String,
     pub is_up: bool,
+    /// The kernel's `ifi_flags` word as mirrored from the dataplane —
+    /// relayed VERBATIM into the INTERFACE_ADD flags field (what real
+    /// zebra does; the pinned `iff` bits document why: ospfd gates on
+    /// UP|RUNNING/BROADCAST|MULTICAST and treats LOOPBACK as a stub).
+    pub flags: LinkFlags,
     /// Configured addresses (host prefixes) — sent as
     /// INTERFACE_ADDRESS_ADD per address.
     pub addresses: Vec<IpPrefix>,
@@ -480,26 +485,6 @@ fn channel_closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "rib command channel closed")
 }
 
-/// Synthesizes the link-flags word for the interface mirror. The RIB
-/// mirror tracks only up/down, but protocol daemons gate hard on the
-/// classic IFF bits: with flags 0 ospfd reports every interface down
-/// (`if_is_operative` needs UP|RUNNING) and without BROADCAST|MULTICAST
-/// it falls back to the non-broadcast network type, which never sends
-/// hellos. Loopback names follow the driver's `lo`-prefix convention
-/// (the mirror has no IFF_LOOPBACK bit of its own). DOWN links carry no
-/// bits, matching a kernel dump of a down link.
-fn mirror_link_flags(name: &str, is_up: bool) -> u64 {
-    if !is_up {
-        return 0;
-    }
-    let base = iff::UP | iff::RUNNING;
-    if name.starts_with("lo") {
-        base | iff::LOOPBACK
-    } else {
-        base | iff::BROADCAST | iff::MULTICAST
-    }
-}
-
 impl ZapiSession {
     /// Dispatches one decoded message: mutate session state, queue
     /// [`RibCommand`]s, write replies. ZAPI↔internal mapping happens here.
@@ -558,7 +543,10 @@ impl ZapiSession {
                 for intf in &mirror {
                     let mut wire = ZapiInterface::new(&intf.name, intf.ifindex);
                     wire.status = u8::from(intf.is_up);
-                    wire.flags = mirror_link_flags(&intf.name, intf.is_up);
+                    // The kernel's own ifi_flags, relayed verbatim like
+                    // zebra does (A12; no name-based synthesis — the
+                    // mirror's word is the truth, W1B deviation 1 retired).
+                    wire.flags = u64::from(intf.flags.bits());
                     let frame = ZapiMessage::InterfaceAdd(wire)
                         .encode_frame(0)
                         .map_err(encode_io_err)?;
@@ -955,7 +943,7 @@ impl ZapiSession {
 mod tests {
     use super::*;
     use crate::message::{
-        message_flag, ZapiHello, ZapiNexthopRegister, ZapiRedistribute, ZapiRoute,
+        iff, message_flag, ZapiHello, ZapiNexthopRegister, ZapiRedistribute, ZapiRoute,
     };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1987,18 +1975,23 @@ mod tests {
                     ifindex: 2,
                     name: "eth0".into(),
                     is_up: true,
+                    flags: LinkFlags::up_broadcast(),
                     addresses: vec!["192.0.2.1/24".parse().unwrap()],
                 },
                 InterfaceMirror {
                     ifindex: 1,
                     name: "lo".into(),
                     is_up: true,
+                    flags: LinkFlags::up_loopback(),
                     addresses: vec!["127.0.0.1/8".parse().unwrap()],
                 },
                 InterfaceMirror {
                     ifindex: 3,
                     name: "eth1".into(),
                     is_up: false,
+                    // Kernel realism: an admin-down eth keeps its static
+                    // capability bits, drops UP|RUNNING.
+                    flags: LinkFlags::BROADCAST | LinkFlags::MULTICAST,
                     addresses: vec![],
                 },
             ],
@@ -2018,7 +2011,7 @@ mod tests {
         assert_eq!(
             intf.flags,
             iff::UP | iff::RUNNING | iff::BROADCAST | iff::MULTICAST,
-            "UP broadcast link carries the bits ospfd gates on"
+            "the kernel's word for an UP broadcast link, relayed verbatim"
         );
         let (h2, b2) = client.read_frame().await;
         assert_eq!(h2.command, 2, "INTERFACE_ADDRESS_ADD");
@@ -2037,7 +2030,68 @@ mod tests {
         let down = crate::ZapiInterface::decode(&b5).unwrap();
         assert_eq!(down.ifname, "eth1");
         assert_eq!(down.status, 0);
-        assert_eq!(down.flags, 0, "DOWN link carries no bits");
+        assert_eq!(
+            down.flags,
+            iff::BROADCAST | iff::MULTICAST,
+            "the word is the mirror's, not re-derived from is_up"
+        );
+    }
+
+    /// A12: the wire flags word is the mirror's `ifi_flags` VERBATIM —
+    /// names no longer participate. An `lo`-named link without the
+    /// LOOPBACK bit gets none; a non-`lo` name carrying the bit gets it;
+    /// and bits outside the pinned `iff` set (here NOARP, 0x80) survive
+    /// the trip, exactly like a zebra relay of the kernel word.
+    #[tokio::test]
+    async fn interface_flags_relay_decoupled_from_names() {
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
+        let driver = Driver {
+            interfaces: vec![
+                InterfaceMirror {
+                    ifindex: 6,
+                    name: "lo9999".into(),
+                    is_up: true,
+                    flags: LinkFlags::UP | LinkFlags::RUNNING | LinkFlags::BROADCAST,
+                    addresses: vec![],
+                },
+                InterfaceMirror {
+                    ifindex: 7,
+                    name: "gre0".into(),
+                    is_up: true,
+                    flags: LinkFlags::from_bits(
+                        LinkFlags::up_loopback().bits() | LinkFlags::MULTICAST.bits() | 0x80,
+                    ),
+                    addresses: vec![],
+                },
+            ],
+            ..Driver::default()
+        };
+        client.send(&ZapiMessage::InterfaceAddRequest, 0).await;
+        match driver.recv(&mut rx).await {
+            Seen::Ifaces => {}
+            other => panic!("expected RequestInterfaces, got {other:?}"),
+        }
+        let (_h1, b1) = client.read_frame().await;
+        let lo_named = crate::ZapiInterface::decode(&b1).unwrap();
+        assert_eq!(lo_named.ifname, "lo9999");
+        assert_eq!(
+            lo_named.flags,
+            iff::UP | iff::RUNNING | iff::BROADCAST,
+            "no LOOPBACK bit reported → none on the wire, whatever the name"
+        );
+        let (_h2, b2) = client.read_frame().await;
+        let gre = crate::ZapiInterface::decode(&b2).unwrap();
+        assert_eq!(gre.ifname, "gre0");
+        assert_eq!(
+            gre.flags,
+            iff::UP
+                | iff::RUNNING
+                | iff::LOOPBACK
+                | iff::MULTICAST
+                // NOARP has no pinned iff constant; the raw bit rides.
+                | 0x80,
+            "LOOPBACK from the flag word, and unnamed kernel bits survive"
+        );
     }
 
     /// Replays the entire staticd Z1 fixture through a session: every

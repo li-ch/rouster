@@ -23,6 +23,109 @@ pub enum DataplaneError {
     Other(String),
 }
 
+/// Kernel link flags (`ifi_flags`, `IFF_*`) observed from the dataplane.
+///
+/// A bit field on the wire: the kernel reports combinations, and bits
+/// outside the named set exist (e.g. `IFF_DEBUG`, `IFF_DYNAMIC`), so bits
+/// are retained, never truncated — the mirror keeps exactly what the
+/// kernel reported (same rule as [`NeighbourState`]). Values are the
+/// kernel ABI (uapi/linux/if.h), identical on every architecture; the
+/// ZAPI edge relays the word verbatim into INTERFACE_ADD bodies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct LinkFlags(u32);
+
+impl LinkFlags {
+    /// Interface is administrively up.
+    pub const UP: Self = Self(0x1);
+    /// Interface carries broadcast frames (ethernet-like).
+    pub const BROADCAST: Self = Self(0x2);
+    /// Loopback interface (hello-less stub for protocol daemons).
+    pub const LOOPBACK: Self = Self(0x8);
+    /// Carrier/resources are up (operational, not just administrative).
+    pub const RUNNING: Self = Self(0x40);
+    /// Interface joins multicast groups (protocol hellos need it).
+    pub const MULTICAST: Self = Self(0x1000);
+
+    /// Retains every bit, unnamed ones included (mirror = observed state).
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// True when every bit of `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// True when any bit of `other` is set.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// The classic set an UP, running, multicast-capable broadcast link
+    /// carries (an ethernet in production); convenience for event
+    /// construction in tests and examples.
+    pub const fn up_broadcast() -> Self {
+        Self(Self::UP.0 | Self::RUNNING.0 | Self::BROADCAST.0 | Self::MULTICAST.0)
+    }
+
+    /// The classic set an UP loopback carries.
+    pub const fn up_loopback() -> Self {
+        Self(Self::UP.0 | Self::RUNNING.0 | Self::LOOPBACK.0)
+    }
+}
+
+impl std::ops::BitOr for LinkFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for LinkFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl fmt::Display for LinkFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const NAMED: [(&str, LinkFlags); 5] = [
+            ("UP", LinkFlags::UP),
+            ("BROADCAST", LinkFlags::BROADCAST),
+            ("LOOPBACK", LinkFlags::LOOPBACK),
+            ("RUNNING", LinkFlags::RUNNING),
+            ("MULTICAST", LinkFlags::MULTICAST),
+        ];
+        let named_mask: u32 = NAMED.iter().map(|&(_, s)| s.0).fold(0, |a, b| a | b);
+        let mut any = false;
+        for (name, bit) in NAMED {
+            if self.contains(bit) {
+                if any {
+                    f.write_str("|")?;
+                }
+                f.write_str(name)?;
+                any = true;
+            }
+        }
+        let rest = self.0 & !named_mask;
+        if rest != 0 {
+            if any {
+                f.write_str("|")?;
+            }
+            write!(f, "0x{rest:x}")?;
+            any = true;
+        }
+        if !any {
+            f.write_str("0x0")?;
+        }
+        Ok(())
+    }
+}
+
 /// Events observed from the forwarding plane (link, address, and route
 /// changes).
 ///
@@ -34,6 +137,12 @@ pub enum DataplaneEvent {
         ifindex: u32,
         name: String,
         is_up: bool,
+        /// The kernel's `ifi_flags` word as reported for the link (UP,
+        /// RUNNING, BROADCAST, MULTICAST, LOOPBACK, …). `is_up` stays the
+        /// primary consumed signal; this carries the bits protocol
+        /// daemons gate on — netlink-sourced events always hold
+        /// `is_up == flags.contains(LinkFlags::UP)`.
+        flags: LinkFlags,
         /// Routing table bound to the link when it is a VRF device (link
         /// kind "vrf", `IFLA_VRF_TABLE`); `None` for every other link kind.
         vrf_table: Option<TableId>,
@@ -95,6 +204,7 @@ impl fmt::Display for DataplaneEvent {
                 is_up,
                 vrf_table,
                 master_ifindex,
+                ..
             } => {
                 write!(
                     f,
@@ -391,9 +501,36 @@ mod tests {
             ifindex: 5,
             name: "vrf-test".into(),
             is_up: true,
+            flags: LinkFlags::up_broadcast(),
             vrf_table,
             master_ifindex,
         }
+    }
+
+    /// LinkFlags mirrors the kernel word: named bits round-trip, unnamed
+    /// bits are retained (mirror = observed state), and Display names the
+    /// classic five with a hex tail for the rest.
+    #[test]
+    fn link_flags_retain_all_bits_and_display_named() {
+        let eth = LinkFlags::up_broadcast();
+        assert!(eth.contains(LinkFlags::UP | LinkFlags::RUNNING));
+        assert!(!eth.contains(LinkFlags::LOOPBACK));
+        assert_eq!(eth.bits(), 0x1043, "0x1000|0x40|0x2|0x1 (kernel ABI)");
+
+        let lo = LinkFlags::up_loopback();
+        assert!(lo.contains(LinkFlags::LOOPBACK));
+        assert!(!lo.intersects(LinkFlags::BROADCAST | LinkFlags::MULTICAST));
+
+        // Unnamed kernel bits survive and render as a hex tail.
+        let with_debug = LinkFlags::from_bits(LinkFlags::UP.bits() | 0x1000_0000);
+        assert_eq!(with_debug.bits(), 0x1000_0001);
+        assert_eq!(with_debug.to_string(), "UP|0x10000000");
+        assert_eq!(LinkFlags::default().to_string(), "0x0");
+        assert_eq!(
+            (LinkFlags::UP | LinkFlags::LOOPBACK).bits(),
+            0x9,
+            "BitOr composes"
+        );
     }
 
     /// A plain link renders exactly as before the VRF extension; a VRF
@@ -405,6 +542,7 @@ mod tests {
             ifindex: 2,
             name: "eth0".into(),
             is_up: false,
+            flags: LinkFlags::default(),
             vrf_table: None,
             master_ifindex: None,
         };
