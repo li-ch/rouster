@@ -203,6 +203,139 @@ impl fmt::Display for NeighbourFlags {
     }
 }
 
+/// Originating protocol of a neighbour entry (`NDA_PROTOCOL`, an
+/// `RTPROT_*` discriminant — not a bit field).
+///
+/// The kernel attaches it to entries an administrative writer created
+/// (`ip neigh add` → `RTPROT_STATIC`); kernel-learned ARP/NDP entries
+/// usually carry none (see [`NeighbourEntry::protocol`]). Values are the
+/// kernel UAPI `RTPROT_*` constants (include/uapi/linux/rtnetlink.h),
+/// retained verbatim — the mirror keeps exactly what the kernel reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct NeighbourProtocol(u8);
+
+impl NeighbourProtocol {
+    /// `RTPROT_UNSPEC`.
+    pub const UNSPEC: Self = Self(0);
+    /// `RTPROT_REDIRECT` — ICMP redirect.
+    pub const REDIRECT: Self = Self(1);
+    /// `RTPROT_KERNEL` — the kernel itself.
+    pub const KERNEL: Self = Self(2);
+    /// `RTPROT_BOOT` — administrative additions (`ip neigh add`-class).
+    pub const BOOT: Self = Self(3);
+    /// `RTPROT_STATIC` — statically configured by an administrator.
+    pub const STATIC: Self = Self(4);
+    /// `RTPROT_GATED`.
+    pub const GATED: Self = Self(8);
+    /// `RTPROT_RA` — router discovery.
+    pub const RA: Self = Self(9);
+    /// `RTPROT_MRT`.
+    pub const MRT: Self = Self(10);
+    /// `RTPROT_ZEBRA` — FRR's zebra.
+    pub const ZEBRA: Self = Self(11);
+    /// `RTPROT_BIRD`.
+    pub const BIRD: Self = Self(12);
+    /// `RTPROT_DNROUTED`.
+    pub const DNROUTED: Self = Self(13);
+    /// `RTPROT_XORP`.
+    pub const XORP: Self = Self(14);
+    /// `RTPROT_NTK`.
+    pub const NTK: Self = Self(15);
+    /// `RTPROT_DHCP`.
+    pub const DHCP: Self = Self(16);
+    /// `RTPROT_MROUTED`.
+    pub const MROUTED: Self = Self(17);
+    /// `RTPROT_KEEPALIVED`.
+    pub const KEEPALIVED: Self = Self(18);
+    /// `RTPROT_BABEL`.
+    pub const BABEL: Self = Self(42);
+    /// `RTPROT_BGP`.
+    pub const BGP: Self = Self(186);
+    /// `RTPROT_ISIS`.
+    pub const ISIS: Self = Self(187);
+    /// `RTPROT_OSPF`.
+    pub const OSPF: Self = Self(188);
+    /// `RTPROT_RIP`.
+    pub const RIP: Self = Self(189);
+    /// `RTPROT_EIGRP`.
+    pub const EIGRP: Self = Self(192);
+
+    /// Retains any value, unnamed ones included (mirror = observed state).
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for NeighbourProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const NAMED: [(&str, NeighbourProtocol); 22] = [
+            ("UNSPEC", NeighbourProtocol::UNSPEC),
+            ("REDIRECT", NeighbourProtocol::REDIRECT),
+            ("KERNEL", NeighbourProtocol::KERNEL),
+            ("BOOT", NeighbourProtocol::BOOT),
+            ("STATIC", NeighbourProtocol::STATIC),
+            ("GATED", NeighbourProtocol::GATED),
+            ("RA", NeighbourProtocol::RA),
+            ("MRT", NeighbourProtocol::MRT),
+            ("ZEBRA", NeighbourProtocol::ZEBRA),
+            ("BIRD", NeighbourProtocol::BIRD),
+            ("DNROUTED", NeighbourProtocol::DNROUTED),
+            ("XORP", NeighbourProtocol::XORP),
+            ("NTK", NeighbourProtocol::NTK),
+            ("DHCP", NeighbourProtocol::DHCP),
+            ("MROUTED", NeighbourProtocol::MROUTED),
+            ("KEEPALIVED", NeighbourProtocol::KEEPALIVED),
+            ("BABEL", NeighbourProtocol::BABEL),
+            ("BGP", NeighbourProtocol::BGP),
+            ("ISIS", NeighbourProtocol::ISIS),
+            ("OSPF", NeighbourProtocol::OSPF),
+            ("RIP", NeighbourProtocol::RIP),
+            ("EIGRP", NeighbourProtocol::EIGRP),
+        ];
+        match NAMED.iter().find(|&(_, p)| p.0 == self.0) {
+            Some(&(name, _)) => f.write_str(name),
+            // A value outside the exported set survives the mirror and
+            // shows as hex.
+            None => write!(f, "0x{:02x}", self.0),
+        }
+    }
+}
+
+/// Neighbour cache statistics (`NDA_CACHEINFO`, `struct nda_cacheinfo`).
+///
+/// `used`, `confirmed`, and `updated` are kernel clock ticks since boot
+/// (`jiffies_to_clock_t` values — the same units `ip neigh` divides by
+/// uptime to render seconds); `refcnt` is a reference count, not a
+/// timestamp. Values pass through uninterpreted: consumers that need
+/// wall-clock ageing (SAV hysteresis à la RFC 8704 §3.6.2, NHT liveness)
+/// pair them with the kernel clock later; the mirror only records what
+/// the kernel reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct NeighbourCacheInfo {
+    /// Last time the neighbour was positively confirmed reachable.
+    pub confirmed: u32,
+    /// Last time the entry was used for forwarding.
+    pub used: u32,
+    /// Last time the entry was updated (state/lladdr change).
+    pub updated: u32,
+    /// Kernel reference count (not a timestamp).
+    pub refcnt: u32,
+}
+
+impl fmt::Display for NeighbourCacheInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "used {} confirmed {} updated {} refcnt {}",
+            self.used, self.confirmed, self.updated, self.refcnt
+        )
+    }
+}
+
 /// One neighbour (ARP/NDP) entry observed on a link.
 ///
 /// Keyed by (`ip`, `link_ifindex`) — the kernel's neighbour identity;
@@ -219,6 +352,13 @@ pub struct NeighbourEntry {
     pub lladdr: Option<Vec<u8>>,
     pub state: NeighbourState,
     pub flags: NeighbourFlags,
+    /// Ageing/reachability statistics (`NDA_CACHEINFO`). `None` when the
+    /// kernel attached none to the message (not every notification or
+    /// dump row carries it).
+    pub cacheinfo: Option<NeighbourCacheInfo>,
+    /// Originating protocol (`NDA_PROTOCOL`). `None` when the kernel
+    /// attached none — the common case for kernel-learned ARP/NDP.
+    pub protocol: Option<NeighbourProtocol>,
 }
 
 impl NeighbourEntry {
@@ -239,7 +379,24 @@ impl NeighbourEntry {
             lladdr,
             state: NeighbourState::from_bits(ndm_state),
             flags: NeighbourFlags::from_bits(ndm_flags),
+            cacheinfo: None,
+            protocol: None,
         }
+    }
+
+    /// Attaches the `NDA_CACHEINFO` statistics, when the message carried
+    /// them. Optional wire attributes arrive after the always-present
+    /// header fields, so they extend the core constructor instead of
+    /// growing its parameter list.
+    pub fn with_cacheinfo(mut self, cacheinfo: Option<NeighbourCacheInfo>) -> Self {
+        self.cacheinfo = cacheinfo;
+        self
+    }
+
+    /// Attaches the `NDA_PROTOCOL` origin, when the message carried it.
+    pub fn with_protocol(mut self, protocol: Option<NeighbourProtocol>) -> Self {
+        self.protocol = protocol;
+        self
     }
 
     /// Good for forwarding now: the entry has a link-layer address and its
@@ -390,5 +547,61 @@ mod tests {
             v6.to_string(),
             "fe80::1 dev 3 lladdr 33:33:00:00:00:01 state REACHABLE"
         );
+    }
+
+    /// CACHEINFO and PROTOCOL ride along as optional attributes: absent
+    /// by default, preserved verbatim when attached — the mirror's job is
+    /// to keep what the kernel reported for the ageing consumers (SAV
+    /// hysteresis, NHT liveness), not to interpret it yet.
+    #[test]
+    fn cacheinfo_and_protocol_mirror_onto_the_entry() {
+        // Kernel-learned entry: neither attribute attached.
+        let bare = NeighbourEntry::from_rtnetlink(ip("192.0.2.11"), 2, mac(0x11), 0x02, 0);
+        assert_eq!(bare.cacheinfo, None);
+        assert_eq!(bare.protocol, None);
+
+        // `ip neigh add ... nud permanent` with its dump-row cacheinfo:
+        // used/confirmed/updated as clock ticks, refcnt, RTPROT_STATIC.
+        let ci = NeighbourCacheInfo {
+            confirmed: 4321,
+            used: 4400,
+            updated: 4300,
+            refcnt: 1,
+        };
+        let e = bare
+            .clone()
+            .with_cacheinfo(Some(ci))
+            .with_protocol(Some(NeighbourProtocol::STATIC));
+        assert_eq!(e.cacheinfo, Some(ci));
+        assert_eq!(e.protocol, Some(NeighbourProtocol::STATIC));
+        assert_eq!(e.protocol.unwrap().bits(), 0x04);
+        // Equivalence ignores nothing: the attributes are part of the
+        // entry's identity for the mirror's replace semantics.
+        assert_ne!(e, bare);
+
+        // Display of the cacheinfo one-liner keeps all four fields.
+        assert_eq!(
+            ci.to_string(),
+            "used 4400 confirmed 4321 updated 4300 refcnt 1"
+        );
+    }
+
+    /// NDA_PROTOCOL names the exported RTPROT set and keeps unknown
+    /// values as hex — same unfiltered-mirror discipline as the
+    /// state/flag bits.
+    #[test]
+    fn protocol_names_rtprot_values_and_hexes_unknowns() {
+        assert_eq!(NeighbourProtocol::KERNEL.bits(), 0x02);
+        assert_eq!(NeighbourProtocol::KERNEL.to_string(), "KERNEL");
+        assert_eq!(NeighbourProtocol::BOOT.to_string(), "BOOT");
+        assert_eq!(NeighbourProtocol::STATIC.to_string(), "STATIC");
+        assert_eq!(NeighbourProtocol::ZEBRA.to_string(), "ZEBRA");
+        assert_eq!(NeighbourProtocol::BGP.to_string(), "BGP");
+        assert_eq!(NeighbourProtocol::default().to_string(), "UNSPEC");
+        // RTPROT values ≥ 0xc0 are in-kernel/unregistered space; the
+        // mirror keeps them.
+        let odd = NeighbourProtocol::from_bits(0x99);
+        assert_eq!(odd.bits(), 0x99);
+        assert_eq!(odd.to_string(), "0x99");
     }
 }

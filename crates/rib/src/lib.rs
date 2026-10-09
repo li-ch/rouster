@@ -965,6 +965,46 @@ mod tests {
         assert!(rib.lookup_neighbour(ip("192.0.2.7"), 3).is_some());
     }
 
+    /// The mirror stores entries whole: the NDA_CACHEINFO ageing
+    /// statistics and the NDA_PROTOCOL origin ride along uninterpreted
+    /// (the SAV-hysteresis / NHT-liveness consumers read them later), and
+    /// a replacement event refreshes them with the newly reported values.
+    #[test]
+    fn neighbour_mirror_preserves_cacheinfo_and_protocol() {
+        let mut rib = Rib::new();
+        let with_attrs = |ci: Option<u32>, proto: u8| DataplaneEvent::NeighbourNew {
+            entry: common::NeighbourEntry::from_rtnetlink(
+                ip("192.0.2.11"),
+                2,
+                Some(vec![0x02, 0, 0, 0, 0, 0x11]),
+                0x80,
+                0,
+            )
+            .with_cacheinfo(ci.map(|updated| common::NeighbourCacheInfo {
+                confirmed: 100,
+                used: 150,
+                updated,
+                refcnt: 1,
+            }))
+            .with_protocol(Some(common::NeighbourProtocol::from_bits(proto))),
+        };
+
+        rib.apply_event(&with_attrs(Some(300), 0x04)); // ip neigh add: RTPROT_STATIC
+        let entry = rib.lookup_neighbour(ip("192.0.2.11"), 2).unwrap();
+        let ci = entry.cacheinfo.expect("cacheinfo stored");
+        assert_eq!(
+            (ci.confirmed, ci.used, ci.updated, ci.refcnt),
+            (100, 150, 300, 1)
+        );
+        assert_eq!(entry.protocol, Some(common::NeighbourProtocol::STATIC));
+
+        // Replacement (re-confirmed entry) carries fresh timestamps.
+        rib.apply_event(&with_attrs(Some(900), 0x04));
+        let entry = rib.lookup_neighbour(ip("192.0.2.11"), 2).unwrap();
+        assert_eq!(entry.cacheinfo.expect("refreshed").updated, 900);
+        assert_eq!(rib.neighbours().len(), 1);
+    }
+
     /// Neighbour events are read-only awareness: they must not move the
     /// kernel route mirror, the programmed set, or gateway resolution.
     #[test]

@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use common::{
-    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, NeighbourEntry,
-    Nexthop, RouteEntry, RouteProtocol, SavMonitorCounts, SavProgram,
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix,
+    NeighbourCacheInfo, NeighbourEntry, NeighbourProtocol, Nexthop, RouteEntry, RouteProtocol,
+    SavMonitorCounts, SavProgram,
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
@@ -246,8 +247,10 @@ fn nl_err(e: rtnetlink::Error) -> DataplaneError {
 ///
 /// Entries without `NDA_DST` (bridge FDB rows key on lladdr instead) are
 /// skipped: they are not IP neighbours. State and flag bits pass through
-/// to [`NeighbourEntry::from_rtnetlink`] unfiltered — the mirror keeps
-/// exactly what the kernel reported.
+/// to [`NeighbourEntry::from_rtnetlink`] unfiltered, and the optional
+/// `NDA_CACHEINFO` (ageing statistics) and `NDA_PROTOCOL` (originating
+/// RTPROT) attributes ride along when present — the mirror keeps exactly
+/// what the kernel reported.
 fn neighbour_event(msg: &NeighbourMessage, is_new: bool) -> Option<DataplaneEvent> {
     let ip = msg.attributes.iter().find_map(|a| match a {
         NeighbourAttribute::Destination(NeighbourAddress::Inet(a)) => {
@@ -264,6 +267,23 @@ fn neighbour_event(msg: &NeighbourMessage, is_new: bool) -> Option<DataplaneEven
             NeighbourAttribute::LinkLocalAddress(bytes) => Some(bytes.clone()),
             _ => None,
         });
+        let cacheinfo = msg.attributes.iter().find_map(|a| match a {
+            NeighbourAttribute::CacheInfo(ci) => Some(NeighbourCacheInfo {
+                confirmed: ci.confirmed,
+                used: ci.used,
+                updated: ci.updated,
+                refcnt: ci.refcnt,
+            }),
+            _ => None,
+        });
+        let protocol = msg.attributes.iter().find_map(|a| match a {
+            // RouteProtocol here is the wire RTPROT discriminant; the
+            // From<RouteProtocol> for u8 impl covers every variant of the
+            // #[non_exhaustive] enum, so the raw value passes through
+            // without a match to go stale.
+            NeighbourAttribute::Protocol(p) => Some(NeighbourProtocol::from_bits(u8::from(*p))),
+            _ => None,
+        });
         Some(DataplaneEvent::NeighbourNew {
             entry: NeighbourEntry::from_rtnetlink(
                 ip,
@@ -271,7 +291,9 @@ fn neighbour_event(msg: &NeighbourMessage, is_new: bool) -> Option<DataplaneEven
                 lladdr,
                 msg.header.state.into(),
                 msg.header.flags.bits(),
-            ),
+            )
+            .with_cacheinfo(cacheinfo)
+            .with_protocol(protocol),
         })
     } else {
         Some(DataplaneEvent::NeighbourDel { ip, link_ifindex })

@@ -13,7 +13,9 @@ pub use dataplane::{
     Dataplane, DataplaneError, DataplaneEvent, SavEnforce, SavMonitorCounts, SavProgram,
     SavProgramOp, SavUrpf,
 };
-pub use neighbour::{NeighbourEntry, NeighbourFlags, NeighbourState};
+pub use neighbour::{
+    NeighbourCacheInfo, NeighbourEntry, NeighbourFlags, NeighbourProtocol, NeighbourState,
+};
 pub use nexthop::{Nexthop, NexthopGroup};
 pub use prefix::{IpPrefix, Ipv4Prefix, Ipv6Prefix, PrefixError};
 pub use route::{RouteEntry, RouteProtocol, TableId};
