@@ -273,3 +273,47 @@ Deviations disclosed (harness-level, same class as Z5B's):
   real FRR install provides.
 - `NO_COLOR=1` in front of rousterd stays as belt-and-braces (W3's
   TTY detection already keeps files ANSI-free).
+
+## Same-window ZAPI-edge follow-ups (2026-10-09, after the Z5B/Z5C runs)
+
+The Z5B/Z5C results above ran against the server as stages W1/W1B left
+it. Later stages of the same overnight window changed the edge further;
+each item cites the program ledger (`away/2026-10-09/LEDGER.md`):
+
+- **W2 closed the Z5B deferred list, then re-ran the bgpd flow green**
+  ("REGRESS incl. bonus z5b" — LEDGER W2): ROUTER_ID_ADD is answered
+  with a derived ROUTER_ID_UPDATE; a REDISTRIBUTE_ADD registration gets
+  an initial best-route dump (so Z5B's deviation-5 two-phase `vtysh -b`
+  can collapse to single-phase); best-route withdrawal now pushes
+  REDISTRIBUTE_ROUTE_DEL (32), which the Z5B topology never exercised.
+  ROUTE_NOTIFY_REQUEST (126) stays unanswered by design: no
+  zebra→client ROUTE_NOTIFY_OWNER (11) wire bytes exist in any capture,
+  so 11 is marked NOT-PINNED in the golden doc and the request warns
+  loudly (LEDGER W2).
+- **BFD_CLIENT_REGISTER (36): recorded, and the no-reply is now
+  source-verified, not inferred** — frr 10.2.2 `zebra/zebra_ptm.c`
+  writes nothing back in either HAVE_BFDD variant and the sender
+  fire-and-forgets; the pinned doc's cmd-36 byte sample was corrected
+  to the real fixture bytes (LEDGER M1). Z5C's tolerated-no-reply
+  observation matches zebra's exact behavior.
+- **Config reload keeps the redistribute channel honest**: SIGHUP
+  reloads push REDISTRIBUTE_ROUTE_ADD/DEL for changed bests exactly
+  like route commands do, and byte-identical reloads stay silent
+  (LEDGER M2) — the soft-reconfiguration an FRR peer observes now
+  extends to the reload path.
+- **Kernel-side VRF awareness landed ahead of the ZAPI VRF fields**:
+  netlink-dp recognizes VRF devices (kind, IFLA_VRF_TABLE, IFLA_MASTER
+  enslavement) and mirrors/programs their route tables without leaking
+  into table 254 (LEDGER W4); ZAPI interface/route VRF-table fields
+  remain a fenced follow-up (W4 report §Deferred 2), and the VRF_ADD
+  replay note above is unchanged.
+- **Rouster's own savd is now a third ZAPI client**: it couples to the
+  RIB through existing message types only (redistribute feed +
+  dummy-register marker), monitor-only by default, fed by neighbour
+  observations at ARP/NDP granularity (LEDGER W8).
+- **All four FRR-facing smokes re-validated in one sequential run**:
+  `scripts/run-smokes.sh` ran the full 12-script suite in 301 s — 11/12
+  PASS (z4/z5/z5b/z5c all green); the single red is the p0c ECMP
+  smoke's own read-side defect — busybox 1.37.0 hides ECMP members
+  while the product's multipath route is proven correct via iproute2
+  kernel read — not an interop failure (LEDGER M4).

@@ -128,3 +128,51 @@ Strategic note: no general-purpose routing suite (FRR, BIRD, Holo) has native SA
 ## Appendix B — Repository layout decision
 
 Owner decision (2026-10-08): all Rouster code and project documentation live in this repository (`rouster/`), which will be open-sourced. Prior research documents live outside the repo.
+
+## Appendix C — Status notes (append-only)
+
+Ticks cite the overnight program's append-only stage ledger
+(`away/2026-10-09/LEDGER.md`, outside this repo; `W#`/`M#` are its
+lines, which carry the commit hashes and name the per-stage reports).
+The phase text above is unchanged; this block is status only.
+
+- 2026-10-09 — Phase 0 (netlink-dp sync surface): the neighbour half of
+  "interface/address/route/neighbour sync" landed — kernel ARP/NDP dump
+  plus live add/replace/del events mirrored into the RIB (LEDGER W3).
+  VRF awareness landed — devices recognized with their table ids and
+  enslavement, VRF-table routes mirrored and programmed back without
+  leaking into table 254 (LEDGER W4). Netns awareness remains open:
+  `setns(2)` has no safe wrapper under the no-unsafe/no-new-deps fence —
+  BLOCKED with a design recommendation recorded for the owner (LEDGER
+  W4).
+- 2026-10-09 — Phase 0 (rib): reconcile-diff partition invariants are
+  property-pinned against a reference model — partition totality,
+  keep-iff-unchanged, stable fixpoint, 10k-case stress green (LEDGER
+  M3, W5B convention).
+- 2026-10-09 — Phase 1 (credibility milestone): DELIVERED — two real
+  FRR 10.2.2 bgpd instances peer iBGP Established through rousterd and
+  BGP-learned prefixes reach the kernel `proto bgp`, stable over a 60 s
+  soak with zero reconnects (LEDGER W1: PEER, ROUTE-KERNEL, STABLE).
+  ospfd followed the same night — Full adjacency, each remote loopback
+  installed `proto ospf` in both directions (LEDGER W1B). Results and
+  deviations: `docs/interop/frr-10.2-interop.md` (Z5B/Z5C sections).
+- 2026-10-09 — Phase 1 (ZAPI breadth): ROUTER_ID_ADD is answered with a
+  derived ROUTER_ID_UPDATE (live-validated by ospfd, no config pin),
+  REDISTRIBUTE_ADD registrations get an initial best-route dump, and
+  REDISTRIBUTE_ROUTE_DEL is modeled and pushed on best-route
+  withdrawal, with the whole bgpd interop flow re-run green after those
+  changes (LEDGER W2, W1B). Config reload now pushes redistribute
+  ADD/DEL for changed bests and stays silent on identical reloads
+  (LEDGER M2). BFD_CLIENT_REGISTER is recorded and its no-reply is
+  source-verified against frr 10.2.2 `zebra_ptm.c` (LEDGER M1).
+- 2026-10-09 — Phase 1.5 (savd core): delivered end-to-end — SIB with
+  typed source-prefix/interface bindings ingested from the RIB (LEDGER
+  W5); the IBA/IBB/PBA/PBB rule model plus uRPF-family rule generation
+  and the table manager, RFC-cited table-driven tests, FP approximation
+  disclosed (LEDGER W6); enforcement through the Dataplane trait with an
+  rp_filter sysctl backend (nft absent from all cached images),
+  spoof-block/legit-pass tests and a monitor-before-drop default
+  (LEDGER W7); the savd daemon wired as a ZAPI client of the RIB,
+  monitor-only by default with drop refusal tested, neighbour-based
+  monitor feed (LEDGER W8). SIB ingest invariants are property-pinned
+  against a reference model, 10k-case stress green (LEDGER W5B).
