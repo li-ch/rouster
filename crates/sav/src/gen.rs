@@ -28,7 +28,7 @@
 
 use std::fmt;
 
-use common::IpPrefix;
+use common::{IpPrefix, RouteProtocol};
 use rib::Rib;
 
 use crate::mode::{SavConfig, ValidationMode};
@@ -90,9 +90,45 @@ impl fmt::Display for UrpfMode {
     }
 }
 
+/// Where a rule came from (B5 observation 5): rule sources are plural
+/// by design — operator statics, the FIB, BGP, a SAVNET agent — and
+/// this field records which one spoke, for W7/W8 logging. Purely
+/// informational provenance: never an enforcement input, and
+/// deliberately optional ([`Option`]) so builders that have no source
+/// to name (tests, future rule builders) carry none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuleOrigin {
+    /// Statically configured: an operator's binding or rule
+    /// (`sav.conf`-shaped config).
+    Static,
+    /// FIB-derived: the uRPF-equivalence generators reading a
+    /// RIB-learned best route that is not BGP.
+    Fib,
+    /// A BGP-learned best route's binding.
+    Bgp,
+    /// A SAVNET agent's rule (the draft-dependent signaling behind
+    /// `experimental-savnet`; nothing sets it tonight).
+    SavnetAgent,
+}
+
+impl fmt::Display for RuleOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            RuleOrigin::Static => "static",
+            RuleOrigin::Fib => "fib",
+            RuleOrigin::Bgp => "bgp",
+            RuleOrigin::SavnetAgent => "savnet-agent",
+        };
+        f.write_str(name)
+    }
+}
+
 /// One typed SAV rule: a source prefix mapped to the interfaces the
 /// rule speaks for, tagged with its validation mode. Pure data; rule
 /// sets are ordered deterministically (see [`RuleSet`]).
+///
+/// Every rule optionally carries its [`RuleOrigin`] provenance (B5
+/// observation 5) — informational only, never an enforcement input.
 ///
 /// Semantics per variant (GSC §2.1–§2.4):
 /// - [`Iba`](SavRule::Iba): sources in `prefix` are valid on
@@ -113,12 +149,16 @@ pub enum SavRule {
         /// The interfaces the rule covers (concrete refs; the SIB's
         /// `Any` marker never appears in generated rules).
         interfaces: Vec<InterfaceRef>,
+        /// Which source produced this rule (B5 observation 5);
+        /// `None` when the builder did not say.
+        origin: Option<RuleOrigin>,
     },
     /// Interface-based prefix blocklist entry (GSC §2.2).
     Ibb {
         /// Sources inside this prefix fail on `interfaces`.
         prefix: IpPrefix,
         interfaces: Vec<InterfaceRef>,
+        origin: Option<RuleOrigin>,
     },
     /// Prefix-based interface allowlist entry (GSC §2.3).
     Pba {
@@ -126,6 +166,7 @@ pub enum SavRule {
         prefix: IpPrefix,
         /// The only interfaces its sources may arrive on.
         interfaces: Vec<InterfaceRef>,
+        origin: Option<RuleOrigin>,
     },
     /// Prefix-based interface blocklist entry (GSC §2.4).
     Pbb {
@@ -133,6 +174,7 @@ pub enum SavRule {
         prefix: IpPrefix,
         /// The interfaces its sources may never arrive on.
         interfaces: Vec<InterfaceRef>,
+        origin: Option<RuleOrigin>,
     },
 }
 
@@ -166,6 +208,17 @@ impl SavRule {
             SavRule::Pbb { .. } => ValidationMode::Pbb,
         }
     }
+
+    /// The rule's provenance, when its builder said one (B5
+    /// observation 5) — informational only.
+    pub fn origin(&self) -> Option<RuleOrigin> {
+        match *self {
+            SavRule::Iba { origin, .. }
+            | SavRule::Ibb { origin, .. }
+            | SavRule::Pba { origin, .. }
+            | SavRule::Pbb { origin, .. } => origin,
+        }
+    }
 }
 
 impl fmt::Display for SavRule {
@@ -182,7 +235,11 @@ impl fmt::Display for SavRule {
             },
             self.prefix(),
             ifaces.join(", ")
-        )
+        )?;
+        match self.origin() {
+            Some(origin) => write!(f, " (from {origin})"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -241,9 +298,13 @@ pub fn generate_urpf(mode: UrpfMode, sib: &Sib, rib: &Rib, cfg: &SavConfig) -> R
             bindings
                 .filter(|b| prefix_len(b.prefix) > 0)
                 .filter_map(|b| {
-                    restrict(&b.interfaces, &enabled).map(|interfaces| (b.prefix, interfaces))
-                })
-                .map(|(prefix, interfaces)| SavRule::Iba { prefix, interfaces }),
+                    let origin = rule_origin(rib, &b.origin, b.prefix);
+                    restrict(&b.interfaces, &enabled).map(|interfaces| SavRule::Iba {
+                        prefix: b.prefix,
+                        interfaces,
+                        origin,
+                    })
+                }),
         ),
         // Loose: any concrete binding makes the source routable on
         // every enabled interface (directionality sacrificed, RFC 3704
@@ -253,6 +314,7 @@ pub fn generate_urpf(mode: UrpfMode, sib: &Sib, rib: &Rib, cfg: &SavConfig) -> R
                 SavRule::Iba {
                     prefix: b.prefix,
                     interfaces: enabled.clone(),
+                    origin: rule_origin(rib, &b.origin, b.prefix),
                 }
             }))
         }
@@ -266,9 +328,13 @@ pub fn generate_urpf(mode: UrpfMode, sib: &Sib, rib: &Rib, cfg: &SavConfig) -> R
                     if b.origin == BindingOrigin::Rib {
                         feasible.extend(alternate_egress(rib, b.prefix));
                     }
-                    restrict(&feasible, &enabled).map(|interfaces| (b.prefix, interfaces))
-                })
-                .map(|(prefix, interfaces)| SavRule::Iba { prefix, interfaces }),
+                    let origin = rule_origin(rib, &b.origin, b.prefix);
+                    restrict(&feasible, &enabled).map(|interfaces| SavRule::Iba {
+                        prefix: b.prefix,
+                        interfaces,
+                        origin,
+                    })
+                }),
         ),
         // EFP: per family, a present default route makes every source
         // routable (one 0/0-or-::/0 rule subsumes the concrete list);
@@ -278,6 +344,7 @@ pub fn generate_urpf(mode: UrpfMode, sib: &Sib, rib: &Rib, cfg: &SavConfig) -> R
                 Some(SavRule::Iba {
                     prefix: b.prefix,
                     interfaces: enabled.clone(),
+                    origin: rule_origin(rib, &b.origin, b.prefix),
                 })
             } else if sib_has_default(sib, family_of(b.prefix)) {
                 None
@@ -285,9 +352,33 @@ pub fn generate_urpf(mode: UrpfMode, sib: &Sib, rib: &Rib, cfg: &SavConfig) -> R
                 Some(SavRule::Iba {
                     prefix: b.prefix,
                     interfaces: enabled.clone(),
+                    origin: rule_origin(rib, &b.origin, b.prefix),
                 })
             }
         })),
+    }
+}
+
+/// The provenance a generated rule carries for one binding (B5
+/// observation 5): operator config is [`RuleOrigin::Static`];
+/// RIB-derived rules are [`RuleOrigin::Fib`], except that a
+/// BGP-learned best route is called out as [`RuleOrigin::Bgp`] — the
+/// binding does not remember the protocol, so the best route is
+/// re-read here. [`RuleOrigin::SavnetAgent`] arrives with the agent.
+fn rule_origin(rib: &Rib, binding: &BindingOrigin, prefix: IpPrefix) -> Option<RuleOrigin> {
+    match binding {
+        BindingOrigin::Config => Some(RuleOrigin::Static),
+        BindingOrigin::Rib => {
+            let bgp = rib
+                .table(MAIN_TABLE)
+                .and_then(|table| table.best(&prefix))
+                .is_some_and(|best| best.protocol == RouteProtocol::Bgp);
+            Some(if bgp {
+                RuleOrigin::Bgp
+            } else {
+                RuleOrigin::Fib
+            })
+        }
     }
 }
 
@@ -427,10 +518,22 @@ mod tests {
         cfg
     }
 
+    /// The expected shape of a generated rule: rib-derived provenance
+    /// (`Fib`) — the generators' common case in the fixtures below.
     fn iba(prefix: &str, ifindexes: &[u32]) -> SavRule {
+        iba_of(prefix, ifindexes, Some(RuleOrigin::Fib))
+    }
+
+    /// …with operator-config provenance (a Config binding's rule).
+    fn iba_static(prefix: &str, ifindexes: &[u32]) -> SavRule {
+        iba_of(prefix, ifindexes, Some(RuleOrigin::Static))
+    }
+
+    fn iba_of(prefix: &str, ifindexes: &[u32], origin: Option<RuleOrigin>) -> SavRule {
         SavRule::Iba {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+            origin,
         }
     }
 
@@ -577,12 +680,12 @@ mod tests {
 
         assert_eq!(
             generate_urpf(UrpfMode::Strict, &sib, &rib, &cfg).rules(),
-            &[iba("198.51.100.0/24", &[3])],
+            &[iba_static("198.51.100.0/24", &[3])],
             "the config binding replaced the rib one in the SIB"
         );
         assert_eq!(
             generate_urpf(UrpfMode::Fp, &sib, &rib, &cfg).rules(),
-            &[iba("198.51.100.0/24", &[3])],
+            &[iba_static("198.51.100.0/24", &[3])],
             "no alternate union into an operator-pinned binding"
         );
 
@@ -593,7 +696,10 @@ mod tests {
         let rib_empty = Rib::new();
         assert_eq!(
             generate_urpf(UrpfMode::Loose, &sib2, &rib_empty, &cfg).rules(),
-            &[iba("10.0.0.0/8", &[2, 3]), iba("192.0.2.0/24", &[2, 3])]
+            &[
+                iba("10.0.0.0/8", &[2, 3]),
+                iba_static("192.0.2.0/24", &[2, 3])
+            ]
         );
     }
 
@@ -682,6 +788,47 @@ mod tests {
         cfg.enable_interface(7, ValidationMode::Iba, SavAction::Monitor);
         let strict = generate_urpf(UrpfMode::Strict, &sib, &rib, &cfg);
         assert_eq!(strict.rules(), &[iba("10.9.0.0/16", &[2, 7])]);
+    }
+
+    /// B5 observation 5: rule sources are plural by design, so every
+    /// generated rule records which one spoke — RIB-derived rules are
+    /// Fib (a BGP-learned best route is called out as Bgp), an
+    /// operator-configured binding is Static, and a hand-built rule
+    /// that said nothing stays None.
+    #[test]
+    fn generated_rules_record_their_source() {
+        let cfg = cfg_iba_2_3();
+
+        // Rib-derived, static best route: Fib.
+        let (sib, rib) = asymmetric_sib_rib();
+        let strict = generate_urpf(UrpfMode::Strict, &sib, &rib, &cfg);
+        assert_eq!(strict.rules()[0].origin(), Some(RuleOrigin::Fib));
+
+        // A BGP-learned best route (the binding is Rib-origin; the
+        // protocol is re-read from the best route): Bgp.
+        let mut rib_bgp = Rib::new();
+        let mut r = static_if_route("198.51.100.0/24", 2);
+        r.protocol = RouteProtocol::Bgp;
+        rib_bgp.add_route(r);
+        let sib_bgp = Sib::from_rib(&rib_bgp);
+        assert_eq!(
+            generate_urpf(UrpfMode::Strict, &sib_bgp, &rib_bgp, &cfg).rules()[0].origin(),
+            Some(RuleOrigin::Bgp)
+        );
+
+        // Operator-configured binding: Static.
+        let mut sib_cfg = Sib::new();
+        sib_cfg
+            .update(config_binding("192.0.2.0/24", &[2]))
+            .unwrap();
+        assert_eq!(
+            generate_urpf(UrpfMode::Strict, &sib_cfg, &Rib::new(), &cfg).rules()[0].origin(),
+            Some(RuleOrigin::Static)
+        );
+
+        // A builder that said nothing: absent stays None.
+        let hand = iba_of("10.0.0.0/8", &[2], None);
+        assert_eq!(hand.origin(), None);
     }
 
     /// The `ip` helper keeps worked-example sources honest (parse

@@ -136,6 +136,7 @@ fn run(args: &[String], command: Command) -> ExitCode {
             ifindex: iba.ifindex,
             prefixes,
             action,
+            origin: None,
         });
     }
 

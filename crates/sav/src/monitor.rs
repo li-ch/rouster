@@ -92,11 +92,13 @@ mod tests {
                 ifindex: 2,
                 prefixes: vec!["198.51.100.0/24".parse().unwrap()],
                 action: crate::mode::SavAction::Monitor,
+                origin: None,
             },
             SavOp::IbaPermit {
                 ifindex: 3,
                 prefixes: vec![],
                 action: crate::mode::SavAction::Monitor,
+                origin: None,
             },
         ];
         let mut monitor = SpoofMonitor::new(&ops);
@@ -128,6 +130,7 @@ mod tests {
             ifindex: 2,
             prefixes: vec![],
             action: crate::mode::SavAction::Monitor,
+            origin: None,
         }];
         let mut monitor = SpoofMonitor::new(&ops);
         for _ in 0..5 {
@@ -162,6 +165,7 @@ mod tests {
             ifindex: 2,
             prefixes: vec!["198.51.100.0/24".parse().unwrap()],
             action: crate::mode::SavAction::Monitor,
+            origin: None,
         }];
         let mut monitor = SpoofMonitor::new(&ops);
         assert_eq!(monitor.observe(ip("198.51.100.9"), 2), Verdict::Valid);

@@ -29,7 +29,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use common::{IpPrefix, Ipv4Prefix, Ipv6Prefix};
 use tracing::{debug, warn};
 
-use crate::gen::{RuleSet, SavRule};
+use crate::gen::{RuleOrigin, RuleSet, SavRule};
 use crate::mode::{SavAction, SavConfig, ValidationMode};
 use crate::{prefix_contains, prefix_len};
 
@@ -38,6 +38,11 @@ use crate::{prefix_contains, prefix_len};
 /// per-prefix interface-set memberships — both directions of GSC §3
 /// Figure 1's "SAV rule" definition ("mapping the incoming interfaces
 /// with specific source addresses/prefixes").
+///
+/// Each op carries the provenance of the rules that produced it (B5
+/// observation 5): [`SavOp::origin`] is the single [`RuleOrigin`]
+/// every contributing rule shared, or `None` when they disagreed or
+/// none said — data for W7/W8 logging, never an enforcement input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavOp {
     /// IBA-SAV on one interface (GSC §2.1): a packet arriving on
@@ -51,6 +56,8 @@ pub enum SavOp {
         prefixes: Vec<IpPrefix>,
         /// What enforcement does with invalid verdicts here.
         action: SavAction,
+        /// The shared provenance of the contributing rules.
+        origin: Option<RuleOrigin>,
     },
     /// IBB-SAV on one interface (GSC §2.2): a packet arriving on
     /// `ifindex` with a source inside some prefix of `prefixes` is
@@ -59,6 +66,7 @@ pub enum SavOp {
         ifindex: u32,
         prefixes: Vec<IpPrefix>,
         action: SavAction,
+        origin: Option<RuleOrigin>,
     },
     /// PBA-SAV for one protected prefix (GSC §2.3): sources inside
     /// `prefix` are valid iff they arrive on one of `ifindexes`;
@@ -67,6 +75,7 @@ pub enum SavOp {
         prefix: IpPrefix,
         ifindexes: Vec<u32>,
         action: SavAction,
+        origin: Option<RuleOrigin>,
     },
     /// PBB-SAV for one protected prefix (GSC §2.4): sources inside
     /// `prefix` are invalid iff they arrive on one of `ifindexes`.
@@ -74,6 +83,7 @@ pub enum SavOp {
         prefix: IpPrefix,
         ifindexes: Vec<u32>,
         action: SavAction,
+        origin: Option<RuleOrigin>,
     },
 }
 
@@ -97,37 +107,66 @@ impl SavOp {
             SavOp::PbbBlock { .. } => ValidationMode::Pbb,
         }
     }
+
+    /// The op's provenance (B5 observation 5): the one origin every
+    /// contributing rule shared, `None` when they disagreed or none
+    /// said. Informational only — W7/W8 logging data.
+    pub fn origin(&self) -> Option<RuleOrigin> {
+        match *self {
+            SavOp::IbaPermit { origin, .. }
+            | SavOp::IbbBlock { origin, .. }
+            | SavOp::PbaPermit { origin, .. }
+            | SavOp::PbbBlock { origin, .. } => origin,
+        }
+    }
 }
 
 impl fmt::Display for SavOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let origin = self.origin();
+        let suffix = |f: &mut fmt::Formatter<'_>| match origin {
+            Some(origin) => write!(f, " (from {origin})"),
+            None => Ok(()),
+        };
         match self {
             SavOp::IbaPermit {
                 ifindex,
                 prefixes,
                 action,
+                ..
             } => {
                 let p: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
-                write!(f, "iba permit #{ifindex} [{}] {action}", p.join(", "))
+                write!(f, "iba permit #{ifindex} [{}] {action}", p.join(", "))?;
+                suffix(f)
             }
             SavOp::IbbBlock {
                 ifindex,
                 prefixes,
                 action,
+                ..
             } => {
                 let p: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
-                write!(f, "ibb block #{ifindex} [{}] {action}", p.join(", "))
+                write!(f, "ibb block #{ifindex} [{}] {action}", p.join(", "))?;
+                suffix(f)
             }
             SavOp::PbaPermit {
                 prefix,
                 ifindexes,
                 action,
-            } => write!(f, "pba permit {prefix} {ifindexes:?} {action}"),
+                ..
+            } => {
+                write!(f, "pba permit {prefix} {ifindexes:?} {action}")?;
+                suffix(f)
+            }
             SavOp::PbbBlock {
                 prefix,
                 ifindexes,
                 action,
-            } => write!(f, "pbb block {prefix} {ifindexes:?} {action}"),
+                ..
+            } => {
+                write!(f, "pbb block {prefix} {ifindexes:?} {action}")?;
+                suffix(f)
+            }
         }
     }
 }
@@ -232,6 +271,10 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
     // prefix set from the rules naming it.
     let mut iba: BTreeMap<u32, Vec<IpPrefix>> = BTreeMap::new();
     let mut ibb: BTreeMap<u32, Vec<IpPrefix>> = BTreeMap::new();
+    // The contributing rules' provenance per site (B5 observation 5),
+    // folded into the op's origin at construction.
+    let mut iba_origins: BTreeMap<u32, Vec<RuleOrigin>> = BTreeMap::new();
+    let mut ibb_origins: BTreeMap<u32, Vec<RuleOrigin>> = BTreeMap::new();
     // The GSC §3 subtraction axis: IBB prefixes colliding with an
     // IBA-configured interface (the config makes both modes on one
     // interface unrepresentable; rule data can still name it).
@@ -241,14 +284,19 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
             SavRule::Iba {
                 prefix,
                 ref interfaces,
+                origin,
             } => {
                 for ifindex in ifindexes_of(interfaces) {
                     iba.entry(ifindex).or_default().push(prefix);
+                    if let Some(origin) = origin {
+                        iba_origins.entry(ifindex).or_default().push(origin);
+                    }
                 }
             }
             SavRule::Ibb {
                 prefix,
                 ref interfaces,
+                origin,
             } => {
                 for ifindex in ifindexes_of(interfaces) {
                     // GSC §3: where IBA is configured, IBB is ignored
@@ -267,11 +315,19 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
                                     "ibb rule subtracted from iba allowlist (GSC §3 merge)"
                                 );
                                 ibb_on_iba.entry(ifindex).or_default().push(prefix);
+                                // The carve shapes the merged op, so its
+                                // provenance contributes too.
+                                if let Some(origin) = origin {
+                                    iba_origins.entry(ifindex).or_default().push(origin);
+                                }
                             }
                         }
                         continue;
                     }
                     ibb.entry(ifindex).or_default().push(prefix);
+                    if let Some(origin) = origin {
+                        ibb_origins.entry(ifindex).or_default().push(origin);
+                    }
                 }
             }
             // Router-scale: union per prefix; exclusivity below.
@@ -308,6 +364,7 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
             ifindex,
             prefixes,
             action: cfg.action_on(ifindex),
+            origin: shared_origin(iba_origins.get(&ifindex).into_iter().flatten().copied()),
         });
     }
     for (&ifindex, prefixes) in &ibb {
@@ -318,12 +375,16 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
             ifindex,
             prefixes: sorted_prefixes(prefixes.clone()),
             action: cfg.action_on(ifindex),
+            origin: shared_origin(ibb_origins.get(&ifindex).into_iter().flatten().copied()),
         });
     }
 
     // Router-scale: group interface sets per (mode, prefix).
     let mut pba: BTreeMap<IpPrefix, Vec<u32>> = BTreeMap::new();
     let mut pbb: BTreeMap<IpPrefix, Vec<u32>> = BTreeMap::new();
+    // The contributing rules' provenance per protected prefix.
+    let mut pba_origins: BTreeMap<IpPrefix, Vec<RuleOrigin>> = BTreeMap::new();
+    let mut pbb_origins: BTreeMap<IpPrefix, Vec<RuleOrigin>> = BTreeMap::new();
     // The GSC §3 subtraction axis: PBB interfaces for prefixes PBA
     // also protects (the collision sites).
     let mut pbb_on_pba: BTreeMap<IpPrefix, Vec<u32>> = BTreeMap::new();
@@ -338,14 +399,19 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
             SavRule::Pba {
                 prefix,
                 ref interfaces,
+                origin,
             } => {
                 pba.entry(prefix)
                     .or_default()
                     .extend(ifindexes_of(interfaces));
+                if let Some(origin) = origin {
+                    pba_origins.entry(prefix).or_default().push(origin);
+                }
             }
             SavRule::Pbb {
                 prefix,
                 ref interfaces,
+                origin,
             } => {
                 // GSC §3: where PBA protects the prefix, PBB is
                 // ignored or merged by subtraction.
@@ -364,6 +430,11 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
                                 .entry(prefix)
                                 .or_default()
                                 .extend(ifindexes_of(interfaces));
+                            // The subtraction shapes the merged op, so
+                            // its provenance contributes too.
+                            if let Some(origin) = origin {
+                                pba_origins.entry(prefix).or_default().push(origin);
+                            }
                         }
                     }
                     continue;
@@ -371,6 +442,9 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
                 pbb.entry(prefix)
                     .or_default()
                     .extend(ifindexes_of(interfaces));
+                if let Some(origin) = origin {
+                    pbb_origins.entry(prefix).or_default().push(origin);
+                }
             }
             _ => {}
         }
@@ -388,6 +462,7 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
             prefix,
             ifindexes,
             action: cfg.router_action(),
+            origin: shared_origin(pba_origins.get(&prefix).into_iter().flatten().copied()),
         });
     }
     for (prefix, mut ifindexes) in pbb {
@@ -397,9 +472,21 @@ pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolic
             prefix,
             ifindexes,
             action: cfg.router_action(),
+            origin: shared_origin(pbb_origins.get(&prefix).into_iter().flatten().copied()),
         });
     }
     ops
+}
+
+/// The op-level provenance: `Some(o)` when every contributing rule
+/// carried origin `o`; `None` when they disagreed, or none said
+/// anything (origin-less hand-built rules, the seeded empty
+/// allowlists no rule spoke for) — a merged op never guesses a
+/// source (B5 observation 5).
+fn shared_origin(origins: impl IntoIterator<Item = RuleOrigin>) -> Option<RuleOrigin> {
+    let mut origins = origins.into_iter();
+    let first = origins.next()?;
+    origins.all(|o| o == first).then_some(first)
 }
 
 /// The ifindexes named by a rule's interface list (concrete refs only;
@@ -619,7 +706,7 @@ fn op_prefix(op: &SavOp) -> IpPrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gen::{generate_urpf, UrpfMode};
+    use crate::gen::{generate_urpf, RuleOrigin, UrpfMode};
     use crate::mode::{SavAction, ValidationMode};
     use crate::{Binding, BindingOrigin, InterfaceRef, Sib};
     use common::{Nexthop, NexthopGroup, RouteEntry, RouteProtocol};
@@ -655,6 +742,7 @@ mod tests {
         SavRule::Pba {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+            origin: None,
         }
     }
 
@@ -662,6 +750,7 @@ mod tests {
         SavRule::Pbb {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+            origin: None,
         }
     }
 
@@ -669,6 +758,7 @@ mod tests {
         SavRule::Ibb {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+            origin: None,
         }
     }
 
@@ -676,6 +766,7 @@ mod tests {
         SavRule::Iba {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+            origin: None,
         }
     }
 
@@ -822,11 +913,13 @@ mod tests {
                     ifindex: 2,
                     prefixes: vec![],
                     action: SavAction::Monitor,
+                    origin: None,
                 },
                 SavOp::IbaPermit {
                     ifindex: 3,
                     prefixes: vec![],
                     action: SavAction::Monitor,
+                    origin: None,
                 },
             ],
             "both IBA-enabled interfaces keep an (empty) allowlist op"
@@ -849,6 +942,7 @@ mod tests {
                 ifindex: 3,
                 prefixes: vec!["192.0.2.0/24".parse().unwrap()],
                 action: SavAction::Monitor,
+                origin: None,
             }]
         );
         assert_eq!(evaluate(&ops, ip("192.0.2.7"), 3), Verdict::Invalid);
@@ -878,6 +972,7 @@ mod tests {
                 prefix: "198.51.100.0/24".parse().unwrap(),
                 ifindexes: vec![2, 3],
                 action: SavAction::Monitor,
+                origin: None,
             }]
         );
         assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
@@ -1043,11 +1138,13 @@ mod tests {
                     prefix: "198.51.100.0/24".parse().unwrap(),
                     ifindexes: vec![2, 4],
                     action: SavAction::Monitor,
+                    origin: None,
                 },
                 SavOp::PbbBlock {
                     prefix: "203.0.113.0/24".parse().unwrap(),
                     ifindexes: vec![7],
                     action: SavAction::Monitor,
+                    origin: None,
                 },
             ]
         );
@@ -1197,6 +1294,62 @@ mod tests {
         );
     }
 
+    /// B5 observation 5, compile side: the op-level origin is the one
+    /// origin every contributing rule shares. A rib-derived rule's Fib
+    /// reaches its compiled op; ops no (or no agreeing) rule spoke for
+    /// stay `None` — the seeded empty allowlist, origin-less hand-built
+    /// rules, and a merge of disagreeing origins all decline to pick.
+    #[test]
+    fn ops_carry_the_contributing_rules_shared_origin() {
+        let (sib, rib, cfg) = worked_example();
+        let rules = generate_urpf(UrpfMode::Strict, &sib, &rib, &cfg);
+        let ops = compile(&rules, &cfg);
+        let carried: Vec<(u32, Option<RuleOrigin>)> = ops
+            .iter()
+            .map(|op| match op {
+                SavOp::IbaPermit {
+                    ifindex, origin, ..
+                } => (*ifindex, *origin),
+                _ => panic!("expected iba ops from the strict generator"),
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            vec![(2, Some(RuleOrigin::Fib)), (3, None)],
+            "the rule-bearing op carries Fib; the seeded empty allowlist carries none"
+        );
+
+        // Hand-built rules that said nothing: their ops stay None too.
+        let cfg2 = cfg_iba_2_3();
+        let hand = RuleSet::from_rules([iba("10.0.0.0/8", &[2])]);
+        let ops2 = compile(&hand, &cfg2);
+        assert_eq!(ops2.len(), 2);
+        assert!(ops2.iter().all(|op| op.origin().is_none()));
+
+        // Disagreeing origins merged onto one interface: never a guess.
+        let mixed = RuleSet::from_rules([
+            SavRule::Iba {
+                prefix: "10.0.0.0/8".parse().unwrap(),
+                interfaces: vec![if_ref(2)],
+                origin: Some(RuleOrigin::Fib),
+            },
+            SavRule::Iba {
+                prefix: "192.0.2.0/24".parse().unwrap(),
+                interfaces: vec![if_ref(2)],
+                origin: Some(RuleOrigin::Static),
+            },
+        ]);
+        let ops3 = compile(&mixed, &cfg2);
+        assert_eq!(ops3.len(), 2, "ifindex 2's merged op plus ifindex 3's seed");
+        let merged = ops3.iter().find_map(|op| match op {
+            SavOp::IbaPermit {
+                ifindex: 2, origin, ..
+            } => Some(*origin),
+            _ => None,
+        });
+        assert_eq!(merged, Some(None), "a merged op never guesses a source");
+    }
+
     /// Compile is deterministic and rule-input-order independent (same
     /// readout as generation, one layer down); overlapping allowlist
     /// prefixes are OR-membership (any contains ⇒ matched).
@@ -1216,10 +1369,12 @@ mod tests {
             crate::gen::SavRule::Iba {
                 prefix: "10.0.0.0/8".parse().unwrap(),
                 interfaces: vec![if_ref(2)],
+                origin: None,
             },
             crate::gen::SavRule::Iba {
                 prefix: "10.1.0.0/16".parse().unwrap(),
                 interfaces: vec![if_ref(2)],
+                origin: None,
             },
         ]);
         let ops = compile(&overlapping, &cfg2);

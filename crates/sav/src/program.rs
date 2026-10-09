@@ -32,6 +32,7 @@ pub fn program(ops: &[SavOp], mode: UrpfMode) -> SavProgram {
             ifindex,
             ref prefixes,
             action,
+            ..
         } => SavProgramOp::IfaceAllow {
             ifindex,
             prefixes: prefixes.clone(),
@@ -48,6 +49,7 @@ pub fn program(ops: &[SavOp], mode: UrpfMode) -> SavProgram {
             ifindex,
             ref prefixes,
             action,
+            ..
         } => SavProgramOp::IfaceBlock {
             ifindex,
             prefixes: prefixes.clone(),
@@ -57,6 +59,7 @@ pub fn program(ops: &[SavOp], mode: UrpfMode) -> SavProgram {
             prefix,
             ref ifindexes,
             action,
+            ..
         } => SavProgramOp::PrefixAllow {
             prefix,
             ifindexes: ifindexes.clone(),
@@ -66,6 +69,7 @@ pub fn program(ops: &[SavOp], mode: UrpfMode) -> SavProgram {
             prefix,
             ref ifindexes,
             action,
+            ..
         } => SavProgramOp::PrefixBlock {
             prefix,
             ifindexes: ifindexes.clone(),
@@ -103,21 +107,25 @@ mod tests {
                 ifindex: 2,
                 prefixes: vec![p("198.51.100.0/24")],
                 action: SavAction::Monitor,
+                origin: None,
             },
             SavOp::IbbBlock {
                 ifindex: 3,
                 prefixes: vec![p("192.0.2.0/24")],
                 action: SavAction::Drop,
+                origin: None,
             },
             SavOp::PbaPermit {
                 prefix: p("203.0.113.0/24"),
                 ifindexes: vec![2, 3],
                 action: SavAction::Drop,
+                origin: None,
             },
             SavOp::PbbBlock {
                 prefix: p("2001:db8::/48"),
                 ifindexes: vec![4],
                 action: SavAction::Monitor,
+                origin: None,
             },
         ];
         let prog = program(&ops, UrpfMode::Strict);
@@ -154,6 +162,7 @@ mod tests {
             ifindex: 7,
             prefixes: vec![p("10.0.0.0/8")],
             action,
+            origin: None,
         };
         for mode in [UrpfMode::Loose, UrpfMode::Fp, UrpfMode::Efp] {
             let prog = program(&[iba(SavAction::Monitor)], mode);
@@ -178,17 +187,20 @@ mod tests {
             ifindex: 2,
             prefixes: vec![],
             action: SavAction::Drop,
+            origin: None,
         }];
         let b = [
             SavOp::IbaPermit {
                 ifindex: 2,
                 prefixes: vec![],
                 action: SavAction::Drop,
+                origin: None,
             },
             SavOp::IbaPermit {
                 ifindex: 2,
                 prefixes: vec![],
                 action: SavAction::Drop,
+                origin: None,
             },
         ];
         assert_eq!(program(&a, UrpfMode::Strict), program(&b, UrpfMode::Strict));
