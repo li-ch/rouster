@@ -27,7 +27,11 @@
 #   3. ONE `vtysh -b` pushes the full iBGP configs: r1 announces `network
 #      203.0.113.0/24` (no import-check) and holds `ip route
 #      198.51.100.0/24 blackhole`; r2 receives both and installs them into
-#      ITS rousterd -> kernel `proto bgp`.
+#      ITS rousterd -> kernel `proto bgp`. Neither config pins
+#      `bgp router-id`: each bgpd takes the id rousterd derives (highest
+#      non-127/8 IPv4 on an UP interface = the bridge eth0 address) via
+#      ROUTER_ID_UPDATE — the W1B ospfd-proven path, here exercised by
+#      bgpd.
 #   4. Redistribution channel live (Z5B hazard) with no ordering
 #      constraint: whether r1's `redistribute static` registration lands
 #      before staticd's route or after it, bgpd receives 198.51.100.0/24
@@ -193,7 +197,6 @@ docker exec "$R1" sh -c "printf '%s\n' \
   'ip route $REDIS_PREFIX blackhole' \
   'router bgp 65000' \
   ' no bgp network import-check' \
-  ' bgp router-id $R1_IP' \
   ' neighbor $R2_IP remote-as 65000' \
   ' address-family ipv4 unicast' \
   '  network $ANNOUNCED' \
@@ -206,7 +209,6 @@ docker exec "$R2" sh -c "printf '%s\n' \
   'frr defaults traditional' \
   'hostname r2' \
   'router bgp 65000' \
-  ' bgp router-id $R2_IP' \
   ' neighbor $R1_IP remote-as 65000' \
   'line vty' \
   > $FRR_CONF"
