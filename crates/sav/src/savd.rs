@@ -29,13 +29,34 @@
 //!   driver processed every earlier `RegisterRedistribute`, so once the
 //!   marker is read the whole dump is at least queued. ZAPI has no
 //!   end-of-dump marker, so a bounded quiet window
-//!   ([`SYNC_SETTLE`]) collects what follows; the poll tick then keeps
-//!   the view eventually-consistent regardless (savd is a POLLING
-//!   consumer tonight — pushes update the mirror, only the timer
-//!   re-evaluates).
+//!   ([`SYNC_SETTLE`]) collects what follows.
 //! - The interface mirror (names, addresses) comes from savd's own
 //!   netlink dataplane dump/events — the same kernel truth the
 //!   enforcement backend writes to. No new IPC, no wire changes.
+//!
+//! # Event-driven re-evaluation + deletion hysteresis (A10)
+//!
+//! savd is an EVENT-DRIVEN consumer: every mirror change that can
+//! alter the program (a redistribute push, an interface/address event)
+//! sets a dirty flag ([`SavDaemon::take_dirty`]), and the resident
+//! select loop re-evaluates — regenerate + install — on the flag
+//! instead of waiting for the poll tick. The poll cadence stays as the
+//! safety net (and SIGHUP still re-evaluates); neighbour observations
+//! feed only the spoof counter and never dirty the view.
+//!
+//! Deletions ride a short hysteresis window (RFC 8704 §3.6.2:
+//! "Deleting entries from the RPF lists SHOULD be delayed by a
+//! predetermined amount ... when responding to route withdrawals"; see
+//! `away/2026-10-09/quarantine/B5-urpf-notes.md` §2.6): a prefix that
+//! leaves a still-present allowlist is held installed for
+//! [`DEFERRED_DELETE_DELAY`] (a pending-deletions set the select loop's
+//! timer arm flushes), so a withdraw/re-advertise transient never
+//! flickers the dataplane — the re-advertised prefix is absorbed
+//! silently. Additions and whole-op removals (the allowlist's
+//! generator mode, interface, or action changed — operator intent, not
+//! a route flap) apply immediately. The spoof monitor judges the same
+//! effective ops the dataplane enforces, so counters and enforcement
+//! never disagree.
 //!
 //! # Config (`/etc/savd.conf`-shaped)
 //!
@@ -64,7 +85,7 @@ use std::time::Duration;
 use common::{Dataplane, DataplaneError, DataplaneEvent, IpPrefix, SavProgram, SavProgramOp};
 use rib::Rib;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tracing::{debug, info, warn};
 use zapi::{route_type, ZapiClient, ZapiMessage};
 
@@ -74,6 +95,15 @@ use crate::monitor::SpoofMonitor;
 use crate::program::program;
 use crate::table::{compile, SavOp, Verdict};
 use crate::{Sib, MAIN_TABLE};
+
+/// Hysteresis window for allowlist deletions (RFC 8704 §3.6.2): a
+/// withdrawn prefix stays enforced this long before it finally
+/// uninstalls, so withdraw/re-advertise transients never flicker the
+/// dataplane. Short and fixed (not configurable) tonight, disclosed:
+/// long enough to absorb a redistribute flap, short enough that a real
+/// withdrawal converges promptly — and the select loop's timer arm
+/// flushes exactly at the deadline, independent of the poll cadence.
+const DEFERRED_DELETE_DELAY: Duration = Duration::from_secs(3);
 
 /// Quiet window after the sync marker: anything the server still had
 /// queued arrives within it (the dump is produced synchronously inside
@@ -352,6 +382,53 @@ pub fn program_diff(
     (added, removed)
 }
 
+/// One allowlist prefix whose deletion is being held for the hysteresis
+/// window (RFC 8704 §3.6.2). The identity is the allowlist the prefix
+/// belongs to — generator mode + interface + action: the deletion stays
+/// deferred only while that same allowlist persists in the desired
+/// view. A withdrawal that removes the whole op (mode/action config
+/// change, interface gone) is an operator or link event, not a route
+/// flap, and applies immediately through the normal diff.
+#[derive(Debug, Clone)]
+struct PendingDeletion {
+    mode: UrpfMode,
+    ifindex: u32,
+    action: SavAction,
+    prefix: IpPrefix,
+    deadline: Instant,
+}
+
+impl PendingDeletion {
+    /// Whether this entry defers exactly the given prefix on the given
+    /// allowlist identity (the re-registration guard: an already-held
+    /// deletion keeps its original deadline).
+    fn is_for(&self, mode: UrpfMode, ifindex: u32, action: SavAction, prefix: IpPrefix) -> bool {
+        self.mode == mode
+            && self.ifindex == ifindex
+            && self.action == action
+            && self.prefix == prefix
+    }
+}
+
+/// The desired allowlist for one (mode, ifindex, action) identity in an
+/// op list, or `None` when no such op exists (the identity is gone).
+fn iba_allowlist(
+    ops: &[(UrpfMode, SavOp)],
+    mode: UrpfMode,
+    ifindex: u32,
+    action: SavAction,
+) -> Option<&[IpPrefix]> {
+    ops.iter().find_map(|(m, op)| match op {
+        SavOp::IbaPermit {
+            ifindex: i,
+            action: a,
+            prefixes,
+            ..
+        } if *m == mode && *i == ifindex && *a == action => Some(&prefixes[..]),
+        _ => None,
+    })
+}
+
 /// The savd core: a ZAPI client (RIB view), the local mirror it feeds,
 /// the spoof counter, and what is currently installed.
 pub struct SavDaemon<IO> {
@@ -363,6 +440,17 @@ pub struct SavDaemon<IO> {
     monitor: SpoofMonitor,
     /// What was last handed to the dataplane (None = never evaluated).
     installed: Option<SavProgram>,
+    /// The ops behind `installed`, desired ∪ deferred prefixes, with
+    /// each op's generator mode (the deferral scan's before-picture).
+    effective_ops: Vec<(UrpfMode, SavOp)>,
+    /// Allowlist deletions being held for the hysteresis window
+    /// (RFC 8704 §3.6.2), flushed by the deadline.
+    pending_deletions: Vec<PendingDeletion>,
+    /// The view changed since the last evaluate in a way that can alter
+    /// the program (redistribute push, interface/address event) — the
+    /// select loop re-evaluates on this flag instead of waiting for the
+    /// poll tick. Neighbour observations never set it (counter-only).
+    dirty: bool,
     config: SavdConfig,
 }
 
@@ -377,6 +465,9 @@ where
             rib: Rib::new(),
             monitor: SpoofMonitor::new(&[]),
             installed: None,
+            effective_ops: Vec::new(),
+            pending_deletions: Vec::new(),
+            dirty: false,
             config: SavdConfig::default(),
         }
     }
@@ -401,6 +492,25 @@ where
     /// The accumulated monitor counters (the spoof counter).
     pub fn counts(&self) -> common::SavMonitorCounts {
         self.monitor.counts()
+    }
+
+    /// Whether a mirror change since the last evaluate can have
+    /// altered the program (the select loop's event-driven
+    /// re-evaluation trigger).
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Take the dirty flag — the select loop's pattern: check it after
+    /// each handled event and evaluate immediately when set.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// The earliest pending-deletion deadline, for the select loop's
+    /// hysteresis flush timer; `None` when nothing is deferred.
+    pub fn deletion_deadline(&self) -> Option<Instant> {
+        self.pending_deletions.iter().map(|d| d.deadline).min()
     }
 
     /// HELLO + redistribute registration + the initial best-route dump,
@@ -433,8 +543,9 @@ where
             }
         }
         // No end-of-dump marker exists in ZAPI: collect what follows
-        // within a bounded quiet window. The poll tick re-evaluates on
-        // top of whatever arrived, so this window is a startup-latency
+        // within a bounded quiet window. The event-driven
+        // re-evaluation (and the poll tick behind it) converge on top
+        // of whatever arrived, so this window is a startup-latency
         // optimization, not a correctness gate.
         while let Ok(message) = timeout(SYNC_SETTLE, self.client.read_message()).await {
             self.apply_push(message?);
@@ -457,10 +568,10 @@ where
     }
 
     /// Applies one incoming zebra message to the RIB view:
-    /// REDISTRIBUTE_ROUTE_ADD/DEL update the protocol-route mirror;
-    /// everything else is logged at debug. Re-evaluation stays on the
-    /// poll tick (polling consumer tonight — event-driven
-    /// re-evaluation is §Deferred).
+    /// REDISTRIBUTE_ROUTE_ADD/DEL update the protocol-route mirror and
+    /// mark the view dirty (the select loop re-evaluates on the flag);
+    /// everything else is logged at debug and does not dirty (the
+    /// program cannot have changed).
     pub fn apply_push(&mut self, message: ZapiMessage) {
         match message {
             ZapiMessage::RedistributeRouteAdd(route) => {
@@ -471,6 +582,7 @@ where
                     entry.table = MAIN_TABLE;
                     debug!(prefix = %entry.prefix, "savd: rib push add");
                     self.rib.add_route(entry);
+                    self.dirty = true;
                 } else {
                     warn!("savd: redistribute push with unmapped type ignored");
                 }
@@ -481,6 +593,7 @@ where
                     self.rib
                         .table_mut(MAIN_TABLE)
                         .remove(&route.prefix, protocol);
+                    self.dirty = true;
                 }
                 None => warn!("savd: redistribute del with unmapped type ignored"),
             },
@@ -502,7 +615,11 @@ where
     /// observations feed the spoof counter — a neighbour entry proves
     /// an address spoke on an interface, which is a real (ARP/NDP
     /// granularity, not per-packet) traffic observation of exactly the
-    /// (source, ingress) shape the monitor judges.
+    /// (source, ingress) shape the monitor judges. Interface/address
+    /// (and kernel-route mirror) events additionally mark the view
+    /// dirty: names resolve against the mirror, so the program can
+    /// change with them; neighbour events never dirty it (counter-only
+    /// — they are the high-frequency feed).
     pub fn apply_event(&mut self, ev: &DataplaneEvent) {
         if let DataplaneEvent::NeighbourNew { entry } = ev {
             let verdict = self.monitor.observe(entry.ip, entry.link_ifindex);
@@ -514,6 +631,12 @@ where
                     "savd: monitor spoof-observed (no drop in monitor mode)"
                 );
             }
+        }
+        if !matches!(
+            ev,
+            DataplaneEvent::NeighbourNew { .. } | DataplaneEvent::NeighbourDel { .. }
+        ) {
+            self.dirty = true;
         }
         self.rib.apply_event(ev);
     }
@@ -540,11 +663,11 @@ where
         out
     }
 
-    /// Build the current enforcement program from the view: SIB from
-    /// the RIB mirror, one generator partition per configured mode,
-    /// compiled and converted per-partition so each op's uRPF hint
-    /// matches the mode that produced it.
-    fn build_program(&self) -> (SavProgram, Vec<SavOp>) {
+    /// Build the current view from the mirror: SIB from the RIB mirror,
+    /// one generator partition per configured mode, compiled and tagged
+    /// with the producing mode (so each op's uRPF hint matches it, and
+    /// the hysteresis pass can group ops by identity).
+    fn build_ops(&self) -> Vec<(UrpfMode, SavOp)> {
         let sib = Sib::from_rib(&self.rib);
         let mut partitions: Vec<(UrpfMode, SavConfig)> = Vec::new();
         for (ifindex, mode) in self.resolved_interfaces() {
@@ -556,15 +679,14 @@ where
                 partitions.push((mode, cfg));
             }
         }
-        let mut program_ops: Vec<SavProgramOp> = Vec::new();
-        let mut all_ops: Vec<SavOp> = Vec::new();
+        let mut ops: Vec<(UrpfMode, SavOp)> = Vec::new();
         for (mode, cfg) in &partitions {
             let rules = generate_urpf(*mode, &sib, &self.rib, cfg);
-            let ops = compile(&rules, cfg);
-            program_ops.extend(program(&ops, *mode).ops().iter().cloned());
-            all_ops.extend(ops);
+            for op in compile(&rules, cfg) {
+                ops.push((*mode, op));
+            }
         }
-        (SavProgram::from_ops(program_ops), all_ops)
+        ops
     }
 
     /// Re-evaluate the view and converge the dataplane onto it:
@@ -572,24 +694,157 @@ where
     /// install through the trait when the program changed, and log the
     /// monitor counters. An identical regeneration installs nothing
     /// (the churn guard W7 deferred at the backend, applied here).
+    /// This call covers every mirror change since the last evaluate
+    /// (it consumes the dirty flag); the poll tick and the select
+    /// loop's event-driven path both land here.
+    ///
+    /// Allowlist deletions ride the RFC 8704 §3.6.2 hysteresis window
+    /// ([`DEFERRED_DELETE_DELAY`]): a prefix leaving a still-present
+    /// allowlist stays enforced until its deadline (a re-advertisement
+    /// inside the window is absorbed with zero dataplane churn), while
+    /// additions and whole-op removals (mode/action/interface changes)
+    /// apply immediately.
     pub async fn evaluate<D: Dataplane>(&mut self, dp: &D) -> std::io::Result<()> {
-        let (program, ops) = self.build_program();
-        self.monitor.set_ops(&ops);
+        self.dirty = false;
+        let desired = self.build_ops();
+
+        // Reconcile the pending set against the fresh view: absorbed
+        // (the prefix came back — the transient never happened), dropped
+        // (the allowlist identity is gone — the removal applies now
+        // through the normal diff, no flap to absorb), or still held.
+        self.pending_deletions.retain(|d| {
+            match iba_allowlist(&desired, d.mode, d.ifindex, d.action) {
+                None => false,
+                Some(held) => {
+                    if held.contains(&d.prefix) {
+                        info!(
+                            ifindex = d.ifindex,
+                            prefix = %d.prefix,
+                            "savd: withdrawal reversed inside the hysteresis window (prefix retained)"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+        });
+
+        // Newly withdrawn prefixes on still-present allowlists enter the
+        // pending set (an already-held deletion keeps its deadline — the
+        // window must not stretch on every re-evaluation). Registration
+        // runs BEFORE the expiry pass: an entry registered now carries
+        // now+DELAY and cannot expire in the same call, while a
+        // previously-held entry is skipped here (still in the set) and
+        // expires below without being re-registered — effective_ops has
+        // not caught up with the flush yet.
+        let now = Instant::now();
+        for (mode, op) in &self.effective_ops {
+            let SavOp::IbaPermit {
+                ifindex,
+                action,
+                prefixes,
+                ..
+            } = op
+            else {
+                continue;
+            };
+            let Some(desired_prefixes) = iba_allowlist(&desired, *mode, *ifindex, *action) else {
+                continue;
+            };
+            for prefix in prefixes {
+                if desired_prefixes.contains(prefix) {
+                    continue;
+                }
+                if self
+                    .pending_deletions
+                    .iter()
+                    .any(|d| d.is_for(*mode, *ifindex, *action, *prefix))
+                {
+                    continue;
+                }
+                self.pending_deletions.push(PendingDeletion {
+                    mode: *mode,
+                    ifindex: *ifindex,
+                    action: *action,
+                    prefix: *prefix,
+                    deadline: now + DEFERRED_DELETE_DELAY,
+                });
+                info!(
+                    ifindex = *ifindex,
+                    prefix = %prefix,
+                    "savd: rule prefix deletion deferred (RFC 8704 §3.6.2 hysteresis)"
+                );
+            }
+        }
+
+        // Expired deferrals leave now: their prefixes drop out of the
+        // effective set below and uninstall through the normal diff.
+        self.pending_deletions.retain(|d| {
+            if d.deadline <= now {
+                info!(
+                    ifindex = d.ifindex,
+                    prefix = %d.prefix,
+                    "savd: deferred deletion applied (hysteresis window elapsed)"
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        // Effective = desired ∪ held prefixes: the dataplane (and the
+        // spoof monitor below) keep enforcing through the window.
+        let mut effective = desired.clone();
+        for d in &self.pending_deletions {
+            for (mode, op) in effective.iter_mut() {
+                if *mode != d.mode {
+                    continue;
+                }
+                if let SavOp::IbaPermit {
+                    ifindex,
+                    action,
+                    prefixes,
+                    ..
+                } = op
+                {
+                    if *ifindex == d.ifindex && *action == d.action && !prefixes.contains(&d.prefix)
+                    {
+                        prefixes.push(d.prefix);
+                        prefixes.sort();
+                        prefixes.dedup();
+                    }
+                }
+            }
+        }
+        self.effective_ops = effective.clone();
+        self.monitor.set_ops(
+            &effective
+                .iter()
+                .map(|(_, op)| op.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        let target = SavProgram::from_ops(
+            effective
+                .iter()
+                .flat_map(|(mode, op)| program(std::slice::from_ref(op), *mode).ops().to_vec()),
+        );
 
         match &self.installed {
             None => {
-                for op in program.ops() {
+                for op in target.ops() {
                     info!(rule = %op, "savd: rule");
                 }
                 info!(
-                    ops = program.ops().len(),
+                    ops = target.ops().len(),
                     %self.config,
                     "savd: rule set installed (monitor action logs, drop action enforces)"
                 );
-                self.install(dp, &program).await?;
+                self.install(dp, &target).await?;
             }
-            Some(prev) if *prev != program => {
-                let (added, removed) = program_diff(prev.ops(), program.ops());
+            Some(prev) if *prev != target => {
+                let (added, removed) = program_diff(prev.ops(), target.ops());
                 for op in &added {
                     info!(rule = %op, "savd: rule added");
                 }
@@ -599,10 +854,11 @@ where
                 info!(
                     added = added.len(),
                     removed = removed.len(),
+                    deferred = self.pending_deletions.len(),
                     %self.config,
                     "savd: rule set changed"
                 );
-                self.install(dp, &program).await?;
+                self.install(dp, &target).await?;
             }
             _ => debug!("savd: rule set unchanged; nothing installed"),
         }
@@ -834,10 +1090,10 @@ mod tests {
         }
     }
 
-    /// The one route the fake zebra dumps: 198.51.100.0/24 best via
-    /// ifindex 2 (push form: ifindex-carrying nexthop), i.e. the
-    /// asymmetric-arrival fixture.
-    fn dumped_route() -> ZapiRoute {
+    /// A static best route for `prefix` egressing `ifindex` (push form:
+    /// ifindex-carrying nexthop); `dumped_route` is the W8 fixture
+    /// (198.51.100.0/24 via ifindex 2, the asymmetric-arrival shape).
+    fn route_push(prefix: &str, ifindex: u32) -> ZapiRoute {
         ZapiRoute {
             route_type: route_type::STATIC,
             instance: 0,
@@ -847,10 +1103,10 @@ mod tests {
                 | zapi::message::message_flag::METRIC
                 | zapi::message::message_flag::MTU,
             safi: 1,
-            prefix: "198.51.100.0/24".parse().unwrap(),
+            prefix: prefix.parse().unwrap(),
             src_prefix: None,
             nhg_id: 0,
-            nexthops: vec![ZapiNexthop::new_ifindex(0, 2)],
+            nexthops: vec![ZapiNexthop::new_ifindex(0, ifindex)],
             backup_nexthops: Vec::new(),
             distance: Some(1),
             metric: Some(0),
@@ -859,6 +1115,12 @@ mod tests {
             tableid: None,
             opaque: None,
         }
+    }
+
+    /// The one route the fake zebra dumps: 198.51.100.0/24 best via
+    /// ifindex 2, i.e. the asymmetric-arrival fixture.
+    fn dumped_route() -> ZapiRoute {
+        route_push("198.51.100.0/24", 2)
     }
 
     /// Fake rousterd: echoes HELLO; on each REDISTRIBUTE_ADD pushes the
@@ -1011,10 +1273,13 @@ mod tests {
         let _ = server.await;
     }
 
-    /// A redistribution withdrawal shrinks the allowlist on the next
-    /// evaluate — the reload/poll diff path, smoke-asserted end to end.
-    #[tokio::test]
-    async fn withdrawal_regenerates_and_diffs_the_program() {
+    /// A redistribution withdrawal dirties the view and the loop's
+    /// re-evaluation runs immediately — but the deletion rides the
+    /// RFC 8704 §3.6.2 hysteresis window: the prefix stays enforced
+    /// until the window elapses (the select loop's timer arm), then
+    /// finally leaves (paused clock: the deadline is advanced by hand).
+    #[tokio::test(start_paused = true)]
+    async fn withdrawal_defers_the_deletion_then_applies_it() {
         let (client_io, server) =
             spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
         let mut daemon = daemon_with_interfaces(client_io);
@@ -1029,12 +1294,37 @@ mod tests {
             ]
         );
 
-        // Withdraw: REDISTRIBUTE_ROUTE_DEL for the static route.
-        let mut del = dumped_route();
-        del.nexthops = Vec::new();
-        daemon.apply_push(ZapiMessage::RedistributeRouteDel(del));
+        // Withdraw: the push dirties the view, the loop re-evaluates
+        // immediately — and the deletion is HELD, not applied.
+        daemon.apply_push(ZapiMessage::RedistributeRouteDel(route_del()));
+        assert!(daemon.take_dirty(), "the withdrawal dirties the view");
         daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["198.51.100.0/24"]),
+                monitor_allow(3, &[])
+            ],
+            "prefix still enforced inside the hysteresis window"
+        );
+        assert_eq!(
+            dp.installed.lock().unwrap().len(),
+            1,
+            "deferred: nothing installed"
+        );
+        assert!(
+            daemon.deletion_deadline().is_some(),
+            "the loop's timer arm has a deadline to flush"
+        );
 
+        // Re-evaluation inside the window is a no-op: the deferral is
+        // not re-registered (the deadline keeps its original position).
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(dp.installed.lock().unwrap().len(), 1);
+
+        // The window elapses: the timer arm's evaluate applies it.
+        tokio::time::advance(DEFERRED_DELETE_DELAY + Duration::from_millis(1)).await;
+        daemon.evaluate(&dp).await.unwrap();
         // The prefix left the allowlist; the deny-all op stays (IBA is
         // still enabled on ifindex 2 — now allowing nothing).
         assert_eq!(
@@ -1044,8 +1334,142 @@ mod tests {
         assert_eq!(
             dp.installed.lock().unwrap().len(),
             2,
-            "changed: reinstalled"
+            "expired deletion installed"
         );
+        assert!(daemon.deletion_deadline().is_none());
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// A REDISTRIBUTE_ROUTE_DEL frame for the dumped static route.
+    fn route_del() -> ZapiRoute {
+        ZapiRoute {
+            nexthops: Vec::new(),
+            ..dumped_route()
+        }
+    }
+
+    /// Event-driven re-evaluation (A10): a redistribute push marks the
+    /// view dirty — the select loop re-evaluates on the flag instead of
+    /// waiting for the poll tick — and evaluate consumes it. Neighbour
+    /// observations and skipped zebra messages never dirty (the program
+    /// cannot change); interface events do (name resolution).
+    #[tokio::test]
+    async fn pushes_mark_the_view_dirty_and_evaluate_consumes_it() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(!daemon.is_dirty(), "evaluate covers the sync's pushes");
+
+        // A neighbour observation feeds only the spoof counter.
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3));
+        assert!(!daemon.is_dirty(), "counter-only: no re-evaluation");
+
+        // A new route push dirties the view (an interface event too)...
+        daemon.apply_push(ZapiMessage::RedistributeRouteAdd(route_push(
+            "203.0.113.0/24",
+            2,
+        )));
+        assert!(daemon.is_dirty());
+        daemon.apply_event(&link_up(4, "eth4"));
+        assert!(
+            daemon.is_dirty(),
+            "interface events dirty (name resolution)"
+        );
+        assert!(daemon.take_dirty());
+        assert!(!daemon.is_dirty(), "taken once");
+
+        // ...and the loop's evaluate installs the new prefix immediately
+        // — no poll tick involved.
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(!daemon.is_dirty(), "evaluate consumes the flag");
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["198.51.100.0/24", "203.0.113.0/24"]),
+                monitor_allow(3, &[]),
+            ],
+            "strict gained exactly the new prefix's egress"
+        );
+        assert_eq!(dp.installed.lock().unwrap().len(), 2);
+
+        // Skipped zebra traffic does not dirty (mirror unchanged).
+        daemon.apply_push(ZapiMessage::NexthopUpdate(ZapiNexthopUpdate::unresolved(
+            "192.0.2.0/24".parse().unwrap(),
+            1,
+        )));
+        assert!(!daemon.is_dirty());
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// Hysteresis separates additions from deletions (RFC 8704 §3.6.2):
+    /// in one push burst the new prefix installs immediately while the
+    /// withdrawn one is held; a re-advertisement inside the window is
+    /// absorbed with ZERO dataplane churn (paused clock).
+    #[tokio::test(start_paused = true)]
+    async fn hysteresis_holds_deletions_but_applies_additions_immediately() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(dp.installed.lock().unwrap().len(), 1);
+
+        // One burst: withdraw the installed prefix, advertise a new one
+        // on the same egress.
+        daemon.apply_push(ZapiMessage::RedistributeRouteDel(route_del()));
+        daemon.apply_push(ZapiMessage::RedistributeRouteAdd(route_push(
+            "203.0.113.0/24",
+            2,
+        )));
+        daemon.take_dirty();
+        daemon.evaluate(&dp).await.unwrap();
+
+        // The addition applied immediately; the deletion is held.
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["198.51.100.0/24", "203.0.113.0/24"]),
+                monitor_allow(3, &[])
+            ],
+            "new prefix enforced now, withdrawn prefix held through the window"
+        );
+        assert_eq!(
+            dp.installed.lock().unwrap().len(),
+            2,
+            "addition installed without waiting"
+        );
+
+        // Transient: the withdrawn prefix is re-advertised inside the
+        // window — absorbed, nothing churns.
+        daemon.apply_push(ZapiMessage::RedistributeRouteAdd(dumped_route()));
+        daemon.take_dirty();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            dp.installed.lock().unwrap().len(),
+            2,
+            "absorbed: no install"
+        );
+        assert!(daemon.deletion_deadline().is_none(), "no deferral left");
+
+        // Withdraw it for real and let the window elapse.
+        daemon.apply_push(ZapiMessage::RedistributeRouteDel(route_del()));
+        daemon.take_dirty();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(dp.installed.lock().unwrap().len(), 2, "still held");
+        tokio::time::advance(DEFERRED_DELETE_DELAY + Duration::from_millis(1)).await;
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[monitor_allow(2, &["203.0.113.0/24"]), monitor_allow(3, &[])],
+            "only the survived prefix is enforced"
+        );
+        assert_eq!(dp.installed.lock().unwrap().len(), 3, "expiry installed");
         drop(daemon);
         let _ = server.await;
     }

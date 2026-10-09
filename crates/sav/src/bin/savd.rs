@@ -3,11 +3,15 @@
 //! Holds the SAV Information Base, keeps a RIB view over the ZAPI client
 //! edge (redistribution pushes — see `sav::savd`'s docs for the coupling
 //! choice), and programs enforcement through the Dataplane trait
-//! **monitor-only by default**. SIGHUP re-parses the config (the drop
-//! friction line is re-checked — a rejected reload keeps the running
-//! config) and regenerates; the poll cadence re-evaluates whatever the
-//! RIB pushes changed; SIGTERM/SIGINT clear everything installed and
-//! exit, leaving the kernel clean.
+//! **monitor-only by default**. Re-evaluation is event-driven: every
+//! redistribute push and interface event marks the view dirty and the
+//! select loop converges immediately (the poll cadence stays as the
+//! safety net); allowlist deletions ride the RFC 8704 §3.6.2
+//! hysteresis window, flushed by a timer on the earliest deadline.
+//! SIGHUP re-parses the config (the drop friction line is re-checked —
+//! a rejected reload keeps the running config) and regenerates;
+//! SIGTERM/SIGINT clear everything installed and exit, leaving the
+//! kernel clean.
 //!
 //! Usage: `savd --config <PATH> --zapi-socket <PATH>`
 //!
@@ -151,6 +155,14 @@ async fn main() -> io::Result<()> {
         );
 
         loop {
+            // Deferred-deletion timer (RFC 8704 §3.6.2): re-created each
+            // iteration from the current earliest deadline (the value is
+            // copied out — select! futures must not hold a daemon
+            // borrow next to read_message's). sleep_until is
+            // cancel-safe and select! drops the losing futures, so a
+            // fresh deferral simply moves the deadline on the next
+            // iteration; the arm is inert while nothing is deferred.
+            let flush_deadline = daemon.deletion_deadline();
             tokio::select! {
                 _ = hangup.recv() => {
                     info!("savd: SIGHUP: reloading config");
@@ -202,6 +214,18 @@ async fn main() -> io::Result<()> {
                         continue 'session;
                     }
                 }
+                _ = async move {
+                    match flush_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // The hysteresis window elapsed: evaluate applies
+                    // the expired deferred deletions.
+                    if let Err(err) = daemon.evaluate(&dp).await {
+                        warn!(%err, "savd: deferred-deletion flush evaluation failed");
+                    }
+                }
                 _ = tokio::signal::ctrl_c() => {
                     info!("savd: SIGINT: clearing installed rules and exiting");
                     if let Err(err) = daemon.clear(&dp).await {
@@ -215,6 +239,15 @@ async fn main() -> io::Result<()> {
                         error!(%err, "savd: clear failed; state file allows a later restore");
                     }
                     return Ok(());
+                }
+            }
+            // Event-driven re-evaluation (W8 §Deferred 1): every mirror
+            // change (redistribute push, interface/address event) marked
+            // the view dirty — converge now instead of waiting for the
+            // poll tick, which stays as the safety-net cadence.
+            if daemon.take_dirty() {
+                if let Err(err) = daemon.evaluate(&dp).await {
+                    warn!(%err, "savd: event-driven evaluation failed");
                 }
             }
         }

@@ -23,3 +23,7 @@ zapi.workspace = true
 # W5B property tests (ingest→query invariants) — dev-only, pinned in the
 # workspace table; sav is its only consumer.
 proptest.workspace = true
+# A10 hysteresis tests: paused-clock time control (`start_paused`) needs
+# tokio's test-util feature — dev-only, so the shipped daemon's tokio
+# feature set is unchanged.
+tokio = { workspace = true, features = ["test-util"] }
