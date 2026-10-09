@@ -20,6 +20,10 @@ pub use linux::NetlinkDataplane;
 #[cfg(not(target_os = "linux"))]
 pub use stub::NetlinkDataplane;
 
+/// SAV program → rp_filter sysctl translation (pure, cross-platform so
+/// its unit tests run on dev machines; the Linux impl executes it).
+pub mod sav;
+
 // TODO(phase-0): netns awareness; TODO(phase-1): nexthop-group objects.
 // (Link — including VRF device/table association —, address, route, and
 // neighbour dumps/events are implemented above.)

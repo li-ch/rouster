@@ -9,7 +9,10 @@ pub mod nexthop;
 pub mod prefix;
 pub mod route;
 
-pub use dataplane::{Dataplane, DataplaneError, DataplaneEvent};
+pub use dataplane::{
+    Dataplane, DataplaneError, DataplaneEvent, SavEnforce, SavMonitorCounts, SavProgram,
+    SavProgramOp, SavUrpf,
+};
 pub use neighbour::{NeighbourEntry, NeighbourFlags, NeighbourState};
 pub use nexthop::{Nexthop, NexthopGroup};
 pub use prefix::{IpPrefix, Ipv4Prefix, Ipv6Prefix, PrefixError};

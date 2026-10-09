@@ -9,3 +9,11 @@ common.workspace = true
 rib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Example-only (the W7 smoke binary drives the real dataplane through
+# the Dataplane trait inside the test container; nothing here affects
+# the library's dependency surface).
+[dev-dependencies]
+netlink-dp.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

@@ -18,17 +18,22 @@
 //! draft-dependent signaling (nothing tonight is draft-dependent, so no
 //! `experimental-savnet` feature flag is needed).
 //!
-//! Slice 2 completes the rule layer between the SIB and enforcement:
+//! Slice 2 completed the rule layer between the SIB and enforcement:
 //! [`mode`] (the IBA/IBB/PBA/PBB validation-mode taxonomy and
 //! per-interface enablement), [`gen`] (strict/loose/FP/EFP-uRPF
 //! equivalence rule generation from a (Sib, Rib) view), and [`table`]
 //! (the SAV Table Manager compile step: rules → `SavOp`s with their
 //! Monitor/Drop action as data, plus the reference evaluation
-//! semantics). Enforcement itself — programming the dataplane — is the
-//! next slice through the `Dataplane` trait.
+//! semantics). Slice 3 bridges enforcement: [`program`] converts
+//! compiled ops into the backend-neutral [`common::SavProgram`] the
+//! `Dataplane` trait installs, and [`monitor`] is the route-lookup
+//! counting surface monitor mode falls back to when the backend
+//! exposes no kernel counters.
 
 pub mod gen;
 pub mod mode;
+pub mod monitor;
+pub mod program;
 pub mod table;
 
 use std::collections::BTreeMap;

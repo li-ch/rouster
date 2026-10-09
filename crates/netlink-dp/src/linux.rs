@@ -1,8 +1,11 @@
 //! Real rtnetlink-backed dataplane (Linux only).
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use common::{
     Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, NeighbourEntry,
-    Nexthop, RouteEntry, RouteProtocol,
+    Nexthop, RouteEntry, RouteProtocol, SavMonitorCounts, SavProgram,
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
@@ -17,18 +20,26 @@ use netlink_packet_route::route::{
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::packet_core::{NetlinkMessage, NetlinkPayload};
 use rtnetlink::sys::{protocols::NETLINK_ROUTE, AsyncSocket, SocketAddr, TokioSocket};
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument, warn};
+
+use crate::sav::SysctlPlan;
 
 /// Netlink-backed dataplane handle.
 ///
 /// Owns the multicast event receiver; `next_event` drives the kernel→RIB
-/// direction of the mirror.
+/// direction of the mirror. SAV enforcement state (`sav_applied`) records
+/// the rp_filter values this handle wrote and the pre-SAV values to
+/// restore on clear/replace.
 pub struct NetlinkDataplane {
     handle: rtnetlink::Handle,
     messages: futures::channel::mpsc::UnboundedReceiver<(
         NetlinkMessage<RouteNetlinkMessage>,
         SocketAddr,
     )>,
+    /// ifindex → (interface name at write time, pre-SAV rp_filter,
+    /// applied value). Interior-mutable so the `&self` trait methods
+    /// can update it; never held across an await.
+    sav_applied: Mutex<BTreeMap<u32, (String, u8, u8)>>,
 }
 
 impl NetlinkDataplane {
@@ -51,7 +62,14 @@ impl NetlinkDataplane {
             .bind(&SocketAddr::new(0, groups as u32))?;
 
         let (connection, handle, messages) = rtnetlink::from_socket(socket);
-        Ok((Self { handle, messages }, connection))
+        Ok((
+            Self {
+                handle,
+                messages,
+                sav_applied: Mutex::new(BTreeMap::new()),
+            },
+            connection,
+        ))
     }
 
     pub fn handle(&self) -> &rtnetlink::Handle {
@@ -485,6 +503,78 @@ fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
     Ok(msg)
 }
 
+/// The per-interface rp_filter sysctl path. rp_filter has no rtnetlink
+/// API (like nftables, whose only config channel is netlink-less: the
+/// `nft` binary) — the procfs file is the kernel's interface, so the
+/// dataplane crate writing it directly is the sanctioned channel; all
+/// dataplane I/O stays inside this crate either way.
+fn rp_filter_path(name: &str) -> String {
+    format!("/proc/sys/net/ipv4/conf/{name}/rp_filter")
+}
+
+fn read_rp_filter(name: &str) -> Result<u8, DataplaneError> {
+    let raw = std::fs::read_to_string(rp_filter_path(name))?;
+    raw.trim()
+        .parse::<u8>()
+        .map_err(|e| DataplaneError::Other(format!("rp_filter of {name} is not a number: {e}")))
+}
+
+fn write_rp_filter(name: &str, value: u8) -> Result<(), DataplaneError> {
+    std::fs::write(rp_filter_path(name), value.to_string())?;
+    Ok(())
+}
+
+/// One interface the SAV plan covers, resolved for execution.
+struct SavTarget {
+    ifindex: u32,
+    name: String,
+    value: u8,
+}
+
+impl NetlinkDataplane {
+    /// Dumps link ifindex → name (the translation the sysctl backend
+    /// needs: rules speak ifindex, /proc/sys speaks names).
+    async fn link_names(&self) -> Result<BTreeMap<u32, String>, DataplaneError> {
+        let mut names = BTreeMap::new();
+        let mut links = self.handle.link().get().execute();
+        while let Some(msg) = links.try_next().await.map_err(nl_err)? {
+            if let Some(LinkAttribute::IfName(name)) = msg
+                .attributes
+                .iter()
+                .find(|a| matches!(a, LinkAttribute::IfName(_)))
+            {
+                names.insert(msg.header.index, name.clone());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Resolve the plan's ifindexes to names; every ifindex must exist
+    /// (programming a rule for a vanished interface is an error, not a
+    /// skip — a silent skip would report protection that does not
+    /// exist).
+    async fn resolve_sav_targets(
+        &self,
+        plan: &SysctlPlan,
+    ) -> Result<Vec<SavTarget>, DataplaneError> {
+        let names = self.link_names().await?;
+        let mut targets = Vec::with_capacity(plan.rp_filter.len());
+        for (&ifindex, &value) in &plan.rp_filter {
+            let Some(name) = names.get(&ifindex) else {
+                return Err(DataplaneError::Other(format!(
+                    "sav install: ifindex {ifindex} has no interface (cannot set rp_filter)"
+                )));
+            };
+            targets.push(SavTarget {
+                ifindex,
+                name: name.clone(),
+                value,
+            });
+        }
+        Ok(targets)
+    }
+}
+
 impl Dataplane for NetlinkDataplane {
     /// Installs or atomically replaces a route (RTM_NEWROUTE, NLM_F_REPLACE).
     #[instrument(skip(self), fields(prefix = %entry.prefix))]
@@ -522,5 +612,141 @@ impl Dataplane for NetlinkDataplane {
         }
         debug!("route deleted");
         Ok(())
+    }
+
+    /// Install or replace a SAV program on the rp_filter backend
+    /// (see [`crate::sav`] for the mapping and its disclosed
+    /// approximations).
+    ///
+    /// Replace semantics: interfaces the previous program covered but
+    /// this one does not are restored to their pre-SAV values. Failures
+    /// are reported after the fact; successfully written interfaces
+    /// stay recorded so [`Dataplane::sav_clear`] can still undo them.
+    #[instrument(skip(self))]
+    async fn sav_install(&self, program: &SavProgram) -> Result<(), DataplaneError> {
+        let plan = SysctlPlan::from_program(program);
+        for (op, reason) in &plan.rejected {
+            warn!(op = ?op, reason, "sav op not expressible on the rp_filter backend");
+        }
+        for &ifindex in &plan.monitored {
+            info!(
+                ifindex,
+                "sav monitor: no kernel rule installed (rp_filter has no count-only mode); \
+                 counting via the sav layer's route-lookup simulation"
+            );
+        }
+
+        let targets = self.resolve_sav_targets(&plan).await?;
+        let planned: BTreeMap<u32, u8> = plan.rp_filter.clone();
+
+        // Revert interfaces that leave the program before writing the
+        // new ones — no window where an interface is both stale and new.
+        let revert: Vec<(u32, String, u8)> = {
+            let applied = self.sav_applied.lock().unwrap();
+            applied
+                .iter()
+                .filter(|(ifindex, _)| !planned.contains_key(ifindex))
+                .map(|(&ifindex, (name, prior, _))| (ifindex, name.clone(), *prior))
+                .collect()
+        };
+        let mut first_err = None;
+        for (ifindex, name, prior) in revert {
+            match write_rp_filter(&name, prior) {
+                Ok(()) => {
+                    info!(ifindex, iface = %name, rp_filter = prior, "sav revert (left program)");
+                    self.sav_applied.lock().unwrap().remove(&ifindex);
+                }
+                Err(e) => {
+                    warn!(ifindex, iface = %name, error = %e, "sav revert failed");
+                    first_err = first_err.or(Some(e));
+                }
+            }
+        }
+
+        for target in &targets {
+            let SavTarget {
+                ifindex,
+                name,
+                value,
+            } = target;
+            // Keep the ORIGINAL prior on re-apply so clear restores the
+            // true pre-SAV value, not a mid-program one.
+            let prior = match self.sav_applied.lock().unwrap().get(ifindex) {
+                Some((_, prior, _)) => *prior,
+                None => read_rp_filter(name)?,
+            };
+            write_rp_filter(name, *value)?;
+            self.sav_applied
+                .lock()
+                .unwrap()
+                .insert(*ifindex, (name.clone(), prior, *value));
+            info!(
+                ifindex,
+                iface = %name,
+                rp_filter = target.value,
+                "sav rp_filter written"
+            );
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The rp_filter backend exposes no per-rule kernel counters (a
+    /// strict/loose value drops, it does not count) — the pre-registered
+    /// answer is `Unsupported`, and monitor counting runs in the sav
+    /// layer's route-lookup simulation (`sav::monitor`).
+    async fn sav_monitor_counts(&self) -> Result<SavMonitorCounts, DataplaneError> {
+        Err(DataplaneError::Unsupported(
+            "rp_filter backend has no per-rule kernel counters; monitor counting runs in the \
+             sav layer (route-lookup simulation)",
+        ))
+    }
+
+    /// Remove every installed SAV rule, restoring each interface's
+    /// pre-SAV rp_filter value. Interfaces that vanished (no name in a
+    /// link dump) have nothing left to restore and are dropped from
+    /// the applied set with a debug note.
+    #[instrument(skip(self))]
+    async fn sav_clear(&self) -> Result<(), DataplaneError> {
+        let applied: Vec<(u32, String, u8)> = {
+            let map = self.sav_applied.lock().unwrap();
+            map.iter()
+                .map(|(&ifindex, (name, prior, _))| (ifindex, name.clone(), *prior))
+                .collect()
+        };
+        let mut first_err = None;
+        for (ifindex, name, prior) in applied {
+            match write_rp_filter(&name, prior) {
+                Ok(()) => {
+                    info!(ifindex, iface = %name, rp_filter = prior, "sav cleared (restored)");
+                    self.sav_applied.lock().unwrap().remove(&ifindex);
+                }
+                Err(e) => {
+                    warn!(ifindex, iface = %name, error = %e, "sav clear failed");
+                    first_err = first_err.or(Some(e));
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sysctl path is the canonical procfs location keyed by
+    /// interface name (what the container smoke greps for).
+    #[test]
+    fn rp_filter_path_is_canonical_procfs() {
+        assert_eq!(
+            rp_filter_path("vethspoof"),
+            "/proc/sys/net/ipv4/conf/vethspoof/rp_filter"
+        );
     }
 }
