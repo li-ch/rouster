@@ -197,6 +197,16 @@ pub struct ZapiSession {
     pub redistributes: BTreeSet<(u8, u8, u16)>,
     /// NEXTHOP_REGISTER set, keyed by registered prefix.
     pub nht: BTreeMap<IpPrefix, NhtRegistration>,
+    /// BFD_CLIENT_REGISTER count — mirrors zebra's per-client
+    /// `bfd_client_reg_cnt` (frr-10.2.2 `zebra/zebra_ptm.c`); clients
+    /// re-send the registration on reconnect replay (`lib/bfd.c`
+    /// `zclient_bfd_session_replay`), so the count can exceed one per
+    /// connection lifetime.
+    pub bfd_client_reg_cnt: u32,
+    /// The pid from the most recent BFD_CLIENT_REGISTER (`getpid()` of
+    /// the registering daemon — the value real zebra forwards to the BFD
+    /// daemon; recorded here, no consumer tonight).
+    pub bfd_pid: Option<u32>,
 }
 
 /// Accept loop for ZAPI clients. Runs until the task is stopped; every
@@ -657,9 +667,26 @@ impl ZapiSession {
                 io.write_all(&reply).await
             }
 
-            // Recorded for completeness; no reply modeled tonight.
             ZapiMessage::BfdClientRegister { pid } => {
-                debug!(id = self.id, pid, "zapi: BFD client registered");
+                // ZEBRA_BFD_CLIENT_REGISTER (36): the client announces
+                // itself as a BFD client (body = its pid, pinned doc E).
+                // Real zebra sends NO reply on the zapi socket —
+                // `zebra_ptm_bfd_client_register` (frr-10.2.2
+                // `zebra/zebra_ptm.c`, both HAVE_BFDD variants) bumps
+                // `client->bfd_client_reg_cnt` and forwards the pid to
+                // the BFD daemon; the sender (`bfd_client_sendmsg`,
+                // `lib/bfd.c`) fire-and-forgets without waiting. A
+                // guessed ack frame would deviate from zebra, so the
+                // recorded registration is the whole answer; BFD
+                // session signaling (26–30) is future work.
+                self.bfd_client_reg_cnt = self.bfd_client_reg_cnt.saturating_add(1);
+                self.bfd_pid = Some(pid);
+                info!(
+                    id = self.id,
+                    pid,
+                    registrations = self.bfd_client_reg_cnt,
+                    "zapi: BFD client registered (no reply, per zebra)"
+                );
                 Ok(())
             }
             ZapiMessage::RouteNotifyRequest { flag } => {
@@ -1632,6 +1659,60 @@ mod tests {
         assert_eq!(header.command, 49);
         assert_eq!(body, vec![10, 0, 0, 0], "proto, instance, result=0");
         assert!(rx.try_recv().is_err(), "no RibCommand for the RPC");
+    }
+
+    /// BFD_CLIENT_REGISTER is answered by RECORDING, not by a frame: real
+    /// zebra writes nothing back (`zebra_ptm_bfd_client_register`, frr
+    /// 10.2.2 zebra/zebra_ptm.c), so the first frame after the
+    /// registration must be the next message's HELLO echo. The pid
+    /// (fixture value 373, bgpd-10.2.2.log:6) lands in the session state.
+    #[tokio::test]
+    async fn bfd_client_register_recorded_without_reply() {
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        client
+            .send(&ZapiMessage::BfdClientRegister { pid: 373 }, 0)
+            .await;
+        client.send(&staticd_hello(), 0).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(
+            header.command, 19,
+            "no BFD reply frame may precede the HELLO echo"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "registration is session state only, no RibCommand"
+        );
+        drop(client);
+        let session = task.await.unwrap().expect("connection survives");
+        assert_eq!(session.bfd_pid, Some(373), "pid recorded");
+        assert_eq!(session.bfd_client_reg_cnt, 1, "counted once");
+        assert!(session.established);
+        rx.close();
+    }
+
+    /// Re-registration (clients re-send cmd 36 on reconnect replay,
+    /// `zclient_bfd_session_replay`): the count accumulates like zebra's
+    /// `bfd_client_reg_cnt` and the latest pid wins — still no frames out
+    /// (both fixture pids used: 373 then the post-restart 535,
+    /// bgpd-10.2.2.log:6/:37).
+    #[tokio::test]
+    async fn bfd_client_reregister_counts_and_updates_pid() {
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        client
+            .send(&ZapiMessage::BfdClientRegister { pid: 373 }, 0)
+            .await;
+        client
+            .send(&ZapiMessage::BfdClientRegister { pid: 535 }, 0)
+            .await;
+        client.send(&staticd_hello(), 0).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 19, "still nothing but the echo");
+        assert!(rx.try_recv().is_err(), "no RibCommand either time");
+        drop(client);
+        let session = task.await.unwrap().expect("connection survives");
+        assert_eq!(session.bfd_client_reg_cnt, 2);
+        assert_eq!(session.bfd_pid, Some(535), "latest pid wins");
+        rx.close();
     }
 
     #[tokio::test]

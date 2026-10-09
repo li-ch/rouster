@@ -316,8 +316,19 @@ AFI_IP. Sent by staticd and bgpd in the connect burst.
 
 ### ZEBRA_BFD_CLIENT_REGISTER (36) — 4-byte body = u32 pid
 
-bgpd: `000000a2` (=162) and later `00000175` (=373) — both match the bgpd
-process pid at capture time. High confidence.
+bgpd: `00000175` (=373, bgpd-10.2.2.log:6 and :24 — two connections) and
+`00000217` (=535, bgpd-10.2.2.log:37, post-restart); ospfd sends it too
+(`00000027` =39, ospfd-10.2.2.log:6). The pid is the sender's `getpid()`
+(`bfd_client_sendmsg`, `lib/bfd.c`). **M1-fix**: this section previously
+cited a sample `000000a2` (=162) that appears in NO fixture — an unbacked
+citation (B10 drift 1), corrected to the fixture bytes above.
+**Zebra side SRC-verified (M1)** — `zebra_ptm_bfd_client_register`
+(`zebra/zebra_ptm.c`, frr-10.2.2 tag via jsdelivr, fetched like Z2B):
+bumps `client->bfd_client_reg_cnt` and forwards the pid to the BFD daemon
+(both `HAVE_BFDD` build variants); zebra writes **NO reply on the zapi
+socket**, and the sender fire-and-forgets (no synchronous wait). A
+conforming server therefore records the registration and stays silent —
+implemented in `crates/zapi/src/server.rs` (M1).
 
 ### ZEBRA_LABEL_MANAGER_CONNECT (49) — 3-byte body `0a 0000`
 
