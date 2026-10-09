@@ -737,6 +737,14 @@ impl Dataplane for NetlinkDataplane {
     /// this one does not are restored to their pre-SAV values. Failures
     /// are reported after the fact; successfully written interfaces
     /// stay recorded so [`Dataplane::sav_clear`] can still undo them.
+    ///
+    /// Churn guard: a replay whose resolved plan already matches the
+    /// applied map — same ifindexes, names, and values, in-memory or
+    /// restored from the state file by `merge_applied_from_disk` —
+    /// writes nothing at all, neither the sysctls nor the state file.
+    /// savd re-evaluates on every dirtying event, so identical
+    /// replays are the common case; a restarted process replays onto
+    /// the state its predecessor left the same way.
     #[instrument(skip(self))]
     async fn sav_install(&self, program: &SavProgram) -> Result<(), DataplaneError> {
         let plan = SysctlPlan::from_program(program);
@@ -752,23 +760,30 @@ impl Dataplane for NetlinkDataplane {
         }
 
         let targets = self.resolve_sav_targets(&plan).await?;
-        let planned: BTreeMap<u32, u8> = plan.rp_filter.clone();
         // A previous process may have applied rules this one must
         // replace or revert (state file; see SAV_STATE_PATH).
         self.merge_applied_from_disk();
 
+        // Churn guard: split the resolved plan into the writes and
+        // reverts still owed; both empty is an identical replay that
+        // must touch neither procfs nor the state file.
+        let planned: Vec<(u32, String, u8)> = targets
+            .into_iter()
+            .map(|t| (t.ifindex, t.name, t.value))
+            .collect();
+        let delta = {
+            let applied = self.sav_applied.lock().unwrap();
+            sav_state::replay_delta(&planned, &applied)
+        };
+        if delta.writes.is_empty() && delta.reverts.is_empty() {
+            debug!("sav replay matches applied state; no sysctl or state writes");
+            return Ok(());
+        }
+
         // Revert interfaces that leave the program before writing the
         // new ones — no window where an interface is both stale and new.
-        let revert: Vec<(u32, String, u8)> = {
-            let applied = self.sav_applied.lock().unwrap();
-            applied
-                .iter()
-                .filter(|(ifindex, _)| !planned.contains_key(ifindex))
-                .map(|(&ifindex, (name, prior, _))| (ifindex, name.clone(), *prior))
-                .collect()
-        };
         let mut first_err = None;
-        for (ifindex, name, prior) in revert {
+        for (ifindex, name, prior) in delta.reverts {
             match write_rp_filter(&name, prior) {
                 Ok(()) => {
                     info!(ifindex, iface = %name, rp_filter = prior, "sav revert (left program)");
@@ -781,27 +796,25 @@ impl Dataplane for NetlinkDataplane {
             }
         }
 
-        for target in &targets {
-            let SavTarget {
-                ifindex,
-                name,
-                value,
-            } = target;
+        for (ifindex, name, value) in delta.writes {
             // Keep the ORIGINAL prior on re-apply so clear restores the
-            // true pre-SAV value, not a mid-program one.
-            let prior = match self.sav_applied.lock().unwrap().get(ifindex) {
-                Some((_, prior, _)) => *prior,
-                None => read_rp_filter(name)?,
+            // true pre-SAV value — but only when the recorded entry is
+            // about this same interface: a name mismatch means the
+            // ifindex was recycled and the recorded prior belongs to a
+            // different sysctl file, so read the current one instead.
+            let prior = match self.sav_applied.lock().unwrap().get(&ifindex) {
+                Some((applied_name, prior, _)) if applied_name == &name => *prior,
+                _ => read_rp_filter(&name)?,
             };
-            write_rp_filter(name, *value)?;
+            write_rp_filter(&name, value)?;
             self.sav_applied
                 .lock()
                 .unwrap()
-                .insert(*ifindex, (name.clone(), prior, *value));
+                .insert(ifindex, (name.clone(), prior, value));
             info!(
                 ifindex,
                 iface = %name,
-                rp_filter = target.value,
+                rp_filter = value,
                 "sav rp_filter written"
             );
         }

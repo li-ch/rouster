@@ -26,8 +26,14 @@
 //! Decoding of the body is deliberately lenient: a malformed line is
 //! skipped, not fatal — a corrupt line must not brick the restoration
 //! of every other interface.
+//!
+//! Beyond persistence, this module owns the replay math the backend's
+//! churn guard runs: [`replay_delta`] splits a resolved install into
+//! the writes and reverts still owed against the applied map, so an
+//! identical replay writes nothing at all — neither sysctls nor the
+//! state file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// ifindex → (interface name at write time, pre-SAV rp_filter, applied
 /// rp_filter value).
@@ -111,6 +117,54 @@ pub fn decode(text: &str, boot_id: &str) -> DecodeOutcome {
         map.insert(ifindex, (name.to_string(), prior, value));
     }
     DecodeOutcome::Current(map)
+}
+
+/// The churn-guard verdict for replaying a resolved install against
+/// the applied map: which writes the replay still owes the kernel,
+/// and which applied entries it must revert. Both empty is an
+/// identical replay — the caller touches nothing, neither the sysctl
+/// files nor the state file. Load-bearing since savd re-evaluates on
+/// every dirtying event (identical replays are the common case), and
+/// for a fresh process whose in-memory map only the disk merge fills.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReplayDelta {
+    /// `(ifindex, name, planned value)` targets whose applied entry
+    /// does not already match on all three fields — the only procfs
+    /// writes the replay still needs.
+    pub writes: Vec<(u32, String, u8)>,
+    /// `(ifindex, name, prior)` applied entries the plan no longer
+    /// covers; their pre-SAV value must be restored.
+    pub reverts: Vec<(u32, String, u8)>,
+}
+
+/// Split a resolved plan — one `(ifindex, interface name, value)`
+/// tuple per target, as the backend resolves it from the sysctl plan
+/// — into the writes and reverts still owed against `applied`.
+///
+/// A target is already in force only when the applied entry under the
+/// same ifindex carries the *same name* (ifindexes are recycled; an
+/// equal value recorded under a different name was written to a
+/// different sysctl file) and the *same value*. `writes` keeps the
+/// planned order; `reverts` follows the applied map's BTreeMap order.
+pub fn replay_delta(planned: &[(u32, String, u8)], applied: &AppliedMap) -> ReplayDelta {
+    let mut delta = ReplayDelta::default();
+    for (ifindex, name, value) in planned {
+        let already = applied
+            .get(ifindex)
+            .is_some_and(|(applied_name, _, applied_value)| {
+                applied_name == name && applied_value == value
+            });
+        if !already {
+            delta.writes.push((*ifindex, name.clone(), *value));
+        }
+    }
+    let planned_indexes: BTreeSet<u32> = planned.iter().map(|&(ix, _, _)| ix).collect();
+    for (&ifindex, (name, prior, _)) in applied {
+        if !planned_indexes.contains(&ifindex) {
+            delta.reverts.push((ifindex, name.clone(), *prior));
+        }
+    }
+    delta
 }
 
 #[cfg(test)]
@@ -208,5 +262,94 @@ mod tests {
                     .collect()
             )
         );
+    }
+
+    /// The churn guard's core claim (W7 §Deferred 5): a replay whose
+    /// resolved plan matches the applied map on (ifindex, name,
+    /// value) — every interface, both directions — owes the kernel
+    /// nothing: no procfs writes, no reverts, no state-file rewrite.
+    /// An empty delta is what `sav_install` short-circuits on, so
+    /// this is the host-side proof an identical replay is a no-op.
+    #[test]
+    fn identical_replay_is_a_noop() {
+        let applied: AppliedMap = [
+            (2u32, ("vethspoof".to_string(), 0u8, 1u8)),
+            (3, ("vethlegit".to_string(), 0, 2)),
+        ]
+        .into_iter()
+        .collect();
+        // Order-invariant: identity holds however the caller ordered
+        // the resolved targets.
+        for planned in [
+            vec![
+                (2u32, "vethspoof".to_string(), 1u8),
+                (3, "vethlegit".to_string(), 2),
+            ],
+            vec![
+                (3, "vethlegit".to_string(), 2),
+                (2, "vethspoof".to_string(), 1),
+            ],
+        ] {
+            assert_eq!(replay_delta(&planned, &applied), ReplayDelta::default());
+        }
+    }
+
+    /// A genuinely different plan still converges: a changed value
+    /// and a new interface produce exactly those writes, a dropped
+    /// interface exactly that revert — never more, never fewer.
+    #[test]
+    fn changed_plan_writes_and_reverts_the_difference() {
+        let applied: AppliedMap = [
+            (2u32, ("vethspoof".to_string(), 0u8, 1u8)),
+            (4, ("vethgone".to_string(), 0, 2)),
+        ]
+        .into_iter()
+        .collect();
+        // 2 changes 1→2; 3 is new; 4 left the program.
+        let planned = vec![
+            (2u32, "vethspoof".to_string(), 2u8),
+            (3, "vethnew".to_string(), 1),
+        ];
+        assert_eq!(
+            replay_delta(&planned, &applied),
+            ReplayDelta {
+                writes: vec![
+                    (2, "vethspoof".to_string(), 2),
+                    (3, "vethnew".to_string(), 1),
+                ],
+                reverts: vec![(4, "vethgone".to_string(), 0)],
+            }
+        );
+    }
+
+    /// An equal value under a different name is NOT identical:
+    /// ifindexes are recycled and the sysctl file is keyed by name,
+    /// so the replay must rewrite onto the new interface (and the
+    /// executor re-reads its prior instead of trusting the stale
+    /// entry's).
+    #[test]
+    fn same_value_under_a_recycled_ifindex_name_still_writes() {
+        let applied: AppliedMap = [(2u32, ("eth-old".to_string(), 0u8, 1u8))]
+            .into_iter()
+            .collect();
+        let planned = vec![(2, "eth-new".to_string(), 1)];
+        assert_eq!(
+            replay_delta(&planned, &applied),
+            ReplayDelta {
+                writes: vec![(2, "eth-new".to_string(), 1)],
+                reverts: Vec::new(),
+            }
+        );
+    }
+
+    /// Nothing applied yet (fresh boot, absent/empty state file): the
+    /// whole plan is owed — the guard must never suppress a first
+    /// install.
+    #[test]
+    fn fresh_surface_writes_everything() {
+        let planned = vec![(2u32, "vethspoof".to_string(), 1u8)];
+        let delta = replay_delta(&planned, &AppliedMap::new());
+        assert_eq!(delta.writes, planned);
+        assert!(delta.reverts.is_empty());
     }
 }
