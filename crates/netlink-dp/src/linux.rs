@@ -30,9 +30,15 @@ use crate::sav_state;
 /// sanctions; `/run/rouster`). Cross-process persistence: a restarted
 /// daemon — or the smoke binary's one-process-per-command shape — reads
 /// what a previous process applied, so clear/replace can restore the
-/// true pre-SAV values.
+/// true pre-SAV values. The file's first line stamps the writing boot
+/// (see [`read_boot_id`]); state from any other boot is discarded
+/// (ifindexes are per-boot and a reboot may have reordered them).
 const SAV_STATE_DIR: &str = "/run/rouster";
 const SAV_STATE_PATH: &str = "/run/rouster/sav-applied";
+/// The machine's boot identity. Not the wall clock: a value that
+/// changes iff the kernel rebooted (and with it, the ifindex
+/// allocation order the state file's keys depend on).
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
 /// Netlink-backed dataplane handle.
 ///
@@ -550,6 +556,23 @@ fn read_rp_filter(name: &str) -> Result<u8, DataplaneError> {
         .map_err(|e| DataplaneError::Other(format!("rp_filter of {name} is not a number: {e}")))
 }
 
+/// This machine's current boot id (procfs, same sanctioned channel as
+/// the rp_filter files). It stamps the applied-state file: it changes
+/// exactly when the kernel reboots — and with it the ifindex
+/// allocation order — so a mismatch means the persisted ifindex keys
+/// cannot be trusted. An unreadable/empty boot id is an error: a file
+/// stamped with "unknown" would be silently restorable forever.
+fn read_boot_id() -> Result<String, DataplaneError> {
+    let raw = std::fs::read_to_string(BOOT_ID_PATH)?;
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err(DataplaneError::Other(format!(
+            "boot id at {BOOT_ID_PATH} is empty; cannot stamp SAV state"
+        )));
+    }
+    Ok(id.to_string())
+}
+
 fn write_rp_filter(name: &str, value: u8) -> Result<(), DataplaneError> {
     std::fs::write(rp_filter_path(name), value.to_string())?;
     Ok(())
@@ -609,23 +632,52 @@ impl NetlinkDataplane {
     /// entries win (this process is the freshest truth); disk entries
     /// fill what a previous process recorded — without this, a fresh
     /// process would clear nothing and believe nothing was ever applied.
+    ///
+    /// Boot safety: the file is only honored when its boot-id stamp
+    /// matches this boot. A mismatch (the machine rebooted, so
+    /// ifindexes may have been reordered onto other interfaces — or the
+    /// boot id cannot be read at all) discards the file: this process
+    /// starts from a fresh install surface, as if nothing had ever
+    /// been applied.
     fn merge_applied_from_disk(&self) {
         let Ok(text) = std::fs::read_to_string(SAV_STATE_PATH) else {
             return; // no state file: nothing was ever applied here
         };
+        let boot_id = match read_boot_id() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "cannot determine boot id; ignoring persisted SAV state"
+                );
+                return;
+            }
+        };
         let mut map = self.sav_applied.lock().unwrap();
-        for (ifindex, entry) in sav_state::decode(&text) {
-            map.entry(ifindex).or_insert(entry);
+        match sav_state::decode(&text, &boot_id) {
+            sav_state::DecodeOutcome::Current(entries) => {
+                for (ifindex, entry) in entries {
+                    map.entry(ifindex).or_insert(entry);
+                }
+            }
+            sav_state::DecodeOutcome::ForeignBoot => {
+                warn!(
+                    "discarding sav-applied state from a different boot \
+                     (ifindexes may have been reordered)"
+                );
+            }
         }
     }
 
-    /// Persist the applied map so a later process (restarted daemon, or
-    /// the smoke binary's next command) can still restore pre-SAV
-    /// values. A failure here is reported: silent success would mean a
-    /// clear that cannot undo.
+    /// Persist the applied map — stamped with this boot's id — so a
+    /// later process (restarted daemon, or the smoke binary's next
+    /// command) can still restore pre-SAV values. A failure here is
+    /// reported: silent success would mean a clear that cannot undo.
+    /// (An empty map writes an empty file, overwriting any stale one.)
     fn persist_applied(&self) -> Result<(), DataplaneError> {
         std::fs::create_dir_all(SAV_STATE_DIR)?;
-        let text = sav_state::encode(&self.sav_applied.lock().unwrap());
+        let boot_id = read_boot_id()?;
+        let text = sav_state::encode(&boot_id, &self.sav_applied.lock().unwrap());
         std::fs::write(SAV_STATE_PATH, text)?;
         Ok(())
     }
