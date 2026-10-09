@@ -6,8 +6,9 @@ over ZAPI and installed its configured static routes into the Linux kernel
 through Rouster's RIB and netlink dataplane. FRR-zebra was replaced by
 rousterd; nothing else changed on the FRR side. This is the direction-A half
 of the repo testing bar ("FRR interop both directions"); the reverse
-direction (rouster staticd against real zebra) remains future work, as does
-the bgpd variant of this direction (Z5B, below).
+direction (rouster staticd against real zebra) remains future work. The
+bgpd variant of this direction (Z5B) passed on 2026-10-09 — see "Z5B
+result" below.
 
 Reproduce: `scripts/test-z5-frr-interop.sh` (musl `rousterd` →
 `docker cp` into a `frr-testbed:10.2.2` container → real
@@ -126,3 +127,70 @@ connections (main/aux/label-manager — the server already assigns
 per-connection owner ids), LABEL_MANAGER_CONNECT must be answered (it is),
 and bgpd's synchronous RPCs make an unanswered message a stall, unlike
 staticd's fire-and-forget route adds.
+
+## Z5B result — PASS (2026-10-09, W1)
+
+Two real FRR 10.2.2 bgpd instances peer iBGP (AS 65000) while BOTH use
+rousterd as their zebra over ZAPI, and a BGP-learned route lands in the
+kernel through rousterd — the implementation-plan Phase-1 credibility
+milestone. Reproduce: `scripts/test-z5b-bgpd-interop.sh` (two consecutive
+clean runs). Evidence archived under `away/2026-10-09/quarantine/z5b/`
+(rousterd.log, bgpd.log, mgmtd.log, staticd.log per side + routes/bgp/env).
+
+What passed:
+
+- **Attach, x2 with zero deadlock**: each bgpd opened its full 3-connection
+  set (main `redist_default`=10, auxiliary =18, label-manager session=1)
+  against its own rousterd; `session established` logged for all, and the
+  counts never grew during a 60 s post-route soak — no reconnect, no stall
+  (Z1's hazard: bgpd deadlocks against a silent zebra; answered messages
+  were sufficient: HELLO echo, LABEL_MANAGER_CONNECT result, NEXTHOP_UPDATE
+  on register, INTERFACE_ADD mirror dump).
+- **PEER**: `show bgp neighbor` reports `BGP state = Established` on both
+  sides over the docker bridge eth0 pair.
+- **ROUTE-KERNEL**: bgpd r2 sent `zapi: route add
+  prefix=203.0.113.0/24 entry.protocol=Bgp`; its rousterd programmed
+  `203.0.113.0/24 via <r1-eth0> dev eth0 proto bgp` (RTPROT_BGP 186).
+- **Redistribute channel live for real**: bgpd r1's `redistribute static`
+  (REDISTRIBUTE_ADD), then staticd's late ROUTE_ADD for
+  198.51.100.0/24 blackhole triggered the Z3B push —
+  `pushing REDISTRIBUTE_ROUTE_ADD id=2` — and bgpd ACCEPTED the Z2B
+  SPEC-encoded body (first live validation of that encoder), advertised it
+  iBGP, and r2's kernel gained the second `proto bgp` prefix. Full circle:
+  staticd → rousterd RIB → REDISTRIBUTE push → bgpd → iBGP → bgpd →
+  rousterd → kernel.
+
+Deviations disclosed:
+
+1. **Two containers on the docker default bridge instead of one container
+   with `-N other`** (pre-registered shape): bgpd refuses a neighbor whose
+   address appears in its own zebra-mirrored connected prefixes —
+   `% Can not configure the local system as neighbor` (it consults the
+   INTERFACE_ADD mirror rousterd serves). In one shared kernel both peers'
+   addresses are local to both bgpds, so the iBGP session cannot form; two
+   containers restore disjoint mirrors and are the realistic shape. Probed
+   along the way: `-z` DOES override `-N` for the zserv path ("‑z option
+   overrides ‑N option for zebra named socket path" in the daemon banner),
+   and pathspace `other` socket/config dirs work (`/var/run/frr/other/`,
+   `/etc/frr/other/`) — the mechanism is fine, the topology was not.
+2. **`echo 186 bgp >> /etc/iproute2/rt_protos`** in both containers: the
+   testbed image ships no name for RTPROT_BGP; the mapping is what a real
+   FRR install provides. Harness-only.
+3. **`NO_COLOR=1` in front of rousterd** inside the script (tracing-subscriber
+   honors it) so quarantine logs are ANSI-free; the in-daemon logging
+   default is untouched (G2/W2 item).
+4. **`bgp router-id` pinned in config** on both bgpds: our zebra records
+   ROUTER_ID_ADD but never answers with ROUTER_ID_UPDATE, so bgp router-id
+   selection is config-pinned to keep the topology independent of that gap
+   (bgpd tolerated the missing answer — session, route exchange and EoR all
+   fine — the pin is belt-and-braces, and ROUTER_ID_UPDATE is on the W2
+   list).
+5. **Two-phase `vtysh -b`** on r1: the initial redistribute dump on
+   registration is NOT implemented (disclosed Z3 cut), so the static route
+   is added by a second push after the REDISTRIBUTE_ADD registration is
+   provably in place — deterministic ordering instead of a race.
+
+Known-stubbed, bgpd-tolerated (same session as staticd's findings):
+ROUTE_NOTIFY_REQUEST and ROUTER_ID_ADD remain recorded-only; no
+REDISTRIBUTE_ROUTE_DEL (32) on withdrawal; no GET_LABEL_CHUNK answers
+(none requested — no MPLS config); no VRF_ADD replay; no ROUTE_NOTIFY_OWNER.
