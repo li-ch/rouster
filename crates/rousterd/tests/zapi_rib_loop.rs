@@ -652,3 +652,84 @@ async fn redistribute_route_add_pushed_over_real_socket() {
     server.abort();
     let _ = std::fs::remove_file(&socket);
 }
+
+/// The FRR reconnect shape (W2 item 3): staticd's route is ALREADY in the
+/// RIB when bgpd connects and registers `redistribute static` — bgpd gets
+/// the initial dump (REDISTRIBUTE_ROUTE_ADD, command 31) unprompted, over
+/// the real socket, in the same byte-verified push form as a best-change
+/// push.
+#[tokio::test]
+async fn redistribute_registration_dumps_existing_route_over_real_socket() {
+    let socket = temp_socket("redist-dump");
+    let (mut rx, server) = spawn_server(&socket);
+
+    // staticd installs first.
+    let mut staticd = TestClient::connect(&socket).await;
+    staticd.handshake().await;
+    let mut driver = RibDriver::new();
+    let dp = MockDp::default();
+    driver.apply_event(&DataplaneEvent::LinkNew {
+        ifindex: 2,
+        name: "eth2".to_string(),
+        is_up: true,
+    });
+    driver.apply_event(&DataplaneEvent::AddressNew {
+        ifindex: 2,
+        prefix: "203.0.113.1/24".parse().unwrap(),
+    });
+    staticd
+        .send(&ZapiMessage::RouteAdd(ZapiRoute {
+            route_type: route_type::STATIC,
+            instance: 0,
+            flags: 0x41,
+            message: message_flag::NEXTHOP | message_flag::DISTANCE,
+            safi: 1,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+            src_prefix: None,
+            nhg_id: 0,
+            nexthops: vec![ZapiNexthop::new_ipv4(0, "203.0.113.9".parse().unwrap())],
+            backup_nexthops: Vec::new(),
+            distance: Some(1),
+            metric: None,
+            tag: None,
+            mtu: None,
+            tableid: None,
+            opaque: None,
+        }))
+        .await;
+    drive_driver_n(&mut driver, &mut rx, 2).await; // attach(staticd) + add
+    driver.rib.reconcile(&dp).await;
+    assert_eq!(dp.installed().len(), 1);
+
+    // bgpd connects LATE (the reconnect case) and registers.
+    let mut bgpd = TestClient::connect(&socket).await;
+    bgpd.handshake().await;
+    bgpd.send(&ZapiMessage::RedistributeAdd(ZapiRedistribute {
+        afi: 1,
+        route_type: route_type::STATIC,
+        instance: 0,
+    }))
+    .await;
+    drive_driver_n(&mut driver, &mut rx, 2).await; // attach(bgpd) + register
+
+    // The existing route arrives unprompted.
+    let (header, body) = bgpd.read_frame().await;
+    assert_eq!(header.command, 31, "initial redistribute dump");
+    match ZapiMessage::decode(31, &body).unwrap() {
+        ZapiMessage::RedistributeRouteAdd(route) => {
+            assert_eq!(route.prefix, "198.51.100.0/24".parse().unwrap());
+            assert_eq!(route.route_type, route_type::STATIC);
+            assert_eq!(route.flags, 0x08, "ZEBRA_FLAG_SELECTED");
+            assert_eq!(route.nexthops.len(), 1);
+            assert_eq!(route.nexthops[0].nh_type, zapi::nexthop_type::IPV4_IFINDEX);
+            assert_eq!(
+                route.nexthops[0].ifindex, 2,
+                "gateway resolved for the dump"
+            );
+        }
+        other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+    }
+    // staticd itself asked for nothing: it saw no dump.
+    server.abort();
+    let _ = std::fs::remove_file(&socket);
+}

@@ -23,7 +23,7 @@ use rib::Rib;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use zapi::{route_type_from, InterfaceMirror, RibCommand, SessionPush};
+use zapi::{route_type_from, InterfaceMirror, RibCommand, SessionPush, DEFAULT_TABLE};
 
 /// RIB plus the driver-side registration state ZAPI sessions feed.
 pub struct RibDriver {
@@ -142,10 +142,34 @@ impl RibDriver {
                     .or_default()
                     .insert((afi, route_type, instance));
                 debug!(owner, afi, route_type, instance, "zapi: redistribute add");
-                // FRR zebra also replays existing routes of the type on
-                // registration; that initial dump is not implemented yet
-                // (disclosed) — pushes start from the next best-route
-                // change.
+                // FRR zebra replays the current best routes of the
+                // registered type on REDISTRIBUTE_ADD — staticd/bgpd expect
+                // the dump on (re)connect (W2, closing Z3B disclosure 1).
+                // Same push form as a best-change push; main table only
+                // (the ZAPI edge lands every client route there).
+                let dumped: Vec<RouteEntry> = self
+                    .rib
+                    .table(DEFAULT_TABLE)
+                    .map(|table| {
+                        table
+                            .iter()
+                            .filter_map(|(prefix, _)| table.best(prefix).cloned())
+                            .filter(|best| {
+                                afi_of(&best.prefix) == afi
+                                    && route_type_from(best.protocol) == route_type
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for best in dumped {
+                    let entry = self.push_form(&best);
+                    info!(
+                        owner,
+                        prefix = %entry.prefix,
+                        "zapi: initial redistribute dump push"
+                    );
+                    self.push(owner, SessionPush::RedistributeRouteAdd(entry));
+                }
                 false
             }
             RibCommand::UnregisterRedistribute {
@@ -697,6 +721,89 @@ mod tests {
             "an ospf-registered session gets no static DEL"
         );
         assert!(static_pushes.try_recv().is_err(), "one DEL per withdrawal");
+    }
+
+    /// REDISTRIBUTE_ADD replays the current best routes of the registered
+    /// type (FRR zebra's initial dump): prefix-sorted, push-form hops, and
+    /// filtered on both afi and type.
+    #[test]
+    fn redistribute_registration_dumps_current_best_routes() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+
+        // Two static (one with a resolvable gateway) and one ospf route,
+        // plus an IPv6 static; nothing is registered yet, so no pushes.
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
+            5,
+        )));
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "203.0.113.0/24",
+            Nexthop::Blackhole,
+            7,
+        )));
+        let mut ospf = static_entry("192.0.2.0/24", Nexthop::IfIndex(2), 0);
+        ospf.protocol = RouteProtocol::Ospf;
+        driver.apply(RibCommand::AddRoute(ospf));
+        let v6 = static_entry("2001:db8::/32", Nexthop::Blackhole, 0);
+        driver.apply(RibCommand::AddRoute(v6));
+        assert!(
+            pushes.try_recv().is_err(),
+            "no registration yet: adds push nothing"
+        );
+
+        // Register static+IPv4: exactly the two v4 static bests, in prefix
+        // order (BTreeMap iteration), gateway hop resolved.
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        let mut prefixes = Vec::new();
+        for _ in 0..2 {
+            match pushes.try_recv().expect("dump push") {
+                SessionPush::RedistributeRouteAdd(entry) => prefixes.push(entry.prefix),
+                other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            prefixes,
+            vec![
+                "198.51.100.0/24".parse::<IpPrefix>().unwrap(),
+                "203.0.113.0/24".parse::<IpPrefix>().unwrap()
+            ],
+            "prefix-sorted dump, only the registered type/afi"
+        );
+        assert!(
+            pushes.try_recv().is_err(),
+            "ospf and v6 static are not in the dump"
+        );
+
+        // A later best change still pushes normally (the dump did not
+        // consume the registration).
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Blackhole,
+            3,
+        )));
+        assert!(matches!(
+            pushes.try_recv().expect("best change still pushes"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+
+        // Registering a type with no routes dumps nothing.
+        let mut bgp_pushes = attach(&mut driver, 2);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 2,
+            afi: 1,
+            route_type: route_type::BGP,
+            instance: 0,
+        });
+        assert!(bgp_pushes.try_recv().is_err(), "no BGP routes: empty dump");
     }
 
     /// The fan-out filters on both AFI and route type.
