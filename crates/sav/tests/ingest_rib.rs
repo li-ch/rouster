@@ -161,6 +161,8 @@ fn fixture() -> (Rib, MockDp) {
         prefix: "192.0.2.0/24".parse().unwrap(),
         protocol: RouteProtocol::Kernel,
         metric: 0,
+        gateway: None,
+        oif: None,
     });
 
     let dp = MockDp::default();

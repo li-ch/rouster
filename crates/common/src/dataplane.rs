@@ -166,12 +166,18 @@ pub enum DataplaneEvent {
     },
     /// A kernel-origin route was observed in the forwarding plane (mirror
     /// direction: routes we did NOT program ourselves; see
-    /// [`RouteProtocol::is_kernel_origin`]).
+    /// [`RouteProtocol::is_kernel_origin`]). `gateway`/`oif` carry the
+    /// kernel's own nexthop for the route when it has one (`RTA_GATEWAY`/
+    /// `RTA_OIF`): observed detail the NHT answer path resolves through —
+    /// e.g. ospfd's NSSA default import check registers 0.0.0.0/0 and
+    /// expects zebra to answer from the routing table (A23).
     RouteNew {
         table: TableId,
         prefix: IpPrefix,
         protocol: RouteProtocol,
         metric: u32,
+        gateway: Option<IpAddr>,
+        oif: Option<u32>,
     },
     /// A route left the forwarding plane. Unlike [`DataplaneEvent::RouteNew`]
     /// this is not filtered by origin: whoever deleted it, the kernel no
@@ -231,10 +237,18 @@ impl fmt::Display for DataplaneEvent {
                 prefix,
                 protocol,
                 metric,
+                gateway,
+                oif,
             } => write!(
                 f,
                 "route new: {prefix} table {table} proto {protocol:?} metric {metric}"
-            ),
+            )
+            .and_then(|_| match (gateway, oif) {
+                (Some(g), Some(ix)) => write!(f, " via {g} dev {ix}"),
+                (Some(g), None) => write!(f, " via {g}"),
+                (None, Some(ix)) => write!(f, " dev {ix}"),
+                (None, None) => Ok(()),
+            }),
             DataplaneEvent::RouteDel { table, prefix } => {
                 write!(f, "route del: {prefix} table {table}")
             }

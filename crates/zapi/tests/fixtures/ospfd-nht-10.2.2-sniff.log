@@ -1,0 +1,13 @@
+ts=2026-10-09T19:57:11.644584Z event=START socket=/var/run/frr/sniff.api respond_hello=true hello_cmd=8
+ts=2026-10-09T19:57:14.925993Z conn=1 event=CONNECT
+ts=2026-10-09T19:57:14.926016Z conn=1 msg=1 cmd=19 len=18 marker=254 version=6 vrf=0 hdr=0012fe06000000000013 body=0700000000000000 decode=ZapiHeader { length: 18, marker: 254, version: 6, vrf_id: 0, command: 19 }
+ts=2026-10-09T19:57:14.926024Z conn=1 msg=2 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-09T19:57:14.926028Z conn=1 msg=3 cmd=36 len=14 marker=254 version=6 vrf=0 hdr=000efe06000000000024 body=00000034 decode=ZapiHeader { length: 14, marker: 254, version: 6, vrf_id: 0, command: 36 }
+ts=2026-10-09T19:57:14.926032Z conn=1 msg=4 cmd=16 len=12 marker=254 version=6 vrf=0 hdr=000cfe06000000000010 body=0001 decode=ZapiHeader { length: 12, marker: 254, version: 6, vrf_id: 0, command: 16 }
+ts=2026-10-09T19:57:14.926036Z conn=1 msg=5 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-09T19:57:34.376805Z conn=1 msg=6 cmd=16 len=12 marker=254 version=6 vrf=0 hdr=000cfe06000000000010 body=0001 decode=ZapiHeader { length: 12, marker: 254, version: 6, vrf_id: 0, command: 16 }
+ts=2026-10-09T19:57:34.376826Z conn=1 msg=7 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-09T19:57:34.388356Z conn=1 msg=8 cmd=12 len=14 marker=254 version=6 vrf=0 hdr=000efe0600000000000c body=01020000 decode=ZapiHeader { length: 14, marker: 254, version: 6, vrf_id: 0, command: 12 }
+ts=2026-10-09T19:57:34.388455Z conn=1 msg=9 cmd=21 len=21 marker=254 version=6 vrf=0 hdr=0015fe06000000000015 body=0001000100020000000000 decode=ZapiHeader { length: 21, marker: 254, version: 6, vrf_id: 0, command: 21 }
+ts=2026-10-09T19:58:15.403287Z conn=1 msg=10 cmd=13 len=14 marker=254 version=6 vrf=0 hdr=000efe0600000000000d body=01020000 decode=ZapiHeader { length: 14, marker: 254, version: 6, vrf_id: 0, command: 13 }
+ts=2026-10-09T19:58:15.403310Z conn=1 event=EOF msgs=10 buffered=0

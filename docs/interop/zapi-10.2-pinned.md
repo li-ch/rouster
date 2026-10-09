@@ -75,8 +75,8 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 18 | ZEBRA_ROUTER_ID_UPDATE | B | zebra→client |
 | 19 | ZEBRA_HELLO | E | first message on every connection; staticd+bgpd (3 connections) |
 | 20 | ZEBRA_CAPABILITIES | B | zebra→client |
-| 21 | ZEBRA_NEXTHOP_REGISTER | E | staticd (192.0.2.1) + bgpd (10.9.9.9) |
-| 22 | ZEBRA_NEXTHOP_UNREGISTER | B | |
+| 21 | ZEBRA_NEXTHOP_REGISTER | E | staticd (192.0.2.1) + bgpd (10.9.9.9) + ospfd (0.0.0.0/0, A23) |
+| 22 | ZEBRA_NEXTHOP_UNREGISTER | B | never seen: not on ospfd graceful shutdown either (A23) |
 | 23 | ZEBRA_NEXTHOP_UPDATE | B | zebra→client |
 | 24 | ZEBRA_INTERFACE_NBR_ADDRESS_ADD | B | |
 | 25 | ZEBRA_INTERFACE_NBR_ADDRESS_DELETE | B | |
@@ -297,18 +297,42 @@ but keeps the NEXTHOP message bit) + distance u8 = 1. Emitted during the
 post-reconnect re-registration (gateway route was in NHT-wait; staticd
 deletes it before re-adding the blackhole one).
 
-### ZEBRA_NEXTHOP_REGISTER (21) — 11-byte body, two samples
+### ZEBRA_NEXTHOP_REGISTER (21) — 11-byte body, three samples
 
 | sender | body | decoded |
 |---|---|---|
 | staticd (gateway 192.0.2.1) | `00 00 0001 0002 20 c0000201` | connected=0, safi=1, 192.0.2.1/32 |
 | bgpd (neighbor 10.9.9.9) | `01 00 0001 0002 20 0a090909` | connected=1, safi=1, 10.9.9.9/32 |
+| ospfd (A23; `area 0.0.0.1 nssa default-information-originate`) | `00 01 0001 0002 00 00000000` | connected=0, **resolve_via_default=1**, safi=1, 0.0.0.0/0 |
 
 **Z2 decoded** (`zclient_send_rnh`): `connected` u8 | `resolve_via_default`
 u8 | `safi` u16 | prefix {family **u16**, prefixlen u8, full 4/16 address
 bytes}. Exactly one REGISTER per tracked prefix, sent when the prefix
 becomes interesting (static route gateway configured / BGP neighbor
 created).
+
+**A23 ospfd trigger** (SRC, frr-10.2.2 tag): the ONLY NHT sender in
+ospfd is `ospf_zebra_import_default_route` (`ospfd/ospf_zebra.c`),
+called from `ospf_area_nssa_default_originate_set/unset`
+(`ospfd/ospfd.c`) when the NSSA default-originate refcount crosses 0/1
+— registering the IPv4 default `0.0.0.0/0` with
+`resolve_via_default=true` (the "force" argument of the FRR call is
+that flag). The answer is consumed by `ospf_zebra_import_check_update`:
+`nssa_default_import_check.status = !!nexthop_num`, driving
+`ospf_abr_nssa_type7_defaults` (type-7 default origination). Graceful
+SIGTERM sends REDISTRIBUTE_DELETE (13) but NOT cmd 22 — pinned on the
+wire (z5e phase 1; capture `crates/zapi/tests/fixtures/
+ospfd-nht-10.2.2-sniff.log`).
+
+**A23 answer semantics** (SRC, `zebra/zebra_rnh.c`): zebra resolves an
+RNH from the **route tables** (`zebra_rnh_resolve_nexthop_entry`,
+route_node_match walking up), and the default prefix may answer ONLY a
+`ZEBRA_NHT_RESOLVE_VIA_DEFAULT`-flagged registration (or a per-VRF
+knob). Rousterd's answer now mirrors the flag-gated part: on-link
+first, then longest-prefix over the observed kernel mirror (main
+table) for flag-set registrations; flag-unset clients keep the
+connected-only answer (an under-approximation of zebra's rib_match,
+disclosed — the staticd/bgpd fixtures' behavior is unchanged).
 
 ### ZEBRA_REDISTRIBUTE_ADD (12) — bgpd `redistribute static`, 4-byte body
 

@@ -43,6 +43,16 @@ use zapi::{route_type_from, InterfaceMirror, RibCommand, SessionPush, DEFAULT_TA
 /// the observed universe does.
 type ClientIdentity = (u8, u16, u32);
 
+/// One live NEXTHOP_REGISTER interest: the registration flag that shapes
+/// resolution (`resolve_via_default` — ospfd's NSSA default import check
+/// sets it, staticd/bgpd do not; A23) plus the last resolution the owner
+/// was told, the flip baseline for re-evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NhtReg {
+    resolve_via_default: bool,
+    last_told: Option<Nexthop>,
+}
+
 /// RIB plus the driver-side registration state ZAPI sessions feed.
 pub struct RibDriver {
     pub rib: Rib,
@@ -50,11 +60,11 @@ pub struct RibDriver {
     /// owner id. Attached at accept time (`RibCommand::AttachSession`);
     /// pruned when a push finds the session gone.
     sessions: HashMap<u64, mpsc::Sender<SessionPush>>,
-    /// NEXTHOP_REGISTER interests per owner, with the last resolution the
-    /// owner was told (the answer to its register). A dataplane event that
-    /// changes a resolution pushes an update only when it differs from
-    /// this — no flip, no push.
-    nht_registrations: HashMap<u64, BTreeMap<IpPrefix, Option<Nexthop>>>,
+    /// NEXTHOP_REGISTER interests per owner, with the registration flags
+    /// and the last resolution the owner was told (the answer to its
+    /// register). A dataplane event that changes a resolution pushes an
+    /// update only when it differs from this — no flip, no push.
+    nht_registrations: HashMap<u64, BTreeMap<IpPrefix, NhtReg>>,
     /// REDISTRIBUTE_ADD interests per owner: (afi, route_type, instance).
     redistributes: HashMap<u64, BTreeSet<(u8, u8, u16)>>,
     /// HELLO-announced identity per owner (M6), the key into the two
@@ -263,13 +273,19 @@ impl RibDriver {
             RibCommand::RegisterNexthop {
                 owner,
                 prefix,
+                resolve_via_default,
                 reply,
             } => {
-                let resolution = self.rib.lookup_nexthop(prefix_addr(&prefix));
-                self.nht_registrations
-                    .entry(owner)
-                    .or_default()
-                    .insert(prefix, resolution);
+                let resolution = self
+                    .rib
+                    .lookup_nexthop_routed(prefix_addr(&prefix), resolve_via_default);
+                self.nht_registrations.entry(owner).or_default().insert(
+                    prefix,
+                    NhtReg {
+                        resolve_via_default,
+                        last_told: resolution,
+                    },
+                );
                 let _ = reply.send(resolution);
                 false
             }
@@ -418,11 +434,12 @@ impl RibDriver {
         let rib = &self.rib;
         let mut flips: Vec<(u64, IpPrefix, Option<Nexthop>)> = Vec::new();
         for (&owner, registrations) in &mut self.nht_registrations {
-            for (prefix, last_told) in registrations {
-                let resolution = rib.lookup_nexthop(prefix_addr(prefix));
-                if *last_told != resolution {
+            for (prefix, reg) in registrations {
+                let resolution =
+                    rib.lookup_nexthop_routed(prefix_addr(prefix), reg.resolve_via_default);
+                if reg.last_told != resolution {
                     flips.push((owner, *prefix, resolution));
-                    *last_told = resolution;
+                    reg.last_told = resolution;
                 }
             }
         }
@@ -748,11 +765,17 @@ mod tests {
         rx
     }
 
-    fn register_nht(driver: &mut RibDriver, owner: u64, prefix: &str) -> Option<Nexthop> {
+    fn register_nht(
+        driver: &mut RibDriver,
+        owner: u64,
+        prefix: &str,
+        resolve_via_default: bool,
+    ) -> Option<Nexthop> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         driver.apply(RibCommand::RegisterNexthop {
             owner,
             prefix: prefix.parse().unwrap(),
+            resolve_via_default,
             reply: tx,
         });
         rx.blocking_recv().expect("answer")
@@ -835,6 +858,58 @@ mod tests {
         drop(rx);
     }
 
+    /// A23: an ospfd-shaped registration (`resolve_via_default`, the NSSA
+    /// default import check's 0.0.0.0/0) is answered from the kernel
+    /// mirror, while a flag-unset registration of the same prefix keeps
+    /// the connected-only answer; a link/address flip still re-evaluates
+    /// both with their own semantics (here: a bare-gateway mirrored
+    /// default whose gateway comes on-link).
+    #[test]
+    fn ospfd_shaped_registration_answers_from_kernel_mirror() {
+        use std::net::Ipv4Addr;
+        let mut driver = RibDriver::new();
+        let mut ospfd = attach(&mut driver, 1);
+        let mut staticd = attach(&mut driver, 2);
+
+        // A mirrored default with a bare gateway (no oif observed).
+        driver.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))),
+            oif: None,
+        });
+
+        // staticd shape (flag 0): 0.0.0.0 is never on-link → unresolved.
+        assert_eq!(register_nht(&mut driver, 2, "0.0.0.0/0", false), None);
+        // ospfd shape (flag 1): the mirror's gateway is not on-link yet —
+        // the routed answer is honest about that too.
+        assert_eq!(register_nht(&mut driver, 1, "0.0.0.0/0", true), None);
+        assert!(ospfd.try_recv().is_err(), "registration answers directly");
+        assert!(staticd.try_recv().is_err());
+
+        // The gateway's prefix appearing on-link resolves the mirrored
+        // default's gateway — the routed interest flips, the flag-unset
+        // one (still connected-only over 0.0.0.0) does not.
+        driver.apply_event(&link_up(3));
+        driver.apply_event(&addr_new(3, "198.51.100.2/24"));
+        match ospfd.try_recv().expect("flip pushed") {
+            SessionPush::NexthopResolution { prefix, resolution } => {
+                assert_eq!(prefix, "0.0.0.0/0".parse().unwrap());
+                assert_eq!(
+                    resolution,
+                    Some(Nexthop::Ipv4If(Ipv4Addr::new(198, 51, 100, 1), 3))
+                );
+            }
+            other => panic!("expected NexthopResolution, got {other:?}"),
+        }
+        assert!(
+            staticd.try_recv().is_err(),
+            "flag-unset interest stays unresolved: no flip"
+        );
+    }
+
     /// The core Z3B flip: a registered-but-unresolved gateway resolves
     /// when a covering address appears, and ONLY the flip pushes.
     #[test]
@@ -842,7 +917,7 @@ mod tests {
         let mut driver = RibDriver::new();
         let mut pushes = attach(&mut driver, 1);
 
-        let answer = register_nht(&mut driver, 1, "10.9.9.9/32");
+        let answer = register_nht(&mut driver, 1, "10.9.9.9/32", false);
         assert_eq!(answer, None, "no mirror yet: unresolved");
 
         driver.apply_event(&link_up(2));
@@ -879,7 +954,7 @@ mod tests {
         driver.apply_event(&link_up(3));
         driver.apply_event(&addr_new(3, "192.0.2.1/24"));
 
-        let answer = register_nht(&mut driver, 1, "192.0.2.9/32");
+        let answer = register_nht(&mut driver, 1, "192.0.2.9/32", false);
         assert_eq!(
             answer,
             Some(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 3)),
@@ -913,12 +988,14 @@ mod tests {
     fn route_events_do_not_re_evaluate_nht() {
         let mut driver = RibDriver::new();
         let mut pushes = attach(&mut driver, 1);
-        assert_eq!(register_nht(&mut driver, 1, "10.9.9.9/32"), None);
+        assert_eq!(register_nht(&mut driver, 1, "10.9.9.9/32", false), None);
         driver.apply_event(&DataplaneEvent::RouteNew {
             table: 254,
             prefix: "10.9.9.0/24".parse().unwrap(),
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
         assert!(
             pushes.try_recv().is_err(),
@@ -937,7 +1014,7 @@ mod tests {
         let mut pushes = attach(&mut driver, 1);
         driver.apply_event(&link_up(2));
         driver.apply_event(&addr_new(2, "203.0.113.1/24"));
-        assert!(register_nht(&mut driver, 1, "203.0.113.9/32").is_some());
+        assert!(register_nht(&mut driver, 1, "203.0.113.9/32", false).is_some());
 
         driver.apply_event(&DataplaneEvent::NeighbourNew {
             entry: NeighbourEntry::from_rtnetlink(
@@ -1577,7 +1654,7 @@ mod tests {
             route_type: route_type::STATIC,
             instance: 0,
         });
-        assert_eq!(register_nht(&mut driver, 9, "10.9.9.9/32"), None);
+        assert_eq!(register_nht(&mut driver, 9, "10.9.9.9/32", false), None);
         drop(pushes); // session gone
 
         // The push attempt discovers the closed channel and prunes.

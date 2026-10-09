@@ -116,6 +116,10 @@ pub struct Rib {
     nht: BTreeMap<IpAddr, Option<Nexthop>>,
 }
 
+/// Linux main table (RT_TABLE_MAIN) — the table the routed NHT lookup
+/// answers from (A23).
+pub const MAIN_TABLE: TableId = 254;
+
 impl Rib {
     pub fn new() -> Self {
         Self::default()
@@ -215,6 +219,56 @@ impl Rib {
     /// [`Rib::resolve_nexthop`]. `None` = unresolved.
     pub fn lookup_nexthop(&self, ip: IpAddr) -> Option<Nexthop> {
         self.resolve_nexthop(ip)
+    }
+
+    /// NHT query with the routing-table fallback zebra's RNH resolution
+    /// has (`zebra_rnh_resolve_nexthop_entry` matches the RIB tables, not
+    /// just connected prefixes). Gated on the client's
+    /// `resolve_via_default` registration flag — the semantic ospfd sets
+    /// for its NSSA default import check (`area <id> nssa
+    /// default-information-originate` registers 0.0.0.0/0): on-link first
+    /// (unchanged), then a longest-prefix match over the observed kernel
+    /// mirror in the main table. Zebra lets the default prefix answer
+    /// exactly flag-set registrations; flag-unset clients (staticd's
+    /// gateway NHT, bgpd's neighbor NHT — both pinned fixtures send 0)
+    /// keep the connected-only answer, an under-approximation disclosed
+    /// in docs/interop/zapi-10.2-pinned.md. A matched route answers with
+    /// its own observed hop; a bare-gateway hop needs one on-link level
+    /// to become usable (full recursion is future work).
+    pub fn lookup_nexthop_routed(&self, ip: IpAddr, resolve_via_default: bool) -> Option<Nexthop> {
+        if let Some(hop) = self.resolve_nexthop(ip) {
+            return Some(hop);
+        }
+        if !resolve_via_default {
+            return None;
+        }
+        // Main table only: NHT registrations are default-VRF today (the
+        // ZAPI edge drops non-default-VRF routes for the same reason).
+        let mirror = self.kernel_mirror.get(&MAIN_TABLE)?;
+        let mut best: Option<(u8, &RouteEntry)> = None;
+        for (_, candidates) in mirror.iter() {
+            for entry in candidates {
+                let matched = match (entry.prefix, ip) {
+                    (IpPrefix::V4(p), IpAddr::V4(a)) if p.contains(a) => p.prefix_len(),
+                    (IpPrefix::V6(p), IpAddr::V6(a)) if p.contains(a) => p.prefix_len(),
+                    _ => continue,
+                };
+                if best.is_none_or(|(len, _)| matched > len) {
+                    best = Some((matched, entry));
+                }
+            }
+        }
+        best.and_then(|(_, entry)| entry.nexthops.hops().first().map(|&(hop, _)| hop))
+            .and_then(|hop| match hop {
+                // Already ifindex-carrying (or blackhole): usable as observed.
+                Nexthop::IfIndex(_)
+                | Nexthop::Ipv4If(..)
+                | Nexthop::Ipv6If(..)
+                | Nexthop::Blackhole => Some(hop),
+                // Bare gateway: one on-link level of recursion, no deeper.
+                Nexthop::Ipv4(g) => self.resolve_nexthop(IpAddr::V4(g)),
+                Nexthop::Ipv6(g) => self.resolve_nexthop(IpAddr::V6(g)),
+            })
     }
 
     /// Gateway IPs currently tracked by nexthop tracking but unresolved.
@@ -341,20 +395,39 @@ impl Rib {
                 prefix,
                 protocol,
                 metric,
+                gateway,
+                oif,
             } => {
                 // Backends already filter self-originated notifications;
                 // this is the second half of the feedback-loop defense.
                 if !protocol.is_kernel_origin() {
                     return;
                 }
-                let mut entry = RouteEntry::new(
-                    *prefix,
-                    RouteProtocol::Kernel,
-                    // Nexthop detail is not carried by the event; mirror
-                    // entries are observed state and never programmed.
-                    NexthopGroup::new(),
-                    *metric,
-                );
+                // Observed nexthop detail from the event: gateway+oif →
+                // the ifindex-carrying form, gateway alone → bare gateway,
+                // oif alone → device route. Never programmed — mirror
+                // state only — but the NHT answer path resolves through
+                // it (A23: ospfd's default-route import check).
+                let mut nexthops = NexthopGroup::new();
+                match (*gateway, *oif) {
+                    (Some(g), Some(ix)) => nexthops.add(
+                        match g {
+                            IpAddr::V4(a) => Nexthop::Ipv4If(a, ix),
+                            IpAddr::V6(a) => Nexthop::Ipv6If(a, ix),
+                        },
+                        1,
+                    ),
+                    (Some(g), None) => nexthops.add(
+                        match g {
+                            IpAddr::V4(a) => Nexthop::Ipv4(a),
+                            IpAddr::V6(a) => Nexthop::Ipv6(a),
+                        },
+                        1,
+                    ),
+                    (None, Some(ix)) => nexthops.add(Nexthop::IfIndex(ix), 1),
+                    (None, None) => {}
+                }
+                let mut entry = RouteEntry::new(*prefix, RouteProtocol::Kernel, nexthops, *metric);
                 entry.table = *table;
                 self.kernel_mirror.entry(*table).or_default().add(entry);
             }
@@ -623,6 +696,8 @@ mod tests {
             prefix: "198.18.0.0/15".parse().unwrap(),
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
 
         let dp = MockDp::default();
@@ -894,12 +969,16 @@ mod tests {
             prefix,
             protocol: RouteProtocol::Kernel,
             metric: 100,
+            gateway: None,
+            oif: None,
         });
         rib.apply_event(&DataplaneEvent::RouteNew {
             table: 255,
             prefix: "192.0.2.0/24".parse().unwrap(),
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
 
         assert_eq!(rib.kernel_route_count(), 2);
@@ -916,6 +995,8 @@ mod tests {
             prefix,
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
         assert_eq!(
             rib.kernel_table(254).unwrap().best(&prefix).unwrap().metric,
@@ -934,6 +1015,128 @@ mod tests {
         assert_eq!(rib.kernel_route_count(), 1);
     }
 
+    /// A23: the routed NHT lookup — ospfd's NSSA default import check
+    /// registers 0.0.0.0/0 with resolve_via_default and must be answered
+    /// from the observed kernel mirror (the on-link-only answer of the
+    /// staticd era stays for flag-unset registrations).
+    #[test]
+    fn routed_nht_lookup_answers_default_registration_from_mirror() {
+        use std::net::Ipv4Addr;
+        let mut rib = Rib::new();
+        // Docker-bridge shape: default via an on-link gateway, connected
+        // /24 as a device route, one UP interface carrying the /24.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: MAIN_TABLE,
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 215, 1))),
+            oif: Some(2),
+        });
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: MAIN_TABLE,
+            prefix: "192.168.215.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: None,
+            oif: Some(2),
+        });
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 2,
+            name: "eth0".into(),
+            is_up: true,
+            flags: common::LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 2,
+            prefix: "192.168.215.4/24".parse().unwrap(),
+        });
+
+        // The ospfd shape resolves to the default route's own observed hop.
+        assert_eq!(
+            rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true),
+            Some(Nexthop::Ipv4If(Ipv4Addr::new(192, 168, 215, 1), 2))
+        );
+        // Flag unset (staticd/bgpd fixtures): connected-only, and 0.0.0.0
+        // is never on-link — the answer stays unresolved.
+        assert_eq!(
+            rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), false),
+            None
+        );
+        // On-link still wins over the mirror for flag-set registrations.
+        assert_eq!(
+            rib.lookup_nexthop_routed("192.168.215.9".parse().unwrap(), true),
+            Some(Nexthop::Ipv4If("192.168.215.9".parse().unwrap(), 2))
+        );
+        // Fresh lookups only (event-driven re-eval is Z3B): deleting the
+        // default drops the mirror answer; the connected /24 does not
+        // cover 0.0.0.0.
+        rib.apply_event(&DataplaneEvent::RouteDel {
+            table: MAIN_TABLE,
+            prefix: "0.0.0.0/0".parse().unwrap(),
+        });
+        assert_eq!(
+            rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true),
+            None
+        );
+    }
+
+    /// A23 edges of the routed lookup: a bare-gateway mirror hop needs one
+    /// on-link level, non-main tables never answer, and families stay
+    /// separate.
+    #[test]
+    fn routed_nht_lookup_bare_gateway_table_scope_and_family() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let mut rib = Rib::new();
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: MAIN_TABLE,
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))),
+            oif: None,
+        });
+        // A default in a non-main table must not answer.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 5001,
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            oif: Some(9),
+        });
+        // No interface state yet: the bare gateway is not on-link either.
+        assert_eq!(
+            rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true),
+            None
+        );
+        // Bringing the gateway's prefix on-link completes the one
+        // recursion level.
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 3,
+            name: "eth3".into(),
+            is_up: true,
+            flags: common::LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 3,
+            prefix: "198.51.100.2/24".parse().unwrap(),
+        });
+        assert_eq!(
+            rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true),
+            Some(Nexthop::Ipv4If(Ipv4Addr::new(198, 51, 100, 1), 3))
+        );
+        // A v6 query does not match the v4 mirror entries.
+        assert_eq!(
+            rib.lookup_nexthop_routed(IpAddr::V6(Ipv6Addr::UNSPECIFIED), true),
+            None
+        );
+    }
+
     #[test]
     fn mirror_ignores_self_originated_notifications() {
         let prefix: IpPrefix = "198.51.100.0/24".parse().unwrap();
@@ -945,6 +1148,8 @@ mod tests {
             prefix,
             protocol: RouteProtocol::Static,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
         assert_eq!(rib.kernel_route_count(), 0);
 
@@ -954,12 +1159,16 @@ mod tests {
             prefix,
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
         rib.apply_event(&DataplaneEvent::RouteNew {
             table: 254,
             prefix,
             protocol: RouteProtocol::Ospf,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
         assert_eq!(rib.kernel_route_count(), 1);
     }
@@ -1084,6 +1293,8 @@ mod tests {
             prefix: "198.18.0.0/15".parse().unwrap(),
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
         let resolved = rib.resolve_nexthop(ip("192.0.2.7"));
         assert!(resolved.is_some());
@@ -1580,6 +1791,8 @@ mod tests {
             prefix,
             protocol: RouteProtocol::Kernel,
             metric: 0,
+            gateway: None,
+            oif: None,
         });
 
         // The mirror holds the route under its table id (P0D), and the

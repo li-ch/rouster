@@ -1,6 +1,7 @@
 //! Real rtnetlink-backed dataplane (Linux only).
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 
 use common::{
@@ -331,6 +332,28 @@ fn route_new_event(msg: &RouteMessage) -> Option<DataplaneEvent> {
         prefix: route_prefix(msg)?,
         protocol: RouteProtocol::Kernel,
         metric: route_metric(msg),
+        gateway: route_gateway(msg),
+        oif: route_oif(msg),
+    })
+}
+
+/// Gateway of a route message (`RTA_GATEWAY`), as a plain IP. Cross-AF
+/// gateways are dropped (the programming path rejects them too,
+/// `check_same_af`); mirror detail must be as trustworthy as what we
+/// would ourselves install.
+fn route_gateway(msg: &RouteMessage) -> Option<IpAddr> {
+    msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Gateway(RouteAddress::Inet(a)) => Some(IpAddr::V4(*a)),
+        RouteAttribute::Gateway(RouteAddress::Inet6(a)) => Some(IpAddr::V6(*a)),
+        _ => None,
+    })
+}
+
+/// Output interface of a route message (`RTA_OIF`).
+fn route_oif(msg: &RouteMessage) -> Option<u32> {
+    msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Oif(ix) => Some(*ix),
+        _ => None,
     })
 }
 

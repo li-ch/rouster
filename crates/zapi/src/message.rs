@@ -2687,9 +2687,15 @@ mod tests {
     }
 
     #[test]
-    fn nexthop_register_decodes_both_samples() {
+    fn nexthop_register_decodes_all_samples() {
         let staticd = hex("00 00 0001 0002 20 c0000201");
         let bgpd = hex("01 00 0001 0002 20 0a090909");
+        // E (A23): real ospfd 10.2.2 under `area 0.0.0.1 nssa
+        // default-information-originate` — the only live sample with
+        // resolve_via_default=1, and the only /0 registration seen
+        // (ospf_area_nssa_default_originate_set → ospf_zebra_import_
+        // default_route, ospfd.c).
+        let ospfd = hex("00 01 0001 0002 00 00000000");
         let m1 = ZapiMessage::decode(21, &staticd).unwrap();
         assert_eq!(
             m1,
@@ -2710,8 +2716,19 @@ mod tests {
                 prefix: "10.9.9.9/32".parse().unwrap(),
             })
         );
+        let m3 = ZapiMessage::decode(21, &ospfd).unwrap();
+        assert_eq!(
+            m3,
+            ZapiMessage::NexthopRegister(ZapiNexthopRegister {
+                connected: false,
+                resolve_via_default: true,
+                safi: 1,
+                prefix: "0.0.0.0/0".parse().unwrap(),
+            })
+        );
         assert_eq!(roundtrip(&m1), staticd);
         assert_eq!(roundtrip(&m2), bgpd);
+        assert_eq!(roundtrip(&m3), ospfd);
         // SPEC side: unregister uses the same shape.
         let unreg = ZapiMessage::NexthopUnregister(ZapiNexthopRegister {
             connected: false,

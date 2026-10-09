@@ -114,10 +114,13 @@ pub enum RibCommand {
     },
     /// NEXTHOP_REGISTER: record the tracking interest (Z3B re-evaluates it
     /// on dataplane events) and answer with the current resolution —
-    /// `Some(hop)` resolved, `None` unresolved.
+    /// `Some(hop)` resolved, `None` unresolved. `resolve_via_default`
+    /// (wire flag; A23 ospfd fixture) gates the routing-table fallback in
+    /// the answer.
     RegisterNexthop {
         owner: u64,
         prefix: IpPrefix,
+        resolve_via_default: bool,
         reply: oneshot::Sender<Option<Nexthop>>,
     },
     /// NEXTHOP_UNREGISTER.
@@ -184,6 +187,10 @@ pub struct InterfaceMirror {
 pub struct NhtRegistration {
     pub safi: u16,
     pub connected: bool,
+    /// `resolve_via_default` from the wire: the registration may be
+    /// answered by the routing table (ospfd's NSSA default import check
+    /// sets it — A23; staticd/bgpd fixtures send 0).
+    pub resolve_via_default: bool,
 }
 
 /// An event-driven push from the RIB owner (rousterd's main loop) to one
@@ -629,13 +636,23 @@ impl ZapiSession {
                     NhtRegistration {
                         safi: register.safi,
                         connected: register.connected,
+                        resolve_via_default: register.resolve_via_default,
                     },
+                );
+                info!(
+                    id = self.id,
+                    prefix = %register.prefix,
+                    safi = register.safi,
+                    connected = register.connected,
+                    resolve_via_default = register.resolve_via_default,
+                    "zapi: nexthop register"
                 );
                 let (reply_tx, reply_rx) = oneshot::channel();
                 commands
                     .send(RibCommand::RegisterNexthop {
                         owner: self.id,
                         prefix: register.prefix,
+                        resolve_via_default: register.resolve_via_default,
                         reply: reply_tx,
                     })
                     .await
@@ -981,6 +998,7 @@ mod tests {
         Nht {
             owner: u64,
             prefix: IpPrefix,
+            resolve_via_default: bool,
         },
         NhtUn {
             owner: u64,
@@ -1048,8 +1066,8 @@ mod tests {
                 RibCommand::RegisterNexthop {
                     owner,
                     prefix,
+                    resolve_via_default,
                     reply,
-                    ..
                 } => {
                     let resolution = self
                         .resolutions
@@ -1058,7 +1076,11 @@ mod tests {
                         .get(&prefix_addr(&prefix))
                         .copied();
                     let _ = reply.send(resolution);
-                    Seen::Nht { owner, prefix }
+                    Seen::Nht {
+                        owner,
+                        prefix,
+                        resolve_via_default,
+                    }
                 }
                 RibCommand::UnregisterNexthop { owner, prefix } => Seen::NhtUn { owner, prefix },
                 RibCommand::RegisterRedistribute {
@@ -1353,9 +1375,14 @@ mod tests {
         );
         client.send(&nht_register("192.0.2.1/32"), 0).await;
         match driver.recv(&mut rx).await {
-            Seen::Nht { owner, prefix } => {
+            Seen::Nht {
+                owner,
+                prefix,
+                resolve_via_default,
+            } => {
                 assert_eq!(owner, 1);
                 assert_eq!(prefix, "192.0.2.1/32".parse::<IpPrefix>().unwrap());
+                assert!(!resolve_via_default, "staticd shape");
             }
             other => panic!("expected RegisterNexthop, got {other:?}"),
         }
@@ -1372,6 +1399,54 @@ mod tests {
         drop(client);
         let session = task.await.unwrap().unwrap();
         assert_eq!(session.nht.len(), 1, "registration recorded for Z3B");
+    }
+
+    /// A23: the live-captured ospfd registration (NSSA default import
+    /// check) — the raw fixture bytes of a real ospfd 10.2.2 cmd-21 frame
+    /// decode, flow to the driver with the flag, and are answered with a
+    /// resolved NEXTHOP_UPDATE.
+    #[tokio::test]
+    async fn nht_register_ospfd_default_import_check_shape() {
+        use crate::header::ZapiHeader;
+        const ZAPI_HEADER_LEN: usize = crate::ZAPI_HEADER_LEN;
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        let driver = driver_with_resolution(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Nexthop::Ipv4If(Ipv4Addr::new(192, 168, 215, 1), 2),
+        );
+        // The exact body captured on the wire (zapi-sniff, a23 probe):
+        // connected=0, resolve_via_default=1, safi=1, 0.0.0.0/0.
+        let body: Vec<u8> = vec![
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut frame = vec![0u8; ZAPI_HEADER_LEN];
+        ZapiHeader::new(21, 0, body.len()).encode(&mut frame);
+        frame.extend_from_slice(&body);
+        client.io.write_all(&frame).await.expect("send");
+        match driver.recv(&mut rx).await {
+            Seen::Nht {
+                owner,
+                prefix,
+                resolve_via_default,
+            } => {
+                assert_eq!(owner, 1);
+                assert_eq!(prefix, "0.0.0.0/0".parse::<IpPrefix>().unwrap());
+                assert!(resolve_via_default, "ospfd sets the flag");
+            }
+            other => panic!("expected RegisterNexthop, got {other:?}"),
+        }
+        let (header, body) = client.read_frame().await;
+        assert_eq!(header.command, 23, "NEXTHOP_UPDATE");
+        let update = ZapiNexthopUpdate::decode(&body).expect("update decodes");
+        assert!(update.is_resolved());
+        assert_eq!(
+            update.nexthops[0].nh_type,
+            crate::nexthop_type::IPV4_IFINDEX
+        );
+        drop(client);
+        let session = task.await.unwrap().unwrap();
+        assert_eq!(session.nht.len(), 1);
+        assert!(session.nht[&"0.0.0.0/0".parse::<IpPrefix>().unwrap()].resolve_via_default);
     }
 
     #[tokio::test]
