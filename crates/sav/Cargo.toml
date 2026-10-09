@@ -1,6 +1,6 @@
 [package]
 name = "sav"
-description = "Rouster SAV: SAV Information Base (SIB) - typed source-prefix/interface bindings"
+description = "Rouster SAV: SIB, validation-mode rule model, uRPF rule generation, SAV table manager"
 edition.workspace = true
 version.workspace = true
 

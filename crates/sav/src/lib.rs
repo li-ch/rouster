@@ -17,6 +17,19 @@
 //! side-effect-free on the dataplane: no IPC, no wire formats, and no
 //! draft-dependent signaling (nothing tonight is draft-dependent, so no
 //! `experimental-savnet` feature flag is needed).
+//!
+//! Slice 2 completes the rule layer between the SIB and enforcement:
+//! [`mode`] (the IBA/IBB/PBA/PBB validation-mode taxonomy and
+//! per-interface enablement), [`gen`] (strict/loose/FP/EFP-uRPF
+//! equivalence rule generation from a (Sib, Rib) view), and [`table`]
+//! (the SAV Table Manager compile step: rules → `SavOp`s with their
+//! Monitor/Drop action as data, plus the reference evaluation
+//! semantics). Enforcement itself — programming the dataplane — is the
+//! next slice through the `Dataplane` trait.
+
+pub mod gen;
+pub mod mode;
+pub mod table;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -31,7 +44,7 @@ use tracing::{debug, info};
 /// derived inside a VRF would be wrong for the default namespace
 /// (VRF-scoped SAV is Phase-1+ work; the W4 `Rib::vrf_of_table`
 /// association is the surface it will build on).
-const MAIN_TABLE: TableId = 254;
+pub(crate) const MAIN_TABLE: TableId = 254;
 
 /// Errors from storing bindings. The SIB's stored invariants: a binding
 /// always names at least one *concrete* egress interface, and the
@@ -279,6 +292,22 @@ impl Sib {
         self.bindings.values()
     }
 
+    /// The effective bindings, one per prefix, applying the documented
+    /// precedence at the prefix level: a [`BindingOrigin::Config`]
+    /// binding shadows the [`BindingOrigin::Rib`] binding of the same
+    /// prefix (the prefix-level form of [`Sib::interfaces_for`]'s rule
+    /// 2). This is the iteration the rule generators use — a rule set
+    /// must see exactly one binding per prefix. Deterministic (prefix
+    /// order).
+    pub fn effective_bindings(&self) -> impl Iterator<Item = &Binding> {
+        self.bindings.values().filter(|b| {
+            b.origin == BindingOrigin::Config
+                || !self
+                    .bindings
+                    .contains_key(&(b.prefix, BindingOrigin::Config))
+        })
+    }
+
     /// The ingress interfaces on which a packet with this `source`
     /// address could legitimately arrive, per the bindings:
     /// **longest-prefix match**, so a more specific binding always
@@ -379,7 +408,7 @@ fn normalize(interfaces: &mut Vec<InterfaceRef>) {
 /// hops carry their ifindex directly, gateway hops go through
 /// [`Rib::resolve_nexthop`], blackholes contribute nothing. Empty result
 /// = no binding (see [`Sib::ingest_rib`]).
-fn rib_egress(rib: &Rib, group: &NexthopGroup) -> Vec<InterfaceRef> {
+pub(crate) fn rib_egress(rib: &Rib, group: &NexthopGroup) -> Vec<InterfaceRef> {
     let mut out: Vec<InterfaceRef> = Vec::new();
     for &(hop, _weight) in group.hops() {
         let ifindex = match hop {
@@ -420,7 +449,7 @@ fn nexthop_ifindex(hop: Nexthop) -> Option<u32> {
 }
 
 /// Family-checked prefix membership.
-fn prefix_contains(prefix: IpPrefix, addr: IpAddr) -> bool {
+pub(crate) fn prefix_contains(prefix: IpPrefix, addr: IpAddr) -> bool {
     match (prefix, addr) {
         (IpPrefix::V4(prefix), IpAddr::V4(addr)) => prefix.contains(addr),
         (IpPrefix::V6(prefix), IpAddr::V6(addr)) => prefix.contains(addr),
@@ -428,7 +457,7 @@ fn prefix_contains(prefix: IpPrefix, addr: IpAddr) -> bool {
     }
 }
 
-fn prefix_len(prefix: IpPrefix) -> u8 {
+pub(crate) fn prefix_len(prefix: IpPrefix) -> u8 {
     match prefix {
         IpPrefix::V4(prefix) => prefix.prefix_len(),
         IpPrefix::V6(prefix) => prefix.prefix_len(),
