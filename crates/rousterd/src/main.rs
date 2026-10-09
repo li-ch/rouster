@@ -206,14 +206,18 @@ async fn main() -> std::io::Result<()> {
                             DataplaneEvent::NeighbourNew { entry } => {
                                 let ifname = ifname_of(&driver, entry.link_ifindex);
                                 if entry.is_up() {
-                                    info!(neighbour = %entry, ifname, "neighbour up");
+                                    info!(neighbour = %entry, ifname = %ifname, "neighbour up");
                                 } else {
-                                    info!(neighbour = %entry, ifname, "neighbour state change");
+                                    info!(
+                                        neighbour = %entry,
+                                        ifname = %ifname,
+                                        "neighbour state change"
+                                    );
                                 }
                             }
                             DataplaneEvent::NeighbourDel { ip, link_ifindex } => {
                                 let ifname = ifname_of(&driver, *link_ifindex);
-                                info!(neighbour = %ip, ifname, "neighbour down");
+                                info!(neighbour = %ip, ifname = %ifname, "neighbour down");
                             }
                             other => info!(
                                 %other,
