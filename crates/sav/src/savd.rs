@@ -879,6 +879,34 @@ where
         self.last_counts
     }
 
+    /// Operator status snapshot (A21): the daemon's state as plain
+    /// text — pid, running config, the installed program (the W8
+    /// `installed` surface, one `rule` line per op in the same
+    /// rendering the rule logs use), and the last evaluate's monitor
+    /// counts with the source that fed them. The thin binary publishes
+    /// this to a run-dir status file after every evaluate (`savd
+    /// --show` prints it) — the rule set without log greps, with no
+    /// IPC and no wire changes.
+    pub fn status_text(&self, pid: u32) -> String {
+        let mut out = format!(
+            "savd {} pid {pid}\nconfig {}\n",
+            env!("CARGO_PKG_VERSION"),
+            self.config
+        );
+        match &self.installed {
+            None => out.push_str("installed 0 rules (never evaluated)\n"),
+            Some(program) => {
+                out.push_str(&format!("installed {} rules\n", program.ops().len()));
+                for op in program.ops() {
+                    out.push_str(&format!("rule {op}\n"));
+                }
+            }
+        }
+        let (source, counts) = self.last_counts;
+        out.push_str(&format!("monitor source {source} {counts}\n"));
+        out
+    }
+
     /// Whether a mirror change since the last evaluate can have
     /// altered the program (the select loop's event-driven
     /// re-evaluation trigger).
@@ -2458,6 +2486,59 @@ mod tests {
             daemon.last_counts(),
             (CountsSource::Simulation, daemon.counts()),
             "a failed read falls back too"
+        );
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// STATUS SURFACE (A21): `status_text` renders the daemon's own
+    /// state — before the first evaluate nothing is installed; after it
+    /// the `rule` lines are exactly the installed program's ops (the W8
+    /// `installed` surface), the config line is the running config, and
+    /// the monitor line carries the last evaluate's counts and source;
+    /// a spoof observation moves the counter and the next evaluate's
+    /// status reflects it.
+    #[tokio::test]
+    async fn status_reflects_installed_state() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+
+        let before = daemon.status_text(4242);
+        assert!(before.contains("pid 4242"), "the caller's pid is named");
+        assert!(
+            before.contains("installed 0 rules (never evaluated)"),
+            "pre-evaluate: nothing installed"
+        );
+        assert!(
+            before.contains("monitor source simulation invalid=0 valid=0 unknown=0"),
+            "counts default to the simulation's zeros"
+        );
+
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        let after = daemon.status_text(4242);
+        assert!(
+            after
+                .contains("config mode strict-uRPF action monitor poll 5s interfaces 2 bindings 0"),
+            "the running config renders"
+        );
+        assert!(after.contains("installed 2 rules"));
+        assert!(
+            after.contains("rule allow if#2 [198.51.100.0/24] strict monitor"),
+            "the installed ops render (the rule-log rendering)"
+        );
+        assert!(after.contains("rule allow if#3 [] strict monitor"));
+
+        // The spoof counter feeds the line through the next evaluate.
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3)); // wrong interface
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(
+            daemon
+                .status_text(4242)
+                .contains("monitor source simulation invalid=1"),
+            "the counts move with the daemon's state"
         );
         drop(daemon);
         let _ = server.await;

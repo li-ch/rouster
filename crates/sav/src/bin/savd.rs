@@ -13,7 +13,19 @@
 //! SIGTERM/SIGINT clear everything installed and exit, leaving the
 //! kernel clean.
 //!
-//! Usage: `savd --config <PATH> --zapi-socket <PATH>`
+//! Usage: `savd --config <PATH> --zapi-socket <PATH> [--pidfile <PATH>]
+//! [--status-file <PATH>]`, or `savd --show` to print the daemon's
+//! published status.
+//!
+//! Operator surface (A21), run-dir files only — no IPC, no wire
+//! changes: a pidfile (`/run/rouster/savd.pid` by default) written at
+//! start and removed on every clean exit (only SIGKILL leaves it
+//! behind, and the pid it names is then dead), and a status file
+//! (`/run/rouster/savd.status`) refreshed after every evaluate with the
+//! installed rule set and monitor counts — `savd --show` prints it
+//! instead of a log grep. On the SIGTERM/SIGINT clear the status file
+//! goes too; after a SIGKILL it survives as the last-known-installed
+//! record.
 //!
 //! The daemon logic lives in `sav::savd` (this binary is the thin shell,
 //! the staticd shape).
@@ -31,14 +43,36 @@ use tracing::{error, info, warn};
 /// Pause between reconnect attempts when rousterd is not up (yet).
 const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
 
-struct Args {
-    config: PathBuf,
-    zapi_socket: PathBuf,
+/// Default pidfile (A21): the run dir the workspace sanctions for
+/// daemon state — the same dir as the netlink backend's sav-applied
+/// file.
+const DEFAULT_PIDFILE: &str = "/run/rouster/savd.pid";
+
+/// Default status file (A21): what `savd --show` prints, refreshed by
+/// the daemon after every evaluate.
+const DEFAULT_STATUS_FILE: &str = "/run/rouster/savd.status";
+
+/// What the operator asked savd to do: run the daemon, or print its
+/// published status (`--show` needs no config or ZAPI socket — it only
+/// reads the status file).
+enum Command {
+    Run {
+        config: PathBuf,
+        zapi_socket: PathBuf,
+        pidfile: PathBuf,
+        status_file: PathBuf,
+    },
+    Show {
+        status_file: PathBuf,
+    },
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args() -> Result<Command, String> {
     let mut config = None;
     let mut zapi_socket = None;
+    let mut pidfile = None;
+    let mut status_file = None;
+    let mut show = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -50,17 +84,112 @@ fn parse_args() -> Result<Args, String> {
                     it.next().ok_or("--zapi-socket requires a path")?,
                 ));
             }
+            "--pidfile" | "-p" => {
+                pidfile = Some(PathBuf::from(it.next().ok_or("--pidfile requires a path")?));
+            }
+            "--status-file" => {
+                status_file = Some(PathBuf::from(
+                    it.next().ok_or("--status-file requires a path")?,
+                ));
+            }
+            "--show" => show = true,
             "--help" | "-h" => {
-                println!("usage: savd --config <PATH> --zapi-socket <PATH>");
+                println!(
+                    "usage: savd --config <PATH> --zapi-socket <PATH> \
+                     [--pidfile <PATH>] [--status-file <PATH>]"
+                );
+                println!("       savd --show [--status-file <PATH>]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    Ok(Args {
+    let status_file = status_file.unwrap_or_else(|| PathBuf::from(DEFAULT_STATUS_FILE));
+    if show {
+        return Ok(Command::Show { status_file });
+    }
+    Ok(Command::Run {
         config: config.ok_or("missing --config <PATH>")?,
         zapi_socket: zapi_socket.ok_or("missing --zapi-socket <PATH>")?,
+        pidfile: pidfile.unwrap_or_else(|| PathBuf::from(DEFAULT_PIDFILE)),
+        status_file,
     })
+}
+
+/// The daemon's pidfile (A21): written at start, removed on exit. The
+/// guard's Drop covers every return path from `run` — the SIGTERM and
+/// SIGINT clean exits included — so only SIGKILL leaves the file
+/// behind, and the pid it names is then dead (a stale-but-dead pid is
+/// the conventional detectable state).
+struct Pidfile {
+    path: PathBuf,
+}
+
+impl Pidfile {
+    /// Writes the live pid to `path`, creating the parent dir
+    /// (`/run/rouster` may not exist yet; the netlink backend creates
+    /// it for the sav-applied file the same way). A leftover from a
+    /// SIGKILLed predecessor is simply overwritten.
+    fn create(path: &Path) -> io::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for Pidfile {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            warn!(%err, path = %self.path.display(), "savd: pidfile removal failed");
+        }
+    }
+}
+
+/// Publishes the daemon's status snapshot to the status file (A21):
+/// operators — and `savd --show` — read the file instead of grepping
+/// logs. Diagnostics only: a failed write warns and never fails the
+/// evaluate that produced the state.
+fn publish_status(path: &Path, pid: u32, daemon: &SavDaemon<tokio::net::UnixStream>) {
+    if let Err(err) = std::fs::write(path, daemon.status_text(pid)) {
+        warn!(%err, path = %path.display(), "savd: status file write failed");
+    }
+}
+
+/// Removes the status file on the clean-exit paths (A21): after the
+/// clear the file's content would be a lie. Best-effort, quiet on
+/// NotFound (the daemon may exit before its first evaluate published
+/// anything).
+fn remove_status(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != io::ErrorKind::NotFound {
+            warn!(%err, path = %path.display(), "savd: status file removal failed");
+        }
+    }
+}
+
+/// `savd --show` (A21): the daemon's published status — the installed
+/// rule set and monitor counts straight from the status file (no IPC;
+/// the daemon refreshes it after every evaluate).
+fn show(path: &Path) -> io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+/// Evaluate + status refresh (A21): every convergence point in the
+/// select loop lands here, so the status file always reflects the last
+/// evaluated state.
+async fn evaluate(
+    daemon: &mut SavDaemon<tokio::net::UnixStream>,
+    dp: &NetlinkDataplane,
+    status_file: &Path,
+    pid: u32,
+) -> io::Result<()> {
+    daemon.evaluate(dp).await?;
+    publish_status(status_file, pid, daemon);
+    Ok(())
 }
 
 /// Reads, parses, and validates the config. The drop-mode friction gate
@@ -103,16 +232,54 @@ async fn main() -> io::Result<()> {
         .try_init();
     info!(version = env!("CARGO_PKG_VERSION"), "savd starting");
 
-    let args = parse_args().map_err(|e| {
+    let command = parse_args().map_err(|e| {
         error!("{e}");
         io::Error::new(io::ErrorKind::InvalidInput, e)
     })?;
+    match command {
+        Command::Show { status_file } => match show(&status_file) {
+            Ok(text) => {
+                print!("{text}");
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    %err,
+                    path = %status_file.display(),
+                    "savd: no status to show (not running, or not yet evaluated)"
+                );
+                Err(err)
+            }
+        },
+        Command::Run {
+            config,
+            zapi_socket,
+            pidfile,
+            status_file,
+        } => run(&config, &zapi_socket, &pidfile, &status_file).await,
+    }
+}
 
-    let mut config = load_config(&args.config).map_err(|e| {
+/// The daemon body (A21: split out of main so `--show` short-circuits
+/// before any daemon setup).
+async fn run(
+    config_path: &Path,
+    zapi_socket: &Path,
+    pidfile_path: &Path,
+    status_file: &Path,
+) -> io::Result<()> {
+    let pid = std::process::id();
+
+    let mut config = load_config(config_path).map_err(|e| {
         error!("savd: {e}");
         io::Error::new(io::ErrorKind::PermissionDenied, e)
     })?;
     info!(%config, "savd: config loaded");
+
+    // PIDFILE (A21): written once the config accepted us; from here on
+    // the guard removes it on every exit (SIGTERM/SIGINT included).
+    let _pidfile = Pidfile::create(pidfile_path)?;
+    info!(path = %pidfile_path.display(), "savd: pidfile written");
 
     // Dataplane: enforcement installs/clears AND the live interface
     // mirror (names for the config's interface lines).
@@ -123,7 +290,7 @@ async fn main() -> io::Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
 
     'session: loop {
-        let mut daemon = connect(&args.zapi_socket).await?;
+        let mut daemon = connect(zapi_socket).await?;
         daemon.set_config(config.clone());
 
         // Seed the interface mirror from the kernel dump BEFORE the
@@ -143,7 +310,7 @@ async fn main() -> io::Result<()> {
         }
         // WIRED: first evaluation installs (monitor by default) and
         // logs the rule set.
-        if let Err(err) = daemon.evaluate(&dp).await {
+        if let Err(err) = evaluate(&mut daemon, &dp, status_file, pid).await {
             error!(%err, "savd: first evaluation failed; retrying");
             sleep(RECONNECT_PAUSE).await;
             continue 'session;
@@ -166,7 +333,7 @@ async fn main() -> io::Result<()> {
             tokio::select! {
                 _ = hangup.recv() => {
                     info!("savd: SIGHUP: reloading config");
-                    match load_config(&args.config) {
+                    match load_config(config_path) {
                         Ok(new_config) => {
                             daemon.set_config(new_config.clone());
                             // Refresh the interface mirror too: a new
@@ -179,7 +346,9 @@ async fn main() -> io::Result<()> {
                             {
                                 daemon.apply_event(&ev);
                             }
-                            if let Err(err) = daemon.evaluate(&dp).await {
+                            if let Err(err) =
+                                evaluate(&mut daemon, &dp, status_file, pid).await
+                            {
                                 warn!(%err, "savd: reload evaluation failed");
                             } else {
                                 config = new_config;
@@ -194,7 +363,7 @@ async fn main() -> io::Result<()> {
                     }
                 }
                 _ = poll.tick() => {
-                    if let Err(err) = daemon.evaluate(&dp).await {
+                    if let Err(err) = evaluate(&mut daemon, &dp, status_file, pid).await {
                         warn!(%err, "savd: poll evaluation failed");
                     }
                 }
@@ -222,7 +391,7 @@ async fn main() -> io::Result<()> {
                 } => {
                     // The hysteresis window elapsed: evaluate applies
                     // the expired deferred deletions.
-                    if let Err(err) = daemon.evaluate(&dp).await {
+                    if let Err(err) = evaluate(&mut daemon, &dp, status_file, pid).await {
                         warn!(%err, "savd: deferred-deletion flush evaluation failed");
                     }
                 }
@@ -231,6 +400,7 @@ async fn main() -> io::Result<()> {
                     if let Err(err) = daemon.clear(&dp).await {
                         error!(%err, "savd: clear failed; state file allows a later restore");
                     }
+                    remove_status(status_file);
                     return Ok(());
                 }
                 _ = terminate.recv() => {
@@ -238,6 +408,7 @@ async fn main() -> io::Result<()> {
                     if let Err(err) = daemon.clear(&dp).await {
                         error!(%err, "savd: clear failed; state file allows a later restore");
                     }
+                    remove_status(status_file);
                     return Ok(());
                 }
             }
@@ -246,12 +417,82 @@ async fn main() -> io::Result<()> {
             // the view dirty — converge now instead of waiting for the
             // poll tick, which stays as the safety-net cadence.
             if daemon.take_dirty() {
-                if let Err(err) = daemon.evaluate(&dp).await {
+                if let Err(err) = evaluate(&mut daemon, &dp, status_file, pid).await {
                     warn!(%err, "savd: event-driven evaluation failed");
                 }
             }
         }
         // Netlink closed: drop the session and reconnect from scratch.
         sleep(RECONNECT_PAUSE).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique-per-run scratch dir (the nested path exercises
+    /// Pidfile's parent-dir creation).
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("savd-a21-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// PIDFILE: written at start (the live pid, newline-terminated) and
+    /// removed on clean exit — the guard's drop, which is `run`'s every
+    /// return path, the SIGTERM/SIGINT arms included.
+    #[test]
+    fn pidfile_written_at_start_and_removed_on_clean_exit() {
+        let dir = scratch("pid");
+        let path = dir.join("savd.pid");
+        let guard = Pidfile::create(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", std::process::id()),
+            "start writes the live pid (parent dir created)"
+        );
+        drop(guard); // the clean-exit path
+        assert!(!path.exists(), "clean exit removes the pidfile");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PIDFILE: a leftover from a SIGKILLed predecessor is overwritten
+    /// by the next start (a stale file never refuses to start).
+    #[test]
+    fn pidfile_overwrites_a_stale_predecessor() {
+        let dir = scratch("stale");
+        let path = dir.join("savd.pid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "99999\n").unwrap();
+        let guard = Pidfile::create(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", std::process::id()),
+            "the live pid replaces the dead one"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STATUS: `--show` returns exactly what the daemon published; a
+    /// missing file is the not-running answer (an error, not a panic);
+    /// the clean-exit path removes the file and stays quiet when there
+    /// was nothing to remove.
+    #[test]
+    fn show_prints_the_published_status_and_errors_when_absent() {
+        let dir = scratch("show");
+        let path = dir.join("savd.status");
+        assert!(
+            show(&path).is_err(),
+            "no daemon, no status file: an error, not a panic"
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "savd 0.0.0 pid 42\n").unwrap();
+        assert_eq!(show(&path).unwrap(), "savd 0.0.0 pid 42\n");
+        remove_status(&path);
+        assert!(!path.exists(), "the clean-exit path removes it");
+        remove_status(&path); // quiet on NotFound (never published)
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
