@@ -16,7 +16,7 @@
 //! carrying the withdrawn route to the same interested sessions.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use common::{Dataplane, DataplaneEvent, IpPrefix, Nexthop, NexthopGroup, RouteEntry, TableId};
 use rib::Rib;
@@ -201,6 +201,12 @@ impl RibDriver {
                 let _ = reply.send(mirror);
                 false
             }
+            RibCommand::RequestRouterId { reply } => {
+                let router_id = self.router_id();
+                debug!(?router_id, "zapi: router-id derived");
+                let _ = reply.send(router_id);
+                false
+            }
         }
     }
 
@@ -246,6 +252,37 @@ impl RibDriver {
 
     fn best_of(&self, table: TableId, prefix: IpPrefix) -> Option<RouteEntry> {
         self.rib.table(table).and_then(|t| t.best(&prefix)).cloned()
+    }
+
+    /// The router-id rousterd derives for ROUTER_ID_UPDATE (18) answers:
+    /// FRR's documented default — the highest IPv4 address on an UP
+    /// loopback interface, falling back to the highest IPv4 address on any
+    /// UP interface, `None` when no UP interface carries one. Simplified
+    /// vs FRR: loopbacks are recognized by a `lo` name prefix (the mirror
+    /// has no IFF_LOOPBACK bit) and IPv6 addresses never participate
+    /// (ZAPI's router-id is an IPv4 construct). Config override is future
+    /// northbound-config work.
+    fn router_id(&self) -> Option<Ipv4Addr> {
+        let mut loopback: Vec<Ipv4Addr> = Vec::new();
+        let mut any_up: Vec<Ipv4Addr> = Vec::new();
+        for iface in self.rib.interfaces().values().filter(|i| i.is_up) {
+            let pool = if iface.name.starts_with("lo") {
+                &mut loopback
+            } else {
+                &mut any_up
+            };
+            for prefix in &iface.addresses {
+                if let IpPrefix::V4(p) = prefix {
+                    pool.push(p.addr());
+                }
+            }
+        }
+        let pool = if loopback.is_empty() {
+            any_up
+        } else {
+            loopback
+        };
+        pool.into_iter().max()
     }
 
     /// Fans a REDISTRIBUTE_ROUTE_ADD out to the sessions registered for
@@ -883,6 +920,74 @@ mod tests {
             fresh.try_recv().expect("re-attached session pushes"),
             SessionPush::RedistributeRouteAdd(_)
         ));
+    }
+
+    /// The router-id derivation behind ROUTER_ID_UPDATE answers: loopbacks
+    /// win over higher non-loopback addresses, the fallback pool is any UP
+    /// interface, DOWN interfaces and IPv6 never contribute, and no
+    /// candidates means None.
+    #[test]
+    fn router_id_prefers_highest_loopback_then_any_up() {
+        let mut driver = RibDriver::new();
+        assert_eq!(driver.router_id(), None, "no mirror: nothing to derive");
+
+        // Loopback preferred even though eth0's address is higher.
+        driver.apply_event(&link_up(1)); // name eth1 — see link_up()
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 4,
+            name: "lo".into(),
+            is_up: true,
+        });
+        driver.apply_event(&addr_new(4, "10.0.0.5/32"));
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 2,
+            name: "eth0".into(),
+            is_up: true,
+        });
+        driver.apply_event(&addr_new(2, "192.168.1.1/24"));
+        assert_eq!(
+            driver.router_id(),
+            Some("10.0.0.5".parse::<std::net::Ipv4Addr>().unwrap()),
+            "loopback address wins over the higher eth0 address"
+        );
+
+        // Highest among multiple loopbacks.
+        driver.apply_event(&addr_new(4, "10.0.0.9/32"));
+        assert_eq!(
+            driver.router_id(),
+            Some("10.0.0.9".parse::<std::net::Ipv4Addr>().unwrap())
+        );
+
+        // Loopback down: fall back to the highest UP non-loopback address.
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 4,
+            name: "lo".into(),
+            is_up: false,
+        });
+        assert_eq!(
+            driver.router_id(),
+            Some("192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap())
+        );
+
+        // A higher address on a DOWN interface and IPv6 addresses never
+        // contribute.
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 3,
+            name: "eth1".into(),
+            is_up: false,
+        });
+        driver.apply_event(&addr_new(3, "200.0.0.1/24"));
+        assert_eq!(
+            driver.router_id(),
+            Some("192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap()),
+            "down interface ignored even with the highest address"
+        );
+        driver.apply_event(&addr_new(2, "2001:db8::1/64"));
+        assert_eq!(
+            driver.router_id(),
+            Some("192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap()),
+            "IPv6 never participates"
+        );
     }
 
     /// Pushes for owners that never attached (e.g. commands racing the

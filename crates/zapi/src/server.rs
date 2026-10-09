@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use common::{IpPrefix, Nexthop, RouteEntry, RouteProtocol, TableId};
@@ -42,7 +43,7 @@ use crate::client::route_type_from;
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN, ZAPI_VERSION};
 use crate::message::{
     blackhole_type, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
-    ZapiNexthopUpdate, ZapiRoute,
+    ZapiNexthopUpdate, ZapiRoute, ZapiRouterIdUpdate,
 };
 
 /// The table all default-VRF client routes land in tonight (RT_TABLE_MAIN).
@@ -118,6 +119,12 @@ pub enum RibCommand {
     /// snapshot, which the session encodes back to the client.
     RequestInterfaces {
         reply: oneshot::Sender<Vec<InterfaceMirror>>,
+    },
+    /// ROUTER_ID_ADD (16): the driver answers with the router-id it derives
+    /// from the interface mirror (`None` = no IPv4 address to derive from);
+    /// the session encodes a ROUTER_ID_UPDATE (18) reply when `Some`.
+    RequestRouterId {
+        reply: oneshot::Sender<Option<Ipv4Addr>>,
     },
 }
 
@@ -639,8 +646,37 @@ impl ZapiSession {
                 Ok(())
             }
             ZapiMessage::RouterIdAdd { afi } => {
-                debug!(id = self.id, afi, "zapi: router-id add recorded");
-                Ok(())
+                // Answer with a ROUTER_ID_UPDATE carrying the derived
+                // router-id (W2): FRR zebra registers the client and sends
+                // its current id; bgpd/staticd use it when config pins
+                // none. No IPv4 address yet → no answer (W1 observed both
+                // daemons tolerate the silence; the next ROUTER_ID_ADD or
+                // reconnect re-asks).
+                let (reply_tx, reply_rx) = oneshot::channel();
+                commands
+                    .send(RibCommand::RequestRouterId { reply: reply_tx })
+                    .await
+                    .map_err(|_| channel_closed())?;
+                match reply_rx.await {
+                    Ok(Some(router_id)) => {
+                        let reply = ZapiMessage::RouterIdUpdate(ZapiRouterIdUpdate {
+                            address: std::net::IpAddr::V4(router_id),
+                            prefix_len: 32,
+                        })
+                        .encode_frame(0)
+                        .map_err(encode_io_err)?;
+                        io.write_all(&reply).await
+                    }
+                    Ok(None) => {
+                        warn!(
+                            id = self.id,
+                            afi,
+                            "zapi: no IPv4 address to derive a router-id; ROUTER_ID_UPDATE withheld"
+                        );
+                        Ok(())
+                    }
+                    Err(_) => Err(channel_closed()),
+                }
             }
 
             ZapiMessage::Unknown { command, body } => {
@@ -784,6 +820,7 @@ mod tests {
         commands: std::sync::Mutex<Vec<String>>,
         interfaces: Vec<InterfaceMirror>,
         resolutions: std::sync::Mutex<HashMap<IpAddr, Nexthop>>,
+        router_id: Option<Ipv4Addr>,
     }
 
     /// What the driver observed, returned after any reply was sent (the
@@ -814,6 +851,7 @@ mod tests {
         },
         RedUn,
         Ifaces,
+        RouterId,
     }
 
     fn describe(cmd: &RibCommand) -> String {
@@ -826,6 +864,7 @@ mod tests {
             RibCommand::RegisterRedistribute { .. } => "red+".to_string(),
             RibCommand::UnregisterRedistribute { .. } => "red-".to_string(),
             RibCommand::RequestInterfaces { .. } => "ifaces".to_string(),
+            RibCommand::RequestRouterId { .. } => "router-id".to_string(),
         }
     }
 
@@ -882,6 +921,10 @@ mod tests {
                 RibCommand::RequestInterfaces { reply } => {
                     let _ = reply.send(self.interfaces.clone());
                     Seen::Ifaces
+                }
+                RibCommand::RequestRouterId { reply } => {
+                    let _ = reply.send(self.router_id);
+                    Seen::RouterId
                 }
             }
         }
@@ -1453,6 +1496,57 @@ mod tests {
             }
             other => panic!("expected RedistributeRouteDel, got {other:?}"),
         }
+    }
+
+    /// ROUTER_ID_ADD is answered with a ROUTER_ID_UPDATE carrying the
+    /// driver-derived id: body `family u8 | address | prefixlen u8` per the
+    /// pinned doc (SRC: zebra_router_id_update_read) — byte-pinned here.
+    #[tokio::test]
+    async fn router_id_add_answered_with_derived_update() {
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
+        let driver = Driver {
+            router_id: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            ..Driver::default()
+        };
+        client.send(&ZapiMessage::RouterIdAdd { afi: 1 }, 0).await;
+        match driver.recv(&mut rx).await {
+            Seen::RouterId => {}
+            other => panic!("expected RequestRouterId, got {other:?}"),
+        }
+        let (header, body) = client.read_frame().await;
+        assert_eq!(header.command, 18, "ZEBRA_ROUTER_ID_UPDATE");
+        assert_eq!(
+            body,
+            vec![crate::message::AF_INET as u8, 192, 168, 1, 1, 32],
+            "family AF_INET, the address, prefixlen 32 (address BEFORE length)"
+        );
+        let update = crate::ZapiRouterIdUpdate::decode(&body).expect("update decodes");
+        assert_eq!(
+            update,
+            crate::ZapiRouterIdUpdate {
+                address: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                prefix_len: 32,
+            }
+        );
+    }
+
+    /// No derivable id → no ROUTER_ID_UPDATE, connection stays usable (the
+    /// next message still gets its reply; W1 observed daemons tolerate the
+    /// silence).
+    #[tokio::test]
+    async fn router_id_add_without_derivable_id_answers_nothing() {
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
+        let driver = Driver::default();
+        client.send(&ZapiMessage::RouterIdAdd { afi: 1 }, 0).await;
+        match driver.recv(&mut rx).await {
+            Seen::RouterId => {}
+            other => panic!("expected RequestRouterId, got {other:?}"),
+        }
+        // The HELLO echo arriving FIRST proves no update frame preceded it.
+        client.send(&staticd_hello(), 0).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 19, "no ROUTER_ID_UPDATE before the echo");
+        assert!(rx.try_recv().is_err(), "no further command");
     }
 
     #[tokio::test]

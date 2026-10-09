@@ -174,6 +174,13 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
             let _ = reply.send(mirror);
             false
         }
+        // No router-id derivation in this raw-RIB harness: none of its
+        // tests send ROUTER_ID_ADD, and the answered None keeps a future
+        // one from blocking (the RibDriver path covers the real derive).
+        RibCommand::RequestRouterId { reply } => {
+            let _ = reply.send(None);
+            false
+        }
     }
 }
 
