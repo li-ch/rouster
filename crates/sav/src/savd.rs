@@ -95,7 +95,9 @@
 use std::fmt;
 use std::time::Duration;
 
-use common::{Dataplane, DataplaneError, DataplaneEvent, IpPrefix, SavProgram, SavProgramOp};
+use common::{
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, SavMonitorCounts, SavProgram, SavProgramOp,
+};
 use rib::Rib;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{timeout, Instant};
@@ -490,6 +492,31 @@ fn iba_allowlist(
     })
 }
 
+/// Which source fed the monitor-counts log line of the last
+/// [`SavDaemon::evaluate`] (dataplane-first, simulation fallback): a
+/// backend that can read real per-rule counters answers
+/// [`Dataplane::sav_monitor_counts`] and its numbers feed the line;
+/// one that cannot (Unsupported — today's rp_filter backend has no
+/// per-rule counters) falls back to the sav layer's route-lookup
+/// simulation, and the line names which one spoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountsSource {
+    /// The backend answered `sav_monitor_counts` (kernel counters).
+    Dataplane,
+    /// The backend cannot answer (Unsupported) or failed to; the
+    /// simulation's counters fed the line.
+    Simulation,
+}
+
+impl fmt::Display for CountsSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CountsSource::Dataplane => "dataplane",
+            CountsSource::Simulation => "simulation",
+        })
+    }
+}
+
 /// The savd core: a ZAPI client (RIB view), the local mirror it feeds,
 /// the spoof counter, and what is currently installed.
 pub struct SavDaemon<IO> {
@@ -513,6 +540,11 @@ pub struct SavDaemon<IO> {
     /// poll tick. Neighbour observations never set it (counter-only).
     dirty: bool,
     config: SavdConfig,
+    /// The source and numbers of the last evaluate's monitor-counts
+    /// log line (dataplane-first, simulation fallback) — test-visible
+    /// so the switch is asserted, not just eyeballed in logs. The
+    /// pre-first-evaluate value is the simulation's zero counts.
+    last_counts: (CountsSource, SavMonitorCounts),
 }
 
 impl<IO> SavDaemon<IO>
@@ -530,6 +562,7 @@ where
             pending_deletions: Vec::new(),
             dirty: false,
             config: SavdConfig::default(),
+            last_counts: (CountsSource::Simulation, SavMonitorCounts::default()),
         }
     }
 
@@ -554,6 +587,15 @@ where
     /// The accumulated monitor counters (the spoof counter).
     pub fn counts(&self) -> common::SavMonitorCounts {
         self.monitor.counts()
+    }
+
+    /// The source and numbers of the last evaluate's monitor-counts
+    /// log line: dataplane when the backend answered
+    /// `sav_monitor_counts`, the simulation otherwise. [`Self::counts`]
+    /// keeps reporting the simulation counter either way (it is the
+    /// spoof counter, not whatever the backend last said).
+    pub fn last_counts(&self) -> (CountsSource, SavMonitorCounts) {
+        self.last_counts
     }
 
     /// Whether a mirror change since the last evaluate can have
@@ -806,7 +848,10 @@ where
     /// Re-evaluate the view and converge the dataplane onto it:
     /// regenerate rules, log the startup rule set or the diff at info,
     /// install through the trait when the program changed, and log the
-    /// monitor counters. An identical regeneration installs nothing
+    /// monitor counts — dataplane-first: a backend that answers
+    /// [`Dataplane::sav_monitor_counts`] feeds the line, anything else
+    /// falls back to the simulation's counts, and the line names the
+    /// source. An identical regeneration installs nothing
     /// (the churn guard W7 deferred at the backend, applied here).
     /// This call covers every mirror change since the last evaluate
     /// (it consumes the dirty flag); the poll tick and the select
@@ -977,8 +1022,30 @@ where
             _ => debug!("savd: rule set unchanged; nothing installed"),
         }
 
-        let counts = self.monitor.counts();
+        // Dataplane-first monitor counts (A18): when a backend can
+        // read real per-rule counters, its numbers feed the line;
+        // Unsupported (today's rp_filter backend — a strict/loose
+        // value drops, it does not count) and failed reads both fall
+        // back to the simulation's counts rather than failing the
+        // evaluate (diagnostics never take enforcement down), and the
+        // line names which source fed it.
+        let (source, counts) = match dp.sav_monitor_counts().await {
+            Ok(counts) => (CountsSource::Dataplane, counts),
+            Err(DataplaneError::Unsupported(reason)) => {
+                debug!(
+                    reason,
+                    "savd: backend has no monitor counters; simulation feeds the line"
+                );
+                (CountsSource::Simulation, self.monitor.counts())
+            }
+            Err(err) => {
+                warn!(error = %err, "savd: backend monitor-count read failed; simulation feeds the line");
+                (CountsSource::Simulation, self.monitor.counts())
+            }
+        };
+        self.last_counts = (source, counts);
         info!(
+            source = %source,
             invalid = counts.invalid,
             valid = counts.valid,
             unknown = counts.unknown,
@@ -1205,12 +1272,25 @@ mod tests {
 
     // ---- daemon over a duplex fake zebra (the staticd test shape) ----
 
+    /// What the mock's `sav_monitor_counts` answers: `Unsupported` (the
+    /// default — the trait-default shape today's rp_filter backend
+    /// keeps), `Counts` (a backend with real per-rule counters), or
+    /// `Failed` (a read that errors).
+    #[derive(Default)]
+    enum MockCounts {
+        #[default]
+        Unsupported,
+        Counts(SavMonitorCounts),
+        Failed,
+    }
+
     /// Dataplane mock recording SAV installs/clears (the W5/W7 recipe:
     /// futures always Ready).
     #[derive(Default)]
     struct MockSavDp {
         installed: Mutex<Vec<SavProgram>>,
         cleared: Mutex<u32>,
+        counts_answer: Mutex<MockCounts>,
     }
 
     impl Dataplane for MockSavDp {
@@ -1232,6 +1312,19 @@ mod tests {
         ) -> impl Future<Output = Result<(), DataplaneError>> + Send {
             self.installed.lock().unwrap().push(program.clone());
             std::future::ready(Ok(()))
+        }
+        fn sav_monitor_counts(
+            &self,
+        ) -> impl Future<Output = Result<SavMonitorCounts, DataplaneError>> + Send {
+            std::future::ready(match *self.counts_answer.lock().unwrap() {
+                MockCounts::Unsupported => Err(DataplaneError::Unsupported(
+                    "mock: no per-rule counters (trait-default shape)",
+                )),
+                MockCounts::Counts(counts) => Ok(counts),
+                MockCounts::Failed => Err(DataplaneError::Other(
+                    "mock: monitor-count read failed".into(),
+                )),
+            })
         }
         fn sav_clear(&self) -> impl Future<Output = Result<(), DataplaneError>> + Send {
             *self.cleared.lock().unwrap() += 1;
@@ -1798,6 +1891,103 @@ mod tests {
         // Regeneration keeps the counter (set_ops semantics, one level up).
         daemon.evaluate(&dp).await.unwrap();
         assert_eq!(daemon.counts().invalid, 2);
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// A18, the answering path: when the backend answers
+    /// `sav_monitor_counts`, ITS numbers feed the counts log line (not
+    /// the simulation's), `counts()` keeps reporting the simulation
+    /// counter (the spoof counter, whatever the backend last said), and
+    /// the source is re-decided on every evaluate — a backend that
+    /// stops answering falls back to the simulation on the next one.
+    #[tokio::test]
+    async fn dataplane_answered_counts_feed_the_log_line() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let backend_counts = SavMonitorCounts {
+            invalid: 7,
+            valid: 5,
+            unknown: 3,
+        };
+        let dp = MockSavDp {
+            counts_answer: Mutex::new(MockCounts::Counts(backend_counts)),
+            ..MockSavDp::default()
+        };
+        daemon.evaluate(&dp).await.unwrap();
+
+        // The simulation counter rises independently of the backend.
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3)); // invalid
+        daemon.apply_event(&neighbour_new("198.51.100.9", 2)); // valid
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.last_counts(),
+            (CountsSource::Dataplane, backend_counts),
+            "the backend's numbers feed the line, not the simulation's"
+        );
+        assert_eq!(
+            daemon.counts(),
+            SavMonitorCounts {
+                invalid: 1,
+                valid: 1,
+                unknown: 0
+            },
+            "counts() keeps reporting the simulation counter"
+        );
+
+        // The backend stops answering (back to the Unsupported shape):
+        // the next evaluate re-decides and the simulation feeds the line.
+        *dp.counts_answer.lock().unwrap() = MockCounts::Unsupported;
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.last_counts(),
+            (CountsSource::Simulation, daemon.counts()),
+            "fallback resumes on the next evaluate with the simulation's numbers"
+        );
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// A18, the fallback path: Unsupported (today's rp_filter shape —
+    /// a strict/loose value drops, it does not count) feeds the line
+    /// from the simulation, and so does a FAILED read — diagnostics
+    /// never fail the evaluate.
+    #[tokio::test]
+    async fn unsupported_or_failed_counts_reads_fall_back_to_the_simulation() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3)); // invalid
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3)); // rises
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.last_counts(),
+            (
+                CountsSource::Simulation,
+                SavMonitorCounts {
+                    invalid: 2,
+                    valid: 0,
+                    unknown: 0
+                }
+            ),
+            "Unsupported: the simulation feeds the line"
+        );
+
+        // A failed read (not Unsupported) is the same fallback, not an
+        // evaluate error.
+        *dp.counts_answer.lock().unwrap() = MockCounts::Failed;
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.last_counts(),
+            (CountsSource::Simulation, daemon.counts()),
+            "a failed read falls back too"
+        );
         drop(daemon);
         let _ = server.await;
     }
