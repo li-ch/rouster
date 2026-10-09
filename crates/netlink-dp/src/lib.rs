@@ -24,6 +24,11 @@ pub use stub::NetlinkDataplane;
 /// its unit tests run on dev machines; the Linux impl executes it).
 pub mod sav;
 
+/// Applied-SAV state persistence (what the backend wrote, and the
+/// pre-SAV values to restore) — pure encode/decode, cross-platform for
+/// host-side tests.
+pub mod sav_state;
+
 // TODO(phase-0): netns awareness; TODO(phase-1): nexthop-group objects.
 // (Link — including VRF device/table association —, address, route, and
 // neighbour dumps/events are implemented above.)

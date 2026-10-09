@@ -23,6 +23,15 @@ use rtnetlink::sys::{protocols::NETLINK_ROUTE, AsyncSocket, SocketAddr, TokioSoc
 use tracing::{debug, info, instrument, warn};
 
 use crate::sav::SysctlPlan;
+use crate::sav_state;
+
+/// Where the applied-SAV state file lives (the daemon run dir AGENTS.md
+/// sanctions; `/run/rouster`). Cross-process persistence: a restarted
+/// daemon — or the smoke binary's one-process-per-command shape — reads
+/// what a previous process applied, so clear/replace can restore the
+/// true pre-SAV values.
+const SAV_STATE_DIR: &str = "/run/rouster";
+const SAV_STATE_PATH: &str = "/run/rouster/sav-applied";
 
 /// Netlink-backed dataplane handle.
 ///
@@ -573,6 +582,31 @@ impl NetlinkDataplane {
         }
         Ok(targets)
     }
+
+    /// Merge the on-disk applied state into the in-memory map. In-memory
+    /// entries win (this process is the freshest truth); disk entries
+    /// fill what a previous process recorded — without this, a fresh
+    /// process would clear nothing and believe nothing was ever applied.
+    fn merge_applied_from_disk(&self) {
+        let Ok(text) = std::fs::read_to_string(SAV_STATE_PATH) else {
+            return; // no state file: nothing was ever applied here
+        };
+        let mut map = self.sav_applied.lock().unwrap();
+        for (ifindex, entry) in sav_state::decode(&text) {
+            map.entry(ifindex).or_insert(entry);
+        }
+    }
+
+    /// Persist the applied map so a later process (restarted daemon, or
+    /// the smoke binary's next command) can still restore pre-SAV
+    /// values. A failure here is reported: silent success would mean a
+    /// clear that cannot undo.
+    fn persist_applied(&self) -> Result<(), DataplaneError> {
+        std::fs::create_dir_all(SAV_STATE_DIR)?;
+        let text = sav_state::encode(&self.sav_applied.lock().unwrap());
+        std::fs::write(SAV_STATE_PATH, text)?;
+        Ok(())
+    }
 }
 
 impl Dataplane for NetlinkDataplane {
@@ -638,6 +672,9 @@ impl Dataplane for NetlinkDataplane {
 
         let targets = self.resolve_sav_targets(&plan).await?;
         let planned: BTreeMap<u32, u8> = plan.rp_filter.clone();
+        // A previous process may have applied rules this one must
+        // replace or revert (state file; see SAV_STATE_PATH).
+        self.merge_applied_from_disk();
 
         // Revert interfaces that leave the program before writing the
         // new ones — no window where an interface is both stale and new.
@@ -687,6 +724,9 @@ impl Dataplane for NetlinkDataplane {
                 "sav rp_filter written"
             );
         }
+        if first_err.is_none() {
+            self.persist_applied()?;
+        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -710,6 +750,7 @@ impl Dataplane for NetlinkDataplane {
     /// the applied set with a debug note.
     #[instrument(skip(self))]
     async fn sav_clear(&self) -> Result<(), DataplaneError> {
+        self.merge_applied_from_disk();
         let applied: Vec<(u32, String, u8)> = {
             let map = self.sav_applied.lock().unwrap();
             map.iter()
@@ -728,6 +769,9 @@ impl Dataplane for NetlinkDataplane {
                     first_err = first_err.or(Some(e));
                 }
             }
+        }
+        if first_err.is_none() {
+            self.persist_applied()?;
         }
         match first_err {
             Some(e) => Err(e),
