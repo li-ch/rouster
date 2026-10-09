@@ -210,11 +210,19 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 
 Route-type numbers seen inside bodies (EMPIRICAL): static = 4 (ROUTE_ADD of
 staticd, REDISTRIBUTE_ADD of static type, staticd HELLO byte 0), BGP = 10
-(bgpd HELLO byte 0, LABEL_MANAGER_CONNECT byte 0). **Z2**: confirmed by
-`lib/zebra.h` — the 10.2.2 numbering starts `ZEBRA_ROUTE_SYSTEM = 1`
-(+1 vs the classic table where SYSTEM=0); `lib/route_types.h` itself stayed
-unreachable, so types other than static/BGP are SRC-inferred from that
-shift: kernel=2, connected=3, rip=5, ripng=6, ospf=7, ospf6=8, isis=9.
+(bgpd HELLO byte 0, LABEL_MANAGER_CONNECT byte 0), connected = 2 (**A19**:
+live ospfd `redistribute connected` REDISTRIBUTE_ADD capture, body
+`01 02 0000`). **Z2, corrected by A19**: the earlier "+1 shift, SYSTEM=1,
+connected=3" inference was wrong — the frr-10.2.2 tag's `lib/route_types.txt`
+(expanded by `lib/route_types.pl`, which assigns `#define <name> <index>`
+sequentially FROM 0) inserts **ZEBRA_ROUTE_LOCAL=3** between CONNECT and
+STATIC; that insertion (not a shift of the whole table) is what lifts
+static=4..bgp=10 above the pre-LOCAL values. Final table: system=0,
+kernel=1, connected=2, local=3, static=4, rip=5, ripng=6, ospf=7, ospf6=8,
+isis=9, bgp=10, pim=11, eigrp=12, nhrp=13, hsls=14, olsr=15, table=16,
+ldp=17, vnc=18, vnc-direct=19, vnc-rh=20, bgp-direct=21, bgp-direct-ext=22,
+babel=23, sharp=24, pbr=25, bfd=26, openfabric=27, vrrp=28, nhg=29, srte=30,
+**table-direct=31** (closing the W2-era "number still unpinned" note).
 
 ## Observed client→zebra bodies (EMPIRICAL, from fixtures)
 

@@ -1330,7 +1330,10 @@ mod tests {
             ZapiMessage::RouteAdd(route) => route,
             _ => unreachable!(),
         };
-        route.route_type = 0; // no ZEBRA_ROUTE_* mapping
+        // PIM (11): a real frr-10.2.2 table value we do not model. 0 no
+        // longer works as the probe — it is SYSTEM, which maps to Kernel
+        // since the A19 numbering correction.
+        route.route_type = 11;
         client.send(&ZapiMessage::RouteAdd(route), 0).await;
         assert_no_command_after(&mut client, &mut rx).await;
     }

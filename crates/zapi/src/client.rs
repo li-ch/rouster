@@ -247,14 +247,14 @@ fn route_message(entry: &RouteEntry, empty_nexthops: bool) -> ZapiRoute {
 /// to their v4 representative (the wire carries no more precision).
 pub fn route_type_from(protocol: RouteProtocol) -> u8 {
     match protocol {
-        RouteProtocol::Kernel => route_type::SYSTEM,
+        RouteProtocol::Kernel => route_type::KERNEL,
         RouteProtocol::Connected => route_type::CONNECT,
         RouteProtocol::Static => route_type::STATIC,
         RouteProtocol::Rip => route_type::RIP,
         RouteProtocol::Ospf => route_type::OSPF,
         RouteProtocol::IsIs => route_type::ISIS,
         RouteProtocol::Bgp => route_type::BGP,
-        RouteProtocol::Local => route_type::SYSTEM,
+        RouteProtocol::Local => route_type::LOCAL,
     }
 }
 

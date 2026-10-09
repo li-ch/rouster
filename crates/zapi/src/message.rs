@@ -56,13 +56,25 @@ pub mod iff {
     pub const MULTICAST: u64 = 0x1000;
 }
 
-/// ZEBRA_ROUTE_* type numbers (frr-10.2.2 numbering; +1 vs the classic
-/// table because `ZEBRA_ROUTE_SYSTEM` starts at 1).
+/// ZEBRA_ROUTE_* type numbers — sequential from 0 over frr-10.2.2's
+/// `lib/route_types.txt` as expanded by `lib/route_types.pl` (its loop
+/// assigns `#define <name> <index>` starting at 0). `ZEBRA_ROUTE_LOCAL`
+/// (3) sits between CONNECT and STATIC — the insertion that lifts
+/// STATIC..BGP one above the pre-LOCAL table; SYSTEM/KERNEL/CONNECT keep
+/// the classic values. E: STATIC=4 (staticd ROUTE_ADD/HELLO/
+/// REDISTRIBUTE_ADD fixtures), OSPF=7 (live ospfd HELLO, z5c), BGP=10
+/// (bgpd HELLO / LABEL_MANAGER_CONNECT fixtures), CONNECT=2 (live ospfd
+/// `redistribute connected` REDISTRIBUTE_ADD capture, body `01 02 0000`).
 pub mod route_type {
-    /// Locally installed system routes (kernel-origin).
-    pub const SYSTEM: u8 = 1;
-    pub const KERNEL: u8 = 2;
-    pub const CONNECT: u8 = 3;
+    /// Reserved, zebra-internal (route_types.txt: "Reserved").
+    pub const SYSTEM: u8 = 0;
+    /// Kernel routes not installed via the zebra RIB.
+    pub const KERNEL: u8 = 1;
+    /// Connected routes (directly attached subnet or host).
+    pub const CONNECT: u8 = 2;
+    /// Local routes (directly attached host route) — the 10.2 table's
+    /// insertion between CONNECT and STATIC.
+    pub const LOCAL: u8 = 3;
     /// E: staticd ROUTE_ADD/HELLO/REDISTRIBUTE_ADD in the fixtures.
     pub const STATIC: u8 = 4;
     pub const RIP: u8 = 5;
@@ -1334,6 +1346,7 @@ impl ZapiRoute {
         match route_type {
             route_type::SYSTEM | route_type::KERNEL => Some(RouteProtocol::Kernel),
             route_type::CONNECT => Some(RouteProtocol::Connected),
+            route_type::LOCAL => Some(RouteProtocol::Local),
             route_type::STATIC => Some(RouteProtocol::Static),
             route_type::RIP | route_type::RIPNG => Some(RouteProtocol::Rip),
             route_type::OSPF | route_type::OSPF6 => Some(RouteProtocol::Ospf),
@@ -2430,6 +2443,18 @@ mod tests {
             })
         );
         assert_eq!(roundtrip(&msg), wire);
+        // Live capture (z5d): a REAL ospfd `redistribute connected`
+        // registration — CONNECT is 2 on the frr-10.2.2 wire, not 3 (the
+        // pre-LOCAL numbering error the capture closed).
+        let ospfd = hex("01020000");
+        assert_eq!(
+            ZapiMessage::decode(12, &ospfd).unwrap(),
+            ZapiMessage::RedistributeAdd(ZapiRedistribute {
+                afi: 1,
+                route_type: route_type::CONNECT,
+                instance: 0
+            })
+        );
         // SPEC side: the delete twin uses the same shape.
         let del = ZapiMessage::RedistributeDelete(ZapiRedistribute {
             afi: 1,
@@ -2470,7 +2495,7 @@ mod tests {
         assert_eq!(
             wire,
             hex(concat!(
-                "03 0000 00000000 00000017 01 02 18 c00002",
+                "02 0000 00000000 00000017 01 02 18 c00002",
                 " 0001 00000000 01 00 00000002",
                 " 00 00000000 00000000"
             ))
@@ -2564,7 +2589,7 @@ mod tests {
     #[test]
     fn redistribute_route_add_decode_never_panics_on_truncation() {
         let wire = hex(concat!(
-            "03 0000 00000000 00000017 01 02 18 c00002",
+            "02 0000 00000000 00000017 01 02 18 c00002",
             " 0001 00000000 01 00 00000002",
             " 00 00000000 00000000"
         ));
@@ -2771,6 +2796,10 @@ mod tests {
             Some(RouteProtocol::Connected)
         );
         assert_eq!(
+            ZapiRoute::route_protocol(route_type::LOCAL),
+            Some(RouteProtocol::Local)
+        );
+        assert_eq!(
             ZapiRoute::route_protocol(route_type::STATIC),
             Some(RouteProtocol::Static)
         );
@@ -2790,8 +2819,31 @@ mod tests {
             ZapiRoute::route_protocol(route_type::BGP),
             Some(RouteProtocol::Bgp)
         );
-        assert_eq!(ZapiRoute::route_protocol(0), None);
+        // 0 is SYSTEM (the frr-10.2.2 table starts there); the unmapped
+        // probe needs a number the table reaches but we do not model.
+        assert_eq!(ZapiRoute::route_protocol(11), None);
         assert_eq!(ZapiRoute::route_protocol(99), None);
+    }
+
+    #[test]
+    fn route_type_constants_pin_the_frr_10_2_2_numbering() {
+        // Source of truth: frr-10.2.2 lib/route_types.txt expanded by
+        // lib/route_types.pl (sequential from 0). ZEBRA_ROUTE_LOCAL=3 is
+        // the insertion between CONNECT and STATIC that lifts STATIC..BGP
+        // above the pre-LOCAL table; SYSTEM/KERNEL/CONNECT keep the
+        // classic values. Empirical anchors: STATIC=4, OSPF=7, BGP=10 in
+        // the fixtures + the live ospfd CONNECT=2 capture (z5d).
+        assert_eq!(route_type::SYSTEM, 0);
+        assert_eq!(route_type::KERNEL, 1);
+        assert_eq!(route_type::CONNECT, 2);
+        assert_eq!(route_type::LOCAL, 3);
+        assert_eq!(route_type::STATIC, 4);
+        assert_eq!(route_type::RIP, 5);
+        assert_eq!(route_type::RIPNG, 6);
+        assert_eq!(route_type::OSPF, 7);
+        assert_eq!(route_type::OSPF6, 8);
+        assert_eq!(route_type::ISIS, 9);
+        assert_eq!(route_type::BGP, 10);
     }
 
     #[test]
