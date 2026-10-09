@@ -9,6 +9,13 @@
 //! programming; enforcing the ops is W7's job through the dataplane
 //! trait.
 //!
+//! Both of GSC §3's sanctioned resolutions for mode collisions are
+//! available: [`compile`] ignores the colliding block-mode rules (the
+//! default), and [`compile_with`] with
+//! [`CollisionPolicy::Subtract`] merges them into the allow-mode
+//! allowlists by subtraction — the variant GSC §5 prefers when
+//! data-plane memory allows.
+//!
 //! [`evaluate`] is the *reference semantics* of the compiled ops — the
 //! GSC §3 four-step pipeline as a pure function. It is what the tests
 //! assert against and what W8's monitor path can log from; W7's real
@@ -17,10 +24,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use common::IpPrefix;
-use tracing::warn;
+use common::{IpPrefix, Ipv4Prefix, Ipv6Prefix};
+use tracing::{debug, warn};
 
 use crate::gen::{RuleSet, SavRule};
 use crate::mode::{SavAction, SavConfig, ValidationMode};
@@ -151,16 +158,45 @@ impl fmt::Display for Verdict {
     }
 }
 
+/// How GSC §3's mode collisions are resolved while compiling.
+///
+/// GSC §3 sanctions two resolutions for the two exclusivity rules —
+/// an IBB rule naming an IBA-configured interface, and a PBB rule for
+/// a prefix PBA also protects: drop the block-mode rules, or "be
+/// merged into IBA-SAV by removing the prefix listed in IBB-SAV from
+/// the allowlist of IBA-SAV" (and the interface listed in PBB-SAV
+/// from PBA-SAV's allowlist). GSC §5's own preference is the merge
+/// ("Option 1 is preferred if memory space in data plane is allowed")
+/// — the split allowlist entries it can produce cost data-plane table
+/// space, which is why [`Ignore`](CollisionPolicy::Ignore) stays the
+/// default here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CollisionPolicy {
+    /// The "should be ignored" option (default): colliding IBB/PBB
+    /// rules are dropped with a warning — one op per surviving rule
+    /// group, the smaller data-plane footprint.
+    #[default]
+    Ignore,
+    /// The merge-by-subtraction option: IBB prefixes are carved out of
+    /// the colliding interface's IBA allowlist (CIDR set semantics —
+    /// a carve crossing a prefix boundary splits the entry into its
+    /// covering halves) and PBB ifindexes are removed from the shared
+    /// prefix's PBA allowlist, so each collision site compiles to
+    /// exactly one allow-mode op.
+    Subtract,
+}
+
 /// Compile a rule set + enforcement config into the deterministic
-/// [`SavOp`] list — the SAV Table Manager's whole local job.
+/// [`SavOp`] list — the SAV Table Manager's whole local job — under
+/// the default [`CollisionPolicy::Ignore`]; [`compile_with`] selects
+/// the other GSC §3 collision resolution.
 ///
 /// GSC §3's coexistence rules, enforced here:
 /// - IBA and IBB cannot both act on one interface. The config already
 ///   makes that unrepresentable per interface; IBB *rules* naming an
 ///   IBA-configured interface are dropped with a warning (GSC §3's
-///   "IBB-SAV should be ignored" option; the merge-by-subtraction
-///   variant is a deliberate later choice, see §Deferred in the stage
-///   report).
+///   "IBB-SAV should be ignored" option; [`compile_with`] implements
+///   the merge-by-subtraction alternative).
 /// - PBA and PBB cannot both act for one prefix: when both rule kinds
 ///   name the same prefix, the PBB rules are dropped with a warning
 ///   (GSC §3's "PBB-SAV should be ignored" option).
@@ -174,10 +210,32 @@ impl fmt::Display for Verdict {
 /// rules listing the query-only [`crate::InterfaceRef::Any`] marker
 /// contribute nothing (it is never an enforcement constraint). No I/O.
 pub fn compile(rules: &RuleSet, cfg: &SavConfig) -> Vec<SavOp> {
+    compile_with(rules, cfg, CollisionPolicy::Ignore)
+}
+
+/// [`compile`] with an explicit [`CollisionPolicy`] for the GSC §3
+/// collisions. Everything else — seeding, inertness of unconfigured
+/// interfaces, ordering, determinism — is identical between the two
+/// policies; only the fate of colliding block-mode rules changes.
+///
+/// [`CollisionPolicy::Subtract`] merges each collision into its allow
+/// op: on an IBA-configured interface the IBB prefixes become holes in
+/// the allowlist (a fully carved-out entry disappears — possibly
+/// leaving the deny-all empty allowlist), and for a PBA-protected
+/// prefix the PBB ifindexes simply leave the interface allowlist (no
+/// CIDR analog at ifindex scale). Non-colliding rules are untouched by
+/// the policy: IBB rules on IBB-configured interfaces still compile to
+/// their own [`SavOp::IbbBlock`], PBB rules for unprotected prefixes
+/// to their own [`SavOp::PbbBlock`].
+pub fn compile_with(rules: &RuleSet, cfg: &SavConfig, collisions: CollisionPolicy) -> Vec<SavOp> {
     // Interface-scale: collect each IBA/IBB-configured interface's
     // prefix set from the rules naming it.
     let mut iba: BTreeMap<u32, Vec<IpPrefix>> = BTreeMap::new();
     let mut ibb: BTreeMap<u32, Vec<IpPrefix>> = BTreeMap::new();
+    // The GSC §3 subtraction axis: IBB prefixes colliding with an
+    // IBA-configured interface (the config makes both modes on one
+    // interface unrepresentable; rule data can still name it).
+    let mut ibb_on_iba: BTreeMap<u32, Vec<IpPrefix>> = BTreeMap::new();
     for rule in rules.rules() {
         match *rule {
             SavRule::Iba {
@@ -193,13 +251,24 @@ pub fn compile(rules: &RuleSet, cfg: &SavConfig) -> Vec<SavOp> {
                 ref interfaces,
             } => {
                 for ifindex in ifindexes_of(interfaces) {
-                    // GSC §3: where IBA is configured, IBB is ignored.
+                    // GSC §3: where IBA is configured, IBB is ignored
+                    // or merged by subtraction.
                     if cfg.mode_on(ifindex) == Some(ValidationMode::Iba) {
-                        warn!(
-                            ifindex,
-                            %prefix,
-                            "ibb rule ignored on iba-enabled interface (GSC §3 exclusivity)"
-                        );
+                        match collisions {
+                            CollisionPolicy::Ignore => warn!(
+                                ifindex,
+                                %prefix,
+                                "ibb rule ignored on iba-enabled interface (GSC §3 exclusivity)"
+                            ),
+                            CollisionPolicy::Subtract => {
+                                debug!(
+                                    ifindex,
+                                    %prefix,
+                                    "ibb rule subtracted from iba allowlist (GSC §3 merge)"
+                                );
+                                ibb_on_iba.entry(ifindex).or_default().push(prefix);
+                            }
+                        }
                         continue;
                     }
                     ibb.entry(ifindex).or_default().push(prefix);
@@ -226,9 +295,18 @@ pub fn compile(rules: &RuleSet, cfg: &SavConfig) -> Vec<SavOp> {
         if cfg.mode_on(ifindex) != Some(ValidationMode::Iba) {
             continue;
         }
+        // GSC §3 merge-by-subtraction: the interface's colliding IBB
+        // prefixes become holes in this one allowlist op.
+        let prefixes = match collisions {
+            CollisionPolicy::Ignore => sorted_prefixes(prefixes.clone()),
+            CollisionPolicy::Subtract => subtract_prefixes(
+                prefixes,
+                ibb_on_iba.get(&ifindex).map_or(&[] as &[_], |v| v),
+            ),
+        };
         ops.push(SavOp::IbaPermit {
             ifindex,
-            prefixes: sorted_prefixes(prefixes.clone()),
+            prefixes,
             action: cfg.action_on(ifindex),
         });
     }
@@ -246,6 +324,9 @@ pub fn compile(rules: &RuleSet, cfg: &SavConfig) -> Vec<SavOp> {
     // Router-scale: group interface sets per (mode, prefix).
     let mut pba: BTreeMap<IpPrefix, Vec<u32>> = BTreeMap::new();
     let mut pbb: BTreeMap<IpPrefix, Vec<u32>> = BTreeMap::new();
+    // The GSC §3 subtraction axis: PBB interfaces for prefixes PBA
+    // also protects (the collision sites).
+    let mut pbb_on_pba: BTreeMap<IpPrefix, Vec<u32>> = BTreeMap::new();
     let pba_prefixes: BTreeSet<IpPrefix> = rules
         .rules()
         .iter()
@@ -266,12 +347,25 @@ pub fn compile(rules: &RuleSet, cfg: &SavConfig) -> Vec<SavOp> {
                 prefix,
                 ref interfaces,
             } => {
-                // GSC §3: where PBA protects the prefix, PBB is ignored.
+                // GSC §3: where PBA protects the prefix, PBB is
+                // ignored or merged by subtraction.
                 if pba_prefixes.contains(&prefix) {
-                    warn!(
-                        %prefix,
-                        "pbb rule ignored: prefix also protected by pba (GSC §3 exclusivity)"
-                    );
+                    match collisions {
+                        CollisionPolicy::Ignore => warn!(
+                            %prefix,
+                            "pbb rule ignored: prefix also protected by pba (GSC §3 exclusivity)"
+                        ),
+                        CollisionPolicy::Subtract => {
+                            debug!(
+                                %prefix,
+                                "pbb rule subtracted from pba allowlist (GSC §3 merge)"
+                            );
+                            pbb_on_pba
+                                .entry(prefix)
+                                .or_default()
+                                .extend(ifindexes_of(interfaces));
+                        }
+                    }
                     continue;
                 }
                 pbb.entry(prefix)
@@ -284,6 +378,12 @@ pub fn compile(rules: &RuleSet, cfg: &SavConfig) -> Vec<SavOp> {
     for (prefix, mut ifindexes) in pba {
         ifindexes.sort();
         ifindexes.dedup();
+        // GSC §3 merge-by-subtraction: the prefix's colliding PBB
+        // interfaces leave this one allowlist op (interfaces the
+        // allowlist never had are simply no-ops here).
+        if let Some(blocked) = pbb_on_pba.get(&prefix) {
+            ifindexes.retain(|ifindex| !blocked.contains(ifindex));
+        }
         ops.push(SavOp::PbaPermit {
             prefix,
             ifindexes,
@@ -312,6 +412,129 @@ fn sorted_prefixes(mut prefixes: Vec<IpPrefix>) -> Vec<IpPrefix> {
     prefixes.sort();
     prefixes.dedup();
     prefixes
+}
+
+/// The GSC §3 merged allowlist for one interface: `allow \ block` as
+/// a sorted, deduplicated CIDR list. An empty blocklist returns the
+/// allowlist verbatim (the byte-stable no-collision case); otherwise
+/// every blocklist prefix is carved out of every allowlist entry,
+/// splitting entries wherever a carve crosses a prefix boundary.
+fn subtract_prefixes(allow: &[IpPrefix], block: &[IpPrefix]) -> Vec<IpPrefix> {
+    if block.is_empty() {
+        return sorted_prefixes(allow.to_vec());
+    }
+    let mut merged = Vec::new();
+    for &entry in allow {
+        // Carve each blocklist prefix out of the pieces still
+        // standing from the previous carve.
+        let mut pieces = vec![entry];
+        for &carve in block {
+            let mut next = Vec::new();
+            for piece in pieces {
+                subtract_prefix(piece, carve, &mut next);
+            }
+            pieces = next;
+        }
+        merged.extend(pieces);
+    }
+    sorted_prefixes(merged)
+}
+
+/// Set-difference of one blocklist prefix from one allowlist entry
+/// (the GSC §3 merge-by-subtraction unit): appends the minimal CIDR
+/// list covering `allow \ block`. A family-crossed or disjoint
+/// `block` keeps `allow`; a `block` covering `allow` removes it; a
+/// `block` nested inside splits `allow` into its two halves at one
+/// longer length and subtracts from each in turn.
+fn subtract_prefix(allow: IpPrefix, block: IpPrefix, out: &mut Vec<IpPrefix>) {
+    match (allow, block) {
+        (IpPrefix::V4(a), IpPrefix::V4(b)) => subtract_bits(
+            u32::from(a.addr()),
+            a.prefix_len(),
+            u32::from(b.addr()),
+            b.prefix_len(),
+            32,
+            &mut |net, len| {
+                out.push(IpPrefix::V4(
+                    Ipv4Prefix::new(Ipv4Addr::from(net), len)
+                        .expect("split length stays within the family bound"),
+                ));
+            },
+        ),
+        (IpPrefix::V6(a), IpPrefix::V6(b)) => subtract_bits(
+            u128::from(a.addr()),
+            a.prefix_len(),
+            u128::from(b.addr()),
+            b.prefix_len(),
+            128,
+            &mut |net, len| {
+                out.push(IpPrefix::V6(
+                    Ipv6Prefix::new(Ipv6Addr::from(net), len)
+                        .expect("split length stays within the family bound"),
+                ));
+            },
+        ),
+        // Different address families never overlap.
+        _ => out.push(allow),
+    }
+}
+
+/// CIDR subtraction core over the two families' bit widths (`u32` for
+/// v4, `u128` for v6), on network-masked integers: `b` covering `a`
+/// (or equal to it) emits nothing, disjoint `b` emits `a` whole, and
+/// a `b` nested inside `a` splits `a` into its two halves at
+/// `a_len + 1` and recurses — the length strictly grows toward the
+/// family bound, so recursion always terminates.
+fn subtract_bits<B>(
+    a_net: B,
+    a_len: u8,
+    b_net: B,
+    b_len: u8,
+    max_len: u8,
+    emit: &mut dyn FnMut(B, u8),
+) where
+    B: Copy
+        + Eq
+        + std::ops::BitAnd<Output = B>
+        + std::ops::BitOr<Output = B>
+        + std::ops::Not<Output = B>
+        + std::ops::Shl<u32, Output = B>
+        + From<u8>,
+{
+    let ones = !(B::from(0));
+    let mask = |len: u8| -> B {
+        if len == 0 {
+            B::from(0)
+        } else {
+            ones << u32::from(max_len - len)
+        }
+    };
+    // Canonical networks (host bits off) make the comparisons below
+    // exact even for non-canonical rule data.
+    let a_net = a_net & mask(a_len);
+    let b_net = b_net & mask(b_len);
+    // b ⊇ a: a is entirely removed.
+    if b_len <= a_len && a_net & mask(b_len) == b_net {
+        return;
+    }
+    // b neither covers nor cuts into a: a survives whole.
+    if b_net & mask(a_len) != a_net {
+        emit(a_net, a_len);
+        return;
+    }
+    // b strictly inside a: carve a into its two halves and subtract
+    // from each (at most one half can still contain b).
+    let half_len = a_len + 1;
+    let branch_bit = B::from(1) << u32::from(max_len - half_len);
+    subtract_bits(a_net, half_len, b_net, b_len, max_len, &mut *emit);
+    subtract_bits(
+        a_net | branch_bit,
+        half_len,
+        b_net,
+        b_len,
+        max_len,
+        &mut *emit,
+    );
 }
 
 /// Reference semantics of a compiled op list: the GSC §3 four-step
@@ -446,6 +669,23 @@ mod tests {
         SavRule::Ibb {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+        }
+    }
+
+    fn iba(prefix: &str, ifindexes: &[u32]) -> SavRule {
+        SavRule::Iba {
+            prefix: prefix.parse().unwrap(),
+            interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
+        }
+    }
+
+    fn prefixes_of(ops: &[SavOp], ifindex: u32) -> Vec<IpPrefix> {
+        match ops
+            .iter()
+            .find(|op| matches!(op, SavOp::IbaPermit { ifindex: i, .. } if *i == ifindex))
+        {
+            Some(SavOp::IbaPermit { prefixes, .. }) => prefixes.clone(),
+            _ => panic!("no iba op for ifindex {ifindex}"),
         }
     }
 
@@ -720,6 +960,183 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], SavOp::PbaPermit { .. }));
         assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
+    }
+
+    /// GSC §3 merge-by-subtraction, interface axis: IBB prefixes
+    /// colliding with an IBA-configured interface are "merged into
+    /// IBA-SAV by removing the prefix listed in IBB-SAV from the
+    /// allowlist of IBA-SAV" — as a CIDR set difference (a carve
+    /// crossing a boundary splits the entry; a covering carve removes
+    /// it), while collision-free entries and interfaces stay verbatim.
+    /// The v6 carve exercises the 128-bit core.
+    #[test]
+    fn subtract_mode_carves_ibb_prefixes_out_of_iba_allowlists() {
+        let cfg = cfg_iba_2_3();
+        let rules = RuleSet::from_rules([
+            iba("10.0.0.0/16", &[2]),
+            iba("192.0.2.0/24", &[2]),
+            iba("198.51.100.0/24", &[2]), // no collision: verbatim
+            ibb("10.0.128.0/17", &[2]),   // carves the /16 in half
+            ibb("192.0.2.0/24", &[2]),    // covers an entry: removed
+            iba("2001:db8::/32", &[3]),
+            ibb("2001:db8:8000::/33", &[3]), // v6 carve
+            ibb("203.0.113.0/24", &[5]),     // unconfigured: inert
+        ]);
+        let ops = compile_with(&rules, &cfg, CollisionPolicy::Subtract);
+        // One unified IbaPermit per interface, no IbbBlock anywhere.
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().all(|op| !matches!(op, SavOp::IbbBlock { .. })));
+        assert_eq!(
+            prefixes_of(&ops, 2),
+            vec![
+                "10.0.0.0/17".parse().unwrap(),
+                "198.51.100.0/24".parse().unwrap()
+            ],
+            "the /16 halved, the covered /24 gone, the free /24 intact"
+        );
+        assert_eq!(
+            prefixes_of(&ops, 3),
+            vec!["2001:db8::/33".parse().unwrap()],
+            "v6 halves along the /33 boundary"
+        );
+        // Merged verdicts on ifindex 2.
+        assert_eq!(evaluate(&ops, ip("10.0.0.1"), 2), Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
+        assert_eq!(
+            evaluate(&ops, ip("10.0.200.1"), 2),
+            Verdict::Invalid,
+            "inside the carved-out /17 half"
+        );
+        assert_eq!(
+            evaluate(&ops, ip("192.0.2.7"), 2),
+            Verdict::Invalid,
+            "entry fully covered by the blocklist"
+        );
+        // And the v6 boundary on ifindex 3.
+        assert_eq!(evaluate(&ops, ip("2001:db8:7fff::1"), 3), Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("2001:db8:8000::1"), 3), Verdict::Invalid);
+        // Contrast: the default policy ignores the colliding IBB rules.
+        let ignored = compile(&rules, &cfg);
+        assert_eq!(prefixes_of(&ignored, 2).len(), 3);
+        assert_eq!(prefixes_of(&ignored, 3).len(), 1);
+    }
+
+    /// GSC §3 merge-by-subtraction, router axis: for a prefix both
+    /// kinds protect, the PBB interfaces are "removed ... from the
+    /// allowlist of PBA-SAV" — plain set removal (no CIDR analog at
+    /// ifindex scale) — and the prefix compiles to exactly one
+    /// PbaPermit. PBB rules for unprotected prefixes are untouched by
+    /// the policy.
+    #[test]
+    fn subtract_mode_removes_pbb_ifindexes_from_pba_allowlists() {
+        let cfg = SavConfig::new();
+        let rules = RuleSet::from_rules([
+            pba("198.51.100.0/24", &[2, 3, 4]),
+            pbb("198.51.100.0/24", &[3, 9]), // 9 was never allowed: no-op
+            pbb("203.0.113.0/24", &[7]),     // no PBA there: own op
+        ]);
+        let ops = compile_with(&rules, &cfg, CollisionPolicy::Subtract);
+        assert_eq!(
+            ops,
+            vec![
+                SavOp::PbaPermit {
+                    prefix: "198.51.100.0/24".parse().unwrap(),
+                    ifindexes: vec![2, 4],
+                    action: SavAction::Monitor,
+                },
+                SavOp::PbbBlock {
+                    prefix: "203.0.113.0/24".parse().unwrap(),
+                    ifindexes: vec![7],
+                    action: SavAction::Monitor,
+                },
+            ]
+        );
+        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 3),
+            Verdict::Invalid,
+            "ifindex 3 subtracted from the allowlist"
+        );
+        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 4), Verdict::Valid);
+        // Contrast: the default policy keeps the whole allowlist —
+        // ingress 3 is valid there because the PBB rule was ignored.
+        let ignored = compile(&rules, &cfg);
+        assert_eq!(evaluate(&ignored, ip("198.51.100.9"), 3), Verdict::Valid);
+    }
+
+    /// Property (fixed probe grid): under [`CollisionPolicy::Subtract`]
+    /// every (source, ingress) verdict equals the GSC §3 sequential
+    /// semantics read straight off the rule lists — at interface scale
+    /// valid iff the source is on the IBA allowlist *and* not on the
+    /// IBB blocklist; at router scale valid iff the ingress is in the
+    /// prefix's PBA allowlist *and* not in its PBB blocklist. The
+    /// merged single-op form and the two sequential checks may never
+    /// disagree. Also pins compile determinism under the policy.
+    #[test]
+    fn subtract_mode_outcomes_match_sequential_semantics() {
+        // IBA on ifindex 2 only, so the router-scale probes on 3/4/9
+        // are not short-circuited by another interface allowlist.
+        let mut cfg = SavConfig::new();
+        cfg.enable_interface(2, ValidationMode::Iba, SavAction::Monitor);
+        let iba_allow = ["10.0.0.0/16", "192.0.2.0/25"];
+        let ibb_block = ["10.0.128.0/17", "192.0.2.64/26"];
+        let protected = "198.51.100.0/24";
+        let pba_allow = [2u32, 3, 4];
+        let pbb_block = [3u32];
+        let rules = RuleSet::from_rules([
+            iba(iba_allow[0], &[2]),
+            iba(iba_allow[1], &[2]),
+            ibb(ibb_block[0], &[2]),
+            ibb(ibb_block[1], &[2]),
+            pba(protected, &pba_allow),
+            pbb(protected, &pbb_block),
+        ]);
+        let ops = compile_with(&rules, &cfg, CollisionPolicy::Subtract);
+        let again = compile_with(&rules, &cfg, CollisionPolicy::Subtract);
+        assert_eq!(format!("{ops:?}"), format!("{again:?}"), "deterministic");
+
+        let contains = |list: &[&str], src: IpAddr| {
+            list.iter()
+                .any(|p| prefix_contains(p.parse().unwrap(), src))
+        };
+        let sources = [
+            "10.0.0.1",     // allowed
+            "10.0.127.254", // last address of the kept /17 half
+            "10.0.128.1",   // first address of the carved half
+            "10.0.200.9",   // deep inside the carve
+            "192.0.2.1",    // inside the kept /26
+            "192.0.2.65",   // inside the nested /26 carve
+            "192.0.2.200",  // outside the /25 allowlist entry
+            "198.51.100.9", // router-scale protected
+            "203.0.113.1",  // nothing's business
+        ];
+        for source in sources {
+            for &ingress in &[2u32, 3, 4, 9] {
+                let src = ip(source);
+                let expected = if ingress == 2 {
+                    // IBA decisive: allow ∧ ¬block, the merged allowlist.
+                    if contains(&iba_allow, src) && !contains(&ibb_block, src) {
+                        Verdict::Valid
+                    } else {
+                        Verdict::Invalid
+                    }
+                } else if contains(&[protected], src) {
+                    // Router scale: (PBA allow − PBB block) membership.
+                    if pba_allow.contains(&ingress) && !pbb_block.contains(&ingress) {
+                        Verdict::Valid
+                    } else {
+                        Verdict::Invalid
+                    }
+                } else {
+                    Verdict::Unknown
+                };
+                assert_eq!(
+                    evaluate(&ops, src, ingress),
+                    expected,
+                    "src {src} ingress {ingress}"
+                );
+            }
+        }
     }
 
     /// GSC §3 step 3: "When the IBB-SAV validation result is 'valid',
