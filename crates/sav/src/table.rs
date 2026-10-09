@@ -1412,6 +1412,7 @@ mod tests {
             prefix: "192.0.2.0/24".parse().unwrap(),
             interfaces: vec![if_ref(3)],
             origin: BindingOrigin::Config,
+            expires_at: None,
         })
         .unwrap();
         let rib = rib::Rib::new();

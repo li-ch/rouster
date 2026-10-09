@@ -66,6 +66,29 @@
 //! an install-behavior change; the dataplane always receives the full
 //! new program).
 //!
+//! # Binding TTL sweep (A22)
+//!
+//! Every evaluate runs one bounded TTL sweep over the freshly built SIB
+//! ([`Sib::sweep`], on an injected clock the daemon reads exactly once
+//! per evaluate): bindings whose optional expiry has passed are removed
+//! *before* rule generation, so the generated program never asserts an
+//! expired binding, and a swept prefix leaves its allowlist through the
+//! normal diff — riding the same RFC 8704 §3.6.2 hysteresis window as
+//! any withdrawal (a re-learn inside the window is absorbed silently).
+//!
+//! Honest disclosure: **no landed origin sets a finite TTL**. Rib
+//! bindings are wholesale re-derived on every evaluate (effectively
+//! fresh — a deadline would misexpire bindings whose route is still
+//! present), and Config bindings are operator-pinned (the SIB
+//! structurally rejects an expiry on them), so today's sweep always
+//! reports empty. The mechanism — the `expires_at` field, the sweep,
+//! this wiring, the injectable clock — lands ready for the SAVNET
+//! agent's future dynamic feed, which will stamp and refresh deadlines.
+//! The sweep clock is `std::time::Instant` (monotonic, injectable so
+//! tests pause it by owning the closure) and is deliberately separate
+//! from the hysteresis clock (tokio's pausable runtime `Instant`, which
+//! the deferred-delete tests drive through `start_paused`).
+//!
 //! # Config (`/etc/savd.conf`-shaped)
 //!
 //! Simple line grammar consistent with rousterd's (blank/`!`/`#`
@@ -821,6 +844,18 @@ pub struct SavDaemon<IO> {
     /// poll tick. Neighbour observations never set it (counter-only).
     dirty: bool,
     config: SavdConfig,
+    /// The clock the per-evaluate SIB TTL sweep reads (A22): monotonic
+    /// wall time by default, injectable ([`SavDaemon::set_clock`]) so
+    /// tests pause and advance it by owning the closure — the sweep is
+    /// this clock's only reader. Deliberately a different clock than
+    /// the hysteresis deadlines, which ride tokio's pausable runtime
+    /// `Instant` for the `start_paused` deferred-delete tests.
+    clock: Box<dyn Fn() -> std::time::Instant + Send>,
+    /// The `(prefix, origin)` keys the last evaluate's TTL sweep
+    /// removed (A22) — test-visible like `last_counts`, and empty
+    /// until an origin stamps expiries (none does tonight; see the
+    /// module docs' honest disclosure).
+    last_swept: Vec<(IpPrefix, BindingOrigin)>,
     /// The source and numbers of the last evaluate's monitor-counts
     /// log line (dataplane-first, simulation fallback) — test-visible
     /// so the switch is asserted, not just eyeballed in logs. The
@@ -843,6 +878,8 @@ where
             pending_deletions: Vec::new(),
             dirty: false,
             config: SavdConfig::default(),
+            clock: Box::new(std::time::Instant::now),
+            last_swept: Vec::new(),
             last_counts: (CountsSource::Simulation, SavMonitorCounts::default()),
         }
     }
@@ -877,6 +914,23 @@ where
     /// spoof counter, not whatever the backend last said).
     pub fn last_counts(&self) -> (CountsSource, SavMonitorCounts) {
         self.last_counts
+    }
+
+    /// Replace the clock the per-evaluate SIB TTL sweep reads (A22).
+    /// The default is the monotonic wall clock; tests inject a
+    /// controlled — effectively paused — one by owning the closure.
+    /// The sweep is this clock's only reader, so one evaluate reads it
+    /// exactly once.
+    pub fn set_clock(&mut self, clock: impl Fn() -> std::time::Instant + Send + 'static) {
+        self.clock = Box::new(clock);
+    }
+
+    /// The `(prefix, origin)` keys the last evaluate's TTL sweep
+    /// removed (A22) — empty until an origin stamps expiries. No
+    /// landed origin does tonight (see the module docs' honest
+    /// disclosure); the SAVNET agent's dynamic feed will be the first.
+    pub fn last_swept(&self) -> &[(IpPrefix, BindingOrigin)] {
+        &self.last_swept
     }
 
     /// Operator status snapshot (A21): the daemon's state as plain
@@ -1116,6 +1170,9 @@ where
                 prefix: line.prefix,
                 interfaces,
                 origin: BindingOrigin::Config,
+                // Operator-pinned: no expiry (the SIB would reject one —
+                // `SavError::PinnedExpiry`).
+                expires_at: None,
             });
         }
         // Every binding above names at least one concrete interface, so
@@ -1127,13 +1184,27 @@ where
 
     /// Build the current view from the mirror: SIB from the RIB mirror
     /// plus the configured `binding` lines (Config origin, shadowing
-    /// Rib per prefix), one generator partition per configured mode,
-    /// compiled and tagged with the producing mode (so each op's uRPF
-    /// hint matches it, and the hysteresis pass can group ops by
-    /// identity).
-    fn build_ops(&self) -> Vec<(UrpfMode, SavOp)> {
+    /// Rib per prefix), one bounded TTL sweep (A22), one generator
+    /// partition per configured mode, compiled and tagged with the
+    /// producing mode (so each op's uRPF hint matches it, and the
+    /// hysteresis pass can group ops by identity).
+    fn build_ops(&mut self) -> Vec<(UrpfMode, SavOp)> {
         let mut sib = Sib::from_rib(&self.rib);
         self.apply_config_bindings(&mut sib);
+        // One bounded TTL sweep per evaluate (A22), on the injected
+        // clock: expired bindings leave the SIB BEFORE rule generation,
+        // so the program never asserts one. A swept prefix then drops
+        // out of its allowlist through the normal diff — riding the
+        // same RFC 8704 §3.6.2 deletion hysteresis as any withdrawal.
+        let swept = sib.sweep((self.clock)());
+        for (prefix, origin) in &swept {
+            info!(
+                prefix = %prefix,
+                origin = %origin,
+                "savd: expired SIB binding swept (TTL; uninstall rides the deletion hysteresis)"
+            );
+        }
+        self.last_swept = swept;
         let mut partitions: Vec<(UrpfMode, SavConfig)> = Vec::new();
         for (ifindex, mode) in self.resolved_interfaces() {
             if let Some((_, cfg)) = partitions.iter_mut().find(|(m, _)| *m == mode) {
@@ -1426,7 +1497,8 @@ fn dp_err(err: DataplaneError) -> std::io::Error {
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use common::{
         NeighbourEntry, Nexthop, NexthopGroup, RouteEntry, RouteProtocol, SavEnforce, SavUrpf,
@@ -2352,6 +2424,69 @@ mod tests {
         assert!(
             daemon.deletion_deadline().is_none(),
             "no deferral left from the swapped-out config"
+        );
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// TTL SWEEP WIRING (A22): every evaluate runs exactly one bounded
+    /// SIB sweep on the injected clock (the injected closure IS the
+    /// paused clock — the test owns time), and the swept keys surface
+    /// on `last_swept`. Honest no-op today, asserted not assumed: no
+    /// landed origin stamps an expiry (rib bindings re-derive wholesale
+    /// per evaluate; config bindings are pinned), so nothing is ever
+    /// swept and the program stays byte-stable — the churn guard holds
+    /// through the sweep path.
+    #[tokio::test]
+    async fn evaluate_sweeps_the_sib_once_per_evaluate_on_the_injected_clock() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let t0 = std::time::Instant::now();
+        {
+            let reads = reads.clone();
+            daemon.set_clock(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                t0
+            });
+        }
+        daemon.initial_sync().await.unwrap();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the sweep clock is read by evaluate alone, not by the sync"
+        );
+
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "one bounded sweep per evaluate"
+        );
+        assert!(
+            daemon.last_swept().is_empty(),
+            "no landed origin sets a finite TTL tonight — the sweep is an honest no-op"
+        );
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["198.51.100.0/24"]),
+                monitor_allow(3, &[])
+            ],
+            "the program is exactly the pre-sweep shape"
+        );
+
+        // Re-evaluation reads the clock once more and still sweeps
+        // nothing: byte-stable, no install.
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(daemon.last_swept().is_empty());
+        assert_eq!(
+            dp.installed.lock().unwrap().len(),
+            1,
+            "the no-op sweep churns nothing"
         );
         drop(daemon);
         let _ = server.await;

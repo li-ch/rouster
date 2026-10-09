@@ -19,6 +19,17 @@
 //! draft-dependent signaling (nothing tonight is draft-dependent, so no
 //! `experimental-savnet` feature flag is needed).
 //!
+//! Bindings may carry an optional expiry ([`Binding::expires_at`], aged
+//! out by [`Sib::sweep`]) so stale *dynamically-learned* state cannot
+//! live forever — the ageing hook the SAVNET agent (a future dynamic
+//! origin) will refresh on confirmation. Honest disclosure: **no landed
+//! origin sets a finite TTL yet**. Rib-derived bindings are wholesale
+//! re-derived on every re-ingest (effectively fresh, so no deadline is
+//! stamped), and Config bindings are operator-pinned: the SIB rejects
+//! an expiry on them at insertion ([`SavError::PinnedExpiry`]) — pinned
+//! means pinned. The mechanism is landed and wired ([`savd`]'s evaluate
+//! sweeps once per cycle), waiting for an origin that learns.
+//!
 //! Slice 2 completed the rule layer between the SIB and enforcement:
 //! [`mode`] (the IBA/IBB/PBA/PBB validation-mode taxonomy and
 //! per-interface enablement), [`gen`] (strict/loose/FP/EFP-uRPF
@@ -45,6 +56,7 @@ pub mod table;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::time::Instant;
 
 use common::{IpPrefix, Nexthop, NexthopGroup, TableId};
 use rib::Rib;
@@ -58,14 +70,17 @@ use tracing::{debug, info};
 pub(crate) const MAIN_TABLE: TableId = 254;
 
 /// Errors from storing bindings. The SIB's stored invariants: a binding
-/// always names at least one *concrete* egress interface, and the
-/// query-only [`InterfaceRef::Any`] marker is never stored.
+/// always names at least one *concrete* egress interface, the
+/// query-only [`InterfaceRef::Any`] marker is never stored, and an
+/// operator-pinned (Config-origin) binding never carries an expiry.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SavError {
     #[error("binding for {prefix} names no interfaces")]
     EmptyBinding { prefix: IpPrefix },
     #[error("binding for {prefix} carries the query-only any-interface marker")]
     MarkerInBinding { prefix: IpPrefix },
+    #[error("binding for {prefix} is operator-pinned (config origin) and cannot carry an expiry")]
+    PinnedExpiry { prefix: IpPrefix },
 }
 
 /// Where a SIB binding came from. Precedence is documented on
@@ -75,10 +90,17 @@ pub enum SavError {
 pub enum BindingOrigin {
     /// Derived from the RIB: best main-table routes whose egress
     /// interfaces resolve. Recomputed wholesale by [`Sib::ingest_rib`].
+    /// This is the dynamically-learned slot: these bindings (and only
+    /// these) may carry an [`Binding::expires_at`] to age out stale
+    /// learning — today's derivation stamps none (the wholesale
+    /// re-ingest already refreshes them), leaving the TTL for the
+    /// SAVNET agent's future dynamic feed.
     Rib,
     /// Statically configured (`sav.conf`-shaped
     /// `binding <prefix> interface <name>...` lines, fed wholesale by
     /// savd — see [`crate::savd::SavdConfig::bindings`]).
+    /// Operator-pinned: a Config binding can never expire (insertion
+    /// rejects an expiry with [`SavError::PinnedExpiry`]).
     Config,
 }
 
@@ -160,6 +182,19 @@ pub struct Binding {
     /// Where this binding came from (precedence rules on
     /// [`Sib::interfaces_for`]).
     pub origin: BindingOrigin,
+    /// Optional expiry for dynamically-learned bindings (the TTL hook
+    /// SAVNET wants): [`Sib::sweep`] removes the binding once `now`
+    /// reaches this deadline. `None` (the only value any landed origin
+    /// stamps tonight) means the binding never ages out. Rejected on
+    /// Config-origin bindings — operator-pinned bindings cannot expire
+    /// ([`SavError::PinnedExpiry`]).
+    ///
+    /// Monotonic clock (`std::time::Instant`), not wall time: expiry is
+    /// an in-process ageing decision that must be immune to wall-clock
+    /// steps. Queries do NOT check expiry — ageing happens only at
+    /// [`Sib::sweep`], so a stale binding answers queries at most until
+    /// the caller's next sweep (one code path, bounded staleness).
+    pub expires_at: Option<Instant>,
 }
 
 impl fmt::Display for Binding {
@@ -244,6 +279,12 @@ impl Sib {
                     prefix: *prefix,
                     interfaces,
                     origin: BindingOrigin::Rib,
+                    // No TTL on rib-derived bindings: the wholesale
+                    // re-ingest that rebuilds this slot on every
+                    // evaluate already refreshes it, so a deadline here
+                    // would only misexpire bindings whose route is still
+                    // present. The field waits for a dynamic origin.
+                    expires_at: None,
                 });
             }
         }
@@ -291,6 +332,41 @@ impl Sib {
     /// if any, is untouched.
     pub fn remove(&mut self, prefix: &IpPrefix, origin: BindingOrigin) -> bool {
         self.bindings.remove(&(*prefix, origin)).is_some()
+    }
+
+    /// Age out expired bindings (the TTL pass): every binding whose
+    /// [`Binding::expires_at`] deadline has passed (`deadline <= now`)
+    /// is removed; the swept `(prefix, origin)` keys are returned in
+    /// deterministic map order (sorted by prefix, then origin).
+    /// Bindings with no expiry never age out, and Config-origin
+    /// bindings can never carry one (insertion rejects it — pinned
+    /// bindings must not expire), so a sweep only ever retires stale
+    /// *dynamic* learning.
+    ///
+    /// Removal follows [`Sib::remove`] semantics — covering fallback
+    /// per the query model: a swept prefix's queries fall through to
+    /// the covering binding, the other origin's same-prefix slot, the
+    /// default-route [`InterfaceRef::Any`] marker, or nothing (unknown
+    /// ≠ invalid — an expired binding leaves *no conclusion* behind,
+    /// never a stale verdict). Re-learning a swept key through
+    /// [`Sib::update`] / [`Sib::replace_origin`] simply re-stores it
+    /// with a fresh deadline. The sweep is idempotent: keys it returns
+    /// once are gone, so an immediate repeat reports nothing.
+    ///
+    /// This is the SIB-level half of the design only; *when* to sweep
+    /// is the owner's call ([`savd`] runs one bounded sweep per
+    /// evaluate cycle, on an injected clock).
+    pub fn sweep(&mut self, now: Instant) -> Vec<(IpPrefix, BindingOrigin)> {
+        let expired: Vec<(IpPrefix, BindingOrigin)> = self
+            .bindings
+            .iter()
+            .filter(|(_, b)| matches!(b.expires_at, Some(deadline) if deadline <= now))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &expired {
+            self.bindings.remove(key);
+        }
+        expired
     }
 
     /// Point lookup: the stored binding for one `(prefix, origin)` key.
@@ -393,7 +469,8 @@ impl Sib {
 }
 
 /// Reject bindings that would break the stored invariants: no interfaces,
-/// or the query-only marker present.
+/// the query-only marker present, or an expiry on an operator-pinned
+/// (Config-origin) binding — pinned bindings must not age out.
 fn validate(binding: &Binding) -> Result<(), SavError> {
     if binding.interfaces.is_empty() {
         return Err(SavError::EmptyBinding {
@@ -402,6 +479,11 @@ fn validate(binding: &Binding) -> Result<(), SavError> {
     }
     if binding.interfaces.iter().any(InterfaceRef::is_any) {
         return Err(SavError::MarkerInBinding {
+            prefix: binding.prefix,
+        });
+    }
+    if binding.origin == BindingOrigin::Config && binding.expires_at.is_some() {
+        return Err(SavError::PinnedExpiry {
             prefix: binding.prefix,
         });
     }
@@ -480,6 +562,7 @@ pub(crate) fn prefix_len(prefix: IpPrefix) -> u8 {
 mod tests {
     use super::*;
     use common::{Nexthop, NexthopGroup, RouteEntry, RouteProtocol};
+    use std::time::Duration;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -497,6 +580,7 @@ mod tests {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix, None)).collect(),
             origin,
+            expires_at: None,
         }
     }
 
@@ -688,6 +772,7 @@ mod tests {
             prefix: "10.0.0.0/8".parse().unwrap(),
             interfaces: vec![],
             origin: BindingOrigin::Rib,
+            expires_at: None,
         };
         assert_eq!(
             sib.update(empty.clone()),
@@ -699,6 +784,7 @@ mod tests {
             prefix: "10.0.0.0/8".parse().unwrap(),
             interfaces: vec![InterfaceRef::Any],
             origin: BindingOrigin::Rib,
+            expires_at: None,
         };
         assert_eq!(
             sib.update(marker.clone()),
@@ -738,6 +824,108 @@ mod tests {
             vec![if_ref(2, None)],
             "falls back to the covering /16"
         );
+    }
+
+    /// TTL sweep (W5 §Deferred 3): a binding whose deadline has passed
+    /// is swept and its queries fall back per the model — the covering
+    /// binding, or the other origin's same-prefix slot — while
+    /// unexpired and un-TTL'd bindings stay. The boundary is inclusive
+    /// (`deadline == now` is expired), the sweep is idempotent, and a
+    /// re-learned key returns with its fresh deadline.
+    #[test]
+    fn sweep_removes_expired_bindings_and_queries_fall_back() {
+        let now = Instant::now();
+        let mut sib = Sib::new();
+        sib.update(rib_binding("10.0.0.0/16", &[2])).unwrap();
+        // Expired exactly at the boundary (deadline == now).
+        let mut expired = rib_binding("10.0.5.0/24", &[3]);
+        expired.expires_at = Some(now);
+        sib.update(expired).unwrap();
+        // Not yet expired: strictly future deadline survives the sweep.
+        let mut fresh = rib_binding("10.9.0.0/24", &[4]);
+        fresh.expires_at = Some(now + Duration::from_secs(30));
+        sib.update(fresh).unwrap();
+        // The same-prefix other-origin fallback: the rib slot expires,
+        // the pinned config slot underneath answers.
+        let mut expired2 = rib_binding("203.0.113.0/24", &[7]);
+        expired2.expires_at = Some(now);
+        sib.update(expired2).unwrap();
+        sib.update(config_binding("203.0.113.0/24", &[5])).unwrap();
+
+        let swept = sib.sweep(now);
+        assert_eq!(
+            swept,
+            vec![
+                ("10.0.5.0/24".parse().unwrap(), BindingOrigin::Rib),
+                ("203.0.113.0/24".parse().unwrap(), BindingOrigin::Rib),
+            ],
+            "exactly the expired keys, deterministic (prefix, origin) order"
+        );
+        assert_eq!(
+            sib.interfaces_for(ip("10.0.5.9")),
+            vec![if_ref(2, None)],
+            "the swept /24 falls back to the covering /16"
+        );
+        assert_eq!(
+            sib.interfaces_for(ip("203.0.113.9")),
+            vec![if_ref(5, None)],
+            "the swept rib slot falls back to the pinned config slot"
+        );
+        assert_eq!(
+            sib.interfaces_for(ip("10.9.0.1")),
+            vec![if_ref(4, None)],
+            "the unexpired TTL binding survives"
+        );
+        assert_eq!(sib.bindings().count(), 3);
+
+        // Idempotent: the swept keys are gone, a repeat reports nothing.
+        assert!(sib.sweep(now).is_empty());
+        assert_eq!(sib.bindings().count(), 3);
+
+        // Re-learning a swept key re-stores it with a fresh deadline.
+        let mut relearned = rib_binding("10.0.5.0/24", &[3]);
+        relearned.expires_at = Some(now + Duration::from_secs(60));
+        sib.update(relearned).unwrap();
+        assert!(sib.sweep(now).is_empty(), "the fresh deadline holds");
+        assert_eq!(
+            sib.interfaces_for(ip("10.0.5.9")),
+            vec![if_ref(3, None)],
+            "the re-learned binding answers again"
+        );
+    }
+
+    /// Pinned bindings never expire: an expiry on a Config-origin
+    /// binding is rejected at insertion — single-key and batch — so
+    /// the sweep can never retire operator state. The same deadline on
+    /// a Rib binding is fine (dynamic origins age out).
+    #[test]
+    fn pinned_config_bindings_cannot_carry_an_expiry() {
+        let mut sib = Sib::new();
+        let mut pinned = config_binding("192.0.2.0/24", &[5]);
+        pinned.expires_at = Some(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(
+            sib.update(pinned.clone()),
+            Err(SavError::PinnedExpiry {
+                prefix: pinned.prefix
+            }),
+            "pinned means pinned — the future deadline does not help"
+        );
+        // The batch form rejects it too, before committing anything.
+        let mut rib_ttl = rib_binding("10.0.0.0/8", &[2]);
+        rib_ttl.expires_at = Some(Instant::now());
+        assert!(
+            sib.replace_origin(BindingOrigin::Config, vec![pinned, rib_ttl.clone()])
+                .is_err(),
+            "a pinned expiry rejects the whole batch"
+        );
+        assert_eq!(
+            sib.bindings().count(),
+            0,
+            "the rejected batch left the slot untouched"
+        );
+        // The same TTL on a rib binding is accepted (dynamic slot).
+        sib.update(rib_ttl).unwrap();
+        assert_eq!(sib.bindings().count(), 1);
     }
 
     #[test]

@@ -30,6 +30,14 @@
 //!    prefix falls back to what the remaining bindings cover per the
 //!    model: the covering binding, the other origin's same-prefix slot,
 //!    the default-route `Any` marker, or empty when nothing is left.
+//! 8. **sweep + covering fallback** (A22) — the TTL pass retires
+//!    exactly the keys whose deadline has passed (deadline ≤ the sweep
+//!    instant; config keys never carry one — pinned bindings cannot
+//!    expire), reports them in map order, and every query over the
+//!    survivors follows the model — a swept prefix's inside-probe is
+//!    answered by the covering binding, the other origin's same-prefix
+//!    slot, the default-route `Any` marker, or nothing; a repeat sweep
+//!    retires nothing (idempotence).
 //!
 //! Determinism (frozen bar "seeds fixed"): every runner is constructed
 //! with an explicit [`proptest::test_runner::RngSeed::Fixed`], so plain
@@ -50,6 +58,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::{Duration, Instant};
 
 use common::{IpPrefix, Ipv4Prefix, Ipv6Prefix, Nexthop, NexthopGroup, RouteEntry, RouteProtocol};
 use proptest::prelude::*;
@@ -67,6 +76,7 @@ const SEED_KEY_REPLACE: u64 = 0x5735_4204;
 const SEED_ROUND_TRIP: u64 = 0x5735_4205;
 const SEED_BATCH_ATOMICITY: u64 = 0x5735_4206;
 const SEED_REMOVE_FALLBACK: u64 = 0x5735_4207;
+const SEED_SWEEP_FALLBACK: u64 = 0x5735_4208;
 
 fn seeded(seed: u64) -> ProptestConfig {
     ProptestConfig {
@@ -143,6 +153,10 @@ fn binding_strategy() -> impl Strategy<Value = Binding> {
             } else {
                 BindingOrigin::Rib
             },
+            // No expiry here: the sweep property stamps deadlines
+            // selectively on rib bindings (config is pinned and would
+            // reject one).
+            expires_at: None,
         })
 }
 
@@ -269,6 +283,7 @@ fn derive_expected(routes: &[RouteEntry]) -> Vec<Binding> {
                 prefix,
                 interfaces,
                 origin: BindingOrigin::Rib,
+                expires_at: None,
             });
         }
     }
@@ -509,8 +524,9 @@ proptest! {
     ) {
         let origin = if is_config { BindingOrigin::Config } else { BindingOrigin::Rib };
         let mut sib = Sib::new();
-        sib.update(Binding { prefix, interfaces: first, origin }).unwrap();
-        sib.update(Binding { prefix, interfaces: second.clone(), origin }).unwrap();
+        sib.update(Binding { prefix, interfaces: first, origin, expires_at: None }).unwrap();
+        sib.update(Binding { prefix, interfaces: second.clone(), origin, expires_at: None })
+            .unwrap();
 
         let mut want = second;
         normalize(&mut want);
@@ -658,11 +674,13 @@ proptest! {
                 prefix: poison_prefix,
                 interfaces: vec![],
                 origin,
+                expires_at: None,
             },
             Binding {
                 prefix: poison_prefix,
                 interfaces: vec![InterfaceRef::Any],
                 origin,
+                expires_at: None,
             },
         ];
         let before = snapshot(&sib);
@@ -776,5 +794,107 @@ proptest! {
                 probe
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 8 — sweep + covering fallback (A22): the TTL pass retires
+// exactly the expired keys and queries fall back to what the survivors
+// cover
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(seeded(SEED_SWEEP_FALLBACK))]
+    #[test]
+    fn sweep_retires_exactly_expired_keys_and_queries_fall_back(
+        updates in proptest::collection::vec(binding_strategy(), 0..=14),
+        coins in proptest::collection::vec(any::<bool>(), 0..=14),
+        offsets in proptest::collection::vec(0u64..=2000, 0..=14),
+        probes in probes_strategy(),
+        entropy in entropy_strategy(),
+    ) {
+        // Deterministic t0-relative time: every deadline and the sweep
+        // instant derive from one base by arithmetic, never from a
+        // later wall-clock read, so pass/fail never depends on machine
+        // speed. Deadlines straddle the sweep instant (0..=2000 ms
+        // against a sweep at 1000 ms).
+        let t0 = Instant::now();
+        let sweep_at = t0 + Duration::from_millis(1000);
+        // Stamp expiries on the rib bindings a coin at a time; the
+        // first rib binding is forced to an already-expired deadline so
+        // every non-empty case exercises at least one sweep hit. Config
+        // bindings stay un-TTL'd — pinned bindings reject an expiry at
+        // insertion (the unit tests pin that rejection).
+        let first_rib = updates.iter().position(|b| b.origin == BindingOrigin::Rib);
+        let updates: Vec<Binding> = updates
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut b)| {
+                if b.origin == BindingOrigin::Rib
+                    && (Some(i) == first_rib || coins.get(i).copied().unwrap_or(false))
+                {
+                    let millis = if Some(i) == first_rib {
+                        0
+                    } else {
+                        offsets.get(i).copied().unwrap_or(0)
+                    };
+                    b.expires_at = Some(t0 + Duration::from_millis(millis));
+                }
+                b
+            })
+            .collect();
+        let mut sib = Sib::new();
+        for binding in &updates {
+            sib.update(binding.clone()).unwrap();
+        }
+        let stored = replay(&updates);
+
+        // Model: the survivors are everything except the expired keys
+        // (deadline ≤ the sweep instant, inclusive boundary).
+        let expired: Vec<(IpPrefix, BindingOrigin)> = stored
+            .iter()
+            .filter(|(_, b)| matches!(b.expires_at, Some(deadline) if deadline <= sweep_at))
+            .map(|(key, _)| *key)
+            .collect();
+        prop_assert!(
+            !expired.is_empty() || first_rib.is_none(),
+            "the forced first-rib deadline guarantees a hit whenever a rib binding exists"
+        );
+        let mut survivors = stored.clone();
+        for key in &expired {
+            survivors.remove(key);
+        }
+
+        let swept = sib.sweep(sweep_at);
+        prop_assert_eq!(&swept, &expired, "exactly the expired keys, in map order");
+        prop_assert!(
+            swept.iter().all(|(_, origin)| *origin != BindingOrigin::Config),
+            "operator-pinned bindings are never swept"
+        );
+        prop_assert_eq!(
+            snapshot(&sib),
+            survivors.values().cloned().collect::<Vec<_>>(),
+            "storage is exactly the replay minus the expired keys"
+        );
+
+        // Queries fall back per the model over the survivors: random
+        // probes plus one address inside every original prefix —
+        // surviving or swept — so a swept key's inside-probe actually
+        // hits the covering fallback.
+        let mut all_probes = probes;
+        for ((prefix, _origin), entropy) in stored.keys().zip(entropy.iter()) {
+            all_probes.push(addr_inside(*prefix, *entropy));
+        }
+        for probe in all_probes {
+            prop_assert_eq!(
+                sib.interfaces_for(probe),
+                model_interfaces_for(&survivors, probe),
+                "for probe {}",
+                probe
+            );
+        }
+
+        // Idempotent: the swept keys are gone, a repeat retires nothing.
+        prop_assert!(sib.sweep(sweep_at).is_empty());
     }
 }

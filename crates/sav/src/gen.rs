@@ -490,6 +490,7 @@ mod tests {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
             origin: BindingOrigin::Rib,
+            expires_at: None,
         }
     }
 
@@ -498,6 +499,7 @@ mod tests {
             prefix: prefix.parse().unwrap(),
             interfaces: ifindexes.iter().map(|&ix| if_ref(ix)).collect(),
             origin: BindingOrigin::Config,
+            expires_at: None,
         }
     }
 
