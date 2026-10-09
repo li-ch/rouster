@@ -260,8 +260,12 @@ impl RibDriver {
     /// UP interface, `None` when no UP interface carries one. Simplified
     /// vs FRR: loopbacks are recognized by a `lo` name prefix (the mirror
     /// has no IFF_LOOPBACK bit) and IPv6 addresses never participate
-    /// (ZAPI's router-id is an IPv4 construct). Config override is future
-    /// northbound-config work.
+    /// (ZAPI's router-id is an IPv4 construct). The 127/8 range is
+    /// excluded like zebra does (`IPV4_NET127`, zebra/router-id.c): a
+    /// Linux `lo` always carries 127.0.0.1, and answering with it would
+    /// give every client the same router-id — live-observed with ospfd,
+    /// whose same-id neighbors can never become adjacent. Config override
+    /// is future northbound-config work.
     fn router_id(&self) -> Option<Ipv4Addr> {
         let mut loopback: Vec<Ipv4Addr> = Vec::new();
         let mut any_up: Vec<Ipv4Addr> = Vec::new();
@@ -273,6 +277,9 @@ impl RibDriver {
             };
             for prefix in &iface.addresses {
                 if let IpPrefix::V4(p) = prefix {
+                    if p.addr().is_loopback() {
+                        continue;
+                    }
                     pool.push(p.addr());
                 }
             }
@@ -982,6 +989,10 @@ mod tests {
             master_ifindex: None,
         });
         driver.apply_event(&addr_new(4, "10.0.0.5/32"));
+        // 127/8 never contributes: without the exclusion every Linux lo
+        // would answer 127.0.0.1 and same-id OSPF neighbors could never
+        // become adjacent (live-observed with ospfd, Z5C).
+        driver.apply_event(&addr_new(4, "127.0.0.1/8"));
         driver.apply_event(&DataplaneEvent::LinkNew {
             ifindex: 2,
             name: "eth0".into(),
@@ -1036,6 +1047,34 @@ mod tests {
             driver.router_id(),
             Some("192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap()),
             "IPv6 never participates"
+        );
+    }
+
+    /// A loopback whose only IPv4 address is 127/8 (the Linux default
+    /// before any address is added) contributes nothing: the fallback
+    /// pool answers instead — zebra's `IPV4_NET127` rule.
+    #[test]
+    fn router_id_skips_loopback_range_addresses() {
+        let mut driver = RibDriver::new();
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 1,
+            name: "lo".into(),
+            is_up: true,
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        driver.apply_event(&addr_new(1, "127.0.0.1/8"));
+        assert_eq!(
+            driver.router_id(),
+            None,
+            "127/8 alone derives nothing — no candidate remains"
+        );
+        driver.apply_event(&addr_new(1, "10.0.0.1/32"));
+        driver.apply_event(&addr_new(1, "127.0.0.9/32"));
+        assert_eq!(
+            driver.router_id(),
+            Some("10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()),
+            "whole 127/8 range excluded, not just 127.0.0.1"
         );
     }
 
