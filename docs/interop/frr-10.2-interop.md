@@ -190,7 +190,86 @@ Deviations disclosed:
    is added by a second push after the REDISTRIBUTE_ADD registration is
    provably in place — deterministic ordering instead of a race.
 
-Known-stubbed, bgpd-tolerated (same session as staticd's findings):
+Known-stubbed, bgpd-tolerated (same session as staticd's findings; as of
+the Z5B runs — W2 has since landed the ROUTER_ID_ADD → ROUTER_ID_UPDATE
+answer, the initial redistribute dump and REDISTRIBUTE_ROUTE_DEL, see the
+Z5C section for the live validation):
 ROUTE_NOTIFY_REQUEST and ROUTER_ID_ADD remain recorded-only; no
 REDISTRIBUTE_ROUTE_DEL (32) on withdrawal; no GET_LABEL_CHUNK answers
 (none requested — no MPLS config); no VRF_ADD replay; no ROUTE_NOTIFY_OWNER.
+
+## ospfd follow-up (Z5C, W1B continuation)
+
+Same container shape with `/usr/lib/frr/ospfd -d -z …`: the pre-registered
+loopback-pair topology — each router's `lo` carries a distinct /32
+(10.255.1.1, 10.255.2.1) before rousterd starts, `network` statements
+enable OSPF on the bridge transit subnet and advertise the loopbacks as
+stub networks. ospfd attaches, the two ospfds form a Full area-0
+adjacency over the docker bridge, and each side's OSPF-learned route to
+the OTHER side's loopback lands in the kernel through rousterd
+(`proto ospf`, RTPROT_OSPF 188). ospfd gated on two answers bgpd never
+exercised, both fixed as minimal answers in W1B (see the Z5C result).
+
+## Z5C result — PASS (2026-10-09, W1B)
+
+Two real FRR 10.2.2 ospfd instances reach Full adjacency while BOTH use
+rousterd as their zebra over ZAPI, and each kernel gains the remote
+loopback /32 as an OSPF route programmed by rousterd. Reproduce:
+`scripts/test-z5c-ospfd-interop.sh` (two consecutive clean runs).
+Evidence archived under `away/2026-10-09/quarantine/z5c/` (rousterd.log,
+ospfd.log, mgmtd.log, routes/ospf/env per side).
+
+What passed:
+
+- **Attach, single zclient**: each ospfd opened exactly ONE zapi
+  connection (unlike bgpd's three); `session established id=1
+  protocol=7` per rousterd, count never grew through the 60 s post-route
+  soak. Initial burst (zapi-sniff capture, now the
+  `crates/zapi/tests/fixtures/ospfd-10.2.2.log` fixture): HELLO
+  (redist_default=7 = the OSPF bit), INTERFACE_ADD request,
+  BFD_CLIENT_REGISTER (pid, recorded no-reply, tolerated), ROUTER_ID_ADD
+  (AFI_IP), a second INTERFACE_ADD request.
+- **Router-id from the ROUTER_ID_UPDATE answer — no config pin**: W2's
+  answer got its first live validation; both ospfds show
+  `Router ID: 10.255.x.1` (their own loopback /32, derived by rousterd),
+  and the adjacency forms with distinct ids. This retires W1's bgpd
+  deviation-4 workaround pattern for ospfd (no `ospf router-id` line in
+  the configs).
+- **Adjacency**: `show ip ospf neighbor` reports `Full/DR` and
+  `Full/Backup` on the two sides (DR election over the bridge works;
+  OSPF multicast 224.0.0.5 passes between containers on the docker
+  default bridge).
+- **ROUTE-KERNEL, both directions**: r1 kernel
+  `10.255.2.1 via 192.168.215.4 dev eth0 proto ospf metric 10` after
+  r1's rousterd logged `zapi: route add prefix=10.255.2.1/32
+  entry.protocol=Ospf`; symmetric on r2 for 10.255.1.1/32. ospfd also
+  installs its own loopback and the transit stub network `proto ospf`
+  (both through rousterd — FRR behavior, kept).
+
+Minimal answers implemented in W1B (both live-required by ospfd,
+tolerated-and-unused by staticd/bgpd):
+
+1. **INTERFACE_ADD mirror now carries link flags** — the RIB mirror
+   tracks only up/down, so the dump's u64 flags word was 0 and ospfd
+   reported `eth0 is down` (`if_is_operative` needs IFF_UP|IFF_RUNNING)
+   and, without BROADCAST|MULTICAST, would fall back to the
+   non-broadcast network type that never multicasts hellos. The server
+   now synthesizes the classic bits per link kind (loopback names get
+   IFF_LOOPBACK; down links carry none). Real zebra relays the kernel's
+   `ifi_flags`; carrying the real flags through the RIB mirror is future
+   polish.
+2. **Router-id derivation excludes 127/8** — every Linux `lo` carries
+   127.0.0.1, and the derived answer handed exactly that: both ospfds
+   came up as `Router ID: 127.0.0.1` and same-id neighbors can never
+   become adjacent. zebra's `IPV4_NET127` rule is now mirrored in the
+   driver's derivation.
+
+Deviations disclosed (harness-level, same class as Z5B's):
+
+- Two containers on the docker default bridge (W1's proven shape), not
+  the one-container probe: same mirror-disjointness rationale.
+- `echo 188 ospf >> /etc/iproute2/rt_protos` in both containers: the
+  testbed image ships no name for RTPROT_OSPF; the mapping is what a
+  real FRR install provides.
+- `NO_COLOR=1` in front of rousterd stays as belt-and-braces (W3's
+  TTY detection already keeps files ANSI-free).
