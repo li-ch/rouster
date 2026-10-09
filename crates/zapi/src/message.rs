@@ -1851,6 +1851,13 @@ pub enum ZapiMessage {
     /// mirror zebra's message-bit policy. SPEC: source-verified, not yet
     /// wire-captured (the masquerade sees only client→zebra traffic).
     RedistributeRouteAdd(ZapiRoute),
+    /// ZEBRA_REDISTRIBUTE_ROUTE_DEL (32), zebra→client: the withdrawal twin
+    /// of [`ZapiMessage::RedistributeRouteAdd`] — `zsend_redistribute_route`
+    /// builds both from the same `zapi_route` shape (pinned doc, Z2B), so
+    /// the body carries the route being withdrawn. Modeled like 31 (W2,
+    /// closing Z2B disclosure 3); SPEC: source-verified, not yet
+    /// wire-captured.
+    RedistributeRouteDel(ZapiRoute),
     /// ZEBRA_BFD_CLIENT_REGISTER (36): u32 pid. E: matches bgpd's pid.
     BfdClientRegister {
         pid: u32,
@@ -1927,6 +1934,9 @@ impl ZapiMessage {
             ZapiCommand::RedistributeRouteAdd => {
                 Ok(Self::RedistributeRouteAdd(ZapiRoute::decode(body)?))
             }
+            ZapiCommand::RedistributeRouteDel => {
+                Ok(Self::RedistributeRouteDel(ZapiRoute::decode(body)?))
+            }
             ZapiCommand::BfdClientRegister => {
                 let mut b = body;
                 let pid = take_be_u32(&mut b)?;
@@ -1985,6 +1995,7 @@ impl ZapiMessage {
             Self::RedistributeAdd(_) => 12,
             Self::RedistributeDelete(_) => 13,
             Self::RedistributeRouteAdd(_) => 31,
+            Self::RedistributeRouteDel(_) => 32,
             Self::BfdClientRegister { .. } => 36,
             Self::LabelManagerConnect { .. } => 49,
             Self::LabelManagerConnectResult { .. } => 49,
@@ -2030,7 +2041,7 @@ impl ZapiMessage {
                 r.encode(buf);
                 Ok(())
             }
-            Self::RedistributeRouteAdd(r) => {
+            Self::RedistributeRouteAdd(r) | Self::RedistributeRouteDel(r) => {
                 r.encode(buf);
                 Ok(())
             }
@@ -2396,25 +2407,84 @@ mod tests {
     }
 
     #[test]
-    fn redistribute_route_add_modeled_and_del_still_passthrough() {
-        // 31 is now a modeled body: garbage errors loudly instead of
-        // silently passing through as Unknown.
+    fn redistribute_route_add_and_del_modeled() {
+        // Both redistribute-route bodies are now modeled: garbage errors
+        // loudly instead of silently passing through as Unknown.
         assert_eq!(
             ZapiMessage::decode(31, &[]),
             Err(ZapiCodecError::Truncated { need: 1 })
         );
-        // 32 (REDISTRIBUTE_ROUTE_DEL) shares the body shape per the source
-        // but is outside tonight's scope: still Unknown passthrough, number
-        // and body preserved byte-for-byte.
-        let del = ZapiMessage::decode(32, &hex("deadbeef")).unwrap();
+        // W2: 32 (REDISTRIBUTE_ROUTE_DEL) shares the body shape per the
+        // source (zsend_redistribute_route builds both) and is modeled the
+        // same way — the Z2B passthrough cut is closed.
         assert_eq!(
-            del,
-            ZapiMessage::Unknown {
-                command: 32,
-                body: hex("deadbeef")
-            }
+            ZapiMessage::decode(32, &[]),
+            Err(ZapiCodecError::Truncated { need: 1 })
         );
-        assert_eq!(roundtrip(&del), hex("deadbeef"));
+    }
+
+    /// The DEL twin: same zapi_route body as 31 and 9, command 32, and the
+    /// withdrawn route's fields survive the round-trip.
+    #[test]
+    fn redistribute_route_del_decodes_and_roundtrips() {
+        let route = ZapiRoute::redistribute_push(
+            route_type::STATIC,
+            0,
+            0x08, // SELECTED — the withdrawn route was the best path
+            "198.51.100.0/24".parse().unwrap(),
+            Vec::new(), // withdrawn routes push no nexthop list
+            1,
+            20,
+            0,
+            0,
+        );
+        let msg = ZapiMessage::RedistributeRouteDel(route);
+        assert_eq!(msg.command(), 32);
+        let wire = roundtrip(&msg);
+        assert_eq!(
+            wire,
+            hex("04 0000 00000008 00000016 01 02 18 c63364 01 00000014 00000000")
+        );
+        // The shared encoder: those bytes are also a ROUTE_ADD body.
+        assert_eq!(
+            ZapiMessage::decode(9, &wire).unwrap(),
+            ZapiMessage::RouteAdd(ZapiRoute::redistribute_push(
+                route_type::STATIC,
+                0,
+                0x08,
+                "198.51.100.0/24".parse().unwrap(),
+                Vec::new(),
+                1,
+                20,
+                0,
+                0,
+            )),
+            "31/32/9 all share the zapi_route_encode body byte-for-byte"
+        );
+        // The framed form carries command 32 with a sane header.
+        let frame = msg.encode_frame(0).unwrap();
+        let header = ZapiHeader::decode(&frame).unwrap();
+        assert_eq!(header.command, 32);
+        assert_eq!(header.version, 6);
+        assert_eq!(header.length as usize, frame.len());
+    }
+
+    #[test]
+    fn redistribute_route_del_decode_never_panics_on_truncation() {
+        let wire = hex(concat!(
+            "04 0000 00000008 00000016 01 02 18 c63364",
+            " 01 00000014 00000000"
+        ));
+        for cut in 0..wire.len() {
+            let result = ZapiMessage::decode(32, &wire[..cut]);
+            assert!(result.is_err(), "cut at {cut} must error, not panic");
+        }
+        let mut extended = wire;
+        extended.push(0);
+        assert_eq!(
+            ZapiMessage::decode(32, &extended),
+            Err(ZapiCodecError::TrailingBytes(1))
+        );
     }
 
     #[test]

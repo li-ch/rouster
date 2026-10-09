@@ -11,7 +11,9 @@
 //! NEXTHOP_UPDATE when a registered nexthop's resolution flips on a
 //! dataplane event ([`RibDriver::apply_event`]), REDISTRIBUTE_ROUTE_ADD
 //! when a ZAPI route command changes the best route for a prefix and a
-//! session registered REDISTRIBUTE interest in its type.
+//! session registered REDISTRIBUTE interest in its type. W2 completes the
+//! pair: a best route that vanishes fans REDISTRIBUTE_ROUTE_DEL (32)
+//! carrying the withdrawn route to the same interested sessions.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -224,15 +226,41 @@ impl RibDriver {
 
     /// Fans a REDISTRIBUTE_ROUTE_ADD out to the sessions registered for
     /// the new best route's (afi, type) when `before` differs from the
-    /// current best. A best route that vanished has no modeled push
-    /// (ZEBRA_REDISTRIBUTE_ROUTE_DEL 32 is still passthrough — Z2B cut).
+    /// current best; a best route that vanished instead fans a
+    /// REDISTRIBUTE_ROUTE_DEL carrying the withdrawn route to the sessions
+    /// registered for ITS (afi, type) — the same zsend_redistribute_route
+    /// body as the ADD (W2, closing Z3B's disclosed cut).
     fn push_best_change(&mut self, table: TableId, prefix: IpPrefix, before: Option<RouteEntry>) {
         let after = self.best_of(table, prefix);
         if after == before {
             return;
         }
         let Some(best) = after else {
-            debug!(%prefix, table, "zapi: best route withdrawn; no redistribute push (DEL unmodeled)");
+            let Some(withdrawn) = before else {
+                return;
+            };
+            let afi = afi_of(&withdrawn.prefix);
+            let route_type = route_type_from(withdrawn.protocol);
+            let owners: Vec<u64> = self
+                .redistributes
+                .iter()
+                .filter(|(_, keys)| keys.iter().any(|k| k.0 == afi && k.1 == route_type))
+                .map(|(&owner, _)| owner)
+                .collect();
+            if owners.is_empty() {
+                return;
+            }
+            let entry = self.push_form(&withdrawn);
+            info!(
+                %prefix,
+                table,
+                route_type,
+                sessions = owners.len(),
+                "zapi: best route withdrawn; pushing REDISTRIBUTE_ROUTE_DEL"
+            );
+            for owner in owners {
+                self.push(owner, SessionPush::RedistributeRouteDel(entry.clone()));
+            }
             return;
         };
         let afi = afi_of(&best.prefix);
@@ -538,8 +566,9 @@ mod tests {
 
     /// Adding a candidate that does NOT change the best route pushes
     /// nothing; replacing the best with a better same-protocol route
-    /// pushes the new best; withdrawing the best pushes nothing (DEL 32
-    /// unmodeled — pinned here so the cut is visible).
+    /// pushes the new best; withdrawing the best pushes a DEL (32)
+    /// carrying the withdrawn route — the W2 completion of the former
+    /// "best gone, no push" pin.
     #[test]
     fn redistribute_push_gates_on_actual_best_change() {
         let mut driver = RibDriver::new();
@@ -586,18 +615,88 @@ mod tests {
         });
         assert!(pushes.try_recv().is_err(), "best still static: no push");
 
-        // Withdrawing the best itself (last candidate): best gone, no
-        // modeled push — REDISTRIBUTE_ROUTE_DEL is the Z2B cut, pinned
-        // here so the gap stays visible.
+        // Withdrawing the best itself (last candidate): best gone, the DEL
+        // push carries the withdrawn route (W2).
         driver.apply(RibCommand::DeleteRoute {
             table: 254,
             prefix: "198.51.100.0/24".parse().unwrap(),
             protocol: RouteProtocol::Static,
         });
+        match pushes.try_recv().expect("best withdrawn pushes DEL") {
+            SessionPush::RedistributeRouteDel(entry) => {
+                assert_eq!(entry.prefix, "198.51.100.0/24".parse().unwrap());
+                assert_eq!(entry.protocol, RouteProtocol::Static);
+                assert_eq!(entry.metric, 10, "the withdrawn best's metric");
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
+        }
+        assert!(pushes.try_recv().is_err(), "one push per withdrawal");
+    }
+
+    /// A best-route withdrawal pushes a DEL only to sessions registered
+    /// for the WITHDRAWN route's type (not the surviving protocol's), and
+    /// the push is in resolved push form.
+    #[test]
+    fn best_route_withdrawal_pushes_del_for_the_withdrawn_type() {
+        let mut driver = RibDriver::new();
+        let mut static_pushes = attach(&mut driver, 1); // wants static
+        let mut ospf_pushes = attach(&mut driver, 2); // wants ospf
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 2,
+            afi: 1,
+            route_type: route_type::OSPF,
+            instance: 0,
+        });
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+
+        // Static best with a resolvable gateway; drain its ADD push.
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
+            5,
+        )));
+        match static_pushes.try_recv().expect("static ADD pushed") {
+            SessionPush::RedistributeRouteAdd(entry) => {
+                assert_eq!(
+                    entry.nexthops.hops(),
+                    &[(Nexthop::Ipv4If("203.0.113.9".parse().unwrap(), 2), 1)]
+                );
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+
+        // Withdraw it: the static-registered session gets the DEL (with
+        // the hop in resolved push form); the ospf-registered session
+        // hears nothing.
+        driver.apply(RibCommand::DeleteRoute {
+            table: 254,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Static,
+        });
+        match static_pushes.try_recv().expect("static DEL pushed") {
+            SessionPush::RedistributeRouteDel(entry) => {
+                assert_eq!(entry.prefix, "198.51.100.0/24".parse().unwrap());
+                assert_eq!(entry.protocol, RouteProtocol::Static);
+                assert_eq!(
+                    entry.nexthops.hops(),
+                    &[(Nexthop::Ipv4If("203.0.113.9".parse().unwrap(), 2), 1)],
+                    "the withdrawn route rides in push form"
+                );
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
+        }
         assert!(
-            pushes.try_recv().is_err(),
-            "best withdrawn: REDISTRIBUTE_ROUTE_DEL is unmodeled (Z2B cut)"
+            ospf_pushes.try_recv().is_err(),
+            "an ospf-registered session gets no static DEL"
         );
+        assert!(static_pushes.try_recv().is_err(), "one DEL per withdrawal");
     }
 
     /// The fan-out filters on both AFI and route type.

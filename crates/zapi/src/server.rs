@@ -16,7 +16,8 @@
 //! the driver a push channel (Z3B), and the driver fans event-driven
 //! updates down it — NEXTHOP_UPDATE when a registered nexthop's resolution
 //! flips on a dataplane event, REDISTRIBUTE_ROUTE_ADD when a best route
-//! changes and the session registered interest in its type. Pushes are
+//! changes and the session registered interest in its type, and (W2)
+//! REDISTRIBUTE_ROUTE_DEL when that best route is withdrawn. Pushes are
 //! never dropped silently by this side: the session interleaves them with
 //! request replies through one writer, so frame order on the wire is the
 //! order the session produced it in.
@@ -162,6 +163,13 @@ pub enum SessionPush {
     /// (gateway-form otherwise, exactly what an NHT-tracking client
     /// expects).
     RedistributeRouteAdd(RouteEntry),
+    /// The best route for a prefix was withdrawn and this session
+    /// registered REDISTRIBUTE interest in its type; answered as
+    /// ZEBRA_REDISTRIBUTE_ROUTE_DEL (32) carrying the withdrawn route —
+    /// the same `zsend_redistribute_route` body as the ADD twin (W2,
+    /// closing Z3B's disclosed cut). The entry is the route as it last
+    /// was, in push form.
+    RedistributeRouteDel(RouteEntry),
 }
 
 /// Per-connection session state, established by the HELLO handshake.
@@ -722,6 +730,34 @@ impl ZapiSession {
                     "zapi: pushing REDISTRIBUTE_ROUTE_ADD"
                 );
                 let frame = ZapiMessage::RedistributeRouteAdd(route)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::RedistributeRouteDel(entry) => {
+                let route = ZapiRoute::redistribute_push(
+                    route_type_from(entry.protocol),
+                    0,
+                    ZEBRA_FLAG_SELECTED,
+                    entry.prefix,
+                    entry
+                        .nexthops
+                        .hops()
+                        .iter()
+                        .map(|&(hop, _)| ZapiNexthop::from_common(hop))
+                        .collect(),
+                    entry.protocol.admin_distance(),
+                    entry.metric,
+                    0,
+                    0,
+                );
+                info!(
+                    id = self.id,
+                    prefix = %entry.prefix,
+                    "zapi: pushing REDISTRIBUTE_ROUTE_DEL"
+                );
+                let frame = ZapiMessage::RedistributeRouteDel(route)
                     .encode_frame(0)
                     .map_err(encode_io_err)?;
                 io.write_all(&frame).await
@@ -1358,6 +1394,64 @@ mod tests {
                 assert_eq!(route.nexthops[0].gate, None);
             }
             other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+    }
+
+    /// The withdrawal twin of `redistribute_push_encodes_command_31`:
+    /// command 32, the withdrawn route's prefix/type, SELECTED flag, the
+    /// always-set DISTANCE/METRIC/MTU bits, and no nexthop list (the
+    /// withdrawn route had none to offer the client).
+    #[tokio::test]
+    async fn redistribute_del_push_encodes_command_32() {
+        let mut session = ZapiSession {
+            id: 5,
+            ..ZapiSession::default()
+        };
+        let (mut client_io, mut server_io) = tokio::io::duplex(1024);
+        let mut entry = RouteEntry::new(
+            "198.51.100.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            common::NexthopGroup::single(Nexthop::Blackhole),
+            20,
+        );
+        entry.table = DEFAULT_TABLE;
+        session
+            .handle_push(SessionPush::RedistributeRouteDel(entry), &mut server_io)
+            .await
+            .expect("push encodes");
+        drop(server_io);
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        client_io.read_to_end(&mut bytes).await.expect("eof");
+
+        let header = ZapiHeader::decode(&bytes[..ZAPI_HEADER_LEN]).unwrap();
+        assert_eq!(header.command, 32, "ZEBRA_REDISTRIBUTE_ROUTE_DEL");
+        assert_eq!(
+            header.length as usize,
+            bytes.len(),
+            "exactly one framed message"
+        );
+        let body = bytes[ZAPI_HEADER_LEN..].to_vec();
+        match ZapiMessage::decode(32, &body).unwrap() {
+            ZapiMessage::RedistributeRouteDel(route) => {
+                assert_eq!(route.route_type, route_type::STATIC);
+                assert_eq!(route.flags, 0x08, "ZEBRA_FLAG_SELECTED");
+                assert_eq!(
+                    route.message,
+                    message_flag::NEXTHOP
+                        | message_flag::DISTANCE
+                        | message_flag::METRIC
+                        | message_flag::MTU,
+                    "NEXTHOP bit because the withdrawn route had a hop (the bit \
+                     is gated on the hop count, per zsend_redistribute_route)"
+                );
+                assert_eq!(route.prefix, "198.51.100.0/24".parse().unwrap());
+                assert_eq!(route.distance, Some(1), "static admin distance");
+                assert_eq!(route.metric, Some(20));
+                assert_eq!(route.nexthops.len(), 1);
+                assert_eq!(route.nexthops[0].nh_type, crate::nexthop_type::BLACKHOLE);
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
         }
     }
 
