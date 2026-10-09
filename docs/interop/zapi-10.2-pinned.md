@@ -65,7 +65,7 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 8 | ZEBRA_INTERFACE_SET_PROTODOWN | B | |
 | 9 | ZEBRA_ROUTE_ADD | E | staticd, carries prefix (below) |
 | 10 | ZEBRA_ROUTE_DELETE | E | staticd, on reconnect |
-| 11 | ZEBRA_ROUTE_NOTIFY_OWNER | B | |
+| 11 | ZEBRA_ROUTE_NOTIFY_OWNER | B | zebra→client; body layout **NOT-PINNED** (neither source-read nor wire-captured — W2). Answering ROUTE_NOTIFY_REQUEST (126) would mean guessing a wire format, so implementations that refuse to guess leave the request unanswered; staticd tolerates the silence |
 | 12 | ZEBRA_REDISTRIBUTE_ADD | E | bgpd `redistribute static` |
 | 13 | ZEBRA_REDISTRIBUTE_DELETE | B | (`no redistribute static` did NOT emit one before zebra ack — see findings) |
 | 14 | ZEBRA_REDISTRIBUTE_DEFAULT_ADD | B | |

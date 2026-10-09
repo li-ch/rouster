@@ -642,7 +642,19 @@ impl ZapiSession {
                 Ok(())
             }
             ZapiMessage::RouteNotifyRequest { flag } => {
-                debug!(id = self.id, flag, "zapi: route notify requested");
+                // ROUTE_NOTIFY_REQUEST wants route-owner status updates,
+                // answered with ROUTE_NOTIFY_OWNER (11) — whose body layout
+                // is NOT-PINNED (no source read, no wire capture; the
+                // pinned doc records the gap). The request is therefore
+                // left unanswered rather than guessed: staticd (the
+                // sender, E in the fixtures) tolerates the silence through
+                // full route installation (Z4/Z5 smokes). Loud on purpose
+                // so the gap surfaces in every log.
+                warn!(
+                    id = self.id,
+                    flag,
+                    "zapi: ROUTE_NOTIFY_REQUEST left unanswered: ROUTE_NOTIFY_OWNER (11) body NOT-PINNED (pinned doc gap)"
+                );
                 Ok(())
             }
             ZapiMessage::RouterIdAdd { afi } => {
@@ -1547,6 +1559,40 @@ mod tests {
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 19, "no ROUTER_ID_UPDATE before the echo");
         assert!(rx.try_recv().is_err(), "no further command");
+    }
+
+    /// ROUTE_NOTIFY_REQUEST is recorded but NOT answered: ROUTE_NOTIFY_OWNER
+    /// (11) has no pinned body (pinned doc gap, W2 disclosure), and no
+    /// answer beats a guessed wire format. Proven by handling one request
+    /// and reading the client side to EOF — empty means nothing was
+    /// written, and the Ok return means the connection survived.
+    #[tokio::test]
+    async fn route_notify_request_left_unanswered_alive() {
+        let mut session = ZapiSession {
+            id: 9,
+            ..ZapiSession::default()
+        };
+        let (mut client_io, mut server_io) = tokio::io::duplex(1024);
+        let (tx, mut rx) = mpsc::channel(16);
+        session
+            .handle(
+                ZapiMessage::RouteNotifyRequest { flag: 1 },
+                0,
+                &tx,
+                &mut server_io,
+            )
+            .await
+            .expect("handled without error (NOT-PINNED, not fatal)");
+        drop(server_io);
+        drop(tx);
+        let mut written = Vec::new();
+        use tokio::io::AsyncReadExt;
+        client_io.read_to_end(&mut written).await.expect("eof");
+        assert!(written.is_empty(), "no ROUTE_NOTIFY_OWNER may be written");
+        assert!(
+            rx.try_recv().is_err(),
+            "no RibCommand: nothing to ask the RIB for"
+        );
     }
 
     #[tokio::test]
