@@ -14,10 +14,15 @@
 //!
 //! ```text
 //! w7-sav-smoke install  --mode strict|loose --action monitor|drop \
-//!                       --iba <ifindex>[:<prefix>] [--iba ...]
+//!                       --iba <ifindex>[:<prefix>[,<prefix>...]] [--iba ...]
 //! w7-sav-smoke simulate --mode ... --iba ... --observe <ip>@<ifindex> [...]
 //! w7-sav-smoke clear
 //! ```
+//!
+//! A per-interface allowlist of several prefixes is written either as
+//! one comma-split `--iba` or as repeated `--iba` flags for the same
+//! ifindex (they merge; the compile step below still emits one op per
+//! interface).
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -46,7 +51,8 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage: w7-sav-smoke install|simulate|clear [options]");
             eprintln!("  install|simulate: --mode strict|loose --action monitor|drop");
-            eprintln!("                    --iba <ifindex>[:<prefix>] (repeatable)");
+            eprintln!("                    --iba <ifindex>[:<prefix>[,<prefix>...]]");
+            eprintln!("                      (repeatable; entries for one ifindex merge)");
             eprintln!("  simulate also:     --observe <ip>@<ifindex> (repeatable)");
             ExitCode::FAILURE
         }
@@ -93,11 +99,11 @@ fn run(args: &[String], command: Command) -> ExitCode {
             },
             "--iba" => {
                 let Some(spec) = it.next() else {
-                    eprintln!("--iba needs <ifindex>[:<prefix>]");
+                    eprintln!("--iba needs <ifindex>[:<prefix>[,<prefix>...]]");
                     return ExitCode::FAILURE;
                 };
                 match parse_iba(spec) {
-                    Ok(iba) => ibas.push(iba),
+                    Ok(iba) => push_iba(&mut ibas, iba),
                     Err(e) => {
                         eprintln!("bad --iba {spec:?}: {e}");
                         return ExitCode::FAILURE;
@@ -203,22 +209,114 @@ fn run(args: &[String], command: Command) -> ExitCode {
     })
 }
 
-/// `ifindex` or `ifindex:prefix` — a missing prefix is the empty
-/// allowlist (deny-all under strict, GSC §2.1).
+/// `ifindex` or `ifindex:prefix[,prefix...]` — a missing or empty
+/// prefix list is the empty allowlist (deny-all under strict,
+/// GSC §2.1); comma-separated prefixes build a multi-prefix allowlist
+/// in a single flag.
 fn parse_iba(spec: &str) -> Result<Iba, String> {
-    let (ifindex, prefix) = match spec.split_once(':') {
-        Some((ifindex, prefix)) => (ifindex, Some(prefix)),
-        None => (spec, None),
+    let (ifindex, prefixes) = match spec.split_once(':') {
+        Some((ifindex, prefixes)) => (ifindex, prefixes),
+        None => (spec, ""),
     };
     let ifindex: u32 = ifindex.parse().map_err(|e| format!("ifindex: {e}"))?;
-    let prefixes = match prefix {
-        Some(p) => vec![p.parse::<IpPrefix>().map_err(|e| e.to_string())?],
-        None => Vec::new(),
+    let prefixes = if prefixes.is_empty() {
+        Vec::new()
+    } else {
+        prefixes
+            .split(',')
+            .map(|p| p.parse::<IpPrefix>().map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
     };
     Ok(Iba { ifindex, prefixes })
+}
+
+/// Repeated `--iba` flags for one interface extend its allowlist
+/// instead of stacking a second op for the same ifindex (the compile
+/// step still merges/sorts/dedups per interface).
+fn push_iba(ibas: &mut Vec<Iba>, iba: Iba) {
+    match ibas.iter_mut().find(|e| e.ifindex == iba.ifindex) {
+        Some(existing) => existing.prefixes.extend(iba.prefixes),
+        None => ibas.push(iba),
+    }
 }
 
 fn parse_observe(spec: &str) -> Option<(IpAddr, u32)> {
     let (ip, ifindex) = spec.split_once('@')?;
     Some((ip.parse().ok()?, ifindex.parse().ok()?))
+}
+
+// No `[[example]] test = true` convention exists in this workspace, so
+// these run via `cargo test -p sav --examples` (self-verification);
+// plain `cargo test` still compile-checks the file.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix(p: &str) -> IpPrefix {
+        p.parse().expect("valid prefix")
+    }
+
+    #[test]
+    fn comma_split_builds_multi_prefix_allowlist() {
+        let iba = parse_iba("2:10.0.0.0/24,10.0.1.0/24,2001:db8::/32").unwrap();
+        assert_eq!(iba.ifindex, 2);
+        assert_eq!(
+            iba.prefixes,
+            vec![
+                prefix("10.0.0.0/24"),
+                prefix("10.0.1.0/24"),
+                prefix("2001:db8::/32")
+            ]
+        );
+    }
+
+    #[test]
+    fn repeatable_flags_merge_per_interface() {
+        let mut ibas = Vec::new();
+        for spec in ["2:10.0.0.0/24", "3:198.51.100.0/24", "2:10.0.1.0/24"] {
+            push_iba(&mut ibas, parse_iba(spec).unwrap());
+        }
+        // one entry per ifindex, in order of first appearance
+        assert_eq!(ibas.len(), 2);
+        assert_eq!(ibas[0].ifindex, 2);
+        assert_eq!(
+            ibas[0].prefixes,
+            vec![prefix("10.0.0.0/24"), prefix("10.0.1.0/24")]
+        );
+        assert_eq!(ibas[1].ifindex, 3);
+        assert_eq!(ibas[1].prefixes, vec![prefix("198.51.100.0/24")]);
+    }
+
+    #[test]
+    fn mixed_forms_and_legacy_single_prefix() {
+        // legacy forms still parse: bare ifindex = empty allowlist,
+        // single prefix without comma
+        assert_eq!(parse_iba("5").unwrap().prefixes, Vec::new());
+        assert_eq!(
+            parse_iba("5:192.0.2.0/24").unwrap().prefixes,
+            vec![prefix("192.0.2.0/24")]
+        );
+        // mixed: one comma-split flag plus a repeated flag, same ifindex
+        let mut ibas = Vec::new();
+        for spec in ["7:10.0.0.0/24,10.0.1.0/24", "7:10.0.2.0/24"] {
+            push_iba(&mut ibas, parse_iba(spec).unwrap());
+        }
+        assert_eq!(ibas.len(), 1);
+        assert_eq!(
+            ibas[0].prefixes,
+            vec![
+                prefix("10.0.0.0/24"),
+                prefix("10.0.1.0/24"),
+                prefix("10.0.2.0/24")
+            ]
+        );
+    }
+
+    #[test]
+    fn bad_iba_specs_error() {
+        assert!(parse_iba("not-an-ifindex:10.0.0.0/24").is_err());
+        assert!(parse_iba("2:10.0.0.0/24,,10.0.1.0/24").is_err()); // empty element
+        assert!(parse_iba("2:not-a-prefix").is_err());
+        assert!(parse_iba("2:10.0.0.0/24,banana").is_err());
+    }
 }
