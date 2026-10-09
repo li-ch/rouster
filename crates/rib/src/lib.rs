@@ -382,6 +382,24 @@ impl Rib {
         self.table_mut(table_id).add(entry);
     }
 
+    /// Every (table, prefix) key holding a static-protocol candidate —
+    /// the exact surface a config reload can withdraw. The RIB driver
+    /// snapshots bests over these keys plus the incoming ones so its
+    /// redistribute fan-out covers precisely the prefixes a reload can
+    /// touch.
+    pub fn static_keys(&self) -> impl Iterator<Item = (TableId, IpPrefix)> + '_ {
+        self.tables.iter().flat_map(|(&table_id, table)| {
+            table
+                .iter()
+                .filter(|(_, candidates)| {
+                    candidates
+                        .iter()
+                        .any(|e| e.protocol == RouteProtocol::Static)
+                })
+                .map(move |(prefix, _)| (table_id, *prefix))
+        })
+    }
+
     /// Replaces the static-protocol routes derived from configuration.
     ///
     /// Prefixes present before and absent now are withdrawn; new prefixes
@@ -392,18 +410,7 @@ impl Rib {
         let fresh: std::collections::BTreeSet<(TableId, IpPrefix)> =
             routes.iter().map(|r| (r.table, r.prefix)).collect();
         let vanished: Vec<(TableId, IpPrefix)> = self
-            .tables
-            .iter()
-            .flat_map(|(&table_id, table)| {
-                table
-                    .iter()
-                    .filter(|(_, candidates)| {
-                        candidates
-                            .iter()
-                            .any(|e| e.protocol == RouteProtocol::Static)
-                    })
-                    .map(move |(prefix, _)| (table_id, *prefix))
-            })
+            .static_keys()
             .filter(|key| !fresh.contains(key))
             .collect();
         for (table_id, prefix) in vanished {

@@ -262,7 +262,10 @@ async fn main() -> std::io::Result<()> {
                         if new_config.zapi_socket != config.zapi_socket {
                             warn!("zapi socket change requires a restart; keeping running socket");
                         }
-                        driver.rib.reload_static(&new_config.static_routes);
+                        // Through the driver (M2): reload-caused best
+                        // changes fan redistribute pushes to registered
+                        // ZAPI sessions, same as route commands.
+                        driver.reload_static(&new_config.static_routes);
                         info!(count = new_config.static_routes.len(), "config reloaded");
                     }
                     Err(e) => error!(%e, "config reload failed; keeping running config"),

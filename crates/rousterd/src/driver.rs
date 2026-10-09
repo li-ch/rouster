@@ -13,7 +13,11 @@
 //! when a ZAPI route command changes the best route for a prefix and a
 //! session registered REDISTRIBUTE interest in its type. W2 completes the
 //! pair: a best route that vanishes fans REDISTRIBUTE_ROUTE_DEL (32)
-//! carrying the withdrawn route to the same interested sessions.
+//! carrying the withdrawn route to the same interested sessions. M2
+//! closes the last gap: a SIGHUP config swap rides the same fan-out —
+//! [`RibDriver::reload_static`] snapshots the bests a reload can touch,
+//! swaps the static candidates, and re-checks each through the
+//! best-change push.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -290,6 +294,28 @@ impl RibDriver {
             loopback
         };
         pool.into_iter().max()
+    }
+
+    /// SIGHUP reload: swap the config-derived static routes through the
+    /// RIB's soft-reconfiguration reload and fan the redistribute pushes
+    /// a direct rib mutation cannot reach — a config swap that changes a
+    /// prefix's best route must tell the registered sessions exactly like
+    /// a route command would. Bests are snapshotted over the prefixes the
+    /// swap can touch (the incoming keys plus the static keys already
+    /// installed) and re-checked after the swap through
+    /// [`RibDriver::push_best_change`], so unchanged prefixes stay silent.
+    pub fn reload_static(&mut self, routes: &[RouteEntry]) {
+        let mut keys: BTreeSet<(TableId, IpPrefix)> =
+            routes.iter().map(|r| (r.table, r.prefix)).collect();
+        keys.extend(self.rib.static_keys());
+        let before: Vec<(TableId, IpPrefix, Option<RouteEntry>)> = keys
+            .into_iter()
+            .map(|(table, prefix)| (table, prefix, self.best_of(table, prefix)))
+            .collect();
+        self.rib.reload_static(routes);
+        for (table, prefix, before) in before {
+            self.push_best_change(table, prefix, before);
+        }
     }
 
     /// Fans a REDISTRIBUTE_ROUTE_ADD out to the sessions registered for
@@ -806,6 +832,154 @@ mod tests {
             "an ospf-registered session gets no static DEL"
         );
         assert!(static_pushes.try_recv().is_err(), "one DEL per withdrawal");
+    }
+
+    /// M2: a SIGHUP-style config swap through the driver fans the same
+    /// redistribute pushes route commands get — ADD for a prefix whose
+    /// best appeared or was replaced by a better one, DEL for one whose
+    /// best vanished (in resolved push form), silence for prefixes the
+    /// reload left alone.
+    #[test]
+    fn config_reload_pushes_redistribute_for_changed_bests() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+
+        // Running config, installed through the same reload path; the two
+        // initial ADDs are the pre-reload state this test reloads from.
+        driver.reload_static(&[
+            static_entry(
+                "198.51.100.0/24",
+                Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
+                20,
+            ),
+            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+        ]);
+        for _ in 0..2 {
+            assert!(matches!(
+                pushes.try_recv().expect("initial install ADD"),
+                SessionPush::RedistributeRouteAdd(_)
+            ));
+        }
+
+        // SIGHUP: one prefix re-announced with a better metric, one kept
+        // byte-identical, one new. Exactly the two changed bests push.
+        driver.reload_static(&[
+            static_entry(
+                "198.51.100.0/24",
+                Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
+                10,
+            ),
+            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+            static_entry("192.0.2.0/24", Nexthop::Blackhole, 3),
+        ]);
+        let mut seen: BTreeMap<IpPrefix, (&'static str, u32)> = BTreeMap::new();
+        while let Ok(push) = pushes.try_recv() {
+            match push {
+                SessionPush::RedistributeRouteAdd(entry) => {
+                    assert!(
+                        seen.insert(entry.prefix, ("ADD", entry.metric)).is_none(),
+                        "one push per changed prefix"
+                    );
+                }
+                other => panic!("unexpected push: {other:?}"),
+            }
+        }
+        assert_eq!(seen.len(), 2, "the identical prefix stays silent");
+        assert_eq!(
+            seen[&"192.0.2.0/24".parse::<IpPrefix>().unwrap()],
+            ("ADD", 3),
+            "new prefix announced"
+        );
+        assert_eq!(
+            seen[&"198.51.100.0/24".parse::<IpPrefix>().unwrap()],
+            ("ADD", 10),
+            "better replacement pushes the new best"
+        );
+
+        // Second SIGHUP drops the gateway route entirely: a DEL carrying
+        // the withdrawn best, gateway hop in resolved push form.
+        driver.reload_static(&[
+            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+            static_entry("192.0.2.0/24", Nexthop::Blackhole, 3),
+        ]);
+        match pushes.try_recv().expect("withdrawn best pushes DEL") {
+            SessionPush::RedistributeRouteDel(entry) => {
+                assert_eq!(entry.prefix, "198.51.100.0/24".parse().unwrap());
+                assert_eq!(entry.metric, 10, "the withdrawn best's metric");
+                assert_eq!(
+                    entry.nexthops.hops(),
+                    &[(Nexthop::Ipv4If("203.0.113.9".parse().unwrap(), 2), 1)],
+                    "the DEL rides in resolved push form"
+                );
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
+        }
+        assert!(pushes.try_recv().is_err(), "one push per withdrawal");
+    }
+
+    /// M2 discipline: a reload that changes no best route pushes nothing
+    /// — a byte-identical config keeps every candidate (soft
+    /// reconfiguration), and sessions registered for other types stay
+    /// silent through static churn.
+    #[test]
+    fn config_reload_without_best_changes_pushes_nothing() {
+        let mut driver = RibDriver::new();
+        let mut static_pushes = attach(&mut driver, 1);
+        let mut ospf_pushes = attach(&mut driver, 2);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 2,
+            afi: 1,
+            route_type: route_type::OSPF,
+            instance: 0,
+        });
+
+        let running = vec![
+            static_entry("198.51.100.0/24", Nexthop::Blackhole, 20),
+            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+        ];
+        driver.reload_static(&running);
+        for _ in 0..2 {
+            assert!(matches!(
+                static_pushes.try_recv().expect("initial install ADD"),
+                SessionPush::RedistributeRouteAdd(_)
+            ));
+        }
+
+        // Same config again: candidates are replaced same-protocol but
+        // every best is identical — silence everywhere.
+        driver.reload_static(&running);
+        assert!(
+            static_pushes.try_recv().is_err(),
+            "identical reload: no push"
+        );
+        assert!(ospf_pushes.try_recv().is_err(), "no ospf best ever changed");
+
+        // Static churn still never reaches the ospf-registered session;
+        // the static-registered one sees only the dropped best.
+        driver.reload_static(&[static_entry("198.51.100.0/24", Nexthop::Blackhole, 20)]);
+        assert!(matches!(
+            static_pushes.try_recv().expect("dropped best pushes DEL"),
+            SessionPush::RedistributeRouteDel(_)
+        ));
+        assert!(
+            ospf_pushes.try_recv().is_err(),
+            "type filter holds through reload"
+        );
+        assert!(static_pushes.try_recv().is_err(), "one push per reload");
     }
 
     /// REDISTRIBUTE_ADD replays the current best routes of the registered
