@@ -24,17 +24,18 @@
 #      bridge eth0 IS the transit; each rousterd's initial mirror carries
 #      its own eth0, so bgpd NHT for the peer's eth0 address resolves).
 #   2. mgmtd (+staticd on r1) and real bgpd start against rousterd.
-#   3. `vtysh -b` pushes iBGP configs: r1 announces `network
-#      203.0.113.0/24` (no import-check), r2 receives and installs it into
+#   3. ONE `vtysh -b` pushes the full iBGP configs: r1 announces `network
+#      203.0.113.0/24` (no import-check) and holds `ip route
+#      198.51.100.0/24 blackhole`; r2 receives both and installs them into
 #      ITS rousterd -> kernel `proto bgp`.
-#   4. Redistribution channel live (Z5B hazard): r1's `redistribute static`
-#      registers REDISTRIBUTE_ADD first; a second `vtysh -b` then adds
-#      `ip route 198.51.100.0/24 blackhole` — the deterministic ordering
-#      (registration provably before the route) makes the Z3B
-#      REDISTRIBUTE_ROUTE_ADD push fire, bgpd accepts it, advertises it
-#      iBGP, and r2 installs the second BGP-learned prefix too. (The
-#      initial-dump gap — no replay of pre-existing routes at registration
-#      — is why the static route must arrive after the registration.)
+#   4. Redistribution channel live (Z5B hazard) with no ordering
+#      constraint: whether r1's `redistribute static` registration lands
+#      before staticd's route or after it, bgpd receives 198.51.100.0/24
+#      from rousterd — the live best-change push (registration first) or
+#      the initial dump at registration (route first, W2 commit 58b0dbe)
+#      — accepts it, advertises it iBGP, and r2 installs the second
+#      BGP-learned prefix too. (W1 needed a two-phase push — the route in
+#      a second `vtysh -b` — precisely because the dump did not exist.)
 #
 # Machine checks (script exit 0):
 #   - PEER: `show bgp neighbor` reports "BGP state = Established" on BOTH
@@ -43,7 +44,9 @@
 #     rousterd logged `zapi: route add` for that prefix (installed by
 #     rousterd, not by anyone else).
 #   - REDISTRIBUTE: 198.51.100.0/24 reaches r2's kernel `proto bgp` after
-#     r1's rousterd logged `pushing REDISTRIBUTE_ROUTE_ADD`.
+#     r1's rousterd logged a redistribute push — the live
+#     `pushing REDISTRIBUTE_ROUTE_ADD` or the `initial redistribute dump
+#     push` (whichever ordering a run exercises).
 #   - STABLE: 60 s after installation the session is still Established on
 #     both sides, both routes still present, the zapi socket file exists,
 #     every daemon alive, and neither rousterd saw a single session
@@ -58,9 +61,9 @@
 # mgmtd's privs_init demand; still non-privileged). The host's network is
 # never touched: containers use the docker default bridge, peer IPs are
 # read from the running containers, and the trap removes both. rousterd
-# runs with NO_COLOR=1 so quarantine logs are ANSI-free (the in-daemon
-# logging polish is tracked separately). Logs are copied to the quarantine
-# dir on success AND failure (trap).
+# colorizes only on a TTY, so the redirected log files (and their
+# quarantine copies) are ANSI-free with no env workaround. Logs are
+# copied to the quarantine dir on success AND failure (trap).
 #
 #   scripts/test-z5b-bgpd-interop.sh
 set -euo pipefail
@@ -158,7 +161,7 @@ echo "==> resident rousterd in both containers"
 for name in "$R1" "$R2"; do
     docker exec "$name" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos"
     docker exec "$name" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-    docker exec -d "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+    docker exec -d "$name" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 done
 wait_in r1 "rousterd r1 listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 wait_in r2 "rousterd r2 listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
@@ -181,12 +184,13 @@ wait_in r2 "r2 daemons up" 20 "pidof mgmtd bgpd"
 wait_in r1 "r1 bgpd vty socket" 30 "test -S /var/run/frr/bgpd.vty"
 wait_in r2 "r2 bgpd vty socket" 30 "test -S /var/run/frr/bgpd.vty"
 
-echo "==> iBGP config push (phase 1: no static route yet — redistribute"
-echo "    registration must precede the route for the Z3B push to fire)"
+echo "==> iBGP config push (single phase: dump or live push covers either"
+echo "    registration-vs-route ordering)"
 docker exec "$R1" sh -c "printf '%s\n' \
   'frr version 10.2' \
   'frr defaults traditional' \
   'hostname r1' \
+  'ip route $REDIS_PREFIX blackhole' \
   'router bgp 65000' \
   ' no bgp network import-check' \
   ' bgp router-id $R1_IP' \
@@ -222,29 +226,11 @@ wait_in r2 "$ANNOUNCED in r2 kernel proto bgp" 30 \
     "ip route show proto bgp | grep -q '$ANNOUNCED'"
 docker exec "$R2" sh -c "ip route show $ANNOUNCED"
 
-echo "==> phase 2: adding the static route AFTER redistribute registration"
-docker exec "$R1" sh -c "printf '%s\n' \
-  'frr version 10.2' \
-  'frr defaults traditional' \
-  'hostname r1' \
-  'ip route $REDIS_PREFIX blackhole' \
-  'router bgp 65000' \
-  ' no bgp network import-check' \
-  ' bgp router-id $R1_IP' \
-  ' neighbor $R2_IP remote-as 65000' \
-  ' address-family ipv4 unicast' \
-  '  network $ANNOUNCED' \
-  '  redistribute static' \
-  ' exit-address-family' \
-  'line vty' \
-  > $FRR_CONF"
-docker exec "$R1" vtysh -b
-
-echo "==> waiting for the redistribute channel: staticd -> REDISTRIBUTE_ROUTE_ADD -> iBGP -> r2 kernel"
+echo "==> waiting for the redistribute channel: staticd -> rousterd push (dump or live) -> iBGP -> r2 kernel"
 wait_in r1 "static route in r1 kernel (staticd via rousterd)" 30 \
     "ip route show proto static | grep -q '$REDIS_PREFIX'"
-wait_in r1 "rousterd r1 pushed REDISTRIBUTE_ROUTE_ADD" 30 \
-    "grep -q 'pushing REDISTRIBUTE_ROUTE_ADD' $ROUSTERD_LOG"
+wait_in r1 "rousterd r1 pushed the redistribute route (dump or live)" 30 \
+    "grep -Eq 'pushing REDISTRIBUTE_ROUTE_ADD|initial redistribute dump push' $ROUSTERD_LOG"
 wait_in r2 "$REDIS_PREFIX in r2 kernel proto bgp" 30 \
     "ip route show proto bgp | grep -q '$REDIS_PREFIX'"
 
