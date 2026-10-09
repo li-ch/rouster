@@ -58,6 +58,14 @@
 //! effective ops the dataplane enforces, so counters and enforcement
 //! never disagree.
 //!
+//! The churn log renders at field granularity (A20): now that every
+//! mirror change re-evaluates, the common change is a few prefixes
+//! moving on a persistent allowlist, and [`rule_changes`] logs exactly
+//! those members instead of the whole op twice (the op-set difference
+//! [`program_diff`] computes is unchanged — a logging compression, not
+//! an install-behavior change; the dataplane always receives the full
+//! new program).
+//!
 //! # Config (`/etc/savd.conf`-shaped)
 //!
 //! Simple line grammar consistent with rousterd's (blank/`!`/`#`
@@ -425,7 +433,8 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
 /// The rendered difference between two installed programs: ops only in
 /// the new program (`added`) and ops only in the old one (`removed`).
 /// Both operand lists come normalized from [`SavProgram::ops`], so a
-/// value-based difference is exact.
+/// value-based difference is exact. [`rule_changes`] renders this same
+/// difference at member granularity for the churn log.
 pub fn program_diff(
     old: &[SavProgramOp],
     new: &[SavProgramOp],
@@ -443,6 +452,278 @@ pub fn program_diff(
         }
     }
     (added, removed)
+}
+
+/// One rendered difference between two installed programs at field
+/// granularity (A20) — the churn log's unit. An op whose identity
+/// persists between the programs (same variant, same every field but
+/// its set member) renders as only the members that moved; an op with
+/// no same-identity counterpart renders whole. Built exclusively from
+/// [`program_diff`]'s output, so the field-level view is a finer
+/// RENDERING of the same op-set difference, never a different one
+/// (what the dataplane installs is untouched: the full new program).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleChange {
+    /// An op the old program has no same-identity counterpart for (a
+    /// new interface, mode, or action — operator intent, the w8
+    /// reload case).
+    OpAdded(SavProgramOp),
+    /// An op whose identity left the new program entirely.
+    OpRemoved(SavProgramOp),
+    /// A persistent interface-scale op (IBA/IBB) whose prefix set
+    /// changed: `added`/`removed` are exactly the prefixes that moved
+    /// (one side may be empty).
+    PrefixesChanged {
+        /// The new op — the current truth; its identity fields render
+        /// the context.
+        op: SavProgramOp,
+        /// Prefixes only the new set has.
+        added: Vec<IpPrefix>,
+        /// Prefixes only the old set had.
+        removed: Vec<IpPrefix>,
+    },
+    /// A persistent router-scale op (PBA/PBB) whose interface set
+    /// changed — the same shape as [`RuleChange::PrefixesChanged`]
+    /// with interface indexes as the members.
+    IfindexesChanged {
+        /// The new op (the current truth).
+        op: SavProgramOp,
+        /// Interface indexes only the new set has.
+        added: Vec<u32>,
+        /// Interface indexes only the old set had.
+        removed: Vec<u32>,
+    },
+}
+
+impl fmt::Display for RuleChange {
+    /// Operator-facing one-liner (the daemon's churn log): a member
+    /// delta renders the op's context once plus only the members that
+    /// moved — e.g. `allow if#2 strict monitor +[203.0.113.0/24]` —
+    /// so a one-prefix change on a large allowlist is one short line,
+    /// not the whole set printed twice. Whole ops render through
+    /// [`SavProgramOp`]'s Display.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuleChange::OpAdded(op) => write!(f, "{op} added"),
+            RuleChange::OpRemoved(op) => write!(f, "{op} removed"),
+            RuleChange::PrefixesChanged { op, added, removed } => {
+                write!(f, "{}", op_context(op))?;
+                write_members(
+                    f,
+                    added.iter().map(|p| p.to_string()),
+                    removed.iter().map(|p| p.to_string()),
+                )
+            }
+            RuleChange::IfindexesChanged { op, added, removed } => {
+                write!(f, "{}", op_context(op))?;
+                write_members(
+                    f,
+                    added.iter().map(|i| i.to_string()),
+                    removed.iter().map(|i| i.to_string()),
+                )
+            }
+        }
+    }
+}
+
+/// The field-level companion to [`program_diff`] (A20): renders the
+/// same op-set difference at the granularity that compresses churn
+/// logs on large sets — a prefix joining or leaving a persistent
+/// allowlist names that prefix, instead of logging the whole op as
+/// removed plus re-added with the full set. Every op `program_diff`
+/// reports lands here exactly once (paired by identity into a member
+/// delta, or whole as [`RuleChange::OpAdded`] /
+/// [`RuleChange::OpRemoved`]), so this is a logging change, not an
+/// install-behavior change.
+pub fn rule_changes(old: &[SavProgramOp], new: &[SavProgramOp]) -> Vec<RuleChange> {
+    let (added, removed) = program_diff(old, new);
+    // Old ops the op-set diff reports, consumed as each pairs with a
+    // new op by identity; the leftovers render whole (removed ops).
+    let mut unpaired = removed;
+    let mut changes = Vec::new();
+    for op in added {
+        let Some(index) = unpaired.iter().position(|prev| same_identity(prev, &op)) else {
+            changes.push(RuleChange::OpAdded(op));
+            continue;
+        };
+        let prev = unpaired.remove(index);
+        // same_identity pairs only within a variant family, so the
+        // differing field is exactly the set member; only actual
+        // movement renders (an identity-paired op with identical
+        // members would BE the same op, which program_diff never
+        // reports — the guard keeps a future op shape from logging a
+        // no-op line).
+        match (&prev, &op) {
+            (
+                SavProgramOp::IfaceAllow {
+                    prefixes: old_set, ..
+                }
+                | SavProgramOp::IfaceBlock {
+                    prefixes: old_set, ..
+                },
+                SavProgramOp::IfaceAllow {
+                    prefixes: new_set, ..
+                }
+                | SavProgramOp::IfaceBlock {
+                    prefixes: new_set, ..
+                },
+            ) => {
+                let (moved_in, moved_out) = set_delta(old_set, new_set);
+                if !moved_in.is_empty() || !moved_out.is_empty() {
+                    changes.push(RuleChange::PrefixesChanged {
+                        op,
+                        added: moved_in,
+                        removed: moved_out,
+                    });
+                }
+            }
+            (
+                SavProgramOp::PrefixAllow {
+                    ifindexes: old_set, ..
+                }
+                | SavProgramOp::PrefixBlock {
+                    ifindexes: old_set, ..
+                },
+                SavProgramOp::PrefixAllow {
+                    ifindexes: new_set, ..
+                }
+                | SavProgramOp::PrefixBlock {
+                    ifindexes: new_set, ..
+                },
+            ) => {
+                let (moved_in, moved_out) = set_delta(old_set, new_set);
+                if !moved_in.is_empty() || !moved_out.is_empty() {
+                    changes.push(RuleChange::IfindexesChanged {
+                        op,
+                        added: moved_in,
+                        removed: moved_out,
+                    });
+                }
+            }
+            // same_identity never pairs across variant families;
+            // defensive — render whole rather than guess a member field.
+            _ => changes.push(RuleChange::OpAdded(op)),
+        }
+    }
+    for op in unpaired {
+        changes.push(RuleChange::OpRemoved(op));
+    }
+    changes
+}
+
+/// Whether two ops share an identity: same variant with every field
+/// except the set member equal (an `IfaceAllow` is its ifindex + uRPF
+/// hint + action; the prefix set is the mutable part). An identity
+/// change — different interface, mode, or action — is a new op (the
+/// w8 reload case: monitor→drop renders whole ops), while a persistent
+/// identity with a changed set renders as the members that moved.
+fn same_identity(a: &SavProgramOp, b: &SavProgramOp) -> bool {
+    match (a, b) {
+        (
+            SavProgramOp::IfaceAllow {
+                ifindex: a_ifindex,
+                urpf: a_urpf,
+                action: a_action,
+                ..
+            },
+            SavProgramOp::IfaceAllow {
+                ifindex: b_ifindex,
+                urpf: b_urpf,
+                action: b_action,
+                ..
+            },
+        ) => a_ifindex == b_ifindex && a_urpf == b_urpf && a_action == b_action,
+        (
+            SavProgramOp::IfaceBlock {
+                ifindex: a_ifindex,
+                action: a_action,
+                ..
+            },
+            SavProgramOp::IfaceBlock {
+                ifindex: b_ifindex,
+                action: b_action,
+                ..
+            },
+        ) => a_ifindex == b_ifindex && a_action == b_action,
+        (
+            SavProgramOp::PrefixAllow {
+                prefix: a_prefix,
+                action: a_action,
+                ..
+            },
+            SavProgramOp::PrefixAllow {
+                prefix: b_prefix,
+                action: b_action,
+                ..
+            },
+        ) => a_prefix == b_prefix && a_action == b_action,
+        (
+            SavProgramOp::PrefixBlock {
+                prefix: a_prefix,
+                action: a_action,
+                ..
+            },
+            SavProgramOp::PrefixBlock {
+                prefix: b_prefix,
+                action: b_action,
+                ..
+            },
+        ) => a_prefix == b_prefix && a_action == b_action,
+        _ => false,
+    }
+}
+
+/// The members that moved between two renditions of an op's set field:
+/// present only in the new set, present only in the old set. Both
+/// operand sets come normalized sorted from [`SavProgram::ops`], so
+/// the results stay sorted.
+fn set_delta<T: Copy + Eq>(old: &[T], new: &[T]) -> (Vec<T>, Vec<T>) {
+    let added = new.iter().copied().filter(|m| !old.contains(m)).collect();
+    let removed = old.iter().copied().filter(|m| !new.contains(m)).collect();
+    (added, removed)
+}
+
+/// The op rendered without its set member — the persistent context a
+/// member-delta line names, mirroring [`SavProgramOp`]'s Display shape
+/// minus the bracketed set (e.g. `allow if#2 strict monitor`).
+fn op_context(op: &SavProgramOp) -> String {
+    match op {
+        SavProgramOp::IfaceAllow {
+            ifindex,
+            urpf,
+            action,
+            ..
+        } => format!("allow if#{ifindex} {urpf} {action}"),
+        SavProgramOp::IfaceBlock {
+            ifindex, action, ..
+        } => {
+            format!("block if#{ifindex} {action}")
+        }
+        SavProgramOp::PrefixAllow { prefix, action, .. } => {
+            format!("allow {prefix} {action}")
+        }
+        SavProgramOp::PrefixBlock { prefix, action, .. } => {
+            format!("block {prefix} {action}")
+        }
+    }
+}
+
+/// ` +[a, b] -[c]` for a member delta, with either side omitted when
+/// empty.
+fn write_members(
+    f: &mut fmt::Formatter<'_>,
+    added: impl Iterator<Item = String>,
+    removed: impl Iterator<Item = String>,
+) -> fmt::Result {
+    let added: Vec<String> = added.collect();
+    let removed: Vec<String> = removed.collect();
+    if !added.is_empty() {
+        write!(f, " +[{}]", added.join(", "))?;
+    }
+    if !removed.is_empty() {
+        write!(f, " -[{}]", removed.join(", "))?;
+    }
+    Ok(())
 }
 
 /// One allowlist prefix whose deletion is being held for the hysteresis
@@ -1003,16 +1284,56 @@ where
                 self.install(dp, &target).await?;
             }
             Some(prev) if *prev != target => {
-                let (added, removed) = program_diff(prev.ops(), target.ops());
-                for op in &added {
-                    info!(rule = %op, "savd: rule added");
+                // Field-granular churn log (A20): ops whose identity
+                // persists render only the members that moved — one
+                // short line per changed allowlist instead of the whole
+                // set twice — while genuinely new and removed ops keep
+                // their whole-op lines. Rendering only: the install
+                // below still swaps the entire program.
+                let changes = rule_changes(prev.ops(), target.ops());
+                for change in &changes {
+                    match change {
+                        RuleChange::OpAdded(op) => info!(rule = %op, "savd: rule added"),
+                        RuleChange::OpRemoved(op) => info!(rule = %op, "savd: rule removed"),
+                        RuleChange::PrefixesChanged { .. } => {
+                            info!(change = %change, "savd: rule prefixes changed");
+                        }
+                        RuleChange::IfindexesChanged { .. } => {
+                            info!(change = %change, "savd: rule ifindexes changed");
+                        }
+                    }
                 }
-                for op in &removed {
-                    info!(rule = %op, "savd: rule removed");
-                }
+                let ops_added = changes
+                    .iter()
+                    .filter(|c| matches!(c, RuleChange::OpAdded(_)))
+                    .count();
+                let ops_removed = changes
+                    .iter()
+                    .filter(|c| matches!(c, RuleChange::OpRemoved(_)))
+                    .count();
+                let prefixes_moved = changes
+                    .iter()
+                    .map(|c| match c {
+                        RuleChange::PrefixesChanged { added, removed, .. } => {
+                            added.len() + removed.len()
+                        }
+                        _ => 0,
+                    })
+                    .sum::<usize>();
+                let ifindexes_moved = changes
+                    .iter()
+                    .map(|c| match c {
+                        RuleChange::IfindexesChanged { added, removed, .. } => {
+                            added.len() + removed.len()
+                        }
+                        _ => 0,
+                    })
+                    .sum::<usize>();
                 info!(
-                    added = added.len(),
-                    removed = removed.len(),
+                    ops_added,
+                    ops_removed,
+                    prefixes_moved,
+                    ifindexes_moved,
                     deferred = self.pending_deletions.len(),
                     %self.config,
                     "savd: rule set changed"
@@ -1268,6 +1589,156 @@ mod tests {
         // Identity: no change, no diff.
         let (added, removed) = program_diff(&old, &old);
         assert!(added.is_empty() && removed.is_empty());
+    }
+
+    #[test]
+    fn field_diff_names_moved_prefixes_on_a_persistent_allowlist() {
+        // The churn case A20 compresses: prefixes join and leave an
+        // allowlist whose identity (ifindex + uRPF hint + action)
+        // persists. The field-level diff names exactly the prefixes
+        // that moved; program_diff's op-set semantics are untouched
+        // (it still reports both whole ops).
+        let old = [allow(
+            2,
+            &["198.51.100.0/24", "203.0.113.0/24"],
+            SavEnforce::Monitor,
+        )];
+        let new = [allow(
+            2,
+            &["192.0.2.0/24", "203.0.113.0/24"],
+            SavEnforce::Monitor,
+        )];
+        let changes = rule_changes(&old, &new);
+        assert_eq!(
+            changes,
+            vec![RuleChange::PrefixesChanged {
+                op: allow(2, &["192.0.2.0/24", "203.0.113.0/24"], SavEnforce::Monitor),
+                added: vec!["192.0.2.0/24".parse().unwrap()],
+                removed: vec!["198.51.100.0/24".parse().unwrap()],
+            }],
+            "one delta for the persistent allowlist, naming the moved prefixes"
+        );
+        assert_eq!(
+            changes[0].to_string(),
+            "allow if#2 strict monitor +[192.0.2.0/24] -[198.51.100.0/24]",
+            "context once, then only the members that moved"
+        );
+
+        // One-sided renderings omit the empty side.
+        let grown = rule_changes(
+            &[allow(2, &["198.51.100.0/24"], SavEnforce::Monitor)],
+            &[allow(
+                2,
+                &["198.51.100.0/24", "203.0.113.0/24"],
+                SavEnforce::Monitor,
+            )],
+        );
+        assert_eq!(
+            grown[0].to_string(),
+            "allow if#2 strict monitor +[203.0.113.0/24]"
+        );
+        let shrunk = rule_changes(
+            &[allow(2, &["198.51.100.0/24"], SavEnforce::Monitor)],
+            &[allow(2, &[], SavEnforce::Monitor)],
+        );
+        assert_eq!(
+            shrunk[0].to_string(),
+            "allow if#2 strict monitor -[198.51.100.0/24]"
+        );
+
+        // Op-set semantics intact: the same inputs still diff as whole
+        // ops at the program_diff level.
+        let (added, removed) = program_diff(&old, &new);
+        assert_eq!(added, vec![new[0].clone()]);
+        assert_eq!(removed, vec![old[0].clone()]);
+    }
+
+    #[test]
+    fn field_diff_keeps_whole_ops_for_new_and_removed_identities() {
+        // Genuinely new op (a new interface's allowlist), removed op
+        // (the interface left the program), and an action swap — a NEW
+        // identity, operator intent (the w8 reload case), not a member
+        // move — all render whole, exactly program_diff's op sets.
+        let old = [
+            allow(2, &["198.51.100.0/24"], SavEnforce::Monitor),
+            allow(3, &["192.0.2.0/24"], SavEnforce::Monitor),
+        ];
+        let new = [
+            allow(2, &["198.51.100.0/24"], SavEnforce::Drop),
+            allow(4, &["203.0.113.0/24"], SavEnforce::Monitor),
+        ];
+        assert_eq!(
+            rule_changes(&old, &new),
+            vec![
+                RuleChange::OpAdded(allow(2, &["198.51.100.0/24"], SavEnforce::Drop)),
+                RuleChange::OpAdded(allow(4, &["203.0.113.0/24"], SavEnforce::Monitor)),
+                RuleChange::OpRemoved(allow(2, &["198.51.100.0/24"], SavEnforce::Monitor)),
+                RuleChange::OpRemoved(allow(3, &["192.0.2.0/24"], SavEnforce::Monitor)),
+            ],
+            "no identity persisted: whole-op lines only, in program_diff's order"
+        );
+
+        // Identity: no change, no lines.
+        assert!(rule_changes(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn field_diff_covers_exactly_the_op_set_difference() {
+        // Mixed change: a persistent allowlist gains a prefix, a
+        // router-scale PBA op's interface set turns over, and a whole
+        // op leaves. Every op program_diff reports is either a
+        // whole-op line or the op behind exactly one member delta —
+        // the field-level diff renders the same difference finer,
+        // never different.
+        let pba = |ifindexes: &[u32]| SavProgramOp::PrefixAllow {
+            prefix: "203.0.113.0/24".parse().unwrap(),
+            ifindexes: ifindexes.to_vec(),
+            action: SavEnforce::Monitor,
+        };
+        let old = [
+            allow(2, &["198.51.100.0/24"], SavEnforce::Monitor),
+            pba(&[2, 3]),
+            allow(9, &["192.0.2.0/24"], SavEnforce::Monitor),
+        ];
+        let new = [
+            allow(
+                2,
+                &["198.51.100.0/24", "203.0.113.0/24"],
+                SavEnforce::Monitor,
+            ),
+            pba(&[3, 4]),
+        ];
+        let changes = rule_changes(&old, &new);
+        assert_eq!(
+            changes,
+            vec![
+                RuleChange::PrefixesChanged {
+                    op: allow(
+                        2,
+                        &["198.51.100.0/24", "203.0.113.0/24"],
+                        SavEnforce::Monitor
+                    ),
+                    added: vec!["203.0.113.0/24".parse().unwrap()],
+                    removed: vec![],
+                },
+                RuleChange::IfindexesChanged {
+                    op: pba(&[3, 4]),
+                    added: vec![4],
+                    removed: vec![2],
+                },
+                RuleChange::OpRemoved(allow(9, &["192.0.2.0/24"], SavEnforce::Monitor)),
+            ]
+        );
+        assert_eq!(
+            changes[1].to_string(),
+            "allow 203.0.113.0/24 monitor +[4] -[2]"
+        );
+
+        // Same op-set difference underneath: two new ops (both paired
+        // into deltas), three old ops (two paired, one removed whole).
+        let (added, removed) = program_diff(&old, &new);
+        assert_eq!(added.len(), 2);
+        assert_eq!(removed.len(), 3);
     }
 
     // ---- daemon over a duplex fake zebra (the staticd test shape) ----
