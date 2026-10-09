@@ -327,6 +327,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sav"
+version = "0.0.0"
+dependencies = [
+ "common",
+ "rib",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/rib",
+    "crates/sav",
     "crates/netlink-dp",
     "crates/zapi",
     "crates/rousterd",
@@ -15,6 +16,7 @@ edition = "2021"
 [workspace.dependencies]
 common = { path = "crates/common" }
 rib = { path = "crates/rib" }
+sav = { path = "crates/sav" }
 netlink-dp = { path = "crates/netlink-dp" }
 zapi = { path = "crates/zapi" }
 

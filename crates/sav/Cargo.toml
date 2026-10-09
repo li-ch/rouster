@@ -1,0 +1,11 @@
+[package]
+name = "sav"
+description = "Rouster SAV: SAV Information Base (SIB) - typed source-prefix/interface bindings"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common.workspace = true
+rib.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
