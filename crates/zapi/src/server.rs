@@ -244,6 +244,14 @@ pub struct ZapiSession {
     /// the registering daemon — the value real zebra forwards to the BFD
     /// daemon; recorded here, no consumer tonight).
     pub bfd_pid: Option<u32>,
+    /// ROUTE_NOTIFY_REQUEST (126) flag, recorded like zebra's per-client
+    /// `route_notify` bit: the client wants ROUTE_NOTIFY_OWNER (11)
+    /// pushes when routes it owns get their status decided. Zebra sends
+    /// NO synchronous reply to the request itself (A5 wire capture), so
+    /// recording the flag IS the answer; pushing the 11 frames needs
+    /// reconcile feedback the driver does not yet surface (deferred,
+    /// pinned doc A5 section).
+    pub route_notify: bool,
 }
 
 /// Accept loop for ZAPI clients. Runs until the task is stopped; every
@@ -739,18 +747,25 @@ impl ZapiSession {
                 Ok(())
             }
             ZapiMessage::RouteNotifyRequest { flag } => {
-                // ROUTE_NOTIFY_REQUEST wants route-owner status updates,
-                // answered with ROUTE_NOTIFY_OWNER (11) — whose body layout
-                // is NOT-PINNED (no source read, no wire capture; the
-                // pinned doc records the gap). The request is therefore
-                // left unanswered rather than guessed: staticd (the
-                // sender, E in the fixtures) tolerates the silence through
-                // full route installation (Z4/Z5 smokes). Loud on purpose
-                // so the gap surfaces in every log.
-                warn!(
+                // ROUTE_NOTIFY_REQUEST: the client (staticd in practice)
+                // asks for ROUTE_NOTIFY_OWNER (11) pushes about routes it
+                // owns. Zebra answers NOTHING synchronously — A5 wire
+                // capture against a real zebra 10.2.2: the only frames a
+                // fresh client receives after the request are the connect
+                // pushes (CAPABILITIES 20, VRF_ADD 33), and the 11 frame
+                // arrives asynchronously once an owned route's install
+                // status is decided (body now PINNED in the doc and
+                // modeled in the codec). So the zebra-faithful answer is
+                // to record the interest, not to write a reply; pushing
+                // the 11 frames needs per-route reconcile feedback the
+                // driver does not surface yet (disclosed in the pinned
+                // doc's A5 section) — staticd tolerates the missing
+                // pushes through full route installation (Z4/Z5 smokes).
+                self.route_notify = flag != 0;
+                info!(
                     id = self.id,
                     flag,
-                    "zapi: ROUTE_NOTIFY_REQUEST left unanswered: ROUTE_NOTIFY_OWNER (11) body NOT-PINNED (pinned doc gap)"
+                    "zapi: route-notify request recorded (no synchronous reply, per zebra — A5)"
                 );
                 Ok(())
             }
@@ -1764,19 +1779,21 @@ mod tests {
         );
     }
 
-    /// ROUTE_NOTIFY_REQUEST is recorded but NOT answered: ROUTE_NOTIFY_OWNER
-    /// (11) has no pinned body (pinned doc gap, W2 disclosure), and no
-    /// answer beats a guessed wire format. Proven by handling one request
-    /// and reading the client side to EOF — empty means nothing was
-    /// written, and the Ok return means the connection survived.
+    /// ROUTE_NOTIFY_REQUEST is recorded and NOT answered synchronously —
+    /// exactly what a real zebra 10.2.2 does (A5 wire capture: no reply
+    /// frame; the ROUTE_NOTIFY_OWNER (11) push comes later, asynchronously,
+    /// once an owned route's status is decided). Proven by handling one
+    /// request and reading the client side to EOF — empty means nothing
+    /// was written, and the Ok return means the connection survived.
     #[tokio::test]
-    async fn route_notify_request_left_unanswered_alive() {
+    async fn route_notify_request_recorded_without_reply() {
         let mut session = ZapiSession {
             id: 9,
             ..ZapiSession::default()
         };
         let (mut client_io, mut server_io) = tokio::io::duplex(1024);
         let (tx, mut rx) = mpsc::channel(16);
+        assert!(!session.route_notify, "flag starts clear");
         session
             .handle(
                 ZapiMessage::RouteNotifyRequest { flag: 1 },
@@ -1785,17 +1802,44 @@ mod tests {
                 &mut server_io,
             )
             .await
-            .expect("handled without error (NOT-PINNED, not fatal)");
+            .expect("handled without error (no-reply is the pinned answer)");
         drop(server_io);
         drop(tx);
         let mut written = Vec::new();
         use tokio::io::AsyncReadExt;
         client_io.read_to_end(&mut written).await.expect("eof");
-        assert!(written.is_empty(), "no ROUTE_NOTIFY_OWNER may be written");
+        assert!(
+            written.is_empty(),
+            "no synchronous reply — no ROUTE_NOTIFY_OWNER may be written here (per zebra, A5)"
+        );
+        assert!(session.route_notify, "interest recorded for later pushes");
         assert!(
             rx.try_recv().is_err(),
             "no RibCommand: nothing to ask the RIB for"
         );
+    }
+
+    /// A ROUTE_NOTIFY_REQUEST with flag 0 clears the interest (zebra's
+    /// `route_notify` bit follows the flag byte verbatim).
+    #[tokio::test]
+    async fn route_notify_request_flag_zero_clears_interest() {
+        let mut session = ZapiSession {
+            id: 10,
+            route_notify: true,
+            ..ZapiSession::default()
+        };
+        let (_client_io, mut server_io) = tokio::io::duplex(1024);
+        let (tx, _rx) = mpsc::channel(16);
+        session
+            .handle(
+                ZapiMessage::RouteNotifyRequest { flag: 0 },
+                0,
+                &tx,
+                &mut server_io,
+            )
+            .await
+            .expect("handled without error");
+        assert!(!session.route_notify, "flag 0 clears the interest");
     }
 
     #[tokio::test]

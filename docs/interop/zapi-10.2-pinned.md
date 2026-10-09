@@ -65,7 +65,7 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 8 | ZEBRA_INTERFACE_SET_PROTODOWN | B | |
 | 9 | ZEBRA_ROUTE_ADD | E | staticd, carries prefix (below) |
 | 10 | ZEBRA_ROUTE_DELETE | E | staticd, on reconnect |
-| 11 | ZEBRA_ROUTE_NOTIFY_OWNER | B | zebra→client; body layout **NOT-PINNED** (neither source-read nor wire-captured — W2). Answering ROUTE_NOTIFY_REQUEST (126) would mean guessing a wire format, so implementations that refuse to guess leave the request unanswered; staticd tolerates the silence |
+| 11 | ZEBRA_ROUTE_NOTIFY_OWNER | B, E | **A5-fix**: body layout PINNED by wire capture (was NOT-PINNED — W2) — see the A5 addendum. Asynchronous: pushed when an owned route's status is decided; zebra sends NO synchronous reply to ROUTE_NOTIFY_REQUEST (126) |
 | 12 | ZEBRA_REDISTRIBUTE_ADD | E | bgpd `redistribute static` |
 | 13 | ZEBRA_REDISTRIBUTE_DELETE | B | (`no redistribute static` did NOT emit one before zebra ack — see findings) |
 | 14 | ZEBRA_REDISTRIBUTE_DEFAULT_ADD | B | |
@@ -180,7 +180,7 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 123 | ZEBRA_OPAQUE_REGISTER | B | |
 | 124 | ZEBRA_OPAQUE_UNREGISTER | B | |
 | 125 | ZEBRA_NEIGH_DISCOVER | B | |
-| 126 | ZEBRA_ROUTE_NOTIFY_REQUEST | E | staticd, body `01` |
+| 126 | ZEBRA_ROUTE_NOTIFY_REQUEST | E | staticd, body `01`; zebra sends no reply — the answer is the later ROUTE_NOTIFY_OWNER (11) push (A5) |
 | 127 | ZEBRA_CLIENT_CLOSE_NOTIFY | B | |
 | 128 | ZEBRA_NEIGH_ADDED | B | |
 | 129 | ZEBRA_NEIGH_REMOVED | B | |
@@ -336,7 +336,9 @@ bgpd's third zclient connection at startup: proto 10 (BGP) + u16 0.
 
 ### ZEBRA_ROUTE_NOTIFY_REQUEST (126) — 1-byte body `01`
 
-staticd connect burst (wants route-owner status notifications).
+staticd connect burst (wants route-owner status notifications). No
+synchronous reply exists — the answer is the asynchronous
+ROUTE_NOTIFY_OWNER (11) push (A5 addendum).
 
 ## Zebra→client bodies — SRC-VERIFIED layouts, still not wire-captured
 
@@ -525,3 +527,65 @@ that does not re-register. Disclosed approximations, all in-process only:
 Implemented in `crates/zapi/src/server.rs` (first-HELLO trigger,
 `RibCommand::SessionEstablished`) and `crates/rousterd/src/driver.rs`
 (identity-keyed registration memory, adoption, delta dump).
+
+## A5 addendum (2026-10-09): ROUTE_NOTIFY_OWNER (11) wire-captured
+
+The W2 gap ("body NOT-PINNED — neither source-read nor wire-captured")
+is closed in both directions. Method: `crates/zapi/src/bin/zapi-notify-probe.rs`
+(the CLIENT twin of zapi-sniff — connects to a REAL zebra's zserv socket,
+sends the staticd-shaped burst HELLO + ROUTE_NOTIFY_REQUEST(126, body `01`)
++ ROUTE_ADD of blackhole 203.0.113.0/24, logs every frame back) against
+zebra 10.2.2 in the frr-testbed container. Logs quarantined under
+`away/2026-10-09/quarantine/a5/`.
+
+Captured frames (26 bytes total, body 16 each) — both flavors:
+
+```text
+INSTALLED : hdr=001afe0600000000000b body=020000000218cb007100000000fe0101
+REMOVED   : hdr=001afe0600000000000b body=030000000218cb007100000000fe0101
+```
+
+Body layout, cross-checked against `zapi_route_notify_decode`
+(`lib/zclient.c`, frr-10.2.2):
+
+| field | size | captured | note |
+|-------|------|----------|------|
+| note | u32, **little-endian raw C-enum copy** | `02000000` = 2 (INSTALLED), `03000000` = 3 (REMOVED) | `enum zapi_route_notify_owner`: 0 FAIL_INSTALL, 1 BETTER_ADMIN_WON, 2 INSTALLED, 3 REMOVED, 4 REMOVE_FAIL. Zebra `stream_put`s the enum `sizeof()`-sized (4), NOT `stream_putc` |
+| family | u8 | `02` | AF_INET (AF_INET6 = 10) |
+| prefixlen | u8 | `18` = 24 | |
+| address | **full family byte-length** (4/16) | `cb0071 00` | NOT the PSIZE(plen) of ROUTE_ADD — `zapi_route_notify_decode` reads `prefix_blen` |
+| tableid | u32 big-endian | `000000fe` = 254 | RT_TABLE_MAIN |
+| afi | u8 | `01` | AFI_IP |
+| safi | u8 | `01` | SAFI_UNICAST |
+
+Pinned behaviors:
+
+1. **No synchronous reply to 126.** The only frames a fresh client
+   receives after the burst are the connect pushes CAPABILITIES (20,
+   body `000000000000000100000000`) and VRF_ADD (33, 76-byte body
+   naming `default`) — then, 14 ms after the ROUTE_ADD, exactly one
+   ROUTE_NOTIFY_OWNER with note=INSTALLED. No HELLO echo either: real
+   zebra 10.2.2 does NOT echo HELLO (extension of operational finding 2
+   — our echo is accepted by staticd/bgpd, so it stays).
+2. **INSTALLED is kernel-true.** `ip route` inside the window shows
+   `blackhole 203.0.113.0/24 proto static metric 20`; a mid-session
+   ROUTE_DELETE in the exact W1 fixture shape (20 bytes, u16 nexthop
+   count 0 + distance) is answered 13 ms later with note=REMOVED and
+   the kernel route disappears; zebra's own disconnect line then reads
+   "0 static routes removed from the rib".
+3. **ROUTE_DELETE shape is load-bearing.** An early probe run sent a
+   19-byte delete (nexthop count truncated to u8-width); zebra 10.2.2
+   parses that as count=1, tries to read the phantom nexthop's vrf
+   u32, logs `stream_getl2: Attempt to get long out of bounds (size:
+   29, getp: 29, endp: 29)` and silently skips the message — no
+   removal, no notify, connection stays up. Encode deletes with the
+   full u16 count.
+4. **Server behavior.** Rouster's ZAPI server records the request flag
+   (`ZapiSession::route_notify`) and writes no reply — the pinned
+   zebra-faithful answer. Pushing the 11 frames needs per-route
+   reconcile feedback the driver does not surface to sessions yet
+   (disclosed; same deferral class as W2's deferred items). The codec
+   (`ZapiMessage::RouteNotifyOwner`) round-trips both captured frames;
+   the probe's live decode lines in
+   `away/2026-10-09/quarantine/a5/notify-cap4-removed.log` show the
+   new codec parsing the real zebra frames as they arrive.

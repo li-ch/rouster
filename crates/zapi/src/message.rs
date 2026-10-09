@@ -122,6 +122,18 @@ pub mod blackhole_type {
     pub const UNSPEC: u8 = 2;
 }
 
+/// `enum zapi_route_notify_owner` values (frr-10.2.2 `lib/zclient.h`):
+/// the flavor of a ZEBRA_ROUTE_NOTIFY_OWNER (11) push. E (A5): 2
+/// (INSTALLED) wire-captured from a real zebra.
+pub mod route_notify_note {
+    pub const FAIL_INSTALL: u32 = 0;
+    pub const BETTER_ADMIN_WON: u32 = 1;
+    /// E: the A5 capture (blackhole static route, kernel-confirmed).
+    pub const INSTALLED: u32 = 2;
+    pub const REMOVED: u32 = 3;
+    pub const REMOVE_FAIL: u32 = 4;
+}
+
 /// ZAPI command codes: `zebra_message_types_t` (frr-10.2.2 `lib/zclient.h`),
 /// values 0..=146. Wire-observed entries are fixture-cited in the pinned doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1819,6 +1831,86 @@ impl ZapiRouterIdUpdate {
     }
 }
 
+/// ZEBRA_ROUTE_NOTIFY_OWNER (11) zebra→client body — the asynchronous
+/// answer to ROUTE_NOTIFY_REQUEST (126) interest: zebra pushes one when a
+/// route owned by the requesting client has its status decided (installed
+/// into the kernel, install failed, better route won, removed). There is
+/// NO synchronous reply to 126 itself (A5 capture: the only frames after
+/// the request are the connect pushes 20/33 and this notification).
+///
+/// Layout per the A5 wire capture, cross-checked against
+/// `zapi_route_notify_decode` (`lib/zclient.c`, frr-10.2.2):
+/// note u32 in the CPU's NATIVE byte order (zebra `stream_put`s the C
+/// enum raw — `sizeof(enum)` = 4, little-endian on x86_64/aarch64) |
+/// family u8 (AF_INET=2/AF_INET6=10) | prefixlen u8 | address at FULL
+/// family byte-length (4/16 — NOT the PSIZE(plen) of ROUTE_ADD) |
+/// tableid u32 big-endian | afi u8 | safi u8.
+///
+/// E (A5): `02000000 02 18 cb007100 000000fe 01 01` = INSTALLED,
+/// 203.0.113.0/24, table 254 (RT_TABLE_MAIN), AFI_IP, SAFI_UNICAST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZapiRouteNotifyOwner {
+    /// [`route_notify_note`] value; see the struct docs for the
+    /// little-endian raw-enum quirk.
+    pub note: u32,
+    pub prefix: IpPrefix,
+    /// E: 254 = RT_TABLE_MAIN (the crate's [`crate::DEFAULT_TABLE`]).
+    pub tableid: u32,
+    /// E: 1 (AFI_IP).
+    pub afi: u8,
+    /// E: 1 (SAFI_UNICAST).
+    pub safi: u8,
+}
+
+impl ZapiRouteNotifyOwner {
+    pub fn decode(body: &[u8]) -> Result<Self, ZapiCodecError> {
+        let mut b = body;
+        let raw_note = take_n(&mut b, 4)?;
+        let note = u32::from_le_bytes([raw_note[0], raw_note[1], raw_note[2], raw_note[3]]);
+        let family = u16::from(take_u8(&mut b)?);
+        let blen = family_blen(family)?;
+        let prefix_len = take_u8(&mut b)?;
+        let addr = take_n(&mut b, blen)?;
+        let prefix = match family {
+            AF_INET => {
+                let mut a = [0u8; 4];
+                a.copy_from_slice(addr);
+                v4_prefix(a, prefix_len)?
+            }
+            _ => {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(addr);
+                v6_prefix(a, prefix_len)?
+            }
+        };
+        let tableid = take_be_u32(&mut b)?;
+        let afi = take_u8(&mut b)?;
+        let safi = take_u8(&mut b)?;
+        if !b.is_empty() {
+            return Err(ZapiCodecError::TrailingBytes(b.len()));
+        }
+        Ok(Self {
+            note,
+            prefix,
+            tableid,
+            afi,
+            safi,
+        })
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_slice(&self.note.to_le_bytes());
+        let (family, len, addr) = prefix_parts(&self.prefix);
+        buf.put_u8(family as u8);
+        buf.put_u8(len);
+        let blen = family_blen(family).expect("IpPrefix is always v4/v6");
+        buf.put_slice(&addr[..blen]);
+        buf.put_u32(self.tableid);
+        buf.put_u8(self.afi);
+        buf.put_u8(self.safi);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The message envelope
 // ---------------------------------------------------------------------------
@@ -1854,6 +1946,10 @@ pub enum ZapiMessage {
     RouteAdd(ZapiRoute),
     /// ZEBRA_ROUTE_DELETE (10). E: staticd reconnect fixture.
     RouteDelete(ZapiRoute),
+    /// ZEBRA_ROUTE_NOTIFY_OWNER (11), zebra→client: asynchronous status
+    /// push to a client that asked with ROUTE_NOTIFY_REQUEST (126).
+    /// E (A5): captured from a real zebra 10.2.2.
+    RouteNotifyOwner(ZapiRouteNotifyOwner),
     /// ZEBRA_REDISTRIBUTE_ADD (12). E: bgpd fixture.
     RedistributeAdd(ZapiRedistribute),
     /// ZEBRA_REDISTRIBUTE_DELETE (13). SPEC (same shape as add).
@@ -1941,6 +2037,9 @@ impl ZapiMessage {
             ZapiCommand::NexthopUpdate => Ok(Self::NexthopUpdate(ZapiNexthopUpdate::decode(body)?)),
             ZapiCommand::RouteAdd => Ok(Self::RouteAdd(ZapiRoute::decode(body)?)),
             ZapiCommand::RouteDelete => Ok(Self::RouteDelete(ZapiRoute::decode(body)?)),
+            ZapiCommand::RouteNotifyOwner => {
+                Ok(Self::RouteNotifyOwner(ZapiRouteNotifyOwner::decode(body)?))
+            }
             ZapiCommand::RedistributeAdd => {
                 Ok(Self::RedistributeAdd(ZapiRedistribute::decode(body)?))
             }
@@ -2008,6 +2107,7 @@ impl ZapiMessage {
             Self::NexthopUpdate(_) => 23,
             Self::RouteAdd(_) => 9,
             Self::RouteDelete(_) => 10,
+            Self::RouteNotifyOwner(_) => 11,
             Self::RedistributeAdd(_) => 12,
             Self::RedistributeDelete(_) => 13,
             Self::RedistributeRouteAdd(_) => 31,
@@ -2051,6 +2151,10 @@ impl ZapiMessage {
             }
             Self::RouteAdd(r) | Self::RouteDelete(r) => {
                 r.encode(buf);
+                Ok(())
+            }
+            Self::RouteNotifyOwner(n) => {
+                n.encode(buf);
                 Ok(())
             }
             Self::RedistributeAdd(r) | Self::RedistributeDelete(r) => {
@@ -2225,6 +2329,60 @@ mod tests {
         assert_eq!(msg2, ZapiMessage::BfdClientRegister { pid: 535 });
         assert_eq!(roundtrip(&msg), hex("00000175"));
         assert_eq!(roundtrip(&msg2), hex("00000217"));
+    }
+
+    #[test]
+    fn route_notify_owner_decodes_captured_bytes() {
+        // A5: the exact 16 bytes a real zebra 10.2.2 pushed after the
+        // probe (announcing STATIC, notify-requested) added blackhole
+        // 203.0.113.0/24: note 2 = INSTALLED as a LITTLE-ENDIAN raw C
+        // enum copy, family 2 (AF_INET), plen 24, full 4-byte address,
+        // tableid 254 big-endian, afi 1, safi 1.
+        let wire = hex("020000000218cb007100000000fe0101");
+        let msg = ZapiMessage::decode(11, &wire).unwrap();
+        assert_eq!(
+            msg,
+            ZapiMessage::RouteNotifyOwner(ZapiRouteNotifyOwner {
+                note: route_notify_note::INSTALLED,
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                tableid: 254,
+                afi: 1,
+                safi: 1,
+            })
+        );
+        assert_eq!(msg.command(), 11);
+        assert_eq!(roundtrip(&msg), wire, "re-encode must be byte-identical");
+    }
+
+    #[test]
+    fn route_notify_owner_note_is_little_endian_raw_enum() {
+        // FAIL_INSTALL (0) still occupies 4 bytes on the wire; the note
+        // field is a raw C-enum copy, not a u8 and not big-endian.
+        let msg = ZapiMessage::RouteNotifyOwner(ZapiRouteNotifyOwner {
+            note: route_notify_note::FAIL_INSTALL,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+            tableid: 254,
+            afi: 1,
+            safi: 1,
+        });
+        // 16 bytes: note 00000000 | family 02 | plen 18 | addr c6336400 |
+        // tableid 000000fe | afi 01 | safi 01.
+        assert_eq!(roundtrip(&msg), hex("000000000218c6336400000000fe0101"));
+    }
+
+    #[test]
+    fn route_notify_owner_rejects_truncated_and_trailing() {
+        let wire = hex("020000000218cb007100000000fe0101");
+        assert_eq!(
+            ZapiMessage::decode(11, &wire[..wire.len() - 1]),
+            Err(ZapiCodecError::Truncated { need: 1 })
+        );
+        let mut long = wire.clone();
+        long.push(0);
+        assert_eq!(
+            ZapiMessage::decode(11, &long),
+            Err(ZapiCodecError::TrailingBytes(1))
+        );
     }
 
     #[test]
