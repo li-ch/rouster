@@ -63,6 +63,14 @@ impl SpoofMonitor {
     pub fn counts(&self) -> SavMonitorCounts {
         self.counts
     }
+
+    /// Replace the op list being judged, keeping the accumulated counters
+    /// (the daemon's reload path: rules regenerate, the spoof counter must
+    /// not reset). Unchanged counters also make before/after comparable
+    /// across an evaluate that produced the same ops.
+    pub fn set_ops(&mut self, ops: &[SavOp]) {
+        self.ops = ops.to_vec();
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +151,34 @@ mod tests {
                 unknown: 1,
             }
         );
+    }
+
+    /// Regenerating the op list (the daemon's poll/reload path) keeps the
+    /// accumulated counters: observations before the swap stay counted,
+    /// new ones accumulate on top.
+    #[test]
+    fn set_ops_keeps_counters_across_regeneration() {
+        let ops = vec![SavOp::IbaPermit {
+            ifindex: 2,
+            prefixes: vec!["198.51.100.0/24".parse().unwrap()],
+            action: crate::mode::SavAction::Monitor,
+        }];
+        let mut monitor = SpoofMonitor::new(&ops);
+        assert_eq!(monitor.observe(ip("198.51.100.9"), 2), Verdict::Valid);
+        assert_eq!(monitor.observe(ip("203.0.113.5"), 2), Verdict::Invalid);
+
+        // Regenerate to an empty op list: counters preserved, new
+        // verdicts judged by the NEW ops (no mode on the interface
+        // anymore → unknown, not invalid — fail-open).
+        monitor.set_ops(&[]);
+        assert_eq!(monitor.counts().invalid, 1);
+        assert_eq!(monitor.counts().valid, 1);
+        assert_eq!(monitor.observe(ip("198.51.100.9"), 2), Verdict::Unknown);
+        assert_eq!(
+            monitor.counts().invalid,
+            1,
+            "unchanged: unknown is not spoof"
+        );
+        assert_eq!(monitor.counts().unknown, 1);
     }
 }

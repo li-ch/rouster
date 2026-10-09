@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN};
 use crate::message::{
     message_flag, route_type, ZapiCodecError, ZapiHello, ZapiMessage, ZapiNexthop,
-    ZapiNexthopRegister, ZapiNexthopUpdate, ZapiRoute,
+    ZapiNexthopRegister, ZapiNexthopUpdate, ZapiRedistribute, ZapiRoute,
 };
 
 /// Route flags FRR 10.2.2 staticd sends on its ROUTE_ADD/DELETE:
@@ -117,6 +117,25 @@ where
         self.send(&ZapiMessage::NexthopUnregister(nexthop_register_message(
             gateway,
         )))
+        .await
+    }
+
+    /// REDISTRIBUTE_ADD (12): register interest in best-route pushes
+    /// (`zclient_redistribute_set`; the zebra side answers with the
+    /// current best-route dump of that type, then event-driven
+    /// REDISTRIBUTE_ROUTE_ADD/DEL). Consumed by Rouster's savd to hold a
+    /// RIB view without any new message type.
+    pub async fn send_redistribute_add(
+        &mut self,
+        afi: u8,
+        route_type: u8,
+        instance: u16,
+    ) -> io::Result<()> {
+        self.send(&ZapiMessage::RedistributeAdd(ZapiRedistribute {
+            afi,
+            route_type,
+            instance,
+        }))
         .await
     }
 
@@ -334,6 +353,22 @@ mod tests {
         send.await.unwrap().unwrap();
         assert_eq!(header.command, 21);
         assert_eq!(body, unhex("00000001000220c0000201"));
+    }
+
+    /// REDISTRIBUTE_ADD must reproduce the bgpd `redistribute static`
+    /// fixture body exactly (E: `01 04 0000`).
+    #[tokio::test]
+    async fn redistribute_add_encodes_fixture_bytes() {
+        let (client_io, mut server_io) = duplex(4096);
+        let mut client = ZapiClient::new(client_io);
+        let send =
+            tokio::spawn(
+                async move { client.send_redistribute_add(1, route_type::STATIC, 0).await },
+            );
+        let (header, body) = server_read_frame(&mut server_io).await;
+        send.await.unwrap().unwrap();
+        assert_eq!(header.command, 12);
+        assert_eq!(body, unhex("01040000"));
     }
 
     /// next_nexthop_update skips an interface push standing in front of

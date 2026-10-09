@@ -180,6 +180,15 @@ pub enum SavUrpf {
     Loose,
 }
 
+impl fmt::Display for SavUrpf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SavUrpf::Strict => "strict",
+            SavUrpf::Loose => "loose",
+        })
+    }
+}
+
 /// One backend-neutral SAV enforcement instruction — the dataplane
 /// mirror of the `sav` crate's compiled op. All four cells of GSC §3
 /// Figure 1's rule taxonomy: interface-scale prefix sets and
@@ -216,6 +225,44 @@ pub enum SavProgramOp {
         ifindexes: Vec<u32>,
         action: SavEnforce,
     },
+}
+
+impl fmt::Display for SavProgramOp {
+    /// Operator-facing one-liner (the daemon's rule logs): mode, scale,
+    /// interface/prefix set, action — e.g.
+    /// `allow if#2 [198.51.100.0/24] strict monitor`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let join = |items: &[String]| items.join(", ");
+        match self {
+            SavProgramOp::IfaceAllow {
+                ifindex,
+                prefixes,
+                urpf,
+                action,
+            } => {
+                let p: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+                write!(f, "allow if#{ifindex} [{}] {urpf} {action}", join(&p))
+            }
+            SavProgramOp::IfaceBlock {
+                ifindex,
+                prefixes,
+                action,
+            } => {
+                let p: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+                write!(f, "block if#{ifindex} [{}] {action}", join(&p))
+            }
+            SavProgramOp::PrefixAllow {
+                prefix,
+                ifindexes,
+                action,
+            } => write!(f, "allow {prefix} if {ifindexes:?} {action}"),
+            SavProgramOp::PrefixBlock {
+                prefix,
+                ifindexes,
+                action,
+            } => write!(f, "block {prefix} if {ifindexes:?} {action}"),
+        }
+    }
 }
 
 /// A compiled SAV program to install in the dataplane, normalized to a
@@ -458,6 +505,53 @@ mod tests {
         assert_eq!(a.ops().len(), 2);
         assert!(!a.is_empty());
         assert!(SavProgram::new().is_empty());
+    }
+
+    /// The operator-facing one-liners (the savd rule logs): each cell of
+    /// the GSC §3 taxonomy renders mode, scale, set, and action.
+    #[test]
+    fn sav_program_op_display_lines() {
+        assert_eq!(
+            allow(&["198.51.100.0/24"], SavUrpf::Strict, SavEnforce::Monitor).to_string(),
+            "allow if#3 [198.51.100.0/24] strict monitor"
+        );
+        assert_eq!(
+            SavProgramOp::IfaceAllow {
+                ifindex: 6,
+                prefixes: vec![],
+                urpf: SavUrpf::Loose,
+                action: SavEnforce::Drop,
+            }
+            .to_string(),
+            "allow if#6 [] loose drop",
+        );
+        assert_eq!(
+            SavProgramOp::IfaceBlock {
+                ifindex: 2,
+                prefixes: vec!["192.0.2.0/24".parse().unwrap()],
+                action: SavEnforce::Drop,
+            }
+            .to_string(),
+            "block if#2 [192.0.2.0/24] drop"
+        );
+        assert_eq!(
+            SavProgramOp::PrefixAllow {
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                ifindexes: vec![2, 3],
+                action: SavEnforce::Monitor,
+            }
+            .to_string(),
+            "allow 203.0.113.0/24 if [2, 3] monitor"
+        );
+        assert_eq!(
+            SavProgramOp::PrefixBlock {
+                prefix: "2001:db8::/48".parse().unwrap(),
+                ifindexes: vec![4],
+                action: SavEnforce::Monitor,
+            }
+            .to_string(),
+            "block 2001:db8::/48 if [4] monitor"
+        );
     }
 
     /// A route-only backend (no SAV impl) gets Unsupported from the

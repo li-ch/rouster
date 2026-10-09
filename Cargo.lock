@@ -337,6 +337,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zapi",
 ]
 
 [[package]]

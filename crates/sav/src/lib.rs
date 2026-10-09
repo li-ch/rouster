@@ -24,16 +24,21 @@
 //! equivalence rule generation from a (Sib, Rib) view), and [`table`]
 //! (the SAV Table Manager compile step: rules → `SavOp`s with their
 //! Monitor/Drop action as data, plus the reference evaluation
-//! semantics). Slice 3 bridges enforcement: [`program`] converts
+//! semantics). Slice 3 bridged enforcement: [`program`] converts
 //! compiled ops into the backend-neutral [`common::SavProgram`] the
 //! `Dataplane` trait installs, and [`monitor`] is the route-lookup
 //! counting surface monitor mode falls back to when the backend
-//! exposes no kernel counters.
+//! exposes no kernel counters. Slice 4 (W8) wired the daemon:
+//! [`savd`] holds the SIB, keeps a RIB view over the ZAPI client edge,
+//! regenerates + installs rules on the poll cadence (SIGHUP = full
+//! reload), and refuses to start in drop mode without the explicit
+//! `i-understand-drop-mode yes` friction line.
 
 pub mod gen;
 pub mod mode;
 pub mod monitor;
 pub mod program;
+pub mod savd;
 pub mod table;
 
 use std::collections::BTreeMap;

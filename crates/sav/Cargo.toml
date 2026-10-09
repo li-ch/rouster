@@ -1,6 +1,6 @@
 [package]
 name = "sav"
-description = "Rouster SAV: SIB, validation-mode rule model, uRPF rule generation, SAV table manager"
+description = "Rouster SAV: SIB, validation-mode rule model, uRPF rule generation, SAV table manager, savd daemon"
 edition.workspace = true
 version.workspace = true
 
@@ -9,11 +9,12 @@ common.workspace = true
 rib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-# Example-only (the W7 smoke binary drives the real dataplane through
-# the Dataplane trait inside the test container; nothing here affects
-# the library's dependency surface).
-[dev-dependencies]
+# savd daemon wiring (W8): the ZAPI client (RIB view via redistribute
+# pushes), the netlink backend (Dataplane installs + interface mirror),
+# the async runtime, and log output. All pre-existing workspace members
+# — no new crates, no lock-file changes; until W8 these were
+# dev-dependencies of the W7 example only.
 netlink-dp.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+zapi.workspace = true
