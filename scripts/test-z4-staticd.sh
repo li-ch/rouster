@@ -24,7 +24,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 IMAGE=rouster:z4
 NAME=rouster-z4
 BASE_IMAGE="${ROUSTER_TEST_BASE_IMAGE:-docker.m.daocloud.io/library/alpine:3.22}"
-ROSTERD_LOG=/var/log/rousterd.log
+ROUSTERD_LOG=/var/log/rousterd.log
 STATICD_LOG=/var/log/staticd.log
 ROUSTERD_CONF=/etc/rouster.conf
 STATICD_CONF=/etc/staticd.conf
@@ -48,6 +48,12 @@ wait_in_container() {
     echo "FAIL: $desc (waited $((attempts / 2))s)" >&2
     docker exec "$NAME" sh -c "tail -40 $ROUSTERD_LOG; tail -40 $STATICD_LOG" >&2 || true
     return 1
+}
+
+# Assert a string in a daemon log; tracing emits ANSI escapes into files, so
+# strip them before grepping (busybox sed handles \x1b fine).
+log_grep() {
+    docker exec "$NAME" sh -c "sed 's/\x1b\[[0-9;]*m//g' $1 | grep -q '$2'"
 }
 
 echo "==> building rousterd + staticd ($MUSL_TARGET, release)"
@@ -83,23 +89,21 @@ docker exec "$NAME" sh -c "printf '%s\n' \
   > $STATICD_CONF"
 
 echo "==> starting resident rousterd (no routes of its own)"
-docker exec "$NAME" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
-wait_in_container "rousterd zapi server up" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
+docker exec -d "$NAME" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+wait_in_container "rousterd zapi server up" 30 "sed 's/\x1b\[[0-9;]*m//g' $ROUSTERD_LOG | grep -q 'zapi: listening'"
 
 echo "==> starting staticd against the zapi socket"
-docker exec "$NAME" sh -c "staticd --config $STATICD_CONF --zapi-socket $ZAPI_SOCK > $STATICD_LOG 2>&1"
+docker exec -d "$NAME" sh -c "staticd --config $STATICD_CONF --zapi-socket $ZAPI_SOCK > $STATICD_LOG 2>&1"
 
 echo "==> (i) route lands in the kernel FIB without rousterd parsing it"
 wait_in_container "blackhole route installed" 40 \
     "ip route show 198.51.100.0/24 | grep -q blackhole"
-docker exec "$NAME" sh -c \
-    "grep -q 'loaded static routes count=0' $ROUSTERD_LOG" \
+log_grep "$ROUSTERD_LOG" "loaded static routes count=0" \
     || { echo "FAIL: rousterd parsed static routes itself" >&2; exit 1; }
 
 echo "==> (ii) the route arrived over ZAPI"
-docker exec "$NAME" sh -c \
-    "grep -q 'zapi: session established' $ROUSTERD_LOG && \
-     grep -q 'zapi: route add' $ROUSTERD_LOG" \
+log_grep "$ROUSTERD_LOG" "zapi: session established" \
+    && log_grep "$ROUSTERD_LOG" "zapi: route add" \
     || { echo "FAIL: no ZAPI route add in rousterd log" >&2; exit 1; }
 
 echo "==> (iii) SIGHUP to staticd with the route removed withdraws it"
