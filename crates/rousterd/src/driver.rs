@@ -29,6 +29,15 @@ use tracing::{debug, info, warn};
 
 use zapi::{route_type_from, InterfaceMirror, RibCommand, SessionPush, DEFAULT_TABLE};
 
+/// A client's identity as announced in its first HELLO (M6):
+/// `(redist_default, instance, session_id)` — stable across one daemon's
+/// reconnects (the same zclient re-HELLOs with the same fields) and
+/// distinct between bgpd's three connections (main 10/0/0, auxiliary
+/// 0x12/0/0, label-manager 10/0/1; pinned doc HELLO table). Approximation:
+/// two daemons announcing the same triple would be conflated — nothing in
+/// the observed universe does.
+type ClientIdentity = (u8, u16, u32);
+
 /// RIB plus the driver-side registration state ZAPI sessions feed.
 pub struct RibDriver {
     pub rib: Rib,
@@ -43,6 +52,27 @@ pub struct RibDriver {
     nht_registrations: HashMap<u64, BTreeMap<IpPrefix, Option<Nexthop>>>,
     /// REDISTRIBUTE_ADD interests per owner: (afi, route_type, instance).
     redistributes: HashMap<u64, BTreeSet<(u8, u8, u16)>>,
+    /// HELLO-announced identity per owner (M6), the key into the two
+    /// reconnect memories below.
+    identities: HashMap<u64, ClientIdentity>,
+    /// REDISTRIBUTE registrations remembered BEYOND their session's death,
+    /// keyed by client identity (M6). bgpd's reconnect burst omits
+    /// REDISTRIBUTE_ADD (pinned doc, operational finding 5) — a
+    /// reconnecting incarnation of the same identity re-adopts these and
+    /// gets the current state dumped instead of waiting for a
+    /// re-registration that never comes. Cleared only by an explicit
+    /// REDISTRIBUTE_DELETE; in-memory, so a rousterd restart loses it
+    /// (disclosed: the restart flavor of the B1 D2 stale-client risk is
+    /// narrowed, not closed).
+    remembered: BTreeMap<ClientIdentity, BTreeSet<(u8, u8, u16)>>,
+    /// The redistribute routes an identity was last TOLD, in push form,
+    /// recorded only when a push was actually queued (M6) — the delta
+    /// baseline: on re-establish, routes here that no longer exist are
+    /// DELed so the client's stale copy is withdrawn. Approximation:
+    /// queued ≠ delivered (a client dying with a full socket loses the
+    /// distinction — D4's class); a push dropped for a full queue is
+    /// treated as never told, so the next establish re-sends it as an ADD.
+    last_known: BTreeMap<ClientIdentity, BTreeMap<IpPrefix, RouteEntry>>,
 }
 
 impl Default for RibDriver {
@@ -73,6 +103,9 @@ impl RibDriver {
             sessions: HashMap::new(),
             nht_registrations: HashMap::new(),
             redistributes: HashMap::new(),
+            identities: HashMap::new(),
+            remembered: BTreeMap::new(),
+            last_known: BTreeMap::new(),
         }
     }
 
@@ -86,6 +119,106 @@ impl RibDriver {
             RibCommand::AttachSession { owner, push } => {
                 self.sessions.insert(owner, push);
                 debug!(owner, "zapi: session attached (push channel open)");
+                false
+            }
+            // The reconnect resync (M6): adopt what this identity
+            // registered before and dump the CURRENT state as a delta —
+            // ADDs for everything present (idempotent refresh, zebra's
+            // registration-dump semantics), DELs for what the identity was
+            // last told but no longer exists. An extension past real
+            // zebra, which never re-syncs a client that does not
+            // re-register (exactly the gap that leaves bgpd stale).
+            RibCommand::SessionEstablished {
+                owner,
+                protocol,
+                instance,
+                session_id,
+            } => {
+                let identity = (protocol, instance, session_id);
+                self.identities.insert(owner, identity);
+                // A bygone earlier connection of the same identity needs
+                // no explicit retirement here: its registrations transfer
+                // through `remembered` below, and its dead channel is
+                // pruned lazily by the next push, exactly like any dead
+                // session (pre-M6 behavior).
+                let Some(keys) = self.remembered.get(&identity).cloned() else {
+                    debug!(
+                        owner,
+                        ?identity,
+                        "zapi: session established (no remembered registrations)"
+                    );
+                    return false;
+                };
+                if keys.is_empty() {
+                    return false;
+                }
+                self.redistributes
+                    .entry(owner)
+                    .or_default()
+                    .extend(keys.iter().copied());
+                info!(
+                    owner,
+                    ?identity,
+                    keys = keys.len(),
+                    "zapi: session established; adopting remembered redistribute registrations (reconnect without REDISTRIBUTE_ADD)"
+                );
+                let mut adds_delivered: Vec<RouteEntry> = Vec::new();
+                let mut dels_delivered: Vec<IpPrefix> = Vec::new();
+                for &(afi, route_type, _instance) in &keys {
+                    let current = self.dump_set(afi, route_type);
+                    let present: BTreeSet<IpPrefix> =
+                        current.iter().map(|best| best.prefix).collect();
+                    for best in &current {
+                        let entry = self.push_form(best);
+                        info!(
+                            owner,
+                            prefix = %entry.prefix,
+                            "zapi: reconnect redistribute dump push"
+                        );
+                        if self.push(owner, SessionPush::RedistributeRouteAdd(entry.clone())) {
+                            adds_delivered.push(entry);
+                        }
+                    }
+                    // The DEL half of the delta: what this identity was
+                    // last told of this (afi, type) that is now gone.
+                    let vanished: Vec<RouteEntry> = self
+                        .last_known
+                        .get(&identity)
+                        .map(|told| {
+                            told.values()
+                                .filter(|e| {
+                                    afi_of(&e.prefix) == afi
+                                        && route_type_from(e.protocol) == route_type
+                                        && !present.contains(&e.prefix)
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for gone in &vanished {
+                        info!(
+                            owner,
+                            prefix = %gone.prefix,
+                            "zapi: reconnect redistribute dump DEL (vanished while away)"
+                        );
+                        if self.push(owner, SessionPush::RedistributeRouteDel(gone.clone())) {
+                            dels_delivered.push(gone.prefix);
+                        }
+                    }
+                }
+                // Bookkeeping after the pushes (no overlapping borrows):
+                // the baseline becomes exactly what was (queue-)delivered.
+                let key_pairs: BTreeSet<(u8, u8)> = keys.iter().map(|k| (k.0, k.1)).collect();
+                let told = self.last_known.entry(identity).or_default();
+                told.retain(|_, entry| {
+                    key_pairs.contains(&(afi_of(&entry.prefix), route_type_from(entry.protocol)))
+                });
+                for entry in adds_delivered {
+                    told.insert(entry.prefix, entry);
+                }
+                for prefix in dels_delivered {
+                    told.remove(&prefix);
+                }
                 false
             }
             RibCommand::AddRoute(entry) => {
@@ -145,26 +278,23 @@ impl RibDriver {
                     .entry(owner)
                     .or_default()
                     .insert((afi, route_type, instance));
+                // M6: the registration outlives the session, keyed by the
+                // owner's HELLO identity, so a reconnecting incarnation
+                // re-adopts it (bgpd never re-sends cmd 12 on reconnect).
+                if let Some(&identity) = self.identities.get(&owner) {
+                    self.remembered
+                        .entry(identity)
+                        .or_default()
+                        .insert((afi, route_type, instance));
+                }
                 debug!(owner, afi, route_type, instance, "zapi: redistribute add");
                 // FRR zebra replays the current best routes of the
                 // registered type on REDISTRIBUTE_ADD — staticd/bgpd expect
                 // the dump on (re)connect (W2, closing Z3B disclosure 1).
                 // Same push form as a best-change push; main table only
                 // (the ZAPI edge lands every client route there).
-                let dumped: Vec<RouteEntry> = self
-                    .rib
-                    .table(DEFAULT_TABLE)
-                    .map(|table| {
-                        table
-                            .iter()
-                            .filter_map(|(prefix, _)| table.best(prefix).cloned())
-                            .filter(|best| {
-                                afi_of(&best.prefix) == afi
-                                    && route_type_from(best.protocol) == route_type
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let dumped = self.dump_set(afi, route_type);
+                let mut delivered: Vec<RouteEntry> = Vec::new();
                 for best in dumped {
                     let entry = self.push_form(&best);
                     info!(
@@ -172,7 +302,15 @@ impl RibDriver {
                         prefix = %entry.prefix,
                         "zapi: initial redistribute dump push"
                     );
-                    self.push(owner, SessionPush::RedistributeRouteAdd(entry));
+                    if self.push(owner, SessionPush::RedistributeRouteAdd(entry.clone())) {
+                        delivered.push(entry);
+                    }
+                }
+                if let Some(&identity) = self.identities.get(&owner) {
+                    let told = self.last_known.entry(identity).or_default();
+                    for entry in delivered {
+                        told.insert(entry.prefix, entry);
+                    }
                 }
                 false
             }
@@ -186,6 +324,23 @@ impl RibDriver {
                     set.remove(&(afi, route_type, instance));
                     if set.is_empty() {
                         self.redistributes.remove(&owner);
+                    }
+                }
+                // M6: an explicit unregister also erases the reconnect
+                // memory — a re-establishing incarnation of the identity
+                // must not resurrect an interest the client withdrew.
+                if let Some(&identity) = self.identities.get(&owner) {
+                    if let Some(set) = self.remembered.get_mut(&identity) {
+                        set.remove(&(afi, route_type, instance));
+                        if set.is_empty() {
+                            self.remembered.remove(&identity);
+                        }
+                    }
+                    if let Some(told) = self.last_known.get_mut(&identity) {
+                        told.retain(|_, entry| {
+                            !(afi_of(&entry.prefix) == afi
+                                && route_type_from(entry.protocol) == route_type)
+                        });
                     }
                 }
                 false
@@ -353,7 +508,9 @@ impl RibDriver {
                 "zapi: best route withdrawn; pushing REDISTRIBUTE_ROUTE_DEL"
             );
             for owner in owners {
-                self.push(owner, SessionPush::RedistributeRouteDel(entry.clone()));
+                if self.push(owner, SessionPush::RedistributeRouteDel(entry.clone())) {
+                    self.record_forgotten(owner, entry.prefix);
+                }
             }
             return;
         };
@@ -379,7 +536,10 @@ impl RibDriver {
             "zapi: best route changed; pushing REDISTRIBUTE_ROUTE_ADD"
         );
         for owner in owners {
-            self.push(owner, SessionPush::RedistributeRouteAdd(entry.clone()));
+            let clone = entry.clone();
+            if self.push(owner, SessionPush::RedistributeRouteAdd(clone)) {
+                self.record_told(owner, entry.clone());
+            }
         }
     }
 
@@ -405,26 +565,71 @@ impl RibDriver {
         form
     }
 
+    /// The best routes of one (afi, route type) in the main table — the
+    /// initial-dump set, shared by the registration (W2) and reconnect
+    /// (M6) paths. Prefix-sorted (BTreeMap iteration).
+    fn dump_set(&self, afi: u8, route_type: u8) -> Vec<RouteEntry> {
+        self.rib
+            .table(DEFAULT_TABLE)
+            .map(|table| {
+                table
+                    .iter()
+                    .filter_map(|(prefix, _)| table.best(prefix).cloned())
+                    .filter(|best| {
+                        afi_of(&best.prefix) == afi && route_type_from(best.protocol) == route_type
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Records a successfully queued redistribute ADD as the identity's
+    /// last-known state (the M6 delta baseline for reconnect DELs).
+    fn record_told(&mut self, owner: u64, entry: RouteEntry) {
+        if let Some(&identity) = self.identities.get(&owner) {
+            self.last_known
+                .entry(identity)
+                .or_default()
+                .insert(entry.prefix, entry);
+        }
+    }
+
+    /// Removes a prefix from the identity's last-known state (its DEL was
+    /// queued — the client, if alive, was told to forget it).
+    fn record_forgotten(&mut self, owner: u64, prefix: IpPrefix) {
+        if let Some(&identity) = self.identities.get(&owner) {
+            if let Some(told) = self.last_known.get_mut(&identity) {
+                told.remove(&prefix);
+            }
+        }
+    }
+
     /// Queues one push to one session. Bounded and non-blocking: the main
-    /// loop must never stall on a slow daemon. A full queue drops the
+    /// loop must never stall on a slow daemon. Returns whether the push
+    /// was queued — callers feeding the M6 delta baseline must not record
+    /// a push a dead or full queue swallowed. A full queue drops the
     /// update with a warning (a stuck client re-syncs on re-registration
     /// or reconnect); a closed channel means the session is gone and
-    /// prunes every registration it left behind.
-    fn push(&mut self, owner: u64, item: SessionPush) {
+    /// prunes every registration it left behind (the identity-keyed
+    /// reconnect memory deliberately survives).
+    fn push(&mut self, owner: u64, item: SessionPush) -> bool {
         let Some(session) = self.sessions.get(&owner) else {
             debug!(owner, "zapi: push for unattached session dropped");
-            return;
+            return false;
         };
         match session.try_send(item) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(owner, "zapi: session push queue full; update dropped");
+                false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.sessions.remove(&owner);
                 self.nht_registrations.remove(&owner);
                 self.redistributes.remove(&owner);
+                self.identities.remove(&owner);
                 debug!(owner, "zapi: session gone; registries pruned");
+                false
             }
         }
     }
@@ -1063,6 +1268,172 @@ mod tests {
             instance: 0,
         });
         assert!(bgp_pushes.try_recv().is_err(), "no BGP routes: empty dump");
+    }
+
+    fn establish(owner: u64, protocol: u8, session_id: u32) -> RibCommand {
+        RibCommand::SessionEstablished {
+            owner,
+            protocol,
+            instance: 0,
+            session_id,
+        }
+    }
+
+    /// M6, the D2 reconnect shape: bgpd (identity 10/0/0) registers
+    /// `redistribute static` and is told two routes; its connection dies
+    /// WITHOUT unregistering (bgpd never sends cmd 13, pinned doc); one
+    /// route vanishes while it is away — the best-change DEL finds the
+    /// dead channel and is dropped; the daemon reconnects and HELLOs
+    /// only (finding 5: no REDISTRIBUTE_ADD re-sent). The remembered
+    /// registration is adopted, the surviving route is re-dumped as an
+    /// ADD, the vanished one is DELed from the baseline the identity was
+    /// last told — and adoption re-arms the live best-change path.
+    #[test]
+    fn reconnect_establish_adopts_registrations_and_dumps_delta() {
+        let mut driver = RibDriver::new();
+        let mut bgpd = attach(&mut driver, 1);
+        driver.apply(establish(1, 10, 0));
+        assert!(
+            bgpd.try_recv().is_err(),
+            "first establish of an identity dumps nothing"
+        );
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "198.51.100.0/24",
+            Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
+            5,
+        )));
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "203.0.113.0/24",
+            Nexthop::Blackhole,
+            7,
+        )));
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        // The W2 registration dump: both routes, prefix order — this is
+        // also the delta baseline the reconnect below diffs against.
+        for prefix in ["198.51.100.0/24", "203.0.113.0/24"] {
+            match bgpd.try_recv().expect("registration dump ADD") {
+                SessionPush::RedistributeRouteAdd(entry) => {
+                    assert_eq!(entry.prefix, prefix.parse::<IpPrefix>().unwrap());
+                }
+                other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+            }
+        }
+
+        // The connection dies; a route vanishes while the daemon is away
+        // (the DEL push finds the closed channel and is dropped — the
+        // baseline keeps the route, which is exactly why the reconnect
+        // must DEL it again).
+        drop(bgpd);
+        driver.apply(RibCommand::DeleteRoute {
+            table: 254,
+            prefix: "198.51.100.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Static,
+        });
+
+        // bgpd reconnects: NEW session id, SAME HELLO identity, and per
+        // the pinned capture it does NOT re-send REDISTRIBUTE_ADD.
+        let mut bgpd2 = attach(&mut driver, 2);
+        driver.apply(establish(2, 10, 0));
+        match bgpd2
+            .try_recv()
+            .expect("reconnect dump ADD for the survivor")
+        {
+            SessionPush::RedistributeRouteAdd(entry) => {
+                assert_eq!(entry.prefix, "203.0.113.0/24".parse::<IpPrefix>().unwrap());
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+        match bgpd2
+            .try_recv()
+            .expect("reconnect dump DEL for the vanished route")
+        {
+            SessionPush::RedistributeRouteDel(entry) => {
+                assert_eq!(entry.prefix, "198.51.100.0/24".parse::<IpPrefix>().unwrap());
+                assert_eq!(
+                    entry.protocol,
+                    RouteProtocol::Static,
+                    "the DEL carries the route as it last was"
+                );
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
+        }
+        assert!(bgpd2.try_recv().is_err(), "the delta is exactly two pushes");
+
+        // Adoption re-armed the live push path: a later best change
+        // reaches the reconnecting session without any re-registration.
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "192.0.2.0/24",
+            Nexthop::Blackhole,
+            3,
+        )));
+        assert!(matches!(
+            bgpd2
+                .try_recv()
+                .expect("best change reaches the re-adopted session"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+    }
+
+    /// M6 discipline: an identity with no remembered registrations gets
+    /// NOTHING on establish — staticd's and ospfd's connect bursts (they
+    /// never send REDISTRIBUTE_ADD) must not see surprise frames, even
+    /// with routes of their own type sitting in the RIB.
+    #[test]
+    fn fresh_identity_establish_pushes_nothing() {
+        let mut driver = RibDriver::new();
+        let mut staticd = attach(&mut driver, 1);
+        driver.apply(establish(1, 4, 0)); // staticd
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "203.0.113.0/24",
+            Nexthop::Blackhole,
+            7,
+        )));
+        let mut ospfd = attach(&mut driver, 2);
+        driver.apply(establish(2, 7, 0)); // ospfd
+        assert!(staticd.try_recv().is_err());
+        assert!(
+            ospfd.try_recv().is_err(),
+            "unknown identity: no dump on establish"
+        );
+    }
+
+    /// M6: an explicit REDISTRIBUTE_DELETE erases the reconnect memory —
+    /// a re-establishing incarnation of the identity must not resurrect
+    /// an interest the client withdrew (no capture ever showed bgpd send
+    /// cmd 13, but if it does, it means it).
+    #[test]
+    fn unregister_erases_the_reconnect_memory() {
+        let mut driver = RibDriver::new();
+        let bgpd = attach(&mut driver, 1);
+        driver.apply(establish(1, 10, 0));
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply(RibCommand::UnregisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        drop(bgpd);
+        let mut bgpd2 = attach(&mut driver, 2);
+        driver.apply(establish(2, 10, 0));
+        assert!(
+            bgpd2.try_recv().is_err(),
+            "unregistered interest stays unregistered across reconnect"
+        );
     }
 
     /// The fan-out filters on both AFI and route type.

@@ -22,6 +22,13 @@
 //! request replies through one writer, so frame order on the wire is the
 //! order the session produced it in.
 //!
+//! The first HELLO also reports the session's identity to the driver (M6):
+//! bgpd's reconnect burst omits REDISTRIBUTE_ADD (pinned doc, operational
+//! finding 5), so the driver remembers redistribute registrations per
+//! client identity and replays the current state as a delta when the same
+//! identity re-establishes — a reconnecting bgpd resyncs without
+//! re-registering.
+//!
 //! Wire-behavior pins: reply to HELLO by echoing the client's body
 //! (pinned doc, operational finding 2); answer LABEL_MANAGER_CONNECT with
 //! proto+instance+result or bgpd's label-manager client stalls
@@ -80,6 +87,24 @@ pub enum RibCommand {
     AttachSession {
         owner: u64,
         push: mpsc::Sender<SessionPush>,
+    },
+    /// First HELLO on a connection (session establish, M6): announces the
+    /// client's identity — `(redist_default, instance, session_id)` from
+    /// the HELLO body, stable across a daemon's reconnects and distinct
+    /// between bgpd's three connections. The driver adopts any
+    /// redistribute registrations it remembers for the identity and dumps
+    /// the current state as a delta (REDISTRIBUTE_ROUTE_ADD per present
+    /// route of the registered types, DEL per route the identity was last
+    /// told about that no longer exists): bgpd's reconnect burst omits
+    /// REDISTRIBUTE_ADD (pinned doc, operational finding 5), so without
+    /// this a reconnecting bgpd stays stale (B1 deadlock-risk D2).
+    /// Fire-and-forget — the dump rides the push channel; FIFO through
+    /// this channel guarantees the driver saw [`AttachSession`] first.
+    SessionEstablished {
+        owner: u64,
+        protocol: u8,
+        instance: u16,
+        session_id: u32,
     },
     AddRoute(RouteEntry),
     DeleteRoute {
@@ -479,6 +504,18 @@ impl ZapiSession {
                         session = hello.session_id,
                         "zapi: session established"
                     );
+                    // M6: report the client's identity so the driver can
+                    // replay redistribute registrations remembered from a
+                    // previous connection of the same daemon.
+                    commands
+                        .send(RibCommand::SessionEstablished {
+                            owner: self.id,
+                            protocol: hello.redist_default,
+                            instance: hello.instance,
+                            session_id: hello.session_id,
+                        })
+                        .await
+                        .map_err(|_| channel_closed())?;
                 }
                 self.protocol = hello.redist_default;
                 self.instance = hello.instance;
@@ -889,6 +926,12 @@ mod tests {
     #[derive(Debug)]
     enum Seen {
         Attach,
+        Established {
+            owner: u64,
+            protocol: u8,
+            instance: u16,
+            session_id: u32,
+        },
         Add(RouteEntry),
         Del {
             table: TableId,
@@ -917,6 +960,7 @@ mod tests {
     fn describe(cmd: &RibCommand) -> String {
         match cmd {
             RibCommand::AttachSession { .. } => "attach".to_string(),
+            RibCommand::SessionEstablished { .. } => "establish".to_string(),
             RibCommand::AddRoute(entry) => format!("add {} {:?}", entry.prefix, entry.protocol),
             RibCommand::DeleteRoute { prefix, .. } => format!("del {prefix}"),
             RibCommand::RegisterNexthop { owner, prefix, .. } => format!("nht+ {owner} {prefix}"),
@@ -940,6 +984,17 @@ mod tests {
         fn answer(&self, cmd: RibCommand) -> Seen {
             match cmd {
                 RibCommand::AttachSession { .. } => Seen::Attach,
+                RibCommand::SessionEstablished {
+                    owner,
+                    protocol,
+                    instance,
+                    session_id,
+                } => Seen::Established {
+                    owner,
+                    protocol,
+                    instance,
+                    session_id,
+                },
                 RibCommand::AddRoute(entry) => Seen::Add(entry),
                 RibCommand::DeleteRoute {
                     table,
@@ -1123,6 +1178,18 @@ mod tests {
             vec![4, 0, 0, 0, 0, 0, 0, 0],
             "echo of the client's 8-byte HELLO body"
         );
+        // M6: the FIRST HELLO reports the session's identity to the
+        // driver — and nothing else queues a command.
+        match driver.recv(&mut rx).await {
+            Seen::Established {
+                owner,
+                protocol,
+                instance,
+                session_id,
+            } => assert_eq!((owner, protocol, instance, session_id), (1, 4, 0, 0)),
+            other => panic!("expected SessionEstablished, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no further command");
         drop(client);
         let session = task.await.unwrap().expect("clean close");
         assert!(session.established);
@@ -1130,7 +1197,10 @@ mod tests {
             (session.protocol, session.instance, session.session_id),
             (4, 0, 0)
         );
-        assert!(driver.commands.lock().unwrap().is_empty(), "no commands");
+        assert!(
+            driver.commands.lock().unwrap().len() == 1,
+            "only the establish command"
+        );
         rx.close();
     }
 
@@ -1191,15 +1261,19 @@ mod tests {
     /// Proves no command was queued for a message, without blocking: the
     /// session is single-threaded per connection, so once it has replied to
     /// a later HELLO, every earlier message was fully handled — anything it
-    /// queued is already in the channel, and `try_recv` sees it.
+    /// queued is already in the channel, and `try_recv` sees it. Since M6
+    /// a HELLO may legitimately queue exactly one command (the marker's
+    /// own `SessionEstablished`); anything else fails.
     async fn assert_no_command_after(client: &mut Client, rx: &mut mpsc::Receiver<RibCommand>) {
         client.send(&staticd_hello(), 0).await;
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 19);
-        assert!(
-            rx.try_recv().is_err(),
-            "no RibCommand should have been queued"
-        );
+        while let Ok(cmd) = rx.try_recv() {
+            assert!(
+                matches!(cmd, RibCommand::SessionEstablished { .. }),
+                "only a HELLO's establish command may be queued, got {cmd:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1606,6 +1680,12 @@ mod tests {
         client.send(&staticd_hello(), 0).await;
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 19, "no ROUTER_ID_UPDATE before the echo");
+        // The marker HELLO is this session's first: its establish command
+        // is the only thing queued.
+        assert!(matches!(
+            driver.recv(&mut rx).await,
+            Seen::Established { .. }
+        ));
         assert!(rx.try_recv().is_err(), "no further command");
     }
 
@@ -1678,9 +1758,14 @@ mod tests {
             header.command, 19,
             "no BFD reply frame may precede the HELLO echo"
         );
+        // The first HELLO's establish command is the whole command traffic.
+        assert!(matches!(
+            rx.recv().await.expect("establish command"),
+            RibCommand::SessionEstablished { .. }
+        ));
         assert!(
             rx.try_recv().is_err(),
-            "registration is session state only, no RibCommand"
+            "registration is session state only, no further RibCommand"
         );
         drop(client);
         let session = task.await.unwrap().expect("connection survives");
@@ -1707,7 +1792,11 @@ mod tests {
         client.send(&staticd_hello(), 0).await;
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 19, "still nothing but the echo");
-        assert!(rx.try_recv().is_err(), "no RibCommand either time");
+        assert!(matches!(
+            rx.recv().await.expect("establish command"),
+            RibCommand::SessionEstablished { .. }
+        ));
+        assert!(rx.try_recv().is_err(), "no further RibCommand either time");
         drop(client);
         let session = task.await.unwrap().expect("connection survives");
         assert_eq!(session.bfd_client_reg_cnt, 2);

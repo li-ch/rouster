@@ -481,3 +481,47 @@ shares the exact body shape but stayed outside Z2B's scope (still
 contradicted the doc (the fixtures are client→zebra and cannot carry 31).
 Z2's open item "wire-capture the zebra→client side" now covers this
 layout too.
+
+## M6 addendum (2026-10-09, reconnect redistribute resync)
+
+Operational finding 5 (bgpd's reconnect burst omits REDISTRIBUTE_ADD)
+left a stale-client window: the registration dump of 58b0dbe fires only
+when cmd 12 arrives, so a reconnecting bgpd that ran `redistribute
+static` waits for static routes nobody will resend (B1's deadlock-risk
+D2). Whether real-world bgpd re-registers on reconnect is unpinned — the
+capture window says no, FRR's `zclient` is built to re-send
+registrations (`zclient_send_reg_requests`) — so rousterd now tolerates
+both: on the FIRST HELLO of a connection the server reports the client's
+identity — `(redist_default, instance, session_id)` straight from the
+HELLO body — to the RIB driver, which (a) re-adopts the redistribute
+registrations it remembers for that identity and (b) dumps the current
+state as a delta: one REDISTRIBUTE_ROUTE_ADD (31) per present best route
+of the registered types (the same `zsend_redistribute_route` body and
+bit policy as the registration dump — an idempotent refresh, so the ADD
+half is not a true delta) plus one REDISTRIBUTE_ROUTE_DEL (32) per route
+the identity was last told about that no longer exists. The per-route
+DEL semantics mirror zebra's `redistribute_delete` sweep, applied at
+reconnect instead of at an explicit REDISTRIBUTE_DELETE (which no capture
+has ever shown a daemon send); the DEL body is the row-32 twin of the
+ADD. This is an extension past real zebra, which never re-syncs a client
+that does not re-register. Disclosed approximations, all in-process only:
+
+- Identity is inferred from HELLO fields; the observed pairs distinguish
+  staticd (4,0,0) and bgpd's three connections (10/0/0, 0x12/0/0,
+  10/0/1). A hypothetical daemon colliding on the triple would be
+  conflated; nothing observed does.
+- The delta baseline ("what the identity was last told") advances only
+  on pushes that were actually queued; queued ≠ delivered (a client
+  dying with a full socket loses the distinction — D4's class). A push
+  dropped for a full queue counts as never told, so the next establish
+  re-sends it as an ADD.
+- Nothing survives a rousterd restart: remembered registrations and the
+  baseline are in-memory, so D2's daemon-restart flavor (state lost on
+  both sides) is narrowed, not closed — the reconnect-within-process
+  flavor is covered.
+- NEXTHOP_REGISTER gets no equivalent replay yet (finding 5's other
+  half): D2's neighbor-NHT staleness after reconnect is still open.
+
+Implemented in `crates/zapi/src/server.rs` (first-HELLO trigger,
+`RibCommand::SessionEstablished`) and `crates/rousterd/src/driver.rs`
+(identity-keyed registration memory, adoption, delta dump).

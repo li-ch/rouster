@@ -143,6 +143,9 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
             PUSH_SENDERS.lock().unwrap().push(push);
             false
         }
+        // This raw-RIB harness has no reconnect memory: the identity is
+        // recorded by the RibDriver tests instead.
+        RibCommand::SessionEstablished { .. } => false,
         RibCommand::AddRoute(entry) => {
             rib.add_route(entry);
             true
@@ -256,14 +259,22 @@ async fn route_add_from_zapi_programs_mock_dataplane() {
 
     client.send(&staticd_route_add()).await;
     // The command crosses the channel once the session task runs; recv()
-    // (blocking) yields to let it. Attach arrives first (Z3B), the route
-    // second; the driver applies both, then reconciles.
+    // (blocking) yields to let it. Attach arrives first (Z3B), the HELLO's
+    // establish second (M6), the route third; the driver applies all,
+    // then reconciles.
     assert!(
         matches!(
             rx.recv().await.expect("attach"),
             RibCommand::AttachSession { .. }
         ),
         "every connection attaches its push channel first"
+    );
+    assert!(
+        matches!(
+            rx.recv().await.expect("establish"),
+            RibCommand::SessionEstablished { .. }
+        ),
+        "the first HELLO reports the session identity (M6)"
     );
     let command = rx.recv().await.expect("AddRoute arrives");
     let mut rib = Rib::new();
@@ -298,7 +309,7 @@ async fn route_delete_from_zapi_withdraws_from_mock_dataplane() {
     let dp = MockDp::default();
 
     client.send(&staticd_route_add()).await;
-    drive_n(&mut rib, &mut rx, 2).await; // attach + AddRoute
+    drive_n(&mut rib, &mut rx, 3).await; // attach + establish + AddRoute
     rib.reconcile(&dp).await;
     assert_eq!(dp.installed().len(), 1);
 
@@ -357,7 +368,7 @@ async fn nht_register_resolved_through_real_rib() {
             prefix: "192.0.2.9/32".parse().unwrap(),
         }))
         .await;
-    drive_n(&mut rib, &mut rx, 2).await; // attach + register
+    drive_n(&mut rib, &mut rx, 3).await; // attach + establish + register
 
     let (header, body) = client.read_frame().await;
     assert_eq!(
@@ -416,7 +427,7 @@ async fn interface_dump_answered_from_rib_mirror() {
     });
 
     client.send(&ZapiMessage::InterfaceAddRequest).await;
-    drive_n(&mut rib, &mut rx, 2).await; // attach + interface dump
+    drive_n(&mut rib, &mut rx, 3).await; // attach + establish + interface dump
 
     let (h1, b1) = client.read_frame().await;
     assert_eq!(ZapiCommand::from_u16(h1.command), ZapiCommand::InterfaceAdd);
@@ -476,7 +487,7 @@ async fn nht_flip_on_address_add_pushed_over_real_socket() {
 
     // Register with no mirror at all: answered unresolved.
     client.send(&nht_register("10.9.9.9/32")).await;
-    drive_driver_n(&mut driver, &mut rx, 2).await; // attach + register
+    drive_driver_n(&mut driver, &mut rx, 3).await; // attach + establish + register
     let (header, body) = client.read_frame().await;
     assert_eq!(
         ZapiCommand::from_u16(header.command),
@@ -544,7 +555,7 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
     });
 
     client.send(&nht_register("192.0.2.9/32")).await;
-    drive_driver_n(&mut driver, &mut rx, 2).await; // attach + register
+    drive_driver_n(&mut driver, &mut rx, 3).await; // attach + establish + register
     let (header, body) = client.read_frame().await;
     assert_eq!(
         ZapiCommand::from_u16(header.command),
@@ -634,8 +645,9 @@ async fn redistribute_route_add_pushed_over_real_socket() {
             opaque: None,
         }))
         .await;
-    // attach(bgpd) + attach(staticd) + redistribute(bgpd) + route(staticd).
-    drive_driver_n(&mut driver, &mut rx, 4).await;
+    // attach(bgpd) + establish(bgpd) + attach(staticd) + establish(staticd)
+    // + redistribute(bgpd) + route(staticd).
+    drive_driver_n(&mut driver, &mut rx, 6).await;
     driver.rib.reconcile(&dp).await;
 
     // The route was programmed (resolved through the mirror)...
@@ -718,7 +730,7 @@ async fn redistribute_registration_dumps_existing_route_over_real_socket() {
             opaque: None,
         }))
         .await;
-    drive_driver_n(&mut driver, &mut rx, 2).await; // attach(staticd) + add
+    drive_driver_n(&mut driver, &mut rx, 3).await; // attach(staticd) + establish + add
     driver.rib.reconcile(&dp).await;
     assert_eq!(dp.installed().len(), 1);
 
@@ -731,7 +743,7 @@ async fn redistribute_registration_dumps_existing_route_over_real_socket() {
         instance: 0,
     }))
     .await;
-    drive_driver_n(&mut driver, &mut rx, 2).await; // attach(bgpd) + register
+    drive_driver_n(&mut driver, &mut rx, 3).await; // attach(bgpd) + establish + register
 
     // The existing route arrives unprompted.
     let (header, body) = bgpd.read_frame().await;
@@ -751,6 +763,164 @@ async fn redistribute_registration_dumps_existing_route_over_real_socket() {
         other => panic!("expected RedistributeRouteAdd, got {other:?}"),
     }
     // staticd itself asked for nothing: it saw no dump.
+    server.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// The M6 reconnect shape (pinned doc finding 5 / B1 deadlock-risk D2):
+/// bgpd's reconnect burst re-HELLOs but does NOT re-send
+/// REDISTRIBUTE_ADD — the remembered registration is adopted at session
+/// establish and the current state dumped unprompted (ADDs for what
+/// exists, command 31, same byte-verified push form), and the adoption
+/// re-arms the live path: a later withdrawal reaches the reconnected
+/// bgpd as REDISTRIBUTE_ROUTE_DEL (32) with no re-registration. The
+/// DEL-for-vanished-while-away half of the delta is pinned in the driver
+/// unit test `reconnect_establish_adopts_registrations_and_dumps_delta`,
+/// where the dead channel makes it deterministic.
+#[tokio::test]
+async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
+    let socket = temp_socket("redist-reconnect");
+    let (mut rx, server) = spawn_server(&socket);
+
+    let bgpd_hello = || {
+        ZapiMessage::Hello(ZapiHello {
+            redist_default: 10, // bgpd main zclient (pinned HELLO table)
+            instance: 0,
+            session_id: 0,
+            synchronous: 0,
+        })
+    };
+
+    // staticd installs two routes (one gateway, one blackhole).
+    let mut staticd = TestClient::connect(&socket).await;
+    staticd.handshake().await;
+    let mut driver = RibDriver::new();
+    let dp = MockDp::default();
+    driver.apply_event(&DataplaneEvent::LinkNew {
+        ifindex: 2,
+        name: "eth2".to_string(),
+        is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
+    });
+    driver.apply_event(&DataplaneEvent::AddressNew {
+        ifindex: 2,
+        prefix: "203.0.113.1/24".parse().unwrap(),
+    });
+    let gateway_route = ZapiMessage::RouteAdd(ZapiRoute {
+        route_type: route_type::STATIC,
+        instance: 0,
+        flags: 0x41,
+        message: message_flag::NEXTHOP | message_flag::DISTANCE,
+        safi: 1,
+        prefix: "198.51.100.0/24".parse().unwrap(),
+        src_prefix: None,
+        nhg_id: 0,
+        nexthops: vec![zapi::ZapiNexthop::new_ipv4(
+            0,
+            "203.0.113.9".parse().unwrap(),
+        )],
+        backup_nexthops: Vec::new(),
+        distance: Some(1),
+        metric: None,
+        tag: None,
+        mtu: None,
+        tableid: None,
+        opaque: None,
+    });
+    staticd.send(&gateway_route).await;
+    staticd.send(&staticd_route_add()).await; // 203.0.113.0/24 blackhole
+    drive_driver_n(&mut driver, &mut rx, 4).await; // attach + establish + add x2
+    driver.rib.reconcile(&dp).await;
+    assert_eq!(dp.installed().len(), 2);
+
+    // bgpd connects and registers `redistribute static`: the W2 dump.
+    let mut bgpd = TestClient::connect(&socket).await;
+    bgpd.send(&bgpd_hello()).await;
+    let (header, _) = bgpd.read_frame().await;
+    assert_eq!(header.command, 19, "HELLO echo");
+    bgpd.send(&ZapiMessage::RedistributeAdd(ZapiRedistribute {
+        afi: 1,
+        route_type: route_type::STATIC,
+        instance: 0,
+    }))
+    .await;
+    drive_driver_n(&mut driver, &mut rx, 3).await; // attach + establish + register
+    for prefix in ["198.51.100.0/24", "203.0.113.0/24"] {
+        let (header, body) = bgpd.read_frame().await;
+        assert_eq!(header.command, 31, "registration dump ADD");
+        match ZapiMessage::decode(31, &body).unwrap() {
+            ZapiMessage::RedistributeRouteAdd(route) => {
+                assert_eq!(route.prefix, prefix.parse::<IpPrefix>().unwrap());
+                assert_eq!(route.route_type, route_type::STATIC);
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+    }
+
+    // The connection dies — bgpd never sends REDISTRIBUTE_DELETE — and
+    // the daemon reconnects with its REAL reconnect burst: HELLO only.
+    drop(bgpd);
+    let mut bgpd2 = TestClient::connect(&socket).await;
+    bgpd2.send(&bgpd_hello()).await;
+    let (header, _) = bgpd2.read_frame().await;
+    assert_eq!(header.command, 19, "HELLO echo");
+    drive_driver_n(&mut driver, &mut rx, 2).await; // attach(bgpd2) + establish
+
+    // The dump arrives unprompted: both current routes, same push form
+    // (SELECTED flag, resolved gateway hop for the 198.51.100.0/24).
+    let mut dumped = Vec::new();
+    for _ in 0..2 {
+        let (header, body) = bgpd2.read_frame().await;
+        assert_eq!(header.command, 31, "reconnect dump ADD without re-register");
+        match ZapiMessage::decode(31, &body).unwrap() {
+            ZapiMessage::RedistributeRouteAdd(route) => dumped.push(route),
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        dumped
+            .iter()
+            .map(|r| r.prefix.to_string())
+            .collect::<Vec<_>>(),
+        vec!["198.51.100.0/24", "203.0.113.0/24"],
+        "prefix-sorted dump of the adopted registration"
+    );
+    assert_eq!(dumped[0].flags, 0x08, "ZEBRA_FLAG_SELECTED");
+    assert_eq!(dumped[0].nexthops.len(), 1);
+    assert_eq!(
+        dumped[0].nexthops[0].nh_type,
+        zapi::nexthop_type::IPV4_IFINDEX
+    );
+    assert_eq!(dumped[0].nexthops[0].ifindex, 2, "gateway resolved");
+
+    // Adoption re-armed the live path: staticd withdraws the gateway
+    // route (198.51.100.0/24 — staticd_route_delete() carries the
+    // blackhole's prefix, so the delete is built inline) and the
+    // RECONNECTED bgpd (still without re-registering) is pushed the DEL,
+    // command 32, carrying the withdrawn route.
+    let mut gateway_delete = match staticd_route_delete() {
+        ZapiMessage::RouteDelete(route) => route,
+        _ => unreachable!(),
+    };
+    gateway_delete.prefix = "198.51.100.0/24".parse().unwrap();
+    staticd
+        .send(&ZapiMessage::RouteDelete(gateway_delete))
+        .await;
+    drive_driver_n(&mut driver, &mut rx, 1).await; // delete
+    let (header, body) = bgpd2.read_frame().await;
+    assert_eq!(
+        header.command, 32,
+        "live DEL reaches the re-adopted session"
+    );
+    match ZapiMessage::decode(32, &body).unwrap() {
+        ZapiMessage::RedistributeRouteDel(route) => {
+            assert_eq!(route.prefix, "198.51.100.0/24".parse::<IpPrefix>().unwrap());
+            assert_eq!(route.route_type, route_type::STATIC);
+        }
+        other => panic!("expected RedistributeRouteDel, got {other:?}"),
+    }
+
     server.abort();
     let _ = std::fs::remove_file(&socket);
 }

@@ -125,15 +125,17 @@ async fn two_concurrent_sessions_share_one_command_queue() {
     // Each accepted connection attaches its push channel first (Z3B):
     // two attach commands carry the same distinct owner ids the session
     // commands below use. The senders are held so the sessions' push
-    // channels stay open for the rest of the test.
+    // channels stay open for the rest of the test. Each first HELLO also
+    // queues its establish command (M6) — tolerated between the attaches.
     let mut attached = Vec::new();
     let mut _push_senders = Vec::new();
-    for _ in 0..2 {
+    while attached.len() < 2 {
         match rx.recv().await.expect("attach command") {
             RibCommand::AttachSession { owner, push } => {
                 attached.push(owner);
                 _push_senders.push(push);
             }
+            RibCommand::SessionEstablished { .. } => {}
             other => panic!("expected AttachSession, got {other:?}"),
         }
     }
@@ -166,13 +168,17 @@ async fn two_concurrent_sessions_share_one_command_queue() {
     c1.send(&route, 0).await;
     c2.send(&route, 0).await;
 
-    // Both adds arrive on the one queue.
-    for _ in 0..2 {
+    // Both adds arrive on the one queue (a trailing establish command may
+    // still be ahead of them, M6).
+    let mut adds = 0;
+    while adds < 2 {
         match rx.recv().await.expect("command") {
             RibCommand::AddRoute(entry) => {
                 assert_eq!(entry.prefix, "203.0.113.0/24".parse().unwrap());
                 assert_eq!(entry.protocol, common::RouteProtocol::Static);
+                adds += 1;
             }
+            RibCommand::SessionEstablished { .. } => {}
             other => panic!("unexpected command {other:?}"),
         }
     }
