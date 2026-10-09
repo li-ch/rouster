@@ -70,6 +70,8 @@
 //! i-understand-drop-mode yes        ! required friction to start in drop mode
 //! interface <name>                  ! opens a per-interface stanza
 //!   mode <strict|loose|fp|efp>      ! per-interface mode override
+//! binding <prefix> interface <name>...
+//!                                   ! operator SIB binding (Config origin)
 //! ```
 //!
 //! `mode` is the one position-dependent directive (inside a stanza it
@@ -78,6 +80,17 @@
 //! (and refuses to reload) without the explicit
 //! `i-understand-drop-mode yes` line — deliberate friction on the one
 //! action that can blackhole legitimate traffic.
+//!
+//! `binding` lines are position-independent operator bindings: sources
+//! inside `<prefix>` may legitimately arrive on the named interfaces,
+//! overriding the RIB-derived binding for that same prefix (the SIB's
+//! documented precedence — Config shadows Rib per prefix; a longer RIB
+//! prefix still wins on specificity). One line per prefix; names
+//! resolve against the local mirror at evaluation time, so a name not
+//! (yet) mirrored warns and drops out while a line with no resolved
+//! name at all stores nothing (unknown ≠ invalid) — the poll/event
+//! re-evaluations re-resolve. A config swap (SIGHUP) replaces the
+//! whole Config origin through [`Sib::replace_origin`].
 
 use std::fmt;
 use std::time::Duration;
@@ -94,7 +107,7 @@ use crate::mode::{SavAction, SavConfig, ValidationMode};
 use crate::monitor::SpoofMonitor;
 use crate::program::program;
 use crate::table::{compile, SavOp, Verdict};
-use crate::{Sib, MAIN_TABLE};
+use crate::{Binding, BindingOrigin, InterfaceRef, Sib, MAIN_TABLE};
 
 /// Hysteresis window for allowlist deletions (RFC 8704 §3.6.2): a
 /// withdrawn prefix stays enforced this long before it finally
@@ -152,6 +165,17 @@ pub struct InterfaceLine {
     pub mode: UrpfMode,
 }
 
+/// One configured `binding <prefix> interface <name>...` line: an
+/// operator-pinned ingress set for a source prefix — the SIB's
+/// [`BindingOrigin::Config`] slot, shadowing the RIB-derived binding
+/// for the same prefix. Names resolve against the local mirror at
+/// evaluation time (same rule as stanza names).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingLine {
+    pub prefix: IpPrefix,
+    pub interfaces: Vec<String>,
+}
+
 /// The parsed savd configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavdConfig {
@@ -167,6 +191,8 @@ pub struct SavdConfig {
     pub drop_ack: bool,
     /// Configured interface stanzas, in file order.
     pub interfaces: Vec<InterfaceLine>,
+    /// Configured `binding` lines, in file order (one per prefix).
+    pub bindings: Vec<BindingLine>,
 }
 
 impl Default for SavdConfig {
@@ -177,6 +203,7 @@ impl Default for SavdConfig {
             poll_secs: DEFAULT_POLL_SECS,
             drop_ack: false,
             interfaces: Vec::new(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -185,11 +212,12 @@ impl fmt::Display for SavdConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode {} action {} poll {}s interfaces {}",
+            "mode {} action {} poll {}s interfaces {} bindings {}",
             self.mode,
             self.action,
             self.poll_secs,
-            self.interfaces.len()
+            self.interfaces.len(),
+            self.bindings.len()
         )
     }
 }
@@ -303,6 +331,38 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                     mode: config.mode,
                 });
             }
+            // Position-independent operator binding (the SIB's Config
+            // origin): one line per prefix, at least one interface name.
+            ["binding", prefix, "interface", names @ ..] => {
+                let prefix: IpPrefix = prefix
+                    .parse()
+                    .map_err(|_| fail(line_no, format!("bad prefix `{prefix}`")))?;
+                if names.is_empty() {
+                    return Err(fail(line_no, "binding needs at least one interface name"));
+                }
+                for (i, name) in names.iter().enumerate() {
+                    if name.len() > 15 {
+                        // Linux IFNAMSIZ-1, the same rule as `interface`.
+                        return Err(fail(
+                            line_no,
+                            format!("interface name `{name}` longer than 15 characters"),
+                        ));
+                    }
+                    if names.iter().skip(i + 1).any(|other| other == name) {
+                        return Err(fail(
+                            line_no,
+                            format!("duplicate interface name `{name}` in binding"),
+                        ));
+                    }
+                }
+                if config.bindings.iter().any(|b| b.prefix == prefix) {
+                    return Err(fail(line_no, format!("duplicate binding for `{prefix}`")));
+                }
+                config.bindings.push(BindingLine {
+                    prefix,
+                    interfaces: names.iter().map(|name| (*name).to_string()).collect(),
+                });
+            }
             ["action", a] => {
                 if seen_action {
                     return Err(fail(line_no, "duplicate `action` line"));
@@ -348,8 +408,9 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                     line_no,
                     format!(
                         "expected `mode <strict|loose|fp|efp>`, `action <monitor|drop>`, \
-                         `poll <secs>`, `i-understand-drop-mode <yes|no>`, or \
-                         `interface <name>`, got `{line}`"
+                         `poll <secs>`, `i-understand-drop-mode <yes|no>`, \
+                         `interface <name>`, or `binding <prefix> interface <name>...`, \
+                         got `{line}`"
                     ),
                 ))
             }
@@ -474,7 +535,8 @@ where
 
     /// Replace the running configuration (SIGHUP semantics; the caller
     /// re-parses and re-validates — a rejected reload never reaches
-    /// here).
+    /// here). The next evaluate feeds the new `binding` lines into the
+    /// SIB's Config origin wholesale (replace semantics are per origin).
     pub fn set_config(&mut self, config: SavdConfig) {
         self.config = config;
     }
@@ -663,12 +725,64 @@ where
         out
     }
 
-    /// Build the current view from the mirror: SIB from the RIB mirror,
-    /// one generator partition per configured mode, compiled and tagged
-    /// with the producing mode (so each op's uRPF hint matches it, and
-    /// the hysteresis pass can group ops by identity).
+    /// Feed the configured `binding` lines into the SIB's Config origin
+    /// (the W5 [`Sib::replace_origin`] surface — wholesale replace, so
+    /// a config swap drops every old line): names resolve against the
+    /// local mirror the same way stanza names do; a name not (yet)
+    /// mirrored warns and drops out, and a line with no resolved name
+    /// stores nothing rather than an empty interface set (unknown ≠
+    /// invalid — the SIB's stored invariant).
+    fn apply_config_bindings(&self, sib: &mut Sib) {
+        let mut made = Vec::new();
+        for line in &self.config.bindings {
+            let mut interfaces = Vec::new();
+            for name in &line.interfaces {
+                match self
+                    .rib
+                    .interfaces()
+                    .iter()
+                    .find(|(_, iface)| iface.name == *name)
+                {
+                    Some((&ifindex, iface)) => interfaces.push(InterfaceRef::If {
+                        ifindex,
+                        name: Some(iface.name.clone()),
+                    }),
+                    None => warn!(
+                        interface = %name,
+                        prefix = %line.prefix,
+                        "savd: binding interface not in mirror (yet); skipped"
+                    ),
+                }
+            }
+            if interfaces.is_empty() {
+                warn!(
+                    prefix = %line.prefix,
+                    "savd: binding stored nothing (no resolved interface; unknown != invalid)"
+                );
+                continue;
+            }
+            made.push(Binding {
+                prefix: line.prefix,
+                interfaces,
+                origin: BindingOrigin::Config,
+            });
+        }
+        // Every binding above names at least one concrete interface, so
+        // this cannot reject; the warn documents the invariant.
+        if let Err(err) = sib.replace_origin(BindingOrigin::Config, made) {
+            warn!(%err, "savd: config bindings rejected by the SIB");
+        }
+    }
+
+    /// Build the current view from the mirror: SIB from the RIB mirror
+    /// plus the configured `binding` lines (Config origin, shadowing
+    /// Rib per prefix), one generator partition per configured mode,
+    /// compiled and tagged with the producing mode (so each op's uRPF
+    /// hint matches it, and the hysteresis pass can group ops by
+    /// identity).
     fn build_ops(&self) -> Vec<(UrpfMode, SavOp)> {
-        let sib = Sib::from_rib(&self.rib);
+        let mut sib = Sib::from_rib(&self.rib);
+        self.apply_config_bindings(&mut sib);
         let mut partitions: Vec<(UrpfMode, SavConfig)> = Vec::new();
         for (ifindex, mode) in self.resolved_interfaces() {
             if let Some((_, cfg)) = partitions.iter_mut().find(|(m, _)| *m == mode) {
@@ -917,6 +1031,8 @@ mod tests {
              interface vethlegit\n\
              mode loose\n\
              interface vethspoof\n\
+             binding 203.0.113.0/24 interface vethlegit vethspoof\n\
+             binding 2001:db8::/64 interface vethlegit\n\
              # strict inherited from the global mode\n\
              ");
         assert_eq!(config.mode, UrpfMode::Strict);
@@ -935,6 +1051,20 @@ mod tests {
                     mode: UrpfMode::Strict
                 },
             ]
+        );
+        assert_eq!(
+            config.bindings,
+            vec![
+                BindingLine {
+                    prefix: "203.0.113.0/24".parse().unwrap(),
+                    interfaces: vec!["vethlegit".into(), "vethspoof".into()],
+                },
+                BindingLine {
+                    prefix: "2001:db8::/64".parse().unwrap(),
+                    interfaces: vec!["vethlegit".into()],
+                },
+            ],
+            "binding is position-independent (parsed inside the stanzas, global)"
         );
         assert_eq!(config.poll_interval(), Duration::from_secs(2));
     }
@@ -983,6 +1113,25 @@ mod tests {
                 "duplicate ack",
             ),
             ("i-understand-drop-mode maybe", "bad ack value"),
+            ("binding", "bare binding"),
+            (
+                "binding 10.0.0.0/8 eth2",
+                "binding without the interface keyword",
+            ),
+            ("binding 10.0.0.0/8 interface", "binding with no names"),
+            ("binding bogus interface eth2", "bad prefix"),
+            (
+                "binding 10.0.0.0/8 interface muchtoolonginterface",
+                "over-IFNAMSIZ binding name",
+            ),
+            (
+                "binding 10.0.0.0/8 interface a a",
+                "duplicate name in one binding",
+            ),
+            (
+                "binding 10.0.0.0/8 interface a\nbinding 10.0.0.0/8 interface b",
+                "duplicate binding prefix",
+            ),
             ("wat", "unknown directive"),
         ];
         for (input, why) in cases {
@@ -1500,6 +1649,117 @@ mod tests {
 
         daemon.clear(&dp).await.unwrap();
         assert_eq!(*dp.cleared.lock().unwrap(), 1, "CLEAN-EXIT path clears");
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// CONFIG-BINDINGS (A11): `binding <prefix> interface <name>...`
+    /// lines feed the SIB's Config origin with per-prefix shadowing of
+    /// the RIB binding (the SIB's documented precedence): the dumped
+    /// route says 198.51.100.0/24 egresses eth2, but the operator pins
+    /// it to eth3, so strict moves the prefix across the program; a
+    /// config-only prefix lands where pinned; a name missing from the
+    /// mirror drops out of its line (the resolved name still answers);
+    /// a line with NO resolved name stores nothing. A regeneration over
+    /// the same config is byte-stable (churn guard).
+    #[tokio::test]
+    async fn config_bindings_shadow_rib_per_prefix() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        let mut config = daemon.config().clone();
+        config.bindings = cfg("binding 198.51.100.0/24 interface eth3\n\
+             binding 203.0.113.0/24 interface eth2\n\
+             binding 192.0.2.0/24 interface eth2 eth9\n\
+             binding 198.18.0.0/15 interface eth9\n")
+        .bindings;
+        daemon.set_config(config);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["192.0.2.0/24", "203.0.113.0/24"]),
+                monitor_allow(3, &["198.51.100.0/24"]),
+            ],
+            "config pinned 198.51.100.0/24 to eth3 (rib egress eth2 shadowed); \
+             203.0.113.0/24 config-only on eth2; 192.0.2.0/24 resolved through \
+             eth2 alone (eth9 unmirrored, dropped); 198.18.0.0/15 stored nothing"
+        );
+
+        // Byte-stable: an identical regeneration installs nothing.
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            dp.installed.lock().unwrap().len(),
+            1,
+            "unchanged: no install"
+        );
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// RELOAD-WHOLESALE (A11): a config swap replaces the Config origin
+    /// wholesale — the old `binding` lines are gone and the new line
+    /// answers alone, the previously shadowed rib binding resurfaces
+    /// (198.51.100.0/24 back on its rib egress eth2). Prefixes leaving
+    /// a still-present allowlist ride the same RFC 8704 §3.6.2 window
+    /// as any withdrawal (the deferral is origin-blind by design), so
+    /// the old config's prefixes are held through the window and then
+    /// expire (paused clock).
+    #[tokio::test(start_paused = true)]
+    async fn reload_replaces_config_bindings_wholesale() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        let mut config = daemon.config().clone();
+        config.bindings = cfg("binding 198.51.100.0/24 interface eth3\n\
+             binding 203.0.113.0/24 interface eth3\n")
+        .bindings;
+        daemon.set_config(config);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &[]),
+                monitor_allow(3, &["198.51.100.0/24", "203.0.113.0/24"]),
+            ],
+            "both prefixes pinned to eth3; the rib egress eth2 is shadowed"
+        );
+
+        // SIGHUP semantics: one different line replaces the whole origin.
+        let mut reloaded = daemon.config().clone();
+        reloaded.bindings = cfg("binding 192.0.2.0/24 interface eth2\n").bindings;
+        daemon.set_config(reloaded);
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["192.0.2.0/24", "198.51.100.0/24"]),
+                monitor_allow(3, &["198.51.100.0/24", "203.0.113.0/24"]),
+            ],
+            "the new binding applied immediately and the lifted shadow \
+             resurfaced the rib binding on eth2; the old config prefixes \
+             leaving eth3's surviving allowlist are held (hysteresis)"
+        );
+
+        // Window elapsed: no trace of the old lines remains.
+        tokio::time::advance(DEFERRED_DELETE_DELAY + Duration::from_millis(1)).await;
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["192.0.2.0/24", "198.51.100.0/24"]),
+                monitor_allow(3, &[]),
+            ],
+            "wholesale replace: only the reloaded line answers; eth3 deny-all again"
+        );
+        assert!(
+            daemon.deletion_deadline().is_none(),
+            "no deferral left from the swapped-out config"
+        );
         drop(daemon);
         let _ = server.await;
     }

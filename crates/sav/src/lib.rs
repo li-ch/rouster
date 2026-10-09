@@ -12,8 +12,9 @@
 //!
 //! Bindings derive from the RIB tonight ([`Sib::from_rib`]: best
 //! main-table routes with their egress interfaces resolved the same way
-//! reconcile programs them). Config-origin bindings arrive with the savd
-//! wiring in W8. Everything here is in-process, synchronous, and
+//! reconcile programs them) and from operator config (the `binding`
+//! lines [`savd`] parses, fed through [`Sib::replace_origin`] as the
+//! Config origin). Everything here is in-process, synchronous, and
 //! side-effect-free on the dataplane: no IPC, no wire formats, and no
 //! draft-dependent signaling (nothing tonight is draft-dependent, so no
 //! `experimental-savnet` feature flag is needed).
@@ -75,8 +76,9 @@ pub enum BindingOrigin {
     /// Derived from the RIB: best main-table routes whose egress
     /// interfaces resolve. Recomputed wholesale by [`Sib::ingest_rib`].
     Rib,
-    /// Statically configured (`sav.conf`-shaped config; arrives with the
-    /// savd wiring in W8 — no config bindings exist yet).
+    /// Statically configured (`sav.conf`-shaped
+    /// `binding <prefix> interface <name>...` lines, fed wholesale by
+    /// savd — see [`crate::savd::SavdConfig::bindings`]).
     Config,
 }
 
