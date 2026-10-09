@@ -1,7 +1,7 @@
 //! W5B property tests: the SIB ingest→query invariants.
 //!
-//! The three pre-registered properties (W5's continuation ladder) plus two
-//! cheap ones that fall out of the same reference model:
+//! The three pre-registered properties (W5's continuation ladder) plus
+//! three cheap ones that fall out of the same reference model:
 //!
 //! 1. **idempotence** — ingesting the same RIB twice changes nothing
 //!    (snapshot and every query answer);
@@ -17,7 +17,12 @@
 //!    key leaves exactly the replacement's normalized interface set;
 //! 5. **snapshot round-trip** — iteration is deterministically sorted and
 //!    rebuilding a SIB from a snapshot reproduces both storage and every
-//!    query answer.
+//!    query answer;
+//! 6. **batch atomicity** — `replace_origin` commits a valid batch
+//!    wholesale (the origin slot equals exactly the replayed batch, the
+//!    other origin's slot survives, queries follow the model over the
+//!    union), while a batch carrying an empty or marker binding anywhere
+//!    in it is rejected with the matching error and commits nothing.
 //!
 //! Determinism (frozen bar "seeds fixed"): every runner is constructed
 //! with an explicit [`proptest::test_runner::RngSeed::Fixed`], so plain
@@ -43,7 +48,7 @@ use common::{IpPrefix, Ipv4Prefix, Ipv6Prefix, Nexthop, NexthopGroup, RouteEntry
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use rib::Rib;
-use sav::{Binding, BindingOrigin, InterfaceRef, Sib};
+use sav::{Binding, BindingOrigin, InterfaceRef, SavError, Sib};
 
 /// One fixed seed per property (distinct streams). Named constants keep
 /// the "seeds fixed" bar greppable and give each property an independent
@@ -53,6 +58,7 @@ const SEED_ORIGIN_REPLACE: u64 = 0x5735_4202;
 const SEED_LONGEST_PREFIX: u64 = 0x5735_4203;
 const SEED_KEY_REPLACE: u64 = 0x5735_4204;
 const SEED_ROUND_TRIP: u64 = 0x5735_4205;
+const SEED_BATCH_ATOMICITY: u64 = 0x5735_4206;
 
 fn seeded(seed: u64) -> ProptestConfig {
     ProptestConfig {
@@ -103,8 +109,8 @@ fn ifindex_strategy() -> impl Strategy<Value = u32> {
 }
 
 /// Concrete interface refs only — the `Any` marker is query-only and a
-/// storage invariant violation, so it is never generated (its rejection
-/// is pinned by the W5 unit tests).
+/// storage invariant violation, so no valid binding ever carries it; the
+/// batch-atomicity property injects it explicitly as a poison instead.
 fn ifref_strategy() -> impl Strategy<Value = InterfaceRef> {
     (
         ifindex_strategy(),
@@ -560,6 +566,122 @@ proptest! {
                 "for probe {}",
                 probe
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 6 — replace_origin batch atomicity: a batch commits wholesale
+// or not at all (the property form of the W5 unit test)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(seeded(SEED_BATCH_ATOMICITY))]
+    #[test]
+    fn replace_origin_commits_a_batch_wholesale_or_not_at_all(
+        initial in proptest::collection::vec(binding_strategy(), 0..=10),
+        batch in proptest::collection::vec(binding_strategy(), 0..=8),
+        is_config in any::<bool>(),
+        poison_prefix in prefix_strategy(),
+        probes in probes_strategy(),
+        entropy in entropy_strategy(),
+    ) {
+        let (origin, other) = if is_config {
+            (BindingOrigin::Config, BindingOrigin::Rib)
+        } else {
+            (BindingOrigin::Rib, BindingOrigin::Config)
+        };
+        let mut sib = Sib::new();
+        for binding in &initial {
+            sib.update(binding.clone()).unwrap();
+        }
+        // Origin-coherent batches are the caller contract (`ingest_rib`
+        // feeds derived Rib bindings; savd feeds the parsed `binding`
+        // lines as Config — see crates/sav/src/savd.rs), so the batch is
+        // coerced to the target origin before every call below.
+        let batch: Vec<Binding> = batch
+            .into_iter()
+            .map(|mut b| {
+                b.origin = origin;
+                b
+            })
+            .collect();
+
+        // A valid batch: accepted, the origin slot wholesale-replaced
+        // with exactly the replayed batch — nothing of the old slot
+        // survives, nothing merges — and the other origin untouched.
+        let other_before = origin_slot(&sib, other);
+        let want = replay(&batch);
+        prop_assert!(sib.replace_origin(origin, batch.clone()).is_ok());
+        prop_assert_eq!(
+            origin_slot(&sib, origin),
+            want.values().cloned().collect::<Vec<_>>(),
+            "the slot equals exactly the batch, replayed per key"
+        );
+        prop_assert_eq!(
+            origin_slot(&sib, other),
+            other_before.clone(),
+            "the other origin's slot survives the replace"
+        );
+
+        // Queries see the replaced slot: the model over the union of the
+        // two slots (random probes plus one address inside every batch
+        // prefix, so the new bindings are actually hit).
+        let mut stored = Stored::new();
+        for binding in other_before.iter().chain(want.values()) {
+            stored.insert((binding.prefix, binding.origin), binding.clone());
+        }
+        let mut all_probes = probes;
+        for (binding, entropy) in batch.iter().zip(entropy.iter()) {
+            all_probes.push(addr_inside(binding.prefix, *entropy));
+        }
+        for probe in all_probes {
+            prop_assert_eq!(sib.interfaces_for(probe), model_interfaces_for(&stored, probe));
+        }
+
+        // An invalid batch — an empty or marker binding, injected at
+        // *every* position — is rejected with the matching error and
+        // commits nothing: the whole SIB is exactly what it was. The
+        // poison's prefix is generated (rejection is per-binding and
+        // key-independent); the same-prefix shape is pinned by the W5
+        // unit test.
+        let poisons = [
+            Binding {
+                prefix: poison_prefix,
+                interfaces: vec![],
+                origin,
+            },
+            Binding {
+                prefix: poison_prefix,
+                interfaces: vec![InterfaceRef::Any],
+                origin,
+            },
+        ];
+        let before = snapshot(&sib);
+        for pos in 0..=batch.len() {
+            for poison in &poisons {
+                let mut poisoned = batch.clone();
+                poisoned.insert(pos, poison.clone());
+                let expected = if poison.interfaces.is_empty() {
+                    SavError::EmptyBinding {
+                        prefix: poison.prefix,
+                    }
+                } else {
+                    SavError::MarkerInBinding {
+                        prefix: poison.prefix,
+                    }
+                };
+                prop_assert_eq!(
+                    sib.replace_origin(origin, poisoned),
+                    Err(expected),
+                    "the poison rejects the batch wherever it sits"
+                );
+                prop_assert_eq!(
+                    snapshot(&sib),
+                    before.clone(),
+                    "a rejected batch leaves the SIB untouched"
+                );
+            }
         }
     }
 }
