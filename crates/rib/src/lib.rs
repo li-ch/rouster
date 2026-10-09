@@ -20,6 +20,12 @@ pub struct InterfaceState {
     pub is_up: bool,
     /// Addresses configured on the interface (as host prefixes).
     pub addresses: Vec<IpPrefix>,
+    /// Routing table bound to the interface when it is a VRF device (link
+    /// kind "vrf"); `None` for every other link.
+    pub vrf_table: Option<TableId>,
+    /// Ifindex of the master device this interface is enslaved to (e.g. a
+    /// VRF device); `None` when unenslaved.
+    pub master_ifindex: Option<u32>,
 }
 
 /// One routing table. `TableId` follows Linux numbering (254 = main).
@@ -137,6 +143,20 @@ impl Rib {
     /// One mirrored kernel table (observation only; never a reconcile input).
     pub fn kernel_table(&self, id: TableId) -> Option<&Table> {
         self.kernel_mirror.get(&id)
+    }
+
+    /// The VRF device that owns `table`, as `(ifindex, mirrored state)`,
+    /// when a mirrored link of kind VRF is bound to that table. This is
+    /// the route→VRF association: [`TableId`]s already ride on every
+    /// route and mirror entry (P0D); this query adds the device link, so
+    /// "routes in table N" answers "routes in VRF vrf-test". Derived from
+    /// the interface mirror (no second source of truth): a LinkDel of the
+    /// VRF device drops the association immediately.
+    pub fn vrf_of_table(&self, table: TableId) -> Option<(u32, &InterfaceState)> {
+        self.interfaces
+            .iter()
+            .find(|(_, iface)| iface.vrf_table == Some(table))
+            .map(|(&ifindex, iface)| (ifindex, iface))
     }
 
     /// Total number of mirrored kernel routes, across tables.
@@ -277,10 +297,17 @@ impl Rib {
                 ifindex,
                 name,
                 is_up,
+                vrf_table,
+                master_ifindex,
             } => {
                 let iface = self.interfaces.entry(*ifindex).or_default();
                 iface.name = name.clone();
                 iface.is_up = *is_up;
+                // Each RTM_NEWLINK carries the link's full state: both VRF
+                // fields overwrite unconditionally, so (un)enslaving or
+                // re-binding a device is reflected on the next notification.
+                iface.vrf_table = *vrf_table;
+                iface.master_ifindex = *master_ifindex;
                 self.rebuild_nht();
             }
             DataplaneEvent::LinkDel { ifindex } => {
@@ -724,6 +751,8 @@ mod tests {
             ifindex: 2,
             name: "eth0".into(),
             is_up: true,
+            vrf_table: None,
+            master_ifindex: None,
         });
         rib.apply_event(&DataplaneEvent::AddressNew {
             ifindex: 2,
@@ -774,6 +803,8 @@ mod tests {
             ifindex: 5,
             name: "eth1".into(),
             is_up: true,
+            vrf_table: None,
+            master_ifindex: None,
         });
         let iface = rib.interfaces().get(&5).unwrap();
         assert_eq!(iface.name, "eth1");
@@ -964,6 +995,8 @@ mod tests {
             ifindex,
             name: name.into(),
             is_up,
+            vrf_table: None,
+            master_ifindex: None,
         }
     }
 
@@ -1314,6 +1347,188 @@ mod tests {
         assert_eq!(
             rib.unresolved_gateways().collect::<Vec<_>>(),
             vec![ip("203.0.113.7")]
+        );
+    }
+
+    // --- VRF device/table awareness (W4) ---
+
+    /// A VRF device link event: kind vrf + bound table, nothing enslaved.
+    fn vrf_link(ifindex: u32, name: &str, table: TableId, is_up: bool) -> DataplaneEvent {
+        DataplaneEvent::LinkNew {
+            ifindex,
+            name: name.into(),
+            is_up,
+            vrf_table: Some(table),
+            master_ifindex: None,
+        }
+    }
+
+    /// A member link event: enslaved to `master`, never a VRF itself.
+    fn member_link(ifindex: u32, name: &str, master: Option<u32>, is_up: bool) -> DataplaneEvent {
+        DataplaneEvent::LinkNew {
+            ifindex,
+            name: name.into(),
+            is_up,
+            vrf_table: None,
+            master_ifindex: master,
+        }
+    }
+
+    #[test]
+    fn vrf_link_event_binds_table_to_device() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+
+        let iface = rib.interfaces().get(&5).unwrap();
+        assert_eq!(iface.name, "vrf-test");
+        assert_eq!(iface.vrf_table, Some(5001));
+        assert_eq!(iface.master_ifindex, None);
+
+        // The route→VRF association surface: table 5001 answers with the
+        // device that owns it; an unbound table answers None.
+        let (ifindex, vrf) = rib.vrf_of_table(5001).unwrap();
+        assert_eq!(ifindex, 5);
+        assert_eq!(vrf.name, "vrf-test");
+        assert!(rib.vrf_of_table(5002).is_none());
+    }
+
+    #[test]
+    fn enslaved_link_records_master() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+        rib.apply_event(&member_link(2, "dummy0", Some(5), true));
+
+        let dummy = rib.interfaces().get(&2).unwrap();
+        assert_eq!(dummy.master_ifindex, Some(5));
+        // Membership never makes a link a VRF device.
+        assert_eq!(dummy.vrf_table, None);
+
+        // Plain links carry neither payload (extend-not-redesign: the
+        // pre-W4 event shape stays representable and defaults to none).
+        rib.apply_event(&link(3, "eth0", true));
+        let plain = rib.interfaces().get(&3).unwrap();
+        assert_eq!(plain.vrf_table, None);
+        assert_eq!(plain.master_ifindex, None);
+    }
+
+    #[test]
+    fn vrf_association_survives_link_flap_and_enslavement_updates() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+
+        // Admin state changes re-emit RTM_NEWLINK; the binding must
+        // survive (and a down VRF still owns its table — that is
+        // observed state, not policy).
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, false));
+        assert_eq!(rib.interfaces().get(&5).unwrap().vrf_table, Some(5001));
+        assert_eq!(rib.vrf_of_table(5001).unwrap().0, 5);
+
+        // Enslaving and un-enslaving a member both arrive as full-state
+        // RTM_NEWLINK notifications; the last one wins.
+        rib.apply_event(&member_link(2, "dummy0", Some(5), true));
+        assert_eq!(rib.interfaces().get(&2).unwrap().master_ifindex, Some(5));
+        rib.apply_event(&member_link(2, "dummy0", None, true));
+        assert_eq!(rib.interfaces().get(&2).unwrap().master_ifindex, None);
+    }
+
+    #[test]
+    fn vrf_device_delete_drops_table_association() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+        assert!(rib.vrf_of_table(5001).is_some());
+
+        rib.apply_event(&DataplaneEvent::LinkDel { ifindex: 5 });
+        assert!(rib.interfaces().get(&5).is_none());
+        assert!(
+            rib.vrf_of_table(5001).is_none(),
+            "the association derives from the interface mirror, so it drops with the device"
+        );
+    }
+
+    #[test]
+    fn kernel_routes_in_vrf_table_associate_with_vrf() {
+        let prefix: IpPrefix = "10.9.0.0/16".parse().unwrap();
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 5001,
+            prefix,
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+
+        // The mirror holds the route under its table id (P0D), and the
+        // table answers to the VRF device: route → table → VRF.
+        let mirror = rib.kernel_table(5001).unwrap();
+        assert_eq!(
+            mirror.best(&prefix).unwrap().protocol,
+            RouteProtocol::Kernel
+        );
+        let (ifindex, vrf) = rib.vrf_of_table(5001).unwrap();
+        assert_eq!(ifindex, 5);
+        assert_eq!(vrf.name, "vrf-test");
+        assert_eq!(rib.kernel_route_count(), 1);
+
+        // Route deletion removes the mirror entry but not the VRF device.
+        rib.apply_event(&DataplaneEvent::RouteDel {
+            table: 5001,
+            prefix,
+        });
+        assert!(rib.kernel_table(5001).unwrap().best(&prefix).is_none());
+        assert!(rib.vrf_of_table(5001).is_some());
+    }
+
+    /// VRF awareness is observation only tonight: an enslaved interface's
+    /// addresses still resolve gateways exactly as before (no VRF-scoped
+    /// resolution semantics — that is Phase-1+ redistribution work).
+    #[test]
+    fn vrf_awareness_does_not_change_gateway_resolution() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+        rib.apply_event(&member_link(2, "dummy0", Some(5), true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+
+        assert_eq!(
+            rib.resolve_nexthop(ip("192.0.2.9")),
+            Some(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 2))
+        );
+
+        // Flapping the VRF device itself changes nothing for resolution.
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, false));
+        assert_eq!(
+            rib.resolve_nexthop(ip("192.0.2.9")),
+            Some(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 2))
+        );
+    }
+
+    /// Round-trip: a static route configured with `table <N>` where N is a
+    /// VRF's table reconciles into that table (P0D behavior, now inside a
+    /// recognized VRF), with the gateway resolved via the enslaved
+    /// interface's connected prefix.
+    #[test]
+    fn vrf_table_static_route_round_trips_to_its_table() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+        rib.apply_event(&member_link(2, "dummy0", Some(5), true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+
+        let mut route = gw_entry("203.0.113.0/24", "192.0.2.9");
+        route.table = 5001;
+        rib.add_route(route);
+        assert!(rib.vrf_of_table(5001).is_some(), "route's table is a VRF");
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        let installed = dp.installed.lock().unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].table, 5001,
+            "programmed back into the VRF table"
+        );
+        assert_eq!(
+            installed[0].nexthops.hops(),
+            &[(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 2), 1)],
+            "gateway resolved through the enslaved member interface"
         );
     }
 }

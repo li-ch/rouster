@@ -129,6 +129,8 @@ async fn staticd_e2e_install_nht_filter_and_withdrawal() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     driver.rib.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,

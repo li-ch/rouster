@@ -159,6 +159,28 @@ async fn main() -> std::io::Result<()> {
         neighbours = driver.rib.neighbours().len(),
         "initial neighbour mirror"
     );
+    // VRF devices seen in the link dump (W4): each logs its bound table,
+    // how many kernel-origin routes the mirror holds in that table, and
+    // how many mirrored links it enslaves. Live VRF changes ride the
+    // generic dataplane-event line (the LinkNew Display carries the vrf
+    // table and master ifindex).
+    for (&ifindex, iface) in driver.rib.interfaces() {
+        let Some(table) = iface.vrf_table else {
+            continue;
+        };
+        let enslaved = driver
+            .rib
+            .interfaces()
+            .values()
+            .filter(|member| member.master_ifindex == Some(ifindex))
+            .count();
+        let routes = driver
+            .rib
+            .kernel_table(table)
+            .map(|t| t.iter().count())
+            .unwrap_or(0);
+        info!(vrf = %iface.name, ifindex, table, enslaved, routes, "vrf mirror");
+    }
     // Mirrored connected prefixes may resolve gateway nexthops that the
     // first pass above had to skip (unresolved gateways are not
     // programmed); re-run the diff before serving or exiting.

@@ -340,6 +340,8 @@ async fn nht_register_resolved_through_real_rib() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     rib.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -405,6 +407,8 @@ async fn interface_dump_answered_from_rib_mirror() {
         ifindex: 7,
         name: "eth7".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     rib.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 7,
@@ -486,6 +490,8 @@ async fn nht_flip_on_address_add_pushed_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -529,6 +535,8 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         ifindex: 3,
         name: "eth3".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 3,
@@ -552,6 +560,8 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         ifindex: 3,
         name: "eth3".to_string(),
         is_up: false,
+        vrf_table: None,
+        master_ifindex: None,
     });
     let (header, body) = client.read_frame().await;
     assert_eq!(
@@ -595,6 +605,8 @@ async fn redistribute_route_add_pushed_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -679,6 +691,8 @@ async fn redistribute_registration_dumps_existing_route_over_real_socket() {
         ifindex: 2,
         name: "eth2".to_string(),
         is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,

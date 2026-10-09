@@ -34,6 +34,13 @@ pub enum DataplaneEvent {
         ifindex: u32,
         name: String,
         is_up: bool,
+        /// Routing table bound to the link when it is a VRF device (link
+        /// kind "vrf", `IFLA_VRF_TABLE`); `None` for every other link kind.
+        vrf_table: Option<TableId>,
+        /// Ifindex of the master device the link is enslaved to via
+        /// `IFLA_MASTER` (a VRF device in the VRF case; bridges and bonds
+        /// use the same attribute); `None` when unenslaved.
+        master_ifindex: Option<u32>,
     },
     LinkDel {
         ifindex: u32,
@@ -86,11 +93,22 @@ impl fmt::Display for DataplaneEvent {
                 ifindex,
                 name,
                 is_up,
-            } => write!(
-                f,
-                "link new: {name} (ifindex {ifindex}, {})",
-                if *is_up { "up" } else { "down" }
-            ),
+                vrf_table,
+                master_ifindex,
+            } => {
+                write!(
+                    f,
+                    "link new: {name} (ifindex {ifindex}, {}",
+                    if *is_up { "up" } else { "down" }
+                )?;
+                if let Some(table) = vrf_table {
+                    write!(f, ", vrf table {table}")?;
+                }
+                if let Some(master) = master_ifindex {
+                    write!(f, ", master ifindex {master}")?;
+                }
+                write!(f, ")")
+            }
             DataplaneEvent::LinkDel { ifindex } => write!(f, "link del: ifindex {ifindex}"),
             DataplaneEvent::AddressNew { ifindex, prefix } => {
                 write!(f, "addr new: {prefix} on ifindex {ifindex}")
@@ -137,7 +155,58 @@ pub trait Dataplane {
         entry: &RouteEntry,
     ) -> impl Future<Output = Result<(), DataplaneError>> + Send;
 
-    // TODO(phase-0): nexthop-group objects, VRF/netns awareness. (Initial
-    // dump + event stream for links, addresses, routes, and neighbours is
+    // TODO(phase-0): netns awareness; TODO(phase-1): nexthop-group
+    // objects. (Initial dump + event stream for links — including VRF
+    // device/table association —, addresses, routes, and neighbours is
     // done — see the netlink-dp backend.)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link_new(vrf_table: Option<u32>, master_ifindex: Option<u32>) -> DataplaneEvent {
+        DataplaneEvent::LinkNew {
+            ifindex: 5,
+            name: "vrf-test".into(),
+            is_up: true,
+            vrf_table,
+            master_ifindex,
+        }
+    }
+
+    /// A plain link renders exactly as before the VRF extension; a VRF
+    /// device and an enslaved link each carry their new payload (smoke
+    /// greps pin the same rendering live).
+    #[test]
+    fn link_new_display_carries_vrf_and_master_fields() {
+        let plain = DataplaneEvent::LinkNew {
+            ifindex: 2,
+            name: "eth0".into(),
+            is_up: false,
+            vrf_table: None,
+            master_ifindex: None,
+        };
+        assert_eq!(plain.to_string(), "link new: eth0 (ifindex 2, down)");
+
+        let vrf = link_new(Some(5001), None);
+        assert_eq!(
+            vrf.to_string(),
+            "link new: vrf-test (ifindex 5, up, vrf table 5001)"
+        );
+
+        let enslaved = link_new(None, Some(5));
+        assert_eq!(
+            enslaved.to_string(),
+            "link new: vrf-test (ifindex 5, up, master ifindex 5)"
+        );
+
+        // A VRF device is never itself enslaved; a link may still carry
+        // both payloads in a malformed stream — rendering covers it.
+        let both = link_new(Some(5001), Some(9));
+        assert_eq!(
+            both.to_string(),
+            "link new: vrf-test (ifindex 5, up, vrf table 5001, master ifindex 9)"
+        );
+    }
 }

@@ -6,7 +6,9 @@ use common::{
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
-use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
+use netlink_packet_route::link::{
+    InfoData, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
+};
 use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol as NlRouteProtocol,
@@ -141,16 +143,47 @@ impl NetlinkDataplane {
 /// `RTA_TABLE` (ids > 255).
 const RT_TABLE_COMPAT: u8 = 252;
 
-/// Maps a kernel link message to a `LinkNew` event (name resolution included).
+/// Maps a kernel link message to a `LinkNew` event (name resolution and
+/// VRF awareness included).
+///
+/// VRF modeling: a link of kind "vrf" (`IFLA_INFO_KIND`) carries its bound
+/// routing table in `IFLA_VRF_TABLE` — netlink-packet-route parses that
+/// pairing as [`LinkInfo::Data`](`InfoData::Vrf`), so seeing the variant
+/// is itself the kind check and [`InfoVrf::TableId`] the table. Enslavement
+/// arrives as `IFLA_MASTER` ([`LinkAttribute::Controller`], the master
+/// device's ifindex — a VRF device here, though bridges and bonds share
+/// the attribute).
 fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
     let name = msg.attributes.iter().find_map(|a| match a {
         LinkAttribute::IfName(n) => Some(n.clone()),
         _ => None,
     })?;
+    let mut vrf_table = None;
+    let mut master_ifindex = None;
+    for attr in &msg.attributes {
+        match attr {
+            LinkAttribute::Controller(ix) => master_ifindex = Some(*ix),
+            LinkAttribute::LinkInfo(infos) => {
+                for info in infos {
+                    if let LinkInfo::Data(InfoData::Vrf(nlas)) = info {
+                        vrf_table = nlas.iter().find_map(|nla| match nla {
+                            InfoVrf::TableId(t) => Some(*t),
+                            // InfoVrf is non_exhaustive; unknown vrf
+                            // attributes carry no table.
+                            _ => None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Some(DataplaneEvent::LinkNew {
         ifindex: msg.header.index,
         name,
         is_up: msg.header.flags.contains(LinkFlags::Up),
+        vrf_table,
+        master_ifindex,
     })
 }
 

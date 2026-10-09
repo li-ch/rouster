@@ -472,6 +472,8 @@ mod tests {
             ifindex,
             name: format!("eth{ifindex}"),
             is_up: true,
+            vrf_table: None,
+            master_ifindex: None,
         }
     }
 
@@ -480,6 +482,8 @@ mod tests {
             ifindex,
             name: format!("eth{ifindex}"),
             is_up: false,
+            vrf_table: None,
+            master_ifindex: None,
         }
     }
 
@@ -974,12 +978,16 @@ mod tests {
             ifindex: 4,
             name: "lo".into(),
             is_up: true,
+            vrf_table: None,
+            master_ifindex: None,
         });
         driver.apply_event(&addr_new(4, "10.0.0.5/32"));
         driver.apply_event(&DataplaneEvent::LinkNew {
             ifindex: 2,
             name: "eth0".into(),
             is_up: true,
+            vrf_table: None,
+            master_ifindex: None,
         });
         driver.apply_event(&addr_new(2, "192.168.1.1/24"));
         assert_eq!(
@@ -1000,6 +1008,8 @@ mod tests {
             ifindex: 4,
             name: "lo".into(),
             is_up: false,
+            vrf_table: None,
+            master_ifindex: None,
         });
         assert_eq!(
             driver.router_id(),
@@ -1012,6 +1022,8 @@ mod tests {
             ifindex: 3,
             name: "eth1".into(),
             is_up: false,
+            vrf_table: None,
+            master_ifindex: None,
         });
         driver.apply_event(&addr_new(3, "200.0.0.1/24"));
         assert_eq!(
