@@ -145,10 +145,15 @@ pub enum RibCommand {
     RequestInterfaces {
         reply: oneshot::Sender<Vec<InterfaceMirror>>,
     },
-    /// ROUTER_ID_ADD (16): the driver answers with the router-id it derives
-    /// from the interface mirror (`None` = no IPv4 address to derive from);
+    /// ROUTER_ID_ADD (16): the driver records `owner` as interested in
+    /// router-id changes and answers with the router-id it derives from
+    /// the interface mirror (`None` = no IPv4 address to derive from);
     /// the session encodes a ROUTER_ID_UPDATE (18) reply when `Some`.
+    /// Later derived-id changes push
+    /// [`SessionPush::RouterIdUpdate`] to the same owner (A2, the
+    /// `reevaluate_nht` pattern applied to router-id).
     RequestRouterId {
+        owner: u64,
         reply: oneshot::Sender<Option<Ipv4Addr>>,
     },
 }
@@ -202,6 +207,13 @@ pub enum SessionPush {
     /// closing Z3B's disclosed cut). The entry is the route as it last
     /// was, in push form.
     RedistributeRouteDel(RouteEntry),
+    /// The derived router-id changed and this session registered interest
+    /// with ROUTER_ID_ADD (A2); answered as ZEBRA_ROUTER_ID_UPDATE (18)
+    /// with the same pinned body as the request answer. Only pushed for
+    /// a derivable id — FRR zebra skips registered clients when the id
+    /// becomes 0/none (`router_id_update`, zebra/router-id.c, which even
+    /// carries a TODO for that case).
+    RouterIdUpdate(Ipv4Addr),
 }
 
 /// Per-connection session state, established by the HELLO handshake.
@@ -744,14 +756,21 @@ impl ZapiSession {
             }
             ZapiMessage::RouterIdAdd { afi } => {
                 // Answer with a ROUTER_ID_UPDATE carrying the derived
-                // router-id (W2): FRR zebra registers the client and sends
-                // its current id; bgpd/staticd use it when config pins
-                // none. No IPv4 address yet → no answer (W1 observed both
-                // daemons tolerate the silence; the next ROUTER_ID_ADD or
-                // reconnect re-asks).
+                // router-id (W2) AND register the session for pushes on
+                // later id changes (A2) — FRR zebra puts the client on
+                // `rid_clients` and re-sends the id whenever the derived
+                // value flips on an address/link event. bgpd/staticd use
+                // the id when config pins none. No IPv4 address yet → no
+                // answer (W1 observed both daemons tolerate the silence;
+                // the next ROUTER_ID_ADD or reconnect re-asks — the
+                // registration burst always includes cmd 16, pinned doc
+                // operational finding 5).
                 let (reply_tx, reply_rx) = oneshot::channel();
                 commands
-                    .send(RibCommand::RequestRouterId { reply: reply_tx })
+                    .send(RibCommand::RequestRouterId {
+                        owner: self.id,
+                        reply: reply_tx,
+                    })
                     .await
                     .map_err(|_| channel_closed())?;
                 match reply_rx.await {
@@ -893,6 +912,24 @@ impl ZapiSession {
                 let frame = ZapiMessage::RedistributeRouteDel(route)
                     .encode_frame(0)
                     .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::RouterIdUpdate(router_id) => {
+                // Same pinned body as the ROUTER_ID_ADD answer: family u8,
+                // address, prefixlen 32 (A2). The driver only pushes a
+                // derivable id, so there is no None arm here.
+                info!(
+                    id = self.id,
+                    %router_id,
+                    "zapi: pushing ROUTER_ID_UPDATE"
+                );
+                let frame = ZapiMessage::RouterIdUpdate(ZapiRouterIdUpdate {
+                    address: std::net::IpAddr::V4(router_id),
+                    prefix_len: 32,
+                })
+                .encode_frame(0)
+                .map_err(encode_io_err)?;
                 io.write_all(&frame).await
             }
         }
@@ -1037,7 +1074,7 @@ mod tests {
                     let _ = reply.send(self.interfaces.clone());
                     Seen::Ifaces
                 }
-                RibCommand::RequestRouterId { reply } => {
+                RibCommand::RequestRouterId { reply, .. } => {
                     let _ = reply.send(self.router_id);
                     Seen::RouterId
                 }
@@ -1687,6 +1724,44 @@ mod tests {
             Seen::Established { .. }
         ));
         assert!(rx.try_recv().is_err(), "no further command");
+    }
+
+    /// A2: the event-driven ROUTER_ID_UPDATE push encodes as command 18
+    /// with the SAME pinned body as the request answer (family AF_INET,
+    /// address, prefixlen 32 — SRC zebra_router_id_update_read).
+    #[tokio::test]
+    async fn router_id_push_encodes_command_18() {
+        let mut session = ZapiSession {
+            id: 11,
+            ..ZapiSession::default()
+        };
+        let (mut client_io, mut server_io) = tokio::io::duplex(1024);
+        session
+            .handle_push(
+                SessionPush::RouterIdUpdate(Ipv4Addr::new(192, 0, 2, 9)),
+                &mut server_io,
+            )
+            .await
+            .expect("push encodes");
+        drop(server_io);
+        let mut bytes = Vec::new();
+        use tokio::io::AsyncReadExt;
+        client_io.read_to_end(&mut bytes).await.expect("eof");
+
+        let header = ZapiHeader::decode(&bytes[..ZAPI_HEADER_LEN]).unwrap();
+        assert_eq!(header.command, 18, "ZEBRA_ROUTER_ID_UPDATE");
+        assert_eq!(
+            header.length as usize,
+            bytes.len(),
+            "exactly one framed message"
+        );
+        let body = bytes[ZAPI_HEADER_LEN..].to_vec();
+        assert_eq!(
+            body,
+            vec![crate::message::AF_INET as u8, 192, 0, 2, 9, 32],
+            "family AF_INET, the address, prefixlen 32 — byte-identical \
+             to the ROUTER_ID_ADD answer body"
+        );
     }
 
     /// ROUTE_NOTIFY_REQUEST is recorded but NOT answered: ROUTE_NOTIFY_OWNER

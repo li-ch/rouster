@@ -17,7 +17,10 @@
 //! closes the last gap: a SIGHUP config swap rides the same fan-out —
 //! [`RibDriver::reload_static`] snapshots the bests a reload can touch,
 //! swaps the static candidates, and re-checks each through the
-//! best-change push.
+//! best-change push. A2 gives the derived router-id the same event-driven
+//! treatment: an address/link event that changes the id pushes
+//! ROUTER_ID_UPDATE to every session that registered with ROUTER_ID_ADD
+//! ([`RibDriver::reevaluate_router_id`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -73,6 +76,14 @@ pub struct RibDriver {
     /// distinction — D4's class); a push dropped for a full queue is
     /// treated as never told, so the next establish re-sends it as an ADD.
     last_known: BTreeMap<ClientIdentity, BTreeMap<IpPrefix, RouteEntry>>,
+    /// ROUTER_ID_ADD interests per owner, with the last id the owner was
+    /// told (the answer to its ROUTER_ID_ADD, or the latest push) — the
+    /// flip baseline for [`RibDriver::reevaluate_router_id`] (A2). FRR
+    /// zebra's `rid_clients` twin; unlike REDISTRIBUTE (operational
+    /// finding 5) every daemon re-sends ROUTER_ID_ADD in its reconnect
+    /// burst, so the interest is session-scoped and needs no
+    /// identity-keyed memory.
+    router_id_interests: HashMap<u64, Option<Ipv4Addr>>,
 }
 
 impl Default for RibDriver {
@@ -106,6 +117,7 @@ impl RibDriver {
             identities: HashMap::new(),
             remembered: BTreeMap::new(),
             last_known: BTreeMap::new(),
+            router_id_interests: HashMap::new(),
         }
     }
 
@@ -360,9 +372,14 @@ impl RibDriver {
                 let _ = reply.send(mirror);
                 false
             }
-            RibCommand::RequestRouterId { reply } => {
+            // Answer immediately from the current derivation; the stored
+            // value is the flip baseline for reevaluate_router_id (A2 —
+            // the RegisterNexthop pattern: the session answer carries this
+            // id, so it is what the owner was told).
+            RibCommand::RequestRouterId { owner, reply } => {
                 let router_id = self.router_id();
-                debug!(?router_id, "zapi: router-id derived");
+                debug!(owner, ?router_id, "zapi: router-id derived");
+                self.router_id_interests.insert(owner, router_id);
                 let _ = reply.send(router_id);
                 false
             }
@@ -374,7 +391,9 @@ impl RibDriver {
     /// (P0B): link and address events can flip a gateway between
     /// resolved and unresolved, and each flip pushes a NEXTHOP_UPDATE to
     /// the owning session. Route events cannot change (direct)
-    /// resolution, so they skip the pass.
+    /// resolution, so they skip the pass. The same link/address events
+    /// can change the derived router-id (A2), so they also re-run the
+    /// router-id evaluation for ROUTER_ID_ADD-registered sessions.
     pub fn apply_event(&mut self, ev: &DataplaneEvent) {
         let flips_resolution = matches!(
             ev,
@@ -386,6 +405,7 @@ impl RibDriver {
         self.rib.apply_event(ev);
         if flips_resolution {
             self.reevaluate_nht();
+            self.reevaluate_router_id();
         }
     }
 
@@ -406,6 +426,42 @@ impl RibDriver {
         for (owner, prefix, resolution) in flips {
             info!(owner, %prefix, resolved = resolution.is_some(), "zapi: NHT flip");
             self.push(owner, SessionPush::NexthopResolution { prefix, resolution });
+        }
+    }
+
+    /// The router-id twin of [`Self::reevaluate_nht`] (A2): re-derives the
+    /// id once per link/address event and pushes ROUTER_ID_UPDATE to every
+    /// ROUTER_ID_ADD-registered owner whose last-told id differs. An id
+    /// that becomes underivable updates the baseline but pushes nothing —
+    /// FRR zebra skips registered clients on a zero id too
+    /// (`router_id_update`, frr-10.2.2 zebra/router-id.c, which carries a
+    /// TODO for exactly this case); like NHT, the baseline moves whether
+    /// or not the push was queued (a stuck client re-asks on its next
+    /// ROUTER_ID_ADD or reconnect, both of which re-register).
+    fn reevaluate_router_id(&mut self) {
+        let current = self.router_id();
+        let flips: Vec<u64> = self
+            .router_id_interests
+            .iter_mut()
+            .filter_map(|(&owner, last_told)| {
+                if *last_told != current {
+                    *last_told = current;
+                    Some(owner)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for owner in flips {
+            if let Some(router_id) = current {
+                info!(owner, %router_id, "zapi: router-id change");
+                self.push(owner, SessionPush::RouterIdUpdate(router_id));
+            } else {
+                debug!(
+                    owner,
+                    "zapi: router-id underivable; registered clients not notified (per zebra)"
+                );
+            }
         }
     }
 
@@ -628,6 +684,7 @@ impl RibDriver {
                 self.nht_registrations.remove(&owner);
                 self.redistributes.remove(&owner);
                 self.identities.remove(&owner);
+                self.router_id_interests.remove(&owner);
                 debug!(owner, "zapi: session gone; registries pruned");
                 false
             }
@@ -693,6 +750,14 @@ mod tests {
             prefix: prefix.parse().unwrap(),
             reply: tx,
         });
+        rx.blocking_recv().expect("answer")
+    }
+
+    /// ROUTER_ID_ADD from `owner` (A2): returns the answer the session
+    /// encodes, and registers the owner for change pushes.
+    fn request_router_id(driver: &mut RibDriver, owner: u64) -> Option<Ipv4Addr> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        driver.apply(RibCommand::RequestRouterId { owner, reply: tx });
         rx.blocking_recv().expect("answer")
     }
 
@@ -1618,8 +1683,114 @@ mod tests {
         driver.apply_event(&addr_new(1, "127.0.0.9/32"));
         assert_eq!(
             driver.router_id(),
-            Some("10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()),
+            Some("10.0.0.1".parse::<Ipv4Addr>().unwrap()),
             "whole 127/8 range excluded, not just 127.0.0.1"
+        );
+    }
+
+    /// A2: a derived router-id change on an address/link event pushes
+    /// ROUTER_ID_UPDATE to every session that registered with
+    /// ROUTER_ID_ADD — and only to those. The underivable direction stays
+    /// silent (per zebra's documented skip) but still moves the baseline,
+    /// so the id coming back pushes again.
+    #[test]
+    fn router_id_change_pushes_update_to_registered_sessions() {
+        let mut driver = RibDriver::new();
+        let mut ospfd = attach(&mut driver, 1);
+        let mut bgpd = attach(&mut driver, 2);
+        let mut staticd = attach(&mut driver, 3); // never sends ROUTER_ID_ADD
+
+        assert_eq!(
+            request_router_id(&mut driver, 1),
+            None,
+            "no mirror: underivable"
+        );
+        assert_eq!(request_router_id(&mut driver, 2), None);
+        assert!(ospfd.try_recv().is_err(), "None answers no frame");
+
+        // An address appears: the id derives and both registered sessions
+        // are told, unprompted.
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "192.0.2.1/24"));
+        for (name, rx) in [("ospfd", &mut ospfd), ("bgpd", &mut bgpd)] {
+            match rx.try_recv().expect("registered session is told") {
+                SessionPush::RouterIdUpdate(id) => assert_eq!(
+                    id,
+                    "192.0.2.1".parse::<Ipv4Addr>().unwrap(),
+                    "{name} sees the derived id"
+                ),
+                other => panic!("expected RouterIdUpdate, got {other:?}"),
+            }
+        }
+        assert!(
+            staticd.try_recv().is_err(),
+            "a session that never registered is not told"
+        );
+
+        // Idempotent events and id-neutral links push nothing.
+        driver.apply_event(&addr_new(2, "192.0.2.1/24"));
+        driver.apply_event(&link_up(9)); // new UP link, no addresses
+        assert!(ospfd.try_recv().is_err(), "no id change, no push");
+        assert!(bgpd.try_recv().is_err());
+
+        // A higher address changes the id: one push each, new value.
+        driver.apply_event(&addr_new(2, "198.51.100.1/24"));
+        match ospfd.try_recv().expect("change pushes") {
+            SessionPush::RouterIdUpdate(id) => {
+                assert_eq!(id, "198.51.100.1".parse::<Ipv4Addr>().unwrap())
+            }
+            other => panic!("expected RouterIdUpdate, got {other:?}"),
+        }
+        assert!(matches!(
+            bgpd.try_recv().expect("change pushes"),
+            SessionPush::RouterIdUpdate(_)
+        ));
+
+        // The carrying link goes down: the id becomes underivable — no
+        // push (zebra skips registered clients on a zero id), and the
+        // baseline moves silently.
+        driver.apply_event(&link_down(2));
+        assert!(ospfd.try_recv().is_err(), "underivable pushes nothing");
+        assert!(bgpd.try_recv().is_err());
+
+        // The link returns: the id re-derives and is pushed again — proof
+        // the silent baseline update above happened.
+        driver.apply_event(&link_up(2));
+        match ospfd.try_recv().expect("re-derive pushes") {
+            SessionPush::RouterIdUpdate(id) => {
+                assert_eq!(
+                    id,
+                    "198.51.100.1".parse::<Ipv4Addr>().unwrap(),
+                    "addresses survive the link bounce in the mirror"
+                )
+            }
+            other => panic!("expected RouterIdUpdate, got {other:?}"),
+        }
+        assert!(matches!(
+            bgpd.try_recv().expect("re-derive pushes"),
+            SessionPush::RouterIdUpdate(_)
+        ));
+        assert!(
+            staticd.try_recv().is_err(),
+            "the never-registered session stays silent throughout"
+        );
+    }
+
+    /// A2 discipline: a dead session's router-id interest is pruned by the
+    /// first push attempt, exactly like the other registries.
+    #[test]
+    fn dead_session_prunes_router_id_interest() {
+        let mut driver = RibDriver::new();
+        let pushes = attach(&mut driver, 9);
+        assert_eq!(request_router_id(&mut driver, 9), None);
+        drop(pushes); // session gone
+
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "192.0.2.1/24"));
+        assert!(!driver.sessions.contains_key(&9), "closed channel pruned");
+        assert!(
+            !driver.router_id_interests.contains_key(&9),
+            "router-id interest pruned with the session"
         );
     }
 

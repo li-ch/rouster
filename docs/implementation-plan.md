@@ -157,7 +157,10 @@ The phase text above is unchanged; this block is status only.
   installed `proto ospf` in both directions (LEDGER W1B). Results and
   deviations: `docs/interop/frr-10.2-interop.md` (Z5B/Z5C sections).
 - 2026-10-09 — Phase 1 (ZAPI breadth): ROUTER_ID_ADD is answered with a
-  derived ROUTER_ID_UPDATE (live-validated by ospfd, no config pin),
+  derived ROUTER_ID_UPDATE (live-validated by ospfd, no config pin) and
+  registered sessions are re-pushed the id whenever the derived value
+  changes on an address/link event, mirroring zebra's `rid_clients`
+  (LEDGER W2, W1B; micro A2),
   REDISTRIBUTE_ADD registrations get an initial best-route dump, and
   REDISTRIBUTE_ROUTE_DEL is modeled and pushed on best-route
   withdrawal, with the whole bgpd interop flow re-run green after those

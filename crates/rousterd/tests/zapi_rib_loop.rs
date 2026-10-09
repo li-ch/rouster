@@ -179,8 +179,9 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
         }
         // No router-id derivation in this raw-RIB harness: none of its
         // tests send ROUTER_ID_ADD, and the answered None keeps a future
-        // one from blocking (the RibDriver path covers the real derive).
-        RibCommand::RequestRouterId { reply } => {
+        // one from blocking (the RibDriver path covers the real derive;
+        // the owner field feeds only the A2 change-register).
+        RibCommand::RequestRouterId { reply, .. } => {
             let _ = reply.send(None);
             false
         }
@@ -920,6 +921,74 @@ async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
         }
         other => panic!("expected RedistributeRouteDel, got {other:?}"),
     }
+
+    server.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// A2: ROUTER_ID_ADD registers the session for change pushes — the id
+/// deriving on an address event (the initial ask was answered nothing,
+/// no mirror yet) and then CHANGING on a higher address both arrive
+/// unprompted as ROUTER_ID_UPDATE (18) with the pinned answer body, over
+/// the real serve() socket through the real driver.
+#[tokio::test]
+async fn router_id_change_pushed_over_real_socket() {
+    let socket = temp_socket("rid");
+    let (mut rx, server) = spawn_server(&socket);
+    let mut client = TestClient::connect(&socket).await;
+    client.handshake().await;
+
+    let mut driver = RibDriver::new();
+    let _dp = MockDp::default();
+
+    // ROUTER_ID_ADD with no mirror: answered nothing (W1 tolerance), but
+    // the interest is registered driver-side.
+    client.send(&ZapiMessage::RouterIdAdd { afi: 1 }).await;
+    drive_driver_n(&mut driver, &mut rx, 3).await; // attach + establish + router-id
+
+    // The id derives on a link/address event: the update arrives on its
+    // own — no request in flight.
+    driver.apply_event(&DataplaneEvent::LinkNew {
+        ifindex: 2,
+        name: "eth2".to_string(),
+        is_up: true,
+        vrf_table: None,
+        master_ifindex: None,
+    });
+    driver.apply_event(&DataplaneEvent::AddressNew {
+        ifindex: 2,
+        prefix: "192.0.2.1/24".parse().unwrap(),
+    });
+    let (header, body) = client.read_frame().await;
+    assert_eq!(
+        ZapiCommand::from_u16(header.command),
+        ZapiCommand::RouterIdUpdate
+    );
+    assert_eq!(
+        zapi::ZapiRouterIdUpdate::decode(&body).unwrap(),
+        zapi::ZapiRouterIdUpdate {
+            address: IpAddr::V4("192.0.2.1".parse().unwrap()),
+            prefix_len: 32,
+        }
+    );
+
+    // A higher address changes the derived id: a second unprompted update.
+    driver.apply_event(&DataplaneEvent::AddressNew {
+        ifindex: 2,
+        prefix: "198.51.100.1/24".parse().unwrap(),
+    });
+    let (header, body) = client.read_frame().await;
+    assert_eq!(
+        ZapiCommand::from_u16(header.command),
+        ZapiCommand::RouterIdUpdate
+    );
+    assert_eq!(
+        zapi::ZapiRouterIdUpdate::decode(&body).unwrap(),
+        zapi::ZapiRouterIdUpdate {
+            address: IpAddr::V4("198.51.100.1".parse().unwrap()),
+            prefix_len: 32,
+        }
+    );
 
     server.abort();
     let _ = std::fs::remove_file(&socket);
