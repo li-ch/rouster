@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use common::DataplaneEvent;
 use netlink_dp::NetlinkDataplane;
 use rousterd::config::Config;
 use rousterd::driver::RibDriver;
@@ -90,6 +91,18 @@ fn spawn_zapi_server(
     })
 }
 
+/// Interface name for the neighbour log lines: the mirrored name when
+/// known, else the bare ifindex (kernel notification order is not
+/// guaranteed to put RTM_NEWLINK before RTM_NEWNEIGH).
+fn ifname_of(driver: &RibDriver, ifindex: u32) -> String {
+    driver
+        .rib
+        .interfaces()
+        .get(&ifindex)
+        .map(|iface| iface.name.clone())
+        .unwrap_or_else(|| format!("ifindex {ifindex}"))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     // ANSI color only on a TTY: redirected log files stay plain bytes
@@ -142,6 +155,10 @@ async fn main() -> std::io::Result<()> {
         kernel_routes = driver.rib.kernel_route_count(),
         "initial kernel route mirror"
     );
+    info!(
+        neighbours = driver.rib.neighbours().len(),
+        "initial neighbour mirror"
+    );
     // Mirrored connected prefixes may resolve gateway nexthops that the
     // first pass above had to skip (unresolved gateways are not
     // programmed); re-run the diff before serving or exiting.
@@ -182,7 +199,28 @@ async fn main() -> std::io::Result<()> {
                         // registered ZAPI nexthops and push NEXTHOP_UPDATE
                         // on resolution flips (Z3B).
                         driver.apply_event(&ev);
-                        info!(%ev, interfaces = driver.rib.interfaces().len(), "dataplane event");
+                        // Neighbours get dedicated up/down lines (ip +
+                        // ifname, resolved from the interface mirror);
+                        // everything else keeps the generic event line.
+                        match &ev {
+                            DataplaneEvent::NeighbourNew { entry } => {
+                                let ifname = ifname_of(&driver, entry.link_ifindex);
+                                if entry.is_up() {
+                                    info!(neighbour = %entry, ifname, "neighbour up");
+                                } else {
+                                    info!(neighbour = %entry, ifname, "neighbour state change");
+                                }
+                            }
+                            DataplaneEvent::NeighbourDel { ip, link_ifindex } => {
+                                let ifname = ifname_of(&driver, *link_ifindex);
+                                info!(neighbour = %ip, ifname, "neighbour down");
+                            }
+                            other => info!(
+                                %other,
+                                interfaces = driver.rib.interfaces().len(),
+                                "dataplane event"
+                            ),
+                        }
                         // Route events invalidate programmed-set belief
                         // (external deletions); reconcile reinstalls.
                         driver.rib.reconcile(&dp).await;

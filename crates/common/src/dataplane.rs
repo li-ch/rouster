@@ -6,7 +6,9 @@
 
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 
+use crate::neighbour::NeighbourEntry;
 use crate::prefix::IpPrefix;
 use crate::route::{RouteEntry, RouteProtocol, TableId};
 
@@ -63,7 +65,18 @@ pub enum DataplaneEvent {
         table: TableId,
         prefix: IpPrefix,
     },
-    // TODO(phase-1): neighbour events.
+    /// A neighbour (ARP/NDP) entry was observed in the forwarding plane.
+    /// Mirror direction only: neighbours are never programmed by Rouster
+    /// (read-only awareness). Replacements arrive as `NeighbourNew` for an
+    /// existing (ip, link) key.
+    NeighbourNew {
+        entry: NeighbourEntry,
+    },
+    /// A neighbour entry left the forwarding plane (RTM_DELNEIGH).
+    NeighbourDel {
+        ip: IpAddr,
+        link_ifindex: u32,
+    },
 }
 
 impl fmt::Display for DataplaneEvent {
@@ -97,6 +110,12 @@ impl fmt::Display for DataplaneEvent {
             DataplaneEvent::RouteDel { table, prefix } => {
                 write!(f, "route del: {prefix} table {table}")
             }
+            DataplaneEvent::NeighbourNew { entry } => {
+                write!(f, "neighbour new: {entry}")
+            }
+            DataplaneEvent::NeighbourDel { ip, link_ifindex } => {
+                write!(f, "neighbour del: {ip} dev {link_ifindex}")
+            }
         }
     }
 }
@@ -118,6 +137,7 @@ pub trait Dataplane {
         entry: &RouteEntry,
     ) -> impl Future<Output = Result<(), DataplaneError>> + Send;
 
-    // TODO(phase-0): initial dump + event stream (links, addresses, routes,
-    // neighbours), nexthop-group objects, VRF/netns awareness.
+    // TODO(phase-0): nexthop-group objects, VRF/netns awareness. (Initial
+    // dump + event stream for links, addresses, routes, and neighbours is
+    // done — see the netlink-dp backend.)
 }

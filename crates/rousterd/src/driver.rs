@@ -589,6 +589,43 @@ mod tests {
         );
     }
 
+    /// Neighbour events are read-only awareness (W3): even a neighbour for
+    /// the tracked gateway IP appearing/disappearing must not look like a
+    /// resolution flip — resolution stays prefix-based.
+    #[test]
+    fn neighbour_events_do_not_re_evaluate_nht() {
+        use common::NeighbourEntry;
+
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+        assert!(register_nht(&mut driver, 1, "203.0.113.9/32").is_some());
+
+        driver.apply_event(&DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink(
+                "203.0.113.9".parse().unwrap(),
+                2,
+                Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x09]),
+                0x80, // NUD_PERMANENT
+                0,
+            ),
+        });
+        driver.apply_event(&DataplaneEvent::NeighbourDel {
+            ip: "203.0.113.9".parse().unwrap(),
+            link_ifindex: 2,
+        });
+        assert!(
+            pushes.try_recv().is_err(),
+            "neighbour events are not resolution flips"
+        );
+        // The mirror itself did update through the same driver path.
+        assert!(driver
+            .rib
+            .lookup_neighbour("203.0.113.9".parse().unwrap(), 2)
+            .is_none());
+    }
+
     /// A route add that becomes the best route pushes to the session that
     /// registered REDISTRIBUTE for its type — in push form (gateway hops
     /// resolved).

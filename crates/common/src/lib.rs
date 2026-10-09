@@ -4,11 +4,13 @@
 //! inter-component boundaries are defined in terms of these types.
 
 pub mod dataplane;
+pub mod neighbour;
 pub mod nexthop;
 pub mod prefix;
 pub mod route;
 
 pub use dataplane::{Dataplane, DataplaneError, DataplaneEvent};
+pub use neighbour::{NeighbourEntry, NeighbourFlags, NeighbourState};
 pub use nexthop::{Nexthop, NexthopGroup};
 pub use prefix::{IpPrefix, Ipv4Prefix, Ipv6Prefix, PrefixError};
 pub use route::{RouteEntry, RouteProtocol, TableId};

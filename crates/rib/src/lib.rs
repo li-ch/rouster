@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use common::{
-    Dataplane, DataplaneEvent, IpPrefix, Nexthop, NexthopGroup, RouteEntry, RouteProtocol, TableId,
+    Dataplane, DataplaneEvent, IpPrefix, NeighbourEntry, Nexthop, NexthopGroup, RouteEntry,
+    RouteProtocol, TableId,
 };
 use tracing::{debug, info, instrument, warn};
 
@@ -67,7 +68,7 @@ impl Table {
 }
 
 /// The RIB: a set of typed routing tables, a mirror of the kernel FIB, and
-/// mirrored interface state.
+/// mirrored interface/neighbour state.
 ///
 /// TODO(phase-1): recursive (multi-hop) nexthop resolution; redistribution
 /// channels between tables (BIRD-style).
@@ -85,6 +86,11 @@ pub struct Rib {
     programmed: BTreeMap<(TableId, IpPrefix), RouteEntry>,
     /// Interface state mirrored from dataplane events, keyed by ifindex.
     interfaces: BTreeMap<u32, InterfaceState>,
+    /// Kernel neighbour (ARP/NDP) mirror, keyed by the kernel's neighbour
+    /// identity (destination ip, link ifindex). Observed state only —
+    /// neighbours are never programmed ([`Rib::lookup_neighbour`] is the
+    /// read surface; nothing in reconcile touches this table).
+    neighbours: BTreeMap<(IpAddr, u32), NeighbourEntry>,
     /// Nexthop-tracking (NHT) table, FRR-zebra-style: every gateway IP
     /// referenced by a protocol route (unresolved `Ipv4`/`Ipv6` hops) mapped
     /// to its current resolution — `None` means tracked but currently
@@ -114,6 +120,18 @@ impl Rib {
     /// Mirrored interface state (ifindex → state).
     pub fn interfaces(&self) -> &BTreeMap<u32, InterfaceState> {
         &self.interfaces
+    }
+
+    /// Mirrored kernel neighbours, keyed by (destination ip, link ifindex).
+    pub fn neighbours(&self) -> &BTreeMap<(IpAddr, u32), NeighbourEntry> {
+        &self.neighbours
+    }
+
+    /// Neighbour mirror query: the current kernel entry for `ip` on
+    /// `link_ifindex`, if any. `None` = no such neighbour (never observed,
+    /// or deleted).
+    pub fn lookup_neighbour(&self, ip: IpAddr, link_ifindex: u32) -> Option<&NeighbourEntry> {
+        self.neighbours.get(&(ip, link_ifindex))
     }
 
     /// One mirrored kernel table (observation only; never a reconcile input).
@@ -312,6 +330,15 @@ impl Rib {
                 // Drop our programmed-set belief so a still-desired route
                 // is reinstalled on the next reconcile pass.
                 self.programmed.remove(&(*table, *prefix));
+            }
+            DataplaneEvent::NeighbourNew { entry } => {
+                // Insert-or-replace: the kernel emits RTM_NEWNEIGH for both
+                // creation and state/lladdr updates.
+                self.neighbours
+                    .insert((entry.ip, entry.link_ifindex), entry.clone());
+            }
+            DataplaneEvent::NeighbourDel { ip, link_ifindex } => {
+                self.neighbours.remove(&(*ip, *link_ifindex));
             }
         }
     }
@@ -829,6 +856,104 @@ mod tests {
             protocol: RouteProtocol::Ospf,
             metric: 0,
         });
+        assert_eq!(rib.kernel_route_count(), 1);
+    }
+
+    // --- Neighbour mirror (W3) ---
+
+    fn neighbour_new(ip: &str, ifindex: u32, mac_last: Option<u8>, state: u16) -> DataplaneEvent {
+        let lladdr = mac_last.map(|last| vec![0x02, 0x00, 0x00, 0x00, 0x00, last]);
+        DataplaneEvent::NeighbourNew {
+            entry: common::NeighbourEntry::from_rtnetlink(
+                ip.parse().unwrap(),
+                ifindex,
+                lladdr,
+                state,
+                0,
+            ),
+        }
+    }
+
+    #[test]
+    fn neighbour_events_update_mirror() {
+        let mut rib = Rib::new();
+        rib.apply_event(&neighbour_new("192.0.2.11", 2, Some(0x11), 0x80));
+
+        let entry = rib.lookup_neighbour(ip("192.0.2.11"), 2).unwrap();
+        assert!(entry.state.contains(common::NeighbourState::PERMANENT));
+        assert!(entry.is_up());
+        assert_eq!(rib.neighbours().len(), 1);
+
+        // RTM_NEWNEIGH for an existing key replaces (state/lladdr update).
+        rib.apply_event(&neighbour_new("192.0.2.11", 2, Some(0x99), 0x02));
+        let entry = rib.lookup_neighbour(ip("192.0.2.11"), 2).unwrap();
+        assert!(entry.state.contains(common::NeighbourState::REACHABLE));
+        assert_eq!(entry.lladdr.as_deref(), Some(&[0x02, 0, 0, 0, 0, 0x99][..]));
+        assert_eq!(rib.neighbours().len(), 1, "replacement, not addition");
+
+        // Deletion drops exactly the (ip, link) key.
+        rib.apply_event(&DataplaneEvent::NeighbourDel {
+            ip: ip("192.0.2.11"),
+            link_ifindex: 2,
+        });
+        assert!(rib.lookup_neighbour(ip("192.0.2.11"), 2).is_none());
+        assert_eq!(rib.neighbours().len(), 0);
+
+        // Deleting an unknown key is a no-op (stale notifications).
+        rib.apply_event(&DataplaneEvent::NeighbourDel {
+            ip: ip("203.0.113.1"),
+            link_ifindex: 9,
+        });
+        assert_eq!(rib.neighbours().len(), 0);
+    }
+
+    #[test]
+    fn same_ip_on_two_links_are_distinct_neighbours() {
+        let mut rib = Rib::new();
+        rib.apply_event(&neighbour_new("192.0.2.7", 2, Some(0x07), 0x80));
+        rib.apply_event(&neighbour_new("192.0.2.7", 3, Some(0x77), 0x02));
+        assert_eq!(rib.neighbours().len(), 2);
+        let on2 = rib.lookup_neighbour(ip("192.0.2.7"), 2).unwrap();
+        let on3 = rib.lookup_neighbour(ip("192.0.2.7"), 3).unwrap();
+        assert_eq!(on2.lladdr.as_deref(), Some(&[0x02, 0, 0, 0, 0, 0x07][..]));
+        assert_eq!(on3.lladdr.as_deref(), Some(&[0x02, 0, 0, 0, 0, 0x77][..]));
+
+        // Removing one leaves the other.
+        rib.apply_event(&DataplaneEvent::NeighbourDel {
+            ip: ip("192.0.2.7"),
+            link_ifindex: 2,
+        });
+        assert!(rib.lookup_neighbour(ip("192.0.2.7"), 2).is_none());
+        assert!(rib.lookup_neighbour(ip("192.0.2.7"), 3).is_some());
+    }
+
+    /// Neighbour events are read-only awareness: they must not move the
+    /// kernel route mirror, the programmed set, or gateway resolution.
+    #[test]
+    fn neighbour_events_leave_route_and_resolution_state_alone() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: 254,
+            prefix: "198.18.0.0/15".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+        });
+        let resolved = rib.resolve_nexthop(ip("192.0.2.7"));
+        assert!(resolved.is_some());
+        assert_eq!(rib.kernel_route_count(), 1);
+
+        // A neighbour for the gateway IP appearing and disappearing changes
+        // neither resolution (prefix-based tonight) nor the route mirror.
+        rib.apply_event(&neighbour_new("192.0.2.7", 2, Some(0x07), 0x80));
+        assert_eq!(rib.resolve_nexthop(ip("192.0.2.7")), resolved);
+        assert_eq!(rib.kernel_route_count(), 1);
+        rib.apply_event(&DataplaneEvent::NeighbourDel {
+            ip: ip("192.0.2.7"),
+            link_ifindex: 2,
+        });
+        assert_eq!(rib.resolve_nexthop(ip("192.0.2.7")), resolved);
         assert_eq!(rib.kernel_route_count(), 1);
     }
 

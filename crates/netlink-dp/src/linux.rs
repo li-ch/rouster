@@ -1,12 +1,13 @@
 //! Real rtnetlink-backed dataplane (Linux only).
 
 use common::{
-    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, Nexthop,
-    RouteEntry, RouteProtocol,
+    Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, NeighbourEntry,
+    Nexthop, RouteEntry, RouteProtocol,
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
+use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol as NlRouteProtocol,
     RouteScope, RouteType,
@@ -29,8 +30,8 @@ pub struct NetlinkDataplane {
 }
 
 impl NetlinkDataplane {
-    /// Opens the netlink connection, subscribed to link/address/route
-    /// multicast groups so kernel changes arrive as events.
+    /// Opens the netlink connection, subscribed to link/address/route/
+    /// neighbour multicast groups so kernel changes arrive as events.
     ///
     /// The returned future is the connection driver; spawn it on the runtime
     /// (e.g. `tokio::spawn(conn)`).
@@ -41,7 +42,8 @@ impl NetlinkDataplane {
             | libc::RTMGRP_IPV4_IFADDR
             | libc::RTMGRP_IPV6_IFADDR
             | libc::RTMGRP_IPV4_ROUTE
-            | libc::RTMGRP_IPV6_ROUTE;
+            | libc::RTMGRP_IPV6_ROUTE
+            | libc::RTMGRP_NEIGH;
         socket
             .socket_mut()
             .bind(&SocketAddr::new(0, groups as u32))?;
@@ -82,6 +84,14 @@ impl NetlinkDataplane {
             }
         }
 
+        // Neighbour table (ARP/NDP), same mapping as the live notifications.
+        let mut neighs = self.handle.neighbours().get().execute();
+        while let Some(msg) = neighs.try_next().await.map_err(nl_err)? {
+            if let Some(ev) = neighbour_event(&msg, true) {
+                events.push(ev);
+            }
+        }
+
         Ok(events)
     }
 
@@ -114,6 +124,10 @@ impl NetlinkDataplane {
                 RouteNetlinkMessage::DelAddress(m) => address_event(&m, false),
                 RouteNetlinkMessage::NewRoute(m) => route_new_event(&m),
                 RouteNetlinkMessage::DelRoute(m) => route_del_event(&m),
+                RouteNetlinkMessage::NewNeighbour(m) => neighbour_event(&m, true),
+                RouteNetlinkMessage::DelNeighbour(m) => neighbour_event(&m, false),
+                // Kernel neighbour-resolution requests (RTM_GETNEIGH) and
+                // everything unmapped are skipped.
                 _ => None,
             };
             if ev.is_some() {
@@ -165,6 +179,43 @@ fn address_event(msg: &AddressMessage, is_new: bool) -> Option<DataplaneEvent> {
 
 fn nl_err(e: rtnetlink::Error) -> DataplaneError {
     DataplaneError::Other(e.to_string())
+}
+
+/// Maps a kernel neighbour message (RTM_NEWNEIGH / RTM_DELNEIGH, and the
+/// dump replies, which share NewNeighbour's shape) to a mirror event.
+///
+/// Entries without `NDA_DST` (bridge FDB rows key on lladdr instead) are
+/// skipped: they are not IP neighbours. State and flag bits pass through
+/// to [`NeighbourEntry::from_rtnetlink`] unfiltered — the mirror keeps
+/// exactly what the kernel reported.
+fn neighbour_event(msg: &NeighbourMessage, is_new: bool) -> Option<DataplaneEvent> {
+    let ip = msg.attributes.iter().find_map(|a| match a {
+        NeighbourAttribute::Destination(NeighbourAddress::Inet(a)) => {
+            Some(std::net::IpAddr::V4(*a))
+        }
+        NeighbourAttribute::Destination(NeighbourAddress::Inet6(a)) => {
+            Some(std::net::IpAddr::V6(*a))
+        }
+        _ => None,
+    })?;
+    let link_ifindex = msg.header.ifindex;
+    if is_new {
+        let lladdr = msg.attributes.iter().find_map(|a| match a {
+            NeighbourAttribute::LinkLocalAddress(bytes) => Some(bytes.clone()),
+            _ => None,
+        });
+        Some(DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink(
+                ip,
+                link_ifindex,
+                lladdr,
+                msg.header.state.into(),
+                msg.header.flags.bits(),
+            ),
+        })
+    } else {
+        Some(DataplaneEvent::NeighbourDel { ip, link_ifindex })
+    }
 }
 
 /// Maps a kernel NewRoute notification to a mirror event.
@@ -250,12 +301,10 @@ fn route_metric(msg: &RouteMessage) -> u32 {
 /// Rejects a gateway whose address family differs from the route's prefix
 /// (RFC 5549-style cross-AF nexthops are not supported yet).
 fn check_same_af(entry: &RouteEntry, gateway: &RouteAddress) -> Result<(), DataplaneError> {
-    let same = match (entry.prefix, gateway) {
-        (IpPrefix::V4(_), RouteAddress::Inet(_)) | (IpPrefix::V6(_), RouteAddress::Inet6(_)) => {
-            true
-        }
-        _ => false,
-    };
+    let same = matches!(
+        (entry.prefix, gateway),
+        (IpPrefix::V4(_), RouteAddress::Inet(_)) | (IpPrefix::V6(_), RouteAddress::Inet6(_))
+    );
     if same {
         Ok(())
     } else {
@@ -431,7 +480,7 @@ impl Dataplane for NetlinkDataplane {
             let already_absent = matches!(
                 &e,
                 rtnetlink::Error::NetlinkError(m)
-                    if m.code == std::num::NonZeroI32::new(-(libc::ESRCH as i32))
+                    if m.code == std::num::NonZeroI32::new(-libc::ESRCH)
             );
             if !already_absent {
                 return Err(nl_err(e));
