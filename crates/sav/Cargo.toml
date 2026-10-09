@@ -18,3 +18,8 @@ netlink-dp.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 zapi.workspace = true
+
+[dev-dependencies]
+# W5B property tests (ingest→query invariants) — dev-only, pinned in the
+# workspace table; sav is its only consumer.
+proptest.workspace = true

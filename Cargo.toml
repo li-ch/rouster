@@ -24,6 +24,9 @@ bytes = "1"
 futures = "0.3"
 ipnet = "2"
 libc = "0.2"
+# W5B: dev-only (sav property tests) — the program's single pre-authorized
+# new dependency; not a dependency of any other crate.
+proptest = "1.11.0"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
