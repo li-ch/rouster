@@ -40,6 +40,22 @@ pub const ZAPI_IFNAMSIZ: usize = 16;
 /// FRR `INTERFACE_HWADDR_MAX`.
 pub const ZAPI_HWADDR_MAX: usize = 20;
 
+/// Linux `IFF_*` bits as relayed in the u64 flags word of ZAPI
+/// INTERFACE_ADD/DELETE bodies (the kernel's `ifi_flags`; zebra forwards
+/// them verbatim). Protocol daemons gate on the classic set:
+/// `if_is_operative` = UP|RUNNING, `if_is_broadcast` = RUNNING|BROADCAST
+/// (ospfd's default broadcast network type and multicast hellos need
+/// both), and `IFF_LOOPBACK` marks hello-less stub interfaces. Values are
+/// the kernel ABI (uapi/linux/if.h) — identical on every architecture we
+/// target.
+pub mod iff {
+    pub const UP: u64 = 0x1;
+    pub const BROADCAST: u64 = 0x2;
+    pub const LOOPBACK: u64 = 0x8;
+    pub const RUNNING: u64 = 0x40;
+    pub const MULTICAST: u64 = 0x1000;
+}
+
 /// ZEBRA_ROUTE_* type numbers (frr-10.2.2 numbering; +1 vs the classic
 /// table because `ZEBRA_ROUTE_SYSTEM` starts at 1).
 pub mod route_type {

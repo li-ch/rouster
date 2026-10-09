@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 use crate::client::route_type_from;
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN, ZAPI_VERSION};
 use crate::message::{
-    blackhole_type, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
+    blackhole_type, iff, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
     ZapiNexthopUpdate, ZapiRoute, ZapiRouterIdUpdate,
 };
 
@@ -425,6 +425,26 @@ fn channel_closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "rib command channel closed")
 }
 
+/// Synthesizes the link-flags word for the interface mirror. The RIB
+/// mirror tracks only up/down, but protocol daemons gate hard on the
+/// classic IFF bits: with flags 0 ospfd reports every interface down
+/// (`if_is_operative` needs UP|RUNNING) and without BROADCAST|MULTICAST
+/// it falls back to the non-broadcast network type, which never sends
+/// hellos. Loopback names follow the driver's `lo`-prefix convention
+/// (the mirror has no IFF_LOOPBACK bit of its own). DOWN links carry no
+/// bits, matching a kernel dump of a down link.
+fn mirror_link_flags(name: &str, is_up: bool) -> u64 {
+    if !is_up {
+        return 0;
+    }
+    let base = iff::UP | iff::RUNNING;
+    if name.starts_with("lo") {
+        base | iff::LOOPBACK
+    } else {
+        base | iff::BROADCAST | iff::MULTICAST
+    }
+}
+
 impl ZapiSession {
     /// Dispatches one decoded message: mutate session state, queue
     /// [`RibCommand`]s, write replies. ZAPI↔internal mapping happens here.
@@ -471,6 +491,7 @@ impl ZapiSession {
                 for intf in &mirror {
                     let mut wire = ZapiInterface::new(&intf.name, intf.ifindex);
                     wire.status = u8::from(intf.is_up);
+                    wire.flags = mirror_link_flags(&intf.name, intf.is_up);
                     let frame = ZapiMessage::InterfaceAdd(wire)
                         .encode_frame(0)
                         .map_err(encode_io_err)?;
@@ -1672,12 +1693,26 @@ mod tests {
     async fn interface_add_request_streams_mirror() {
         let (mut client, mut rx, _push, _task) = spawn_session(16);
         let driver = Driver {
-            interfaces: vec![InterfaceMirror {
-                ifindex: 2,
-                name: "eth0".into(),
-                is_up: true,
-                addresses: vec!["192.0.2.1/24".parse().unwrap()],
-            }],
+            interfaces: vec![
+                InterfaceMirror {
+                    ifindex: 2,
+                    name: "eth0".into(),
+                    is_up: true,
+                    addresses: vec!["192.0.2.1/24".parse().unwrap()],
+                },
+                InterfaceMirror {
+                    ifindex: 1,
+                    name: "lo".into(),
+                    is_up: true,
+                    addresses: vec!["127.0.0.1/8".parse().unwrap()],
+                },
+                InterfaceMirror {
+                    ifindex: 3,
+                    name: "eth1".into(),
+                    is_up: false,
+                    addresses: vec![],
+                },
+            ],
             ..Driver::default()
         };
         client.send(&ZapiMessage::InterfaceAddRequest, 0).await;
@@ -1691,11 +1726,29 @@ mod tests {
         assert_eq!(intf.ifname, "eth0");
         assert_eq!(intf.ifindex, 2);
         assert_eq!(intf.status, 1, "is_up → ACTIVE");
+        assert_eq!(
+            intf.flags,
+            iff::UP | iff::RUNNING | iff::BROADCAST | iff::MULTICAST,
+            "UP broadcast link carries the bits ospfd gates on"
+        );
         let (h2, b2) = client.read_frame().await;
         assert_eq!(h2.command, 2, "INTERFACE_ADDRESS_ADD");
         let addr = crate::ZapiInterfaceAddress::decode(&b2).unwrap();
         assert_eq!(addr.address, "192.0.2.1/24".parse::<IpPrefix>().unwrap());
         assert_eq!(addr.ifindex, 2);
+        let (h3, b3) = client.read_frame().await;
+        assert_eq!(h3.command, 0, "INTERFACE_ADD (lo)");
+        let lo = crate::ZapiInterface::decode(&b3).unwrap();
+        assert_eq!(lo.ifname, "lo");
+        assert_eq!(lo.flags, iff::UP | iff::RUNNING | iff::LOOPBACK);
+        let (h4, _b4) = client.read_frame().await;
+        assert_eq!(h4.command, 2, "INTERFACE_ADDRESS_ADD (lo)");
+        let (h5, b5) = client.read_frame().await;
+        assert_eq!(h5.command, 0, "INTERFACE_ADD (down eth1)");
+        let down = crate::ZapiInterface::decode(&b5).unwrap();
+        assert_eq!(down.ifname, "eth1");
+        assert_eq!(down.status, 0);
+        assert_eq!(down.flags, 0, "DOWN link carries no bits");
     }
 
     /// Replays the entire staticd Z1 fixture through a session: every
@@ -1830,6 +1883,132 @@ mod tests {
         let session = task.await.unwrap().expect("clean close after burst");
         assert!(session.established);
         assert_eq!(session.protocol, 4);
+    }
+
+    /// Replays the ospfd Z5C fixture through a session: every captured
+    /// frame must decode, both INTERFACE_ADD requests and the
+    /// ROUTER_ID_ADD must reach the driver, the HELLO echo and a
+    /// ROUTER_ID_UPDATE come back, and the connection survives the burst.
+    #[tokio::test]
+    async fn ospfd_fixture_burst_replay() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ospfd-10.2.2.log");
+        let text = std::fs::read_to_string(fixture).expect("fixture present");
+
+        let (mut client, rx, _push, task) = spawn_session(256);
+        let driver = std::sync::Arc::new(Driver {
+            router_id: Some("10.255.1.1".parse::<Ipv4Addr>().unwrap()),
+            ..Driver::default()
+        });
+        let mut frames = 0usize;
+        let mut cmd_sequence = Vec::new();
+        for line in text.lines() {
+            if !line.contains(" msg=") {
+                continue;
+            }
+            let mut hdr = None;
+            let mut body = None;
+            let mut cmd = None;
+            for tok in line.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("hdr=") {
+                    hdr = Some(unhex(v));
+                } else if let Some(v) = tok.strip_prefix("body=") {
+                    body = Some(unhex(v));
+                } else if let Some(v) = tok.strip_prefix("cmd=") {
+                    cmd = Some(v.parse::<u16>().unwrap());
+                }
+            }
+            let (Some(mut hdr), Some(body), Some(cmd)) = (hdr, body, cmd) else {
+                panic!("malformed fixture line: {line}");
+            };
+            hdr.extend(body);
+            client.io.write_all(&hdr).await.expect("replay frame");
+            frames += 1;
+            cmd_sequence.push(cmd);
+        }
+        // The captured burst: HELLO(redist_default=7 OSPF), INTERFACE_ADD
+        // request, BFD_CLIENT_REGISTER (pid), ROUTER_ID_ADD (AFI_IP), and
+        // a second INTERFACE_ADD request.
+        assert_eq!(cmd_sequence, vec![19, 0, 36, 16, 0]);
+        assert_eq!(frames, 5, "full burst replayed");
+
+        // Service the command channel while the burst is processed: the
+        // ROUTER_ID_ADD blocks its session until answered, so the driver
+        // must run concurrently with the client (the marker HELLO below
+        // ends the loop once its echo is the last reply out).
+        let (burst_done_tx, mut burst_done_rx) = oneshot::channel::<()>();
+        let drv = std::sync::Arc::clone(&driver);
+        let servicing = tokio::spawn(async move {
+            let mut rx = rx;
+            let mut ifaces = 0usize;
+            let mut router_ids = 0usize;
+            let mut done = false;
+            while !done {
+                tokio::select! {
+                    cmd = rx.recv() => {
+                        if let Some(cmd) = cmd {
+                            match drv.answer(cmd) {
+                                Seen::Ifaces => ifaces += 1,
+                                Seen::RouterId => router_ids += 1,
+                                _ => {}
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = &mut burst_done_rx => {
+                        while let Ok(cmd) = rx.try_recv() {
+                            match drv.answer(cmd) {
+                                Seen::Ifaces => ifaces += 1,
+                                Seen::RouterId => router_ids += 1,
+                                _ => {}
+                            }
+                        }
+                        done = true;
+                    }
+                }
+            }
+            (ifaces, router_ids)
+        });
+
+        // Marker HELLO: the fixture's own replies are the HELLO echo and
+        // the ROUTER_ID_UPDATE; the marker's echo is the last of three.
+        client
+            .send(
+                &ZapiMessage::Hello(ZapiHello {
+                    redist_default: route_type::OSPF,
+                    instance: 0,
+                    session_id: 0,
+                    synchronous: 0,
+                }),
+                0,
+            )
+            .await;
+        let mut saw_router_id_update = false;
+        let mut last_reply_command = 0u16;
+        for _ in 0..3 {
+            let (header, _body) = client.read_frame().await;
+            match header.command {
+                19 => {}
+                18 => saw_router_id_update = true,
+                other => panic!("unexpected reply command {other}"),
+            }
+            last_reply_command = header.command;
+        }
+        assert!(
+            saw_router_id_update,
+            "ROUTER_ID_ADD answered with an update"
+        );
+        assert_eq!(last_reply_command, 19, "marker echo arrives last");
+        burst_done_tx.send(()).expect("servicing task alive");
+        let (ifaces, router_ids) = servicing.await.expect("servicing task");
+        assert_eq!(ifaces, 2, "both INTERFACE_ADD requests reached the driver");
+        assert_eq!(router_ids, 1, "ROUTER_ID_ADD reached the driver");
+
+        drop(client);
+        let session = task.await.unwrap().expect("clean close after burst");
+        assert!(session.established);
+        assert_eq!(session.protocol, 7, "ospfd redist_default = OSPF bit");
     }
 
     fn unhex(s: &str) -> Vec<u8> {

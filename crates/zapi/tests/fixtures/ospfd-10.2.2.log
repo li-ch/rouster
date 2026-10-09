@@ -1,0 +1,8 @@
+ts=2026-10-09T12:32:58.133139Z event=START socket=/var/run/frr/zserv.api respond_hello=true hello_cmd=19
+ts=2026-10-09T12:33:00.231998Z conn=1 event=CONNECT
+ts=2026-10-09T12:33:00.232017Z conn=1 msg=1 cmd=19 len=18 marker=254 version=6 vrf=0 hdr=0012fe06000000000013 body=0700000000000000 decode=ZapiHeader { length: 18, marker: 254, version: 6, vrf_id: 0, command: 19 }
+ts=2026-10-09T12:33:00.232029Z conn=1 event=REPLY cmd=19 len=18 body=0700000000000000
+ts=2026-10-09T12:33:00.232033Z conn=1 msg=2 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
+ts=2026-10-09T12:33:00.232038Z conn=1 msg=3 cmd=36 len=14 marker=254 version=6 vrf=0 hdr=000efe06000000000024 body=00000027 decode=ZapiHeader { length: 14, marker: 254, version: 6, vrf_id: 0, command: 36 }
+ts=2026-10-09T12:33:00.232042Z conn=1 msg=4 cmd=16 len=12 marker=254 version=6 vrf=0 hdr=000cfe06000000000010 body=0001 decode=ZapiHeader { length: 12, marker: 254, version: 6, vrf_id: 0, command: 16 }
+ts=2026-10-09T12:33:00.232045Z conn=1 msg=5 cmd=0 len=10 marker=254 version=6 vrf=0 hdr=000afe06000000000000 body= decode=ZapiHeader { length: 10, marker: 254, version: 6, vrf_id: 0, command: 0 }
