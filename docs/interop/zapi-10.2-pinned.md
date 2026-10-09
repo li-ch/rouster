@@ -337,10 +337,14 @@ fetched by Z2 — and are implemented + synthetic-round-trip-tested in
 `crates/zapi/src/message.rs` (`SPEC` tags). Still worth capturing for real
 (Z5) by extending zapi-sniff into a responding proxy:
 
-- **ZEBRA_INTERFACE_ADD/DELETE (0/1)**: ifname exactly 20 bytes (IFNAMSIZ,
-  NUL padded) | ifindex u32 | status u8 | flags u64 | ptm_enable u8 |
-  ptm_status u8 | metric u32 | speed u32 | txqlen u32 | mtu u32 | mtu6 u32
-  | bandwidth u32 | link_ifindex u32 | ll_type u32 | hw_addr_len u32 +
+- **ZEBRA_INTERFACE_ADD/DELETE (0/1)**: ifname exactly **16 bytes on Linux**
+  (`IFNAMSIZ`; **Z5-fix** — was documented as 20, a misreading: FRR does not
+  widen names on the wire, `zclient.c` reads the system `IFNAMSIZ`, which is
+  16 on Linux. A 20-byte field makes the client eat 4 padding bytes as the
+  ifindex and reject every INTERFACE_ADDRESS_ADD with "Cannot find IF") |
+  ifindex u32 | status u8 | flags u64 | ptm_enable u8 | ptm_status u8 |
+  metric u32 | speed u32 | txqlen u32 | mtu u32 | mtu6 u32 | bandwidth u32 |
+  link_ifindex u32 | ll_type u32 | hw_addr_len u32 +
   min(len,20) bytes | link_params_status u8 [+ link-params blob]. Note the
   layout diagram inside `zclient.c`'s comment block is STALE — the code
   above is what 10.2.2 parses. Oracle run shows a fresh client gets VRF_ADD

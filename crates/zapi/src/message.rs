@@ -30,8 +30,13 @@ pub const AF_INET: u16 = 2;
 /// `AF_INET6` as it appears in ZAPI prefix fields.
 pub const AF_INET6: u16 = 10;
 
-/// FRR `IFNAMSIZ`: interface names occupy exactly this many wire bytes.
-pub const ZAPI_IFNAMSIZ: usize = 20;
+/// FRR `IFNAMSIZ` on Linux (16): interface names occupy exactly this many
+/// wire bytes in INTERFACE_ADD/DELETE. Z5-fix: was 20 (a misreading of the
+/// pinned doc — FRR does NOT widen the name on the wire; `zclient.c` reads
+/// the system `IFNAMSIZ`, and a 20-byte write makes the client consume 4
+/// padding bytes as the ifindex, registering every interface with ifindex 0
+/// and rejecting all INTERFACE_ADDRESS_ADDs: "Cannot find IF 1 in VRF 0").
+pub const ZAPI_IFNAMSIZ: usize = 16;
 /// FRR `INTERFACE_HWADDR_MAX`.
 pub const ZAPI_HWADDR_MAX: usize = 20;
 
