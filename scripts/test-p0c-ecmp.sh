@@ -12,6 +12,11 @@
 #
 # Base image override works the same as in test-phase0.sh:
 #   ROUSTER_TEST_BASE_IMAGE=... scripts/test-p0c-ecmp.sh
+#
+# The ECMP verification reads kernel truth with real iproute2 from the
+# cached frr-testbed image, joining this container's netns: busybox ip
+# (alpine 3.22, 1.37.0) renders a multipath route as a bare prefix line,
+# hiding the RTA_MULTIPATH members.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,6 +24,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 IMAGE=rouster:p0c
 NAME=rouster-p0c
+IP_IMAGE=frr-testbed:10.2.2
 BASE_IMAGE="${ROUSTER_TEST_BASE_IMAGE:-docker.m.daocloud.io/library/alpine:3.22}"
 CONF=/etc/rouster.conf
 
@@ -65,12 +71,21 @@ docker exec "$NAME" sh -c "printf '%s\n' \
 echo "==> running rousterd --once"
 docker exec "$NAME" rousterd --config "$CONF" --once
 
+# Read the kernel table with full iproute2 in $NAME's netns (read-only,
+# needs no caps); `--rm` keeps the helper container self-cleaning.
+kroute_show() {
+    docker run --rm --net "container:$NAME" --entrypoint ip \
+        "$IP_IMAGE" -details route show "$@"
+}
+
 echo "==> verifying both nexthops are programmed"
 # A multipath route prints one `nexthop ...` line per member; exactly two
 # are expected, both on dummy0.
-NEXTHOPS="$(docker exec "$NAME" ip route show 198.51.100.0/24)"
+NEXTHOPS="$(kroute_show 198.51.100.0/24)"
 echo "$NEXTHOPS"
-COUNT="$(echo "$NEXTHOPS" | grep -c nexthop)"
+# `grep -c` exits 1 when it counts zero matches; without `|| true` that
+# aborts the script under `set -e` before the FAIL guard can print.
+COUNT="$(echo "$NEXTHOPS" | grep -c nexthop || true)"
 [ "$COUNT" -eq 2 ] || {
     echo "FAIL: expected 2 nexthops, got $COUNT" >&2
     exit 1
