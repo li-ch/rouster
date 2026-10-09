@@ -452,6 +452,7 @@ name = "rib"
 version = "0.0.0"
 dependencies = [
  "common",
+ "proptest",
  "thiserror 2.0.21",
  "tracing",
 ]
