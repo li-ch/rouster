@@ -1,7 +1,7 @@
 //! W5B property tests: the SIB ingest→query invariants.
 //!
 //! The three pre-registered properties (W5's continuation ladder) plus
-//! three cheap ones that fall out of the same reference model:
+//! four cheap ones that fall out of the same reference model:
 //!
 //! 1. **idempotence** — ingesting the same RIB twice changes nothing
 //!    (snapshot and every query answer);
@@ -23,6 +23,13 @@
 //!    other origin's slot survives, queries follow the model over the
 //!    union), while a batch carrying an empty or marker binding anywhere
 //!    in it is rejected with the matching error and commits nothing.
+//! 7. **remove + covering fallback** — withdrawing a (prefix, origin)
+//!    key drops exactly that slot (`remove` reports true once, false on
+//!    a repeat or on a key never stored, and never touches the other
+//!    origin's same-prefix slot), and every query inside a withdrawn
+//!    prefix falls back to what the remaining bindings cover per the
+//!    model: the covering binding, the other origin's same-prefix slot,
+//!    the default-route `Any` marker, or empty when nothing is left.
 //!
 //! Determinism (frozen bar "seeds fixed"): every runner is constructed
 //! with an explicit [`proptest::test_runner::RngSeed::Fixed`], so plain
@@ -59,6 +66,7 @@ const SEED_LONGEST_PREFIX: u64 = 0x5735_4203;
 const SEED_KEY_REPLACE: u64 = 0x5735_4204;
 const SEED_ROUND_TRIP: u64 = 0x5735_4205;
 const SEED_BATCH_ATOMICITY: u64 = 0x5735_4206;
+const SEED_REMOVE_FALLBACK: u64 = 0x5735_4207;
 
 fn seeded(seed: u64) -> ProptestConfig {
     ProptestConfig {
@@ -682,6 +690,91 @@ proptest! {
                     "a rejected batch leaves the SIB untouched"
                 );
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 7 — remove + covering fallback: withdrawing a key drops exactly
+// its slot and queries fall back to what the remaining bindings cover
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(seeded(SEED_REMOVE_FALLBACK))]
+    #[test]
+    fn remove_drops_one_slot_and_queries_fall_back_to_the_covering_binding(
+        updates in proptest::collection::vec(binding_strategy(), 0..=14),
+        coins in proptest::collection::vec(any::<bool>(), 0..=14),
+        absent in proptest::collection::vec(prefix_strategy(), 0..=4),
+        probes in probes_strategy(),
+        entropy in entropy_strategy(),
+    ) {
+        let mut sib = Sib::new();
+        for binding in &updates {
+            sib.update(binding.clone()).unwrap();
+        }
+        let mut stored = replay(&updates);
+
+        // Withdraw a subset of the stored keys: one coin per key, with
+        // the first key forced out so every non-empty case exercises at
+        // least one withdrawal (the coins alone could keep everything).
+        let keys: Vec<(IpPrefix, BindingOrigin)> = stored.keys().cloned().collect();
+        for (index, &(prefix, origin)) in keys.iter().enumerate() {
+            if !(index == 0 || coins.get(index).copied().unwrap_or(false)) {
+                continue;
+            }
+            prop_assert!(
+                sib.remove(&prefix, origin),
+                "removing the stored key ({}, {}) reports true",
+                prefix,
+                origin
+            );
+            prop_assert!(
+                !sib.remove(&prefix, origin),
+                "a repeat remove of the now-absent key reports false"
+            );
+            stored.remove(&(prefix, origin));
+        }
+        prop_assert_eq!(
+            snapshot(&sib),
+            stored.values().cloned().collect::<Vec<_>>(),
+            "storage is exactly the replay minus the withdrawn keys — the \
+             other origin's same-prefix slot, when kept, is still there"
+        );
+
+        // Keys never stored (or coincidentally still present — generated
+        // prefixes may collide) report model membership exactly; a miss
+        // must not mutate anything, which the snapshot check below pins.
+        for prefix in &absent {
+            for origin in [BindingOrigin::Rib, BindingOrigin::Config] {
+                let was_there = stored.contains_key(&(*prefix, origin));
+                prop_assert_eq!(
+                    sib.remove(prefix, origin),
+                    was_there,
+                    "remove returns whether the key is stored, nothing else"
+                );
+                stored.remove(&(*prefix, origin));
+            }
+        }
+        prop_assert_eq!(snapshot(&sib), stored.values().cloned().collect::<Vec<_>>());
+
+        // Queries fall back per the model over what remains: random
+        // probes, one address inside every original prefix — surviving
+        // or withdrawn — so the covering fallback is actually hit: a
+        // withdrawn prefix's inside-probe must be answered by the
+        // covering binding, the other origin's same-prefix slot, the
+        // default-route `Any` marker, or nothing at all.
+        let mut all_probes = probes;
+        for ((prefix, _origin), entropy) in keys.iter().zip(entropy.iter()) {
+            all_probes.push(addr_inside(*prefix, *entropy));
+        }
+        for probe in all_probes {
+            prop_assert_eq!(
+                sib.interfaces_for(probe),
+                model_interfaces_for(&stored, probe),
+                "for probe {}",
+                probe
+            );
         }
     }
 }
