@@ -169,8 +169,8 @@ The phase text above is unchanged; this block is status only.
   (LEDGER M2). BFD_CLIENT_REGISTER is recorded and its no-reply is
   source-verified against frr 10.2.2 `zebra_ptm.c` (LEDGER M1).
 - 2026-10-09 — Phase 1.5 (savd core): delivered end-to-end — SIB with
-  typed source-prefix/interface bindings ingested from the RIB (LEDGER
-  W5); the IBA/IBB/PBA/PBB rule model plus uRPF-family rule generation
+  typed source-prefix/interface bindings ingested from the RIB (LEDGER W5);
+  the IBA/IBB/PBA/PBB rule model plus uRPF-family rule generation
   and the table manager, RFC-cited table-driven tests, FP approximation
   disclosed (LEDGER W6); enforcement through the Dataplane trait with an
   rp_filter sysctl backend (nft absent from all cached images),
@@ -179,3 +179,39 @@ The phase text above is unchanged; this block is status only.
   monitor-only by default with drop refusal tested, neighbour-based
   monitor feed (LEDGER W8). SIB ingest invariants are property-pinned
   against a reference model, 10k-case stress green (LEDGER W5B).
+- 2026-10-10 — Phase 1 / Phase 1.5 delivered, consolidated: the
+  2026-10-09/10 overnight program closed 49/49 stages PASS — LEDGER W1–W8,
+  W1B, W5B, M1–M6, A1–A23 — ending at HEAD `59412d4`, 53 commits ahead of
+  its baseline `5fc0446`, gate green (fmt/clippy clean, 317 tests / 0
+  failed; RETURN_REPORT §5 — which also corrects the A23 LEDGER line's
+  "314/0" arithmetic typo to 317/0, §4). Open items are fenced owner
+  decisions (netns wrapper, nft-carrying image, direction-B interop),
+  not gaps in the delivered scope (RETURN_REPORT §7).
+- 2026-10-10 — Phase 1 (ZAPI breadth, ADD stages): the run-smokes.sh
+  runner discovers every scripts/test-*.sh with a bounded docker
+  pre-flight and per-script logs (LEDGER M4); first-HELLO establish-dump
+  via remembered registrations, DEL replay for vanished routes,
+  adopt/unregister lifecycle (LEDGER M6); cmd-11 both flavors
+  wire-captured from real zebra and pinned (LEDGER A5); real ifi_flags
+  carried end-to-end netlink → rib → ZAPI INTERFACE_ADD, replacing the
+  lo-name convention (LEDGER A12); z5b unpinned router-id — both bgpds
+  take rousterd's derived ROUTER_ID_UPDATE (LEDGER A13); genuine defect
+  found and fixed: route-type numbering corrected to SYSTEM=0/KERNEL=1/
+  CONNECT=2/LOCAL=3 per frr-10.2.2 route_types.txt, pinned doc corrected
+  (LEDGER A19); ospfd NHT registrations answered with routed resolution
+  from the kernel mirror, live-driving NSSA type-7 default origination
+  (LEDGER A23). Supporting: cacheinfo provenance mirrored into route
+  entries (A3), VRF enslavement live link events (A4), p0c ECMP smoke
+  read-side fixed via an iproute2 helper (A16).
+- 2026-10-10 — Phase 1.5 (savd polish + SIB depth, ADD stages): event-
+  driven evaluation plus RFC 8704 §3.6.2 deletion hysteresis (LEDGER A10);
+  config `binding` lines feed the SIB's Config origin (A11); sav_install
+  churn guard on identical replays (A17); backend monitor counts preferred
+  over simulation with disclosed fallback (A18); rule-diff logging at
+  member granularity (A20); run-dir operator surface — pidfile, status
+  file, `savd --show` (A21); binding TTL + sweep, mechanism ready for the
+  future SAVNET agent (A22); multi-prefix --iba (A9). SIB property depth:
+  replace_origin batch-atomicity and remove + covering-fallback pinned
+  against the reference model (A14, A15, W5B convention); GSC
+  merge-by-subtraction policy (A6); rule provenance tracking (A7); boot-id
+  stamped state for restart idempotence (A8).
