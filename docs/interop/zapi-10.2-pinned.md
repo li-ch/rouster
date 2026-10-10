@@ -560,6 +560,104 @@ Implemented in `crates/zapi/src/server.rs` (first-HELLO trigger,
 `RibCommand::SessionEstablished`) and `crates/rousterd/src/driver.rs`
 (identity-keyed registration memory, adoption, delta dump).
 
+## M4 addendum (2026-10-10): neighbour messages + VRF/table fields, wire-captured
+
+Method: new `crates/zapi/src/bin/zapi-neigh-probe.rs` (client twin of
+zapi-sniff, zapi-notify-probe pattern) against a real zebra 10.2.2 in
+frr-testbed with a VRF device (`vrf-test`, table 5001) + enslaved
+`dummy0` in place before connect; the driving script
+(`scripts/test-m4-pin-capture.sh`) mutates neighbours and static routes
+during the 25 s window. Raw capture committed at
+`crates/zapi/tests/fixtures/m4-capture/neigh-probe.log` (two runs).
+
+### ZEBRA_NEIGH_REGISTER (131) — body source-pinned, acceptance wire-proven
+
+Body is exactly `afi` u16 (cached frr-10.2.2 `lib/zclient.c`
+`zclient_register_neigh`); the probe sent `0001` (AFI_IP) and zebra
+REGISTERED the interest — neighbour changes then pushed. UNREGISTER
+(132) is the mirror image (same body; source).
+
+### ZEBRA_NEIGH_ADDED (128) / ZEBRA_NEIGH_REMOVED (129) — wire-pinned
+
+`zsend_neighbor_notify` bodies, matching `zclient_neigh_ip_encode` byte
+for byte (the client-side reader was already in the cached zclient.c):
+
+```
+family(in) u8 (2=AF_INET, 10=AF_INET6)
+ip.addr          4/16 bytes (family-sized)
+family(out) u8   2 when a link-layer exists, 0 (AF_UNSPEC) when not
+out.addr         FOUR bytes — the sockunion's v4-sized body carries only
+                 the FIRST 4 BYTES of the 6-byte MAC (live frames for
+                 lladdr 02:00:00:00:00:99 and ...:aa are byte-IDENTICAL;
+                 the MAC is truncated on the wire, a real FRR quirk)
+ip_len u32 BE    6 for a MAC entry, 0 without one
+ifindex u32 BE
+ndm_state u32 BE NUD value (0x80 PERMANENT observed; 0x20 FAILED)
+```
+
+Observed frames (192.168.215.99 on eth0, ifindex 2):
+
+- add `lladdr 02:00:00:00:00:99 nud permanent` → cmd 128, 22-byte body
+  `02 c0a8d763 02 02000000 00000006 00000002 00000080`.
+- replace to `lladdr ...:aa` → cmd 128 AGAIN, byte-identical body (the
+  changed MAC bytes 5-6 do not fit the 4-byte field).
+- delete → cmd 128 FIRST with the no-link-layer body
+  (`02 c0a8d763 00 00000000 00000002 00000020` — the kernel's
+  pre-DELNEIGH NEWNEIGH(FAILED), W3's observation, IS forwarded as an
+  ADDED-flavour frame with ndm=FAILED), THEN cmd 129 with the SAME
+  18-byte body. REMOVED is exactly the encode's `out == NULL` branch:
+  family_out 0, ip_len 0, ndm_state = ZEBRA_NEIGH_STATE_FAILED (0x20).
+- Neighbour changes on a VRF-SLAVE interface (dummy0 in vrf-test) push
+  NOTHING to a vrf-0 registration: the per-client interest is a
+  per-(afi, vrf) bitmap (source: `zebra_neigh_register` handler,
+  `client->neighinfo[afi]`), so pushes are vrf-scoped.
+
+### INTERFACE_ADD under a VRF — the VRF rides the HEADER, not the body
+
+With vrf-test (ifindex 3, table 5001) + enslaved dummy0 (ifindex 4):
+
+- dummy0's INTERFACE_ADD arrives with **header vrf_id = 3** (the vrf
+  device's ifindex in this capture) and body ifindex 4;
+  `link_ifindex` stays 0 — enslavement is NOT expressed in the body.
+  Its INTERFACE_ADDRESS_ADD frames also carry header vrf_id = 3.
+- The VRF device itself dumps as a normal interface (ifname vrf-test,
+  ifindex 3, header vrf_id 3, 6-byte hw_addr, mtu 65775) — vrf devices
+  are dumped, not filtered.
+- eth0 (a veth) shows `link_ifindex = 2425` — that is the veth PEER
+  (IFLA_LINK, `eth0@if2425`), NOT a master field; link_ifindex is the
+  link peer.
+- Each interface's dump is followed by INTERFACE_LINK_PARAMS (41),
+  5-byte body `ifindex u32 BE + status u8 0`.
+
+### VRF_ADD (33) at connect — one per VRF
+
+A fresh client receives TWO VRF_ADD frames (76-byte bodies): default
+and vrf-test. First body word reads as a LITTLE-ENDIAN u32 equal to the
+VRF's table id (254 for default, 5001 for vrf-test — both frames
+consistent); the name rides a 16-byte field at offset 40. Raw bytes in
+the fixture; the LE-table reading is an interpretation, not a
+source-verified field map.
+
+### REDISTRIBUTE_ROUTE_ADD (31) — live frame pins three deltas
+
+The main-table static (`ip route 203.0.113.0/24 blackhole` via vtysh)
+pushed to the vrf-0 static-registered probe:
+
+- **No TABLEID field**: message bits are NEXTHOP|DISTANCE|METRIC|MTU
+  (0x17) with tableid absent — the TABLEID bit is NOT set for a
+  main-table (254) route (Z2B's source-read bit policy, now
+  wire-confirmed).
+- **The blackhole nexthop carries flags 0x04** (ZEBRA_NEXTHOP_FLAG_
+  ACTIVE) — our Z2B SPEC encoder wrote 0; corrected in this change
+  (bgpd consumed the flags-0 form live in z5b, so both interoperate,
+  but 0x04 is what zebra sends).
+- The static route configured with `table 5001` pushed NOTHING to the
+  vrf-0 registration (it is a default-vrf-owned static installing into
+  table 5001; no redistribute push for it reached the vrf-0 registrant
+  within the window) — the TABLEID-carrying push shape for non-main
+  tables remains UNPINNED (no client registered in that VRF; the probe
+  would need a vrf-3-scoped REDISTRIBUTE_ADD).
+
 ## A5 addendum (2026-10-09): ROUTE_NOTIFY_OWNER (11) wire-captured
 
 The W2 gap ("body NOT-PINNED — neither source-read nor wire-captured")

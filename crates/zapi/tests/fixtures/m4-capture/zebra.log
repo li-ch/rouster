@@ -1,0 +1,5 @@
+2026/10/10 03:54:43 ZEBRA: [NNACN-54BDA][EC 4043309110] Disabling MPLS support (no kernel support)
+2026/10/10 03:54:43 ZEBRA: [T83RR-8SM5G] zebra 10.2.2 starting: vty@2601
+2026/10/10 03:54:43 ZEBRA: [K55SV-YMF8X] Sweeping the RIB for stale routes...
+2026/10/10 03:54:47 ZEBRA: [V98V0-MTWPF] client 29 says hello and bids fair to announce only static routes vrf=0
+2026/10/10 03:54:50 ZEBRA: [V98V0-MTWPF] client 34 says hello and bids fair to announce only static routes vrf=0
