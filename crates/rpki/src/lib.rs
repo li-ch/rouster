@@ -15,7 +15,11 @@
 //!   covering/matching semantics.
 //! - [`rov`]: RFC 6811 §2 prefix-origin validation (the pure
 //!   NotFound/Valid/Invalid function over the VRP set).
+//! - [`aspa`]: the ASPA table and the up-ramp/down-ramp AS_PATH
+//!   verification procedures of
+//!   draft-ietf-sidrops-aspa-verification-28 §5.
 
+pub mod aspa;
 pub mod pdu;
 pub mod rov;
 pub mod vrp;
@@ -23,6 +27,10 @@ pub mod vrp;
 pub use pdu::{
     ErrorCode, Pdu, PayloadFlags, Timing, MAX_PDU_LEN, RTR_PORT, VERSION_0, VERSION_1,
     VERSION_2, HIGHEST_VERSION,
+};
+pub use aspa::{
+    authorized, verify, verify_downstream, verify_upstream, AsPath, AspaTable, AspaValidity,
+    Authorization, PeerRelation, PathSegment,
 };
 pub use rov::{validate, OriginAsn, Validity};
 pub use vrp::{Vrp, VrpTable};
