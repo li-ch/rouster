@@ -286,12 +286,18 @@ impl SessionHandle {
 /// Spawns one session task: `tx` is its transmit socket, `inbound`
 /// feeds it demultiplexed control packets, `echo_tx` (when the peer
 /// runs echo) carries the echo packets to and from port 3785.
+/// `report` (the zapi edge's feed, W1-b) receives a snapshot on every
+/// state TRANSITION — best-effort (try_send): a full queue drops the
+/// report (the next transition re-reports; zebra clients re-sync the
+/// same way).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_session(
     spec: PeerSpec,
     local_discr: u32,
     tx: UdpSocket,
     inbound: mpsc::Receiver<InboundPacket>,
     echo_tx: Option<UdpSocket>,
+    report: Option<mpsc::Sender<SessionSnapshot>>,
 ) -> SessionHandle {
     let label = spec.peer.to_string();
     let sm = SessionSm::new(spec.session.clone(), local_discr, label);
@@ -314,6 +320,7 @@ pub fn spawn_session(
         inbound,
         ctl_rx,
         snap_tx,
+        report,
     ));
     SessionHandle {
         spec,
@@ -323,8 +330,15 @@ pub fn spawn_session(
     }
 }
 
-/// Publishes a fresh snapshot (cheap; the watch coalesces).
-fn publish(sm: &SessionSm, snap: &watch::Sender<SessionSnapshot>, note: Option<&str>) {
+/// Publishes a fresh snapshot (cheap; the watch coalesces) and, when
+/// the update IS a transition, feeds the zapi edge's report channel.
+fn publish(
+    sm: &SessionSm,
+    snap: &watch::Sender<SessionSnapshot>,
+    note: Option<&str>,
+    report: &Option<mpsc::Sender<SessionSnapshot>>,
+) {
+    let mut snapshot = None;
     snap.send_modify(|s| {
         s.state = sm.state();
         s.diag = sm.diag();
@@ -334,12 +348,21 @@ fn publish(sm: &SessionSm, snap: &watch::Sender<SessionSnapshot>, note: Option<&
         if let Some(note) = note {
             s.last_transition = Some(note.to_string());
         }
+        if note.is_some() {
+            snapshot = Some(s.clone());
+        }
     });
+    if let (Some(feed), Some(snapshot)) = (report, snapshot) {
+        if let Err(err) = feed.try_send(snapshot) {
+            tracing::debug!(%err, "bfdd: status report dropped (queue full)");
+        }
+    }
 }
 
 /// The session loop: receive, periodic transmit, detection expiry,
 /// echo arms, and control — every timer recomputed from the state
 /// machine's pure math, per §6.8.2's "on every change" rule.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     spec: PeerSpec,
     mut sm: SessionSm,
@@ -348,6 +371,7 @@ async fn run_session(
     mut inbound: mpsc::Receiver<InboundPacket>,
     mut ctl: mpsc::Receiver<SessionCtl>,
     snap: watch::Sender<SessionSnapshot>,
+    report: Option<mpsc::Sender<SessionSnapshot>>,
 ) {
     let mut rng = Rng::new_seeded();
     let policy = if spec.session.version_negotiation {
@@ -385,7 +409,7 @@ async fn run_session(
                     tracing::info!(peer = %spec.peer, "bfdd: session shutdown: AdminDown for one detection time (RFC 5882 §8)");
                     sm.enter_admin_down(Diagnostic::AdminDown);
                     let _ = transmit_now(&tx, &mut sm).await;
-                    publish(&sm, &snap, Some("admin down (shutdown, RFC 5882 §8)"));
+                    publish(&sm, &snap, Some("admin down (shutdown, RFC 5882 §8)"), &report);
                     let hold = sm
                         .detection_time()
                         .max(sm.negotiated_tx_interval())
@@ -419,7 +443,7 @@ async fn run_session(
                             detect_at = Some(Instant::now() + sm.detection_time());
                             if let Some(t) = &outcome.transition {
                                 tracing::info!(peer = %spec.peer, %t, "bfdd: session transition");
-                                publish(&sm, &snap, Some(&t.to_string()));
+                                publish(&sm, &snap, Some(&t.to_string()), &report);
                                 // §6.8.7: transmit promptly on change.
                                 let _ = transmit_now(&tx, &mut sm).await;
                                 // §6.8.2: the interval changed with
@@ -454,7 +478,7 @@ async fn run_session(
                 let t = sm.on_detection_timeout();
                 if t.from != t.to {
                     tracing::info!(peer = %spec.peer, %t, "bfdd: session transition");
-                    publish(&sm, &snap, Some(&t.to_string()));
+                    publish(&sm, &snap, Some(&t.to_string()), &report);
                 }
                 detect_at = None;
                 let _ = transmit_now(&tx, &mut sm).await;
@@ -465,7 +489,7 @@ async fn run_session(
                 let t = sm.on_echo_timeout();
                 if t.from != t.to {
                     tracing::info!(peer = %spec.peer, %t, "bfdd: session transition");
-                    publish(&sm, &snap, Some(&t.to_string()));
+                    publish(&sm, &snap, Some(&t.to_string()), &report);
                 }
                 echo_detect_at = None;
                 echo_next_tx = None;
@@ -770,8 +794,8 @@ mod tests {
             echo: false,
             session: timers.clone(),
         };
-        let handle_a = spawn_session(spec(b_addr.ip()), pool.allocate(), tx_a, feed_a, None);
-        let handle_b = spawn_session(spec(a_addr.ip()), pool.allocate(), tx_b, feed_b, None);
+        let handle_a = spawn_session(spec(b_addr.ip()), pool.allocate(), tx_a, feed_a, None, None);
+        let handle_b = spawn_session(spec(a_addr.ip()), pool.allocate(), tx_b, feed_b, None, None);
         (handle_a, handle_b)
     }
 

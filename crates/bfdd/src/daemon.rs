@@ -336,14 +336,30 @@ pub struct BfddDaemon {
     /// Snapshot subscribers for the status surface, config order.
     watches: Vec<watch::Receiver<SessionSnapshot>>,
     config: BfddConfig,
+    /// Feeds the zapi edge (W1-b): every session's state TRANSITIONS
+    /// land here when the daemon runs with `--zapi`. `None` in the
+    /// pure-config mode (no edge task draining — a Some feed with no
+    /// reader would drop reports; the field exists so spawn_peer can
+    /// thread it through without a second construction path).
+    status_feed: Option<mpsc::Sender<SessionSnapshot>>,
     /// Feeds the echo reflector uses to reach each session's control
     /// channel (EchoLoopback refreshes).
     echo_ctls: Vec<(u32, mpsc::Sender<SessionCtl>)>,
 }
 
 impl BfddDaemon {
-    /// Builds every session and listener for the config.
+    /// Builds every session and listener for the config (no zapi edge).
     pub async fn spawn(config: BfddConfig) -> io::Result<Self> {
+        Self::spawn_with_status_feed(config, None).await
+    }
+
+    /// [`Self::spawn`] with a transition feed for the zapi edge
+    /// (W1-b): every session — config AND dynamically added — reports
+    /// state transitions onto `status_feed`.
+    pub async fn spawn_with_status_feed(
+        config: BfddConfig,
+        status_feed: Option<mpsc::Sender<SessionSnapshot>>,
+    ) -> io::Result<Self> {
         let mut daemon = Self {
             sessions: Vec::new(),
             demux: Demux::new(),
@@ -352,6 +368,7 @@ impl BfddDaemon {
             echo_sockets: Vec::new(),
             watches: Vec::new(),
             config,
+            status_feed,
             echo_ctls: Vec::new(),
         };
 
@@ -513,7 +530,14 @@ impl BfddDaemon {
             None
         };
         let discr = crate::transport::DiscriminatorPool::new().allocate();
-        let handle = spawn_session(spec, discr, tx, feed_rx, echo_sock);
+        let handle = spawn_session(
+            spec,
+            discr,
+            tx,
+            feed_rx,
+            echo_sock,
+            self.status_feed.clone(),
+        );
         self.demux.register(key, discr, feed_tx);
         self.watches.push(handle.subscribe());
         self.echo_ctls.push((discr, handle.ctl_sender().clone()));
@@ -624,6 +648,124 @@ impl BfddDaemon {
     pub async fn shutdown_all(&mut self) {
         for handle in self.sessions.drain(..) {
             handle.shutdown().await;
+        }
+    }
+
+    /// Creates a DYNAMIC session from a forwarded BFD_DEST_REGISTER
+    /// (W1-b): the zapi edge's client command mapped onto a peer spec
+    /// — timers and multihop straight off the wire, local address from
+    /// the register's src when it is not the wildcard. Echo, passive
+    /// and demand are off (the register carries no such fields).
+    pub async fn add_dynamic_peer(
+        &mut self,
+        cmd: &crate::zapi::ZapiBfdSessionCmd,
+    ) -> io::Result<()> {
+        // An UPDATE for an existing session restarts it with the new
+        // timers (the config-reload "changed peer restarts" rule).
+        let key = (cmd.dst, cmd.mhop);
+        if let Some(pos) = self
+            .sessions
+            .iter()
+            .position(|h| (h.spec.peer, h.spec.multihop) == key)
+        {
+            self.remove_dynamic_peer(cmd.dst, cmd.mhop).await;
+            let _ = pos; // position computed before removal
+        }
+        let local = match cmd.src {
+            IpAddr::V4(v4) if !v4.is_unspecified() => Some(IpAddr::V4(v4)),
+            IpAddr::V6(v6) if !v6.is_unspecified() => Some(IpAddr::V6(v6)),
+            _ => None,
+        };
+        let line = PeerLine {
+            peer: cmd.dst,
+            multihop: cmd.mhop,
+            local_address: local,
+            transmit_ms: u64::from(cmd.min_tx_ms.max(1)),
+            receive_ms: u64::from(cmd.min_rx_ms.max(1)),
+            multiplier: cmd.detection_multiplier.max(1),
+            echo: false,
+            echo_interval_ms: DEFAULT_INTERVAL_MS,
+            passive: false,
+            demand: false,
+            version_negotiation: false,
+            password: None,
+        };
+        // Listeners: a first v4/v6/(mhop) peer needs its shared
+        // listener bound (the wanted-list logic from spawn).
+        let entry = (line.peer.is_ipv6(), line.multihop);
+        let port = if line.multihop {
+            PORT_MULTIHOP
+        } else {
+            PORT_SINGLEHOP
+        };
+        let already = self.listeners.iter().any(|s| {
+            s.local_addr()
+                .map(|a| a.port() == port && a.is_ipv6() == entry.0)
+                .unwrap_or(false)
+        });
+        if !already {
+            let bind_addr: SocketAddr = if entry.0 {
+                SocketAddr::new(IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED), port)
+            } else {
+                SocketAddr::new(IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), port)
+            };
+            let sock = UdpSocket::bind(bind_addr).await?;
+            let sock = Arc::new(sock);
+            let multihop_listener = port == PORT_MULTIHOP;
+            let demux = self.demux.clone();
+            let weak = Arc::downgrade(&sock);
+            self.tasks.push(tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                loop {
+                    let sock = weak.upgrade().expect("strong ref held by the daemon");
+                    match sock.recv_from(&mut buf).await {
+                        Ok((len, from)) => {
+                            let feed =
+                                demux.route(from, multihop_listener, peek_your_discr(&buf[..len]));
+                            match feed {
+                                Some(feed) => {
+                                    let _ = feed.send((from, buf[..len].to_vec())).await;
+                                }
+                                None => tracing::debug!(
+                                    peer = %from,
+                                    "bfdd: control packet for no session dropped"
+                                ),
+                            }
+                        }
+                        Err(err) => {
+                            warn!(%err, "bfdd: listener read failed; stopping");
+                            return;
+                        }
+                    }
+                }
+            }));
+            self.listeners.push(sock);
+        }
+        self.spawn_peer(&line).await?;
+        info!(peer = %cmd.dst, mhop = cmd.mhop, "bfdd: dynamic session created (zapi)");
+        Ok(())
+    }
+
+    /// Removes a dynamic session (a forwarded DEREGISTER, W1-b): the
+    /// graceful RFC 5882 §8 hold applies — the peer learns AdminDown
+    /// before the session vanishes.
+    pub async fn remove_dynamic_peer(&mut self, dst: IpAddr, mhop: bool) {
+        if let Some(pos) = self
+            .sessions
+            .iter()
+            .position(|h| h.spec.peer == dst && h.spec.multihop == mhop)
+        {
+            let handle = self.sessions.remove(pos);
+            let discr = handle.snapshot().local_discr;
+            self.demux.unregister(&(dst, mhop), discr);
+            info!(peer = %dst, "bfdd: dynamic session removed (zapi); graceful hold");
+            handle.shutdown().await;
+            self.watches = self.sessions.iter().map(|h| h.subscribe()).collect();
+            self.echo_ctls = self
+                .sessions
+                .iter()
+                .map(|h| (h.snapshot().local_discr, h.ctl_sender().clone()))
+                .collect();
         }
     }
 }

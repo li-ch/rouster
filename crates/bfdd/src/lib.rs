@@ -26,3 +26,4 @@ pub mod daemon;
 pub mod packet;
 pub mod session;
 pub mod transport;
+pub mod zapi;

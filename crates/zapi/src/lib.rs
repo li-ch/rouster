@@ -13,6 +13,10 @@ pub mod message;
 pub mod server;
 
 pub use client::{route_add_message, route_delete_message, route_type_from, ZapiClient};
+/// Re-exported for edge consumers (bfdd's zapi edge builds
+/// `ZapiBfdDestStatus` prefixes without depending on `common`
+/// themselves — P2-a deliberately kept bfdd dependency-light).
+pub use common::IpPrefix;
 pub use header::{ZapiHeader, ZapiHeaderError, ZAPI_HEADER_LEN, ZAPI_MARKER, ZAPI_VERSION};
 pub use message::{
     bfd_status, blackhole_type, message_flag, nexthop_flag, nexthop_type, route_notify_note,

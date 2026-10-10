@@ -44,6 +44,11 @@ enum Command {
         config: PathBuf,
         pidfile: PathBuf,
         status_file: PathBuf,
+        /// The ZAPI edge (W1-b, default OFF): the daemon's client
+        /// connection to a rousterd — claims the BFD-daemon role,
+        /// serves forwarded registrations as dynamic sessions, and
+        /// reports every transition back.
+        zapi_socket: Option<PathBuf>,
     },
     Show {
         status_file: PathBuf,
@@ -54,6 +59,7 @@ fn parse_args() -> Result<Command, String> {
     let mut config = None;
     let mut pidfile = None;
     let mut status_file = None;
+    let mut zapi_socket = None;
     let mut show = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -69,9 +75,15 @@ fn parse_args() -> Result<Command, String> {
                     it.next().ok_or("--status-file requires a path")?,
                 ));
             }
+            "--zapi" | "-z" => {
+                zapi_socket = Some(PathBuf::from(
+                    it.next().ok_or("--zapi requires a socket path")?,
+                ));
+            }
             "--show" => show = true,
             "--help" | "-h" => {
                 println!("usage: bfdd --config <PATH> [--pidfile <PATH>] [--status-file <PATH>]");
+                println!("                [--zapi <SOCKET>]");
                 println!("       bfdd --show [--status-file <PATH>]");
                 std::process::exit(0);
             }
@@ -86,6 +98,7 @@ fn parse_args() -> Result<Command, String> {
         config: config.ok_or("missing --config <PATH>")?,
         pidfile: pidfile.unwrap_or_else(|| PathBuf::from(DEFAULT_PIDFILE)),
         status_file,
+        zapi_socket,
     })
 }
 
@@ -171,17 +184,37 @@ async fn main() -> io::Result<()> {
             config,
             pidfile,
             status_file,
-        } => run(&config, &pidfile, &status_file).await,
+            zapi_socket,
+        } => run(&config, &pidfile, &status_file, zapi_socket).await,
     }
 }
 
-async fn run(config_path: &Path, pidfile_path: &Path, status_file: &Path) -> io::Result<()> {
+async fn run(
+    config_path: &Path,
+    pidfile_path: &Path,
+    status_file: &Path,
+    zapi_socket: Option<PathBuf>,
+) -> io::Result<()> {
     let pid = std::process::id();
 
-    let mut daemon = BfddDaemon::spawn(load_config(config_path).map_err(|e| {
-        error!("bfdd: {e}");
-        io::Error::new(io::ErrorKind::PermissionDenied, e)
-    })?)
+    // The zapi edge's transition feed (W1-b): created first so
+    // spawn_with_status_feed can thread it into every session.
+    let (status_tx, status_rx) = zapi_socket
+        .as_ref()
+        .map(|_| tokio::sync::mpsc::channel::<bfdd::zapi::SessionSnapshot>(64))
+        .unzip();
+    let mut edge = zapi_socket.as_ref().map(|socket| {
+        let rx = status_rx.expect("channel pair constructed together");
+        bfdd::zapi::spawn_zapi_edge(socket.clone(), rx)
+    });
+
+    let mut daemon = BfddDaemon::spawn_with_status_feed(
+        load_config(config_path).map_err(|e| {
+            error!("bfdd: {e}");
+            io::Error::new(io::ErrorKind::PermissionDenied, e)
+        })?,
+        status_tx,
+    )
     .await?;
     info!(
         config = %config_path.display(),
@@ -211,6 +244,28 @@ async fn run(config_path: &Path, pidfile_path: &Path, status_file: &Path) -> io:
                     Err(e) => error!(%e, "bfdd: reload refused; keeping running config"),
                 }
                 publish_status(status_file, pid, &daemon);
+            }
+            // The zapi edge's forwarded commands (W1-b): dynamic
+            // sessions live outside the config file.
+            event = async {
+                match edge.as_mut() {
+                    Some(e) => e.events.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    Some(bfdd::zapi::ZapiEdgeEvent::Register(cmd)) => {
+                        if let Err(err) = daemon.add_dynamic_peer(&cmd).await {
+                            error!(%err, peer = %cmd.dst, "bfdd: dynamic session create failed");
+                        }
+                        publish_status(status_file, pid, &daemon);
+                    }
+                    Some(bfdd::zapi::ZapiEdgeEvent::Deregister(cmd)) => {
+                        daemon.remove_dynamic_peer(cmd.dst, cmd.mhop).await;
+                        publish_status(status_file, pid, &daemon);
+                    }
+                    None => { /* edge task gone (daemon owner dropped last?) */ }
+                }
             }
             _ = refresh.tick() => publish_status(status_file, pid, &daemon),
             _ = tokio::signal::ctrl_c() => {
