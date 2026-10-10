@@ -1,4 +1,5 @@
-//! Rouster `policy` — the typed, compiled filter engine (BIRD-inspired).
+//! Rouster `policy` — the typed, compiled filter engine (BIRD-inspired)
+//! plus the FRR route-map compatibility grammar for frr.conf import.
 //!
 //! Architecture invariant 4 (docs/architecture.md): "Policy engine is
 //! typed and compiled (BIRD-inspired); route-map grammar exists only as
@@ -18,10 +19,15 @@
 //!   combinators, `then { accept; reject; set ...; }` actions; a filter
 //!   builds once and evaluates many times, purely and (on the hot path)
 //!   allocation-free.
+//! - [`routemap`]: the parser from FRR route-map/prefix-list/community-list
+//!   syntax into the typed engine — the frr.conf-import edge. Unknown
+//!   keywords are parse errors carrying line numbers, never silently
+//!   dropped.
 
 pub mod asregex;
 pub mod filter;
 pub mod route;
+pub mod routemap;
 pub mod sets;
 
 pub use asregex::{AsRegex, AsRegexError};
@@ -30,8 +36,12 @@ pub use filter::{
     SetTables, Term, Verdict,
 };
 pub use route::{
-    AsPath, AsSegment, BgpAttrs, BgpOrigin, Community, ExtCommunity, ExtCommunityKind,
-    RouteData, RouteView, WellKnownCommunity,
+    AsPath, AsSegment, BgpAttrs, BgpOrigin, Community, ExtCommunity, ExtCommunityKind, RouteData,
+    RouteView, WellKnownCommunity,
+};
+pub use routemap::{
+    compile_route_map, parse_policy_config, CompileOutput, PolicyConfigError, PolicyDocument,
+    RmEntry, RmExit, RmMatch, RmNum, RmPolicy, RmSet, RouteMap,
 };
 pub use sets::{
     AsPathAccessList, AsPathListEntry, AsSet, CommunityAccessList, CommunityListEntry,
