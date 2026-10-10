@@ -11,10 +11,14 @@
 //!   additions of draft-ietf-sidrops-8210bis-27 (ASPA PDU, 64 KiB
 //!   cap, error codes 9–12) and version-0 (RFC 6810) downgrade
 //!   shapes.
+//! - [`vrp`]: the Validated ROA Payload table with RFC 6811
+//!   covering/matching semantics.
 
 pub mod pdu;
+pub mod vrp;
 
 pub use pdu::{
     ErrorCode, Pdu, PayloadFlags, Timing, MAX_PDU_LEN, RTR_PORT, VERSION_0, VERSION_1,
     VERSION_2, HIGHEST_VERSION,
 };
+pub use vrp::{Vrp, VrpTable};
