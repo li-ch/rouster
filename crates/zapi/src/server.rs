@@ -49,8 +49,8 @@ use tracing::{debug, info, warn};
 use crate::client::route_type_from;
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN, ZAPI_VERSION};
 use crate::message::{
-    blackhole_type, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
-    ZapiNexthopUpdate, ZapiRoute, ZapiRouterIdUpdate,
+    blackhole_type, nexthop_flag, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage,
+    ZapiNeighNotify, ZapiNexthop, ZapiNexthopUpdate, ZapiRoute, ZapiRouterIdUpdate,
 };
 
 /// The table all default-VRF client routes land in tonight (RT_TABLE_MAIN).
@@ -159,6 +159,15 @@ pub enum RibCommand {
         owner: u64,
         reply: oneshot::Sender<Option<Ipv4Addr>>,
     },
+    /// NEIGH_REGISTER (131) / NEIGH_UNREGISTER (132): the client's
+    /// per-afi neighbour-change interest (vrf 0 only — the edge's
+    /// default-VRF scope). No reply exists on this path (the pinned
+    /// capture shows a silent registration that then earns pushes).
+    RegisterNeighbourInterest {
+        owner: u64,
+        afi: u16,
+        interested: bool,
+    },
 }
 
 /// Interface state snapshot the driver sends back to answer an
@@ -171,6 +180,16 @@ pub struct InterfaceMirror {
     pub ifindex: u32,
     pub name: String,
     pub is_up: bool,
+    /// The VRF context of the INTERFACE_ADD/ADDRESS_ADD frames: 0 for
+    /// plain interfaces, the enslaving VRF device's ifindex for slaves,
+    /// and the vrf device's OWN ifindex for the vrf device itself — the
+    /// header vrf_id of the M4 wire capture (the body carries no master
+    /// field; link_ifindex is the veth peer there, not a master).
+    pub vrf_id: u32,
+    /// The mirrored enslavement (IFLA_MASTER), carried for consumers; NOT
+    /// encoded on the wire (W4's mirror field, A12's pass-through
+    /// pattern).
+    pub master_ifindex: Option<u32>,
     /// The kernel's `ifi_flags` word as mirrored from the dataplane —
     /// relayed VERBATIM into the INTERFACE_ADD flags field (what real
     /// zebra does; the pinned `iff` bits document why: ospfd gates on
@@ -197,7 +216,7 @@ pub struct NhtRegistration {
 /// ZAPI session — the driver-side counterpart of [`RibCommand`]. Internal
 /// types only: the session maps them onto wire bodies at this edge
 /// ([`ZapiSession::handle_push`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SessionPush {
     /// A registered nexthop's resolution flipped (dataplane event); the
     /// session answers with NEXTHOP_UPDATE. `None` = now unresolved.
@@ -226,6 +245,13 @@ pub enum SessionPush {
     /// becomes 0/none (`router_id_update`, zebra/router-id.c, which even
     /// carries a TODO for that case).
     RouterIdUpdate(Ipv4Addr),
+    /// A neighbour change for an AF this session registered with
+    /// NEIGH_REGISTER (131); answered as ZEBRA_NEIGH_ADDED (128) with
+    /// the wire-pinned body (M4 capture: with-MAC and FAILED flavours).
+    NeighbourAdded(ZapiNeighNotify),
+    /// The withdrawal twin: ZEBRA_NEIGH_REMOVED (129), AF_UNSPEC body
+    /// with ndm FAILED (the pinned encoder branch).
+    NeighbourRemoved(ZapiNeighNotify),
 }
 
 /// Per-connection session state, established by the HELLO handshake.
@@ -246,6 +272,8 @@ pub struct ZapiSession {
     pub redistributes: BTreeSet<(u8, u8, u16)>,
     /// NEXTHOP_REGISTER set, keyed by registered prefix.
     pub nht: BTreeMap<IpPrefix, NhtRegistration>,
+    /// NEIGH_REGISTER interests: the afis this client watches (vrf 0).
+    pub neigh_afis: BTreeSet<u16>,
     /// BFD_CLIENT_REGISTER count — mirrors zebra's per-client
     /// `bfd_client_reg_cnt` (frr-10.2.2 `zebra/zebra_ptm.c`); clients
     /// re-send the registration on reconnect replay (`lib/bfd.c`
@@ -484,6 +512,26 @@ fn zapi_nexthop_from(hop: Nexthop) -> ZapiNexthop {
     }
 }
 
+/// A redistribute-push nexthop: the internal hop with the flags byte and
+/// flag-gated tail zebra's live 31 frames carry — the M4 capture shows
+/// flags 0x04 (the codec's WEIGHT bit) with an 8-byte weight block whose
+/// last byte is 1 (default single-path weight) on the pushed blackhole
+/// hop. The flags-0 form also interoperated (z5b/z5d live, bgpd/ospfd
+/// consumed it); 0x04 is the byte zebra itself sends.
+fn redistribute_nexthop(hop: Nexthop) -> ZapiNexthop {
+    let mut wire = match hop {
+        Nexthop::Ipv4(gate) => ZapiNexthop::new_ipv4(0, gate),
+        Nexthop::Ipv6(gate) => ZapiNexthop::new_ipv6(0, gate),
+        Nexthop::IfIndex(ifindex) => ZapiNexthop::new_ifindex(0, ifindex),
+        Nexthop::Ipv4If(gate, ifindex) => ZapiNexthop::new_ipv4_ifindex(0, gate, ifindex),
+        Nexthop::Ipv6If(gate, ifindex) => ZapiNexthop::new_ipv6_ifindex(0, gate, ifindex),
+        Nexthop::Blackhole => ZapiNexthop::new_blackhole(0, blackhole_type::REJECT),
+    };
+    wire.flags |= nexthop_flag::WEIGHT;
+    wire.tail = vec![0, 0, 0, 0, 0, 0, 0, 1];
+    wire
+}
+
 fn encode_io_err(err: crate::ZapiCodecError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())
 }
@@ -554,8 +602,13 @@ impl ZapiSession {
                     // zebra does (A12; no name-based synthesis — the
                     // mirror's word is the truth, W1B deviation 1 retired).
                     wire.flags = u64::from(intf.flags.bits());
+                    // M4 pin: an enslaved interface's frames carry the
+                    // enslaving VRF's id in the HEADER (vrf_id = the vrf
+                    // device's ifindex, observed live); the body's
+                    // link_ifindex field is NOT the master (it is the
+                    // veth peer on real zebra — see the M4 addendum).
                     let frame = ZapiMessage::InterfaceAdd(wire)
-                        .encode_frame(0)
+                        .encode_frame(intf.vrf_id)
                         .map_err(encode_io_err)?;
                     io.write_all(&frame).await?;
                     for &address in &intf.addresses {
@@ -565,7 +618,7 @@ impl ZapiSession {
                             address,
                             destination: None,
                         })
-                        .encode_frame(0)
+                        .encode_frame(intf.vrf_id)
                         .map_err(encode_io_err)?;
                         io.write_all(&frame).await?;
                     }
@@ -815,6 +868,35 @@ impl ZapiSession {
                 }
             }
 
+            ZapiMessage::NeighRegister(register) => {
+                // NEIGH_REGISTER (131): record the per-afi interest and
+                // tell the driver. Zebra writes NO reply on this path
+                // (the M4 capture: a silent registration that then earns
+                // the 128/129 pushes), so recording is the whole answer.
+                self.neigh_afis.insert(register.afi);
+                info!(id = self.id, afi = register.afi, "zapi: neighbour register");
+                commands
+                    .send(RibCommand::RegisterNeighbourInterest {
+                        owner: self.id,
+                        afi: register.afi,
+                        interested: true,
+                    })
+                    .await
+                    .map_err(|_| channel_closed())
+            }
+
+            ZapiMessage::NeighUnregister(register) => {
+                self.neigh_afis.remove(&register.afi);
+                commands
+                    .send(RibCommand::RegisterNeighbourInterest {
+                        owner: self.id,
+                        afi: register.afi,
+                        interested: false,
+                    })
+                    .await
+                    .map_err(|_| channel_closed())
+            }
+
             ZapiMessage::Unknown { command, body } => {
                 debug!(
                     id = self.id,
@@ -917,7 +999,7 @@ impl ZapiSession {
                         .nexthops
                         .hops()
                         .iter()
-                        .map(|&(hop, _)| ZapiNexthop::from_common(hop))
+                        .map(|&(hop, _)| redistribute_nexthop(hop))
                         .collect(),
                     entry.protocol.admin_distance(),
                     entry.metric,
@@ -950,6 +1032,44 @@ impl ZapiSession {
                 })
                 .encode_frame(0)
                 .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::NeighbourAdded(notify) => {
+                // The session-level interest check mirrors the driver's
+                // fan-out (a stale push for a withdrawn interest is
+                // dropped, the NHT pattern).
+                let afi = match notify.ip {
+                    std::net::IpAddr::V4(_) => 1u16,
+                    std::net::IpAddr::V6(_) => 2u16,
+                };
+                if !self.neigh_afis.contains(&afi) {
+                    debug!(
+                        id = self.id,
+                        ?notify.ip,
+                        "zapi: neighbour push for unregistered afi dropped"
+                    );
+                    return Ok(());
+                }
+                info!(id = self.id, ip = %notify.ip, "zapi: pushing NEIGH_ADDED");
+                let frame = ZapiMessage::NeighAdded(notify)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::NeighbourRemoved(notify) => {
+                let afi = match notify.ip {
+                    std::net::IpAddr::V4(_) => 1u16,
+                    std::net::IpAddr::V6(_) => 2u16,
+                };
+                if !self.neigh_afis.contains(&afi) {
+                    return Ok(());
+                }
+                info!(id = self.id, ip = %notify.ip, "zapi: pushing NEIGH_REMOVED");
+                let frame = ZapiMessage::NeighRemoved(notify)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
                 io.write_all(&frame).await
             }
         }
@@ -1013,6 +1133,7 @@ mod tests {
         RedUn,
         Ifaces,
         RouterId,
+        NeighbourInterest,
     }
 
     fn describe(cmd: &RibCommand) -> String {
@@ -1027,6 +1148,7 @@ mod tests {
             RibCommand::UnregisterRedistribute { .. } => "red-".to_string(),
             RibCommand::RequestInterfaces { .. } => "ifaces".to_string(),
             RibCommand::RequestRouterId { .. } => "router-id".to_string(),
+            RibCommand::RegisterNeighbourInterest { .. } => "neighbour-interest".to_string(),
         }
     }
 
@@ -1103,6 +1225,7 @@ mod tests {
                     let _ = reply.send(self.router_id);
                     Seen::RouterId
                 }
+                RibCommand::RegisterNeighbourInterest { .. } => Seen::NeighbourInterest,
             }
         }
     }
@@ -1154,6 +1277,14 @@ mod tests {
         let (push_tx, push_rx) = mpsc::channel(16);
         let task = tokio::spawn(run_session(server_io, 1, tx, push_rx));
         (Client { io: client_io }, rx, push_tx, task)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
     }
 
     fn staticd_hello() -> ZapiMessage {
@@ -1807,9 +1938,206 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no further command");
     }
 
-    /// A2: the event-driven ROUTER_ID_UPDATE push encodes as command 18
-    /// with the SAME pinned body as the request answer (family AF_INET,
-    /// address, prefixlen 32 — SRC zebra_router_id_update_read).
+    /// M4: NEIGH_REGISTER (131) records the per-afi interest, forwards it
+    /// to the driver, and writes NO reply (the pinned capture's silent
+    /// registration that then earns pushes).
+    #[tokio::test]
+    async fn neigh_register_records_interest_without_reply() {
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        client
+            .send(
+                &ZapiMessage::NeighRegister(crate::ZapiNeighRegister { afi: 1 }),
+                0,
+            )
+            .await;
+        client
+            .send(
+                &ZapiMessage::NeighUnregister(crate::ZapiNeighRegister { afi: 2 }),
+                0,
+            )
+            .await;
+        client.send(&staticd_hello(), 0).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(
+            header.command, 19,
+            "no NEIGH_REGISTER reply frame may precede the HELLO echo"
+        );
+        let first = rx.recv().await.expect("register forwarded");
+        let second = rx.recv().await.expect("unregister forwarded");
+        assert!(
+            matches!(
+                (&first, &second),
+                (
+                    RibCommand::RegisterNeighbourInterest {
+                        afi: 1,
+                        interested: true,
+                        ..
+                    },
+                    RibCommand::RegisterNeighbourInterest {
+                        afi: 2,
+                        interested: false,
+                        ..
+                    },
+                )
+            ),
+            "interest commands: {first:?} {second:?}"
+        );
+        assert!(matches!(
+            rx.recv().await.expect("establish"),
+            RibCommand::SessionEstablished { .. }
+        ));
+        drop(client);
+        let session = task.await.unwrap().expect("connection survives");
+        assert_eq!(
+            session.neigh_afis,
+            BTreeSet::from([1]),
+            "afi 1 in, afi 2 never registered"
+        );
+        rx.close();
+    }
+
+    /// M4: the NEIGH_ADDED/REMOVED push bodies are byte-pinned to the
+    /// live zebra capture (crates/zapi/tests/fixtures/m4-capture,
+    /// 2026-10-10): the 22-byte with-MAC ADDED and the 18-byte AF_UNSPEC
+    /// forms, header vrf 0.
+    #[tokio::test]
+    async fn neighbour_pushes_encode_the_captured_bodies() {
+        let mut session = ZapiSession {
+            id: 7,
+            ..Default::default()
+        };
+        session.neigh_afis.insert(1);
+
+        let added = ZapiMessage::NeighAdded(ZapiNeighNotify::added(
+            "192.168.215.99".parse().unwrap(),
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x99],
+            2,
+            0x80,
+        ))
+        .encode_frame(0)
+        .unwrap();
+        let body = &added[crate::ZAPI_HEADER_LEN..];
+        assert_eq!(
+            hex(body),
+            // 02|c0a8d763|02|02000000|00000006|00000002|00000080 — the
+            // captured 22-byte body verbatim (the MAC truncated to its
+            // first four bytes, true length 6 in ip_len).
+            "02c0a8d7630202000000000000060000000200000080"
+        );
+
+        let removed = ZapiMessage::NeighRemoved(ZapiNeighNotify::without_link_layer(
+            "192.168.215.99".parse().unwrap(),
+            2,
+            0x20,
+        ))
+        .encode_frame(0)
+        .unwrap();
+        let body = &removed[crate::ZAPI_HEADER_LEN..];
+        assert_eq!(hex(body), "02c0a8d76300000000000000000200000020");
+
+        // The AF gate: an unregistered family's push is dropped.
+        session.neigh_afis.clear();
+        let (mut server_io, mut client_io) = tokio::io::duplex(64);
+        session
+            .handle_push(
+                SessionPush::NeighbourAdded(ZapiNeighNotify::added(
+                    "192.168.215.99".parse().unwrap(),
+                    &[0x02, 0x00, 0x00, 0x00, 0x00, 0x99],
+                    2,
+                    0x80,
+                )),
+                &mut server_io,
+            )
+            .await
+            .unwrap();
+        drop(server_io);
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        client_io.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.is_empty(), "unregistered afi: nothing written");
+    }
+
+    /// M4: the interface dump's frames carry the VRF in the HEADER —
+    /// header vrf_id = the enslaving vrf device's ifindex for a slave,
+    /// own ifindex for the vrf device itself, 0 for plain links (the
+    /// live capture: dummy0 under vrf-test answered vrf_id 3).
+    #[tokio::test]
+    async fn interface_dump_carries_vrf_in_the_header() {
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        client.send(&ZapiMessage::InterfaceAddRequest, 0).await;
+        // Answer the request like the driver would: the mirror in
+        // ifindex order (eth0 plain, the vrf device, its slave).
+        let cmd = rx.recv().await.expect("request");
+        let RibCommand::RequestInterfaces { reply } = cmd else {
+            panic!("not an interface request: {cmd:?}")
+        };
+        let _ = reply.send(vec![
+            InterfaceMirror {
+                ifindex: 2,
+                name: "eth0".into(),
+                is_up: true,
+                vrf_id: 0,
+                master_ifindex: None,
+                flags: common::LinkFlags::up_broadcast(),
+                addresses: vec!["10.0.0.1/24".parse().unwrap()],
+            },
+            InterfaceMirror {
+                ifindex: 3,
+                name: "vrf-test".into(),
+                is_up: true,
+                vrf_id: 3,
+                master_ifindex: None,
+                flags: common::LinkFlags::UP,
+                addresses: vec![],
+            },
+            InterfaceMirror {
+                ifindex: 4,
+                name: "dummy0".into(),
+                is_up: true,
+                vrf_id: 3,
+                master_ifindex: Some(3),
+                flags: common::LinkFlags::up_broadcast(),
+                addresses: vec!["192.0.2.1/24".parse().unwrap()],
+            },
+        ]);
+
+        // eth0: header vrf 0; its ADDRESS_ADD too.
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.vrf_id, 0);
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 2, "eth0 address");
+        assert_eq!(header.vrf_id, 0);
+        // vrf-test itself: header vrf 3.
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.vrf_id, 3, "the vrf device dumps under its own id");
+        // dummy0 (slave): INTERFACE_ADD and its address both vrf 3.
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.vrf_id, 3, "the slave dumps under the vrf's id");
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 2, "dummy0 address");
+        assert_eq!(header.vrf_id, 3);
+
+        drop(client);
+        task.await.unwrap().expect("connection survives");
+    }
+
+    /// M4: redistribute-push nexthops carry the flags byte and weight
+    /// block zebra's live 31 frames show (0x04 + the 8-byte block ending
+    /// 1) — the captured blackhole hop's bytes, reproduced.
+    #[test]
+    fn redistribute_nexthop_carries_the_captured_flags() {
+        let wire = redistribute_nexthop(Nexthop::Blackhole);
+        assert_eq!(wire.flags, nexthop_flag::WEIGHT);
+        assert_eq!(wire.tail, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut buf = bytes::BytesMut::new();
+        wire.encode(&mut buf);
+        // vrf 0 | BLACKHOLE | flags 04 | bh_type 1 | weight block
+        assert_eq!(
+            buf,
+            bytes::BytesMut::from(&[0, 0, 0, 0, 6, 4, 1, 0, 0, 0, 0, 0, 0, 0, 1][..])
+        );
+    }
+
     #[tokio::test]
     async fn router_id_push_encodes_command_18() {
         let mut session = ZapiSession {
@@ -2053,6 +2381,8 @@ mod tests {
                     ifindex: 2,
                     name: "eth0".into(),
                     is_up: true,
+                    vrf_id: 0,
+                    master_ifindex: None,
                     flags: LinkFlags::up_broadcast(),
                     addresses: vec!["192.0.2.1/24".parse().unwrap()],
                 },
@@ -2060,6 +2390,8 @@ mod tests {
                     ifindex: 1,
                     name: "lo".into(),
                     is_up: true,
+                    vrf_id: 0,
+                    master_ifindex: None,
                     flags: LinkFlags::up_loopback(),
                     addresses: vec!["127.0.0.1/8".parse().unwrap()],
                 },
@@ -2067,6 +2399,8 @@ mod tests {
                     ifindex: 3,
                     name: "eth1".into(),
                     is_up: false,
+                    vrf_id: 0,
+                    master_ifindex: None,
                     // Kernel realism: an admin-down eth keeps its static
                     // capability bits, drops UP|RUNNING.
                     flags: LinkFlags::BROADCAST | LinkFlags::MULTICAST,
@@ -2129,6 +2463,8 @@ mod tests {
                     ifindex: 6,
                     name: "lo9999".into(),
                     is_up: true,
+                    vrf_id: 0,
+                    master_ifindex: None,
                     flags: LinkFlags::UP | LinkFlags::RUNNING | LinkFlags::BROADCAST,
                     addresses: vec![],
                 },
@@ -2136,6 +2472,8 @@ mod tests {
                     ifindex: 7,
                     name: "gre0".into(),
                     is_up: true,
+                    vrf_id: 0,
+                    master_ifindex: None,
                     flags: LinkFlags::from_bits(
                         LinkFlags::up_loopback().bits() | LinkFlags::MULTICAST.bits() | 0x80,
                     ),

@@ -1792,6 +1792,145 @@ impl ZapiNexthopUpdate {
     }
 }
 
+/// ZEBRA_NEIGH_REGISTER (131) / NEIGH_UNREGISTER (132) body — `afi` u16,
+/// exactly (frr-10.2.2 `lib/zclient.c` `zclient_register_neigh`,
+/// source-pinned from the cached copy; acceptance wire-proven by the M4
+/// capture: a `0001` registration earned NEIGH_ADDED pushes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZapiNeighRegister {
+    pub afi: u16,
+}
+
+impl ZapiNeighRegister {
+    pub fn decode(body: &[u8]) -> Result<Self, ZapiCodecError> {
+        let mut b = body;
+        let afi = take_be_u16(&mut b)?;
+        if !b.is_empty() {
+            return Err(ZapiCodecError::TrailingBytes(b.len()));
+        }
+        Ok(Self { afi })
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u16(self.afi);
+    }
+}
+
+/// ZEBRA_NEIGH_ADDED (128) / NEIGH_REMOVED (129) body — the
+/// `zclient_neigh_ip_encode` shape, wire-pinned by the M4 capture
+/// (docs/interop/zapi-10.2-pinned.md, M4 addendum):
+/// family(in) u8 | ip.addr 4/16 | family(out) u8 (2 when a link-layer
+/// exists, 0 = AF_UNSPEC otherwise) | out.addr FOUR bytes — the v4-sized
+/// sockunion body carries only the first 4 bytes of the 6-byte MAC, a
+/// real FRR quirk (replace frames for ...:99 and ...:aa are
+/// byte-identical) | ip_len u32 BE (6 with a MAC, 0 without) | ifindex
+/// u32 BE | ndm_state u32 BE (NUD value; REMOVED hardcodes FAILED 0x20,
+/// the encoder's `out == NULL` branch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZapiNeighNotify {
+    pub ip: IpAddr,
+    /// The first 4 bytes of the link-layer address when one exists.
+    pub link_layer: Option<[u8; 4]>,
+    /// The link-layer's TRUE length (6 for a MAC) when one exists.
+    pub ip_len: u32,
+    pub ifindex: u32,
+    /// NUD state bits; `ZEBRA_NEIGH_STATE_FAILED` (0x20) for REMOVED.
+    pub ndm_state: u32,
+}
+
+/// `ZEBRA_NEIGH_STATE_FAILED` (lib/zclient.h NUD-mapped constants).
+pub const ZEBRA_NEIGH_STATE_FAILED: u32 = 0x20;
+
+impl ZapiNeighNotify {
+    /// The ADDED flavour for a neighbour holding a link-layer address.
+    pub fn added(ip: IpAddr, lladdr: &[u8], ifindex: u32, ndm_state: u32) -> Self {
+        let mut prefix = [0u8; 4];
+        for (i, b) in lladdr.iter().take(4).enumerate() {
+            prefix[i] = *b;
+        }
+        Self {
+            ip,
+            link_layer: Some(prefix),
+            ip_len: lladdr.len() as u32,
+            ifindex,
+            ndm_state,
+        }
+    }
+
+    /// The no-link-layer flavour: an INCOMPLETE/FAILED ADDED, or the
+    /// REMOVED twin (which hardcodes ndm FAILED per the encoder).
+    pub fn without_link_layer(ip: IpAddr, ifindex: u32, ndm_state: u32) -> Self {
+        Self {
+            ip,
+            link_layer: None,
+            ip_len: 0,
+            ifindex,
+            ndm_state,
+        }
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, ZapiCodecError> {
+        let mut b = body;
+        let family = take_u8(&mut b)?;
+        let ip = match family {
+            2 => {
+                let raw = take_n(&mut b, 4)?;
+                let mut a = [0u8; 4];
+                a.copy_from_slice(raw);
+                IpAddr::V4(Ipv4Addr::from(a))
+            }
+            10 => {
+                let raw = take_n(&mut b, 16)?;
+                let mut a = [0u8; 16];
+                a.copy_from_slice(raw);
+                IpAddr::V6(Ipv6Addr::from(a))
+            }
+            other => return Err(ZapiCodecError::BadFamily(u16::from(other))),
+        };
+        let out_family = take_u8(&mut b)?;
+        let link_layer = if out_family != 0 {
+            let raw = take_n(&mut b, 4)?;
+            let mut a = [0u8; 4];
+            a.copy_from_slice(raw);
+            Some(a)
+        } else {
+            None
+        };
+        let ip_len = take_be_u32(&mut b)?;
+        let ifindex = take_be_u32(&mut b)?;
+        let ndm_state = take_be_u32(&mut b)?;
+        if !b.is_empty() {
+            return Err(ZapiCodecError::TrailingBytes(b.len()));
+        }
+        Ok(Self {
+            ip,
+            link_layer,
+            ip_len,
+            ifindex,
+            ndm_state,
+        })
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let (family, addr): (u8, &[u8]) = match self.ip {
+            IpAddr::V4(a) => (2, &a.octets()),
+            IpAddr::V6(a) => (10, &a.octets()),
+        };
+        buf.put_u8(family);
+        buf.put_slice(addr);
+        match self.link_layer {
+            Some(four) => {
+                buf.put_u8(2); // the sockunion carries AF_INET
+                buf.put_slice(&four);
+            }
+            None => buf.put_u8(0), // AF_UNSPEC
+        }
+        buf.put_u32(self.ip_len);
+        buf.put_u32(self.ifindex);
+        buf.put_u32(self.ndm_state);
+    }
+}
+
 /// ZEBRA_ROUTER_ID_UPDATE (18) zebra→client body — mirrored from
 /// `zebra_router_id_update_read`: family u8, address bytes, prefixlen u8.
 /// SPEC: no fixture yet.
@@ -1963,6 +2102,17 @@ pub enum ZapiMessage {
     /// push to a client that asked with ROUTE_NOTIFY_REQUEST (126).
     /// E (A5): captured from a real zebra 10.2.2.
     RouteNotifyOwner(ZapiRouteNotifyOwner),
+    /// ZEBRA_NEIGH_REGISTER (131), client→zebra: `afi` u16. SRC
+    /// (cached zclient.c) + acceptance wire-proven (M4 capture).
+    NeighRegister(ZapiNeighRegister),
+    /// ZEBRA_NEIGH_UNREGISTER (132): same body.
+    NeighUnregister(ZapiNeighRegister),
+    /// ZEBRA_NEIGH_ADDED (128), zebra→client. E (M4): captured from a
+    /// real zebra 10.2.2 (both the with-MAC and the FAILED flavours).
+    NeighAdded(ZapiNeighNotify),
+    /// ZEBRA_NEIGH_REMOVED (129), zebra→client. E (M4): captured
+    /// (AF_UNSPEC + ndm FAILED body).
+    NeighRemoved(ZapiNeighNotify),
     /// ZEBRA_REDISTRIBUTE_ADD (12). E: bgpd fixture.
     RedistributeAdd(ZapiRedistribute),
     /// ZEBRA_REDISTRIBUTE_DELETE (13). SPEC (same shape as add).
@@ -2053,6 +2203,12 @@ impl ZapiMessage {
             ZapiCommand::RouteNotifyOwner => {
                 Ok(Self::RouteNotifyOwner(ZapiRouteNotifyOwner::decode(body)?))
             }
+            ZapiCommand::NeighRegister => Ok(Self::NeighRegister(ZapiNeighRegister::decode(body)?)),
+            ZapiCommand::NeighUnregister => {
+                Ok(Self::NeighUnregister(ZapiNeighRegister::decode(body)?))
+            }
+            ZapiCommand::NeighAdded => Ok(Self::NeighAdded(ZapiNeighNotify::decode(body)?)),
+            ZapiCommand::NeighRemoved => Ok(Self::NeighRemoved(ZapiNeighNotify::decode(body)?)),
             ZapiCommand::RedistributeAdd => {
                 Ok(Self::RedistributeAdd(ZapiRedistribute::decode(body)?))
             }
@@ -2121,6 +2277,10 @@ impl ZapiMessage {
             Self::RouteAdd(_) => 9,
             Self::RouteDelete(_) => 10,
             Self::RouteNotifyOwner(_) => 11,
+            Self::NeighRegister(_) => 131,
+            Self::NeighUnregister(_) => 132,
+            Self::NeighAdded(_) => 128,
+            Self::NeighRemoved(_) => 129,
             Self::RedistributeAdd(_) => 12,
             Self::RedistributeDelete(_) => 13,
             Self::RedistributeRouteAdd(_) => 31,
@@ -2167,6 +2327,14 @@ impl ZapiMessage {
                 Ok(())
             }
             Self::RouteNotifyOwner(n) => {
+                n.encode(buf);
+                Ok(())
+            }
+            Self::NeighRegister(r) | Self::NeighUnregister(r) => {
+                r.encode(buf);
+                Ok(())
+            }
+            Self::NeighAdded(n) | Self::NeighRemoved(n) => {
                 n.encode(buf);
                 Ok(())
             }
@@ -2223,6 +2391,79 @@ impl ZapiMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4 wire pins: the captured NEIGH_ADDED (128) bodies round-trip
+    /// byte-exactly — the 22-byte with-MAC form and the 18-byte
+    /// AF_UNSPEC form (fixtures/m4-capture, 2026-10-10).
+    #[test]
+    fn neigh_added_round_trips_the_captured_bodies() {
+        let with_mac = ZapiMessage::NeighAdded(ZapiNeighNotify::added(
+            "192.168.215.99".parse().unwrap(),
+            &[0x02, 0x00, 0x00, 0x00, 0x00, 0x99],
+            2,
+            0x80,
+        ));
+        let mut buf = BytesMut::new();
+        with_mac.encode_body(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            BytesMut::from(
+                &[
+                    0x02, 0xc0, 0xa8, 0xd7, 0x63, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x06, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x80
+                ][..]
+            )
+        );
+        assert_eq!(ZapiMessage::decode(128, &buf).unwrap(), with_mac);
+
+        let failed = ZapiMessage::NeighAdded(ZapiNeighNotify::without_link_layer(
+            "192.168.215.99".parse().unwrap(),
+            2,
+            0x20,
+        ));
+        let mut buf = BytesMut::new();
+        failed.encode_body(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            BytesMut::from(
+                &[
+                    0x02, 0xc0, 0xa8, 0xd7, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x02, 0x00, 0x00, 0x00, 0x20
+                ][..]
+            )
+        );
+        assert_eq!(ZapiMessage::decode(128, &buf).unwrap(), failed);
+
+        let removed = ZapiMessage::NeighRemoved(ZapiNeighNotify::without_link_layer(
+            "192.168.215.99".parse().unwrap(),
+            2,
+            0x20,
+        ));
+        let mut buf = BytesMut::new();
+        removed.encode_body(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            BytesMut::from(
+                &[
+                    0x02, 0xc0, 0xa8, 0xd7, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x02, 0x00, 0x00, 0x00, 0x20
+                ][..]
+            )
+        );
+        assert_eq!(ZapiMessage::decode(129, &buf).unwrap(), removed);
+    }
+
+    /// NEIGH_REGISTER (131) is exactly `afi` u16 — the source-pinned body
+    /// the probe sent and zebra accepted.
+    #[test]
+    fn neigh_register_body_is_afi_u16() {
+        let msg = ZapiMessage::NeighRegister(ZapiNeighRegister { afi: 1 });
+        let mut buf = BytesMut::new();
+        msg.encode_body(&mut buf).unwrap();
+        assert_eq!(buf, BytesMut::from(&[0x00, 0x01][..]));
+        assert_eq!(ZapiMessage::decode(131, &buf).unwrap(), msg);
+        assert_eq!(msg.command(), 131);
+    }
 
     /// Encodes, re-decodes, asserts structural equality, returns the wire.
     fn roundtrip(msg: &ZapiMessage) -> Vec<u8> {

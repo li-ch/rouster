@@ -32,7 +32,9 @@ use rib::Rib;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use zapi::{route_type_from, InterfaceMirror, RibCommand, SessionPush, DEFAULT_TABLE};
+use zapi::{
+    route_type_from, InterfaceMirror, RibCommand, SessionPush, ZapiNeighNotify, DEFAULT_TABLE,
+};
 
 /// A client's identity as announced in its first HELLO (M6):
 /// `(redist_default, instance, session_id)` — stable across one daemon's
@@ -96,6 +98,11 @@ pub struct RibDriver {
     /// burst, so the interest is session-scoped and needs no
     /// identity-keyed memory.
     router_id_interests: HashMap<u64, Option<Ipv4Addr>>,
+    /// NEIGH_REGISTER (131) interests per owner: the afis whose neighbour
+    /// changes the client watches (vrf 0 only — the edge's default-VRF
+    /// scope). Neighbour events fan NEIGH_ADDED/REMOVED pushes out to
+    /// exactly these (the `reevaluate_nht` pattern, M4).
+    neighbour_interests: HashMap<u64, BTreeSet<u16>>,
 }
 
 impl Default for RibDriver {
@@ -130,6 +137,7 @@ impl RibDriver {
             remembered: BTreeMap::new(),
             last_known: BTreeMap::new(),
             router_id_interests: HashMap::new(),
+            neighbour_interests: HashMap::new(),
         }
     }
 
@@ -376,16 +384,41 @@ impl RibDriver {
                 false
             }
             RibCommand::RequestInterfaces { reply } => {
+                // The vrf context per the M4 pin: a VRF slave's frames
+                // carry the enslaving vrf device's ifindex as the header
+                // vrf_id; a vrf device carries its OWN ifindex; plain
+                // interfaces carry 0.
                 let mirror: Vec<InterfaceMirror> = self
                     .rib
                     .interfaces()
                     .iter()
-                    .map(|(&ifindex, iface)| InterfaceMirror {
-                        ifindex,
-                        name: iface.name.clone(),
-                        is_up: iface.is_up,
-                        flags: iface.flags,
-                        addresses: iface.addresses.clone(),
+                    .map(|(&ifindex, iface)| {
+                        let vrf_id = match iface.master_ifindex {
+                            Some(master)
+                                if self
+                                    .rib
+                                    .interfaces()
+                                    .get(&master)
+                                    .is_some_and(|m| m.vrf_table.is_some()) =>
+                            {
+                                master
+                            }
+                            // A vrf device itself (and an unenslaved
+                            // interface enslaved to a non-vrf master,
+                            // e.g. a bridge): own ifindex only when this
+                            // link IS the vrf device.
+                            _ if iface.vrf_table.is_some() => ifindex,
+                            _ => 0,
+                        };
+                        InterfaceMirror {
+                            ifindex,
+                            name: iface.name.clone(),
+                            is_up: iface.is_up,
+                            vrf_id,
+                            master_ifindex: iface.master_ifindex,
+                            flags: iface.flags,
+                            addresses: iface.addresses.clone(),
+                        }
                     })
                     .collect();
                 let _ = reply.send(mirror);
@@ -400,6 +433,22 @@ impl RibDriver {
                 debug!(owner, ?router_id, "zapi: router-id derived");
                 self.router_id_interests.insert(owner, router_id);
                 let _ = reply.send(router_id);
+                false
+            }
+            RibCommand::RegisterNeighbourInterest {
+                owner,
+                afi,
+                interested,
+            } => {
+                let set = self.neighbour_interests.entry(owner).or_default();
+                if interested {
+                    set.insert(afi);
+                } else {
+                    set.remove(&afi);
+                    if set.is_empty() {
+                        self.neighbour_interests.remove(&owner);
+                    }
+                }
                 false
             }
         }
@@ -460,7 +509,60 @@ impl RibDriver {
             // router-id or connected-table work), but the NHT answer is
             // neighbour-gated (M3): a confirmed neighbour appearing or
             // disappearing flips a gateway's answer.
+            self.push_neighbour_change(ev);
             self.reevaluate_nht();
+        }
+    }
+
+    /// Fans a NEIGH_ADDED/REMOVED push to the sessions registered for the
+    /// event's address family (M4, the pinned zebra semantics: the
+    /// interest is a per-(afi, vrf) bitmap; our scope is vrf 0). The ADDED
+    /// flavour follows the mirrored entry: an is_up entry carries its
+    /// (4-byte-truncated) link-layer prefix and true length; an
+    /// INCOMPLETE/FAILED entry renders the AF_UNSPEC form — the same body
+    /// shape zebra forwarded for the kernel's pre-delete FAILED
+    /// notification. REMOVED is the encoder's `out == NULL` branch:
+    /// AF_UNSPEC, ip_len 0, ndm FAILED.
+    fn push_neighbour_change(&mut self, ev: &DataplaneEvent) {
+        let (ip, push) = match ev {
+            DataplaneEvent::NeighbourNew { entry } => {
+                let notify = match &entry.lladdr {
+                    Some(lladdr) if entry.is_up() => ZapiNeighNotify::added(
+                        entry.ip,
+                        lladdr,
+                        entry.link_ifindex,
+                        u32::from(entry.state.bits()),
+                    ),
+                    _ => ZapiNeighNotify::without_link_layer(
+                        entry.ip,
+                        entry.link_ifindex,
+                        u32::from(entry.state.bits()),
+                    ),
+                };
+                (entry.ip, SessionPush::NeighbourAdded(notify))
+            }
+            DataplaneEvent::NeighbourDel { ip, link_ifindex } => (
+                *ip,
+                SessionPush::NeighbourRemoved(ZapiNeighNotify::without_link_layer(
+                    *ip,
+                    *link_ifindex,
+                    zapi::ZEBRA_NEIGH_STATE_FAILED,
+                )),
+            ),
+            _ => return,
+        };
+        let afi = match ip {
+            IpAddr::V4(_) => 1u16,
+            IpAddr::V6(_) => 2u16,
+        };
+        let owners: Vec<u64> = self
+            .neighbour_interests
+            .iter()
+            .filter(|(_, afis)| afis.contains(&afi))
+            .map(|(&owner, _)| owner)
+            .collect();
+        for owner in owners {
+            self.push(owner, push.clone());
         }
     }
 
@@ -784,6 +886,7 @@ impl RibDriver {
                 self.redistributes.remove(&owner);
                 self.identities.remove(&owner);
                 self.router_id_interests.remove(&owner);
+                self.neighbour_interests.remove(&owner);
                 debug!(owner, "zapi: session gone; registries pruned");
                 false
             }
@@ -2217,5 +2320,222 @@ mod tests {
             }
             other => panic!("expected RedistributeRouteAdd, got {other:?}"),
         }
+    }
+    /// M4: neighbour changes fan NEIGH_ADDED/REMOVED pushes out to
+    /// sessions registered for the event's address family — the pinned
+    /// zebra semantics (per-(afi, vrf) interest; ours is vrf 0). The
+    /// ADDED body follows the mirror: is_up entries carry their
+    /// (4-byte-truncated) MAC prefix and true length; INCOMPLETE/FAILED
+    /// entries and REMOVED carry the AF_UNSPEC form.
+    #[test]
+    fn neighbour_changes_push_to_afi_registered_sessions() {
+        use common::NeighbourEntry;
+
+        let mut driver = RibDriver::new();
+        let mut v4_watcher = attach(&mut driver, 1);
+        let mut v6_watcher = attach(&mut driver, 2);
+        driver.apply(RibCommand::RegisterNeighbourInterest {
+            owner: 1,
+            afi: 1,
+            interested: true,
+        });
+        driver.apply(RibCommand::RegisterNeighbourInterest {
+            owner: 2,
+            afi: 2,
+            interested: true,
+        });
+
+        // A confirmed PERMANENT v4 neighbour: the with-MAC ADDED shape.
+        driver.apply_event(&DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink(
+                "192.0.2.99".parse().unwrap(),
+                2,
+                Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x99]),
+                0x80,
+                0,
+            ),
+        });
+        match v4_watcher.try_recv().expect("v4 watcher pushed") {
+            SessionPush::NeighbourAdded(notify) => {
+                assert_eq!(notify.ip, "192.0.2.99".parse::<IpAddr>().unwrap());
+                assert_eq!(notify.link_layer, Some([0x02, 0x00, 0x00, 0x00]));
+                assert_eq!(notify.ip_len, 6, "the MAC's true length");
+                assert_eq!(notify.ifindex, 2);
+                assert_eq!(notify.ndm_state, 0x80);
+            }
+            other => panic!("expected NeighbourAdded, got {other:?}"),
+        }
+        assert!(
+            v6_watcher.try_recv().is_err(),
+            "a v4 neighbour never reaches the v6 watcher"
+        );
+
+        // An INCOMPLETE entry (no lladdr): the AF_UNSPEC ADDED flavour —
+        // the same body shape zebra forwarded for the kernel's pre-delete
+        // FAILED notification.
+        driver.apply_event(&DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink("192.0.2.99".parse().unwrap(), 2, None, 0x01, 0),
+        });
+        match v4_watcher.try_recv().expect("INCOMPLETE forwarded") {
+            SessionPush::NeighbourAdded(notify) => {
+                assert_eq!(notify.link_layer, None);
+                assert_eq!(notify.ip_len, 0);
+                assert_eq!(notify.ndm_state, 0x01);
+            }
+            other => panic!("expected NeighbourAdded, got {other:?}"),
+        }
+
+        // Deletion: the REMOVED twin with the pinned FAILED ndm_state.
+        driver.apply_event(&DataplaneEvent::NeighbourDel {
+            ip: "192.0.2.99".parse().unwrap(),
+            link_ifindex: 2,
+        });
+        match v4_watcher.try_recv().expect("REMOVED pushed") {
+            SessionPush::NeighbourRemoved(notify) => {
+                assert_eq!(notify.link_layer, None);
+                assert_eq!(notify.ip_len, 0);
+                assert_eq!(
+                    notify.ndm_state,
+                    zapi::ZEBRA_NEIGH_STATE_FAILED,
+                    "the encoder's out == NULL branch hardcodes FAILED"
+                );
+            }
+            other => panic!("expected NeighbourRemoved, got {other:?}"),
+        }
+        assert!(v4_watcher.try_recv().is_err());
+
+        // An unregistered session hears nothing even for its own family.
+        let mut stranger = attach(&mut driver, 3);
+        driver.apply_event(&DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink(
+                "192.0.2.98".parse().unwrap(),
+                2,
+                Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x98]),
+                0x80,
+                0,
+            ),
+        });
+        assert!(stranger.try_recv().is_err(), "no registration, no pushes");
+    }
+
+    /// M4: unregistering an afi stops its pushes; a closed session's
+    /// interest is pruned with the rest of its registries.
+    #[test]
+    fn neighbour_interest_unregister_and_prune() {
+        use common::NeighbourEntry;
+
+        let mut driver = RibDriver::new();
+        let mut watcher = attach(&mut driver, 1);
+        driver.apply(RibCommand::RegisterNeighbourInterest {
+            owner: 1,
+            afi: 1,
+            interested: true,
+        });
+        driver.apply(RibCommand::RegisterNeighbourInterest {
+            owner: 1,
+            afi: 1,
+            interested: false,
+        });
+        driver.apply_event(&DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink(
+                "192.0.2.99".parse().unwrap(),
+                2,
+                Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x99]),
+                0x80,
+                0,
+            ),
+        });
+        assert!(
+            watcher.try_recv().is_err(),
+            "the interest was withdrawn: no push"
+        );
+        assert!(
+            !driver.neighbour_interests.contains_key(&1),
+            "the registry entry is gone entirely"
+        );
+
+        // Closed-session pruning: re-register, drop the channel, and the
+        // next push attempt prunes the interest.
+        let watcher2 = attach(&mut driver, 1);
+        driver.apply(RibCommand::RegisterNeighbourInterest {
+            owner: 1,
+            afi: 1,
+            interested: true,
+        });
+        drop(watcher2);
+        driver.apply_event(&DataplaneEvent::NeighbourNew {
+            entry: NeighbourEntry::from_rtnetlink(
+                "192.0.2.99".parse().unwrap(),
+                2,
+                Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x99]),
+                0x80,
+                0,
+            ),
+        });
+        assert!(!driver.neighbour_interests.contains_key(&1));
+    }
+
+    /// M4: the interface mirror's vrf_id derivation — the enslaving vrf
+    /// device's ifindex for a slave, the device's OWN ifindex for a vrf
+    /// device, 0 for plain links and bridge slaves (a master without a
+    /// vrf_table is not a VRF).
+    #[test]
+    fn interface_mirror_vrf_id_derivation() {
+        let mut driver = RibDriver::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // The VRF device, its slave, a plain link, and a bridge master
+        // (enslavement without a table).
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 3,
+            name: "vrf-test".into(),
+            is_up: true,
+            flags: LinkFlags::UP,
+            vrf_table: Some(5001),
+            master_ifindex: None,
+        });
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 4,
+            name: "dummy0".into(),
+            is_up: true,
+            flags: LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: Some(3),
+        });
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 2,
+            name: "eth0".into(),
+            is_up: true,
+            flags: LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 6,
+            name: "br0".into(),
+            is_up: true,
+            flags: LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        driver.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 7,
+            name: "eth1".into(),
+            is_up: true,
+            flags: LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: Some(6),
+        });
+        driver.apply(RibCommand::RequestInterfaces { reply: tx });
+        let mirror = rx.blocking_recv().expect("mirror");
+        let by_name = |n: &str| mirror.iter().find(|m| m.name == n).unwrap();
+        assert_eq!(by_name("vrf-test").vrf_id, 3, "own ifindex");
+        assert_eq!(by_name("dummy0").vrf_id, 3, "the master vrf's ifindex");
+        assert_eq!(by_name("eth0").vrf_id, 0);
+        assert_eq!(
+            by_name("eth1").vrf_id,
+            0,
+            "a bridge slave is not vrf-scoped"
+        );
+        assert_eq!(by_name("dummy0").master_ifindex, Some(3));
     }
 }

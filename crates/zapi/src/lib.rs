@@ -17,8 +17,9 @@ pub use header::{ZapiHeader, ZapiHeaderError, ZAPI_HEADER_LEN, ZAPI_MARKER, ZAPI
 pub use message::{
     blackhole_type, message_flag, nexthop_flag, nexthop_type, route_notify_note, route_type,
     ZapiCodecError, ZapiCommand, ZapiHello, ZapiInterface, ZapiInterfaceAddress, ZapiMessage,
-    ZapiNexthop, ZapiNexthopRegister, ZapiNexthopUpdate, ZapiRedistribute, ZapiRoute,
-    ZapiRouteNotifyOwner, ZapiRouterIdUpdate,
+    ZapiNeighNotify, ZapiNeighRegister, ZapiNexthop, ZapiNexthopRegister, ZapiNexthopUpdate,
+    ZapiRedistribute, ZapiRoute, ZapiRouteNotifyOwner, ZapiRouterIdUpdate,
+    ZEBRA_NEIGH_STATE_FAILED,
 };
 pub use server::{
     run_session, serve, InterfaceMirror, NhtRegistration, RibCommand, SessionPush, ZapiSession,

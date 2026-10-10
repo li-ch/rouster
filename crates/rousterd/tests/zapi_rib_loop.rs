@@ -164,6 +164,7 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
         RibCommand::RegisterRedistribute { .. } | RibCommand::UnregisterRedistribute { .. } => {
             false
         }
+        RibCommand::RegisterNeighbourInterest { .. } => false,
         RibCommand::RequestInterfaces { reply } => {
             let mirror: Vec<InterfaceMirror> = rib
                 .interfaces()
@@ -172,6 +173,8 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
                     ifindex,
                     name: iface.name.clone(),
                     is_up: iface.is_up,
+                    vrf_id: 0,
+                    master_ifindex: iface.master_ifindex,
                     flags: iface.flags,
                     addresses: iface.addresses.clone(),
                 })
