@@ -1,0 +1,13 @@
+[package]
+name = "ospfd"
+description = "Rouster OSPFv2 - AF-generic IGP (Phase 3)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { workspace = true }
+zapi = { workspace = true }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

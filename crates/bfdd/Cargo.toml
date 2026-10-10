@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+zapi = { workspace = true }
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

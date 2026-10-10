@@ -1,0 +1,11 @@
+[package]
+name = "vty"
+description = "Rouster vtysh-compatible VTY server - Cisco-style show/config surface"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

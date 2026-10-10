@@ -11,6 +11,9 @@ members = [
     "crates/bfdd",
     "crates/bgpd",
     "crates/rpki",
+    "crates/policy",
+    "crates/vty",
+    "crates/ospfd",
 ]
 
 [workspace.package]
@@ -20,6 +23,7 @@ license = "MIT"
 
 [workspace.dependencies]
 common = { path = "crates/common" }
+policy = { path = "crates/policy" }
 rib = { path = "crates/rib" }
 sav = { path = "crates/sav" }
 netlink-dp = { path = "crates/netlink-dp" }

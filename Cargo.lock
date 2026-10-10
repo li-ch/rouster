@@ -16,6 +16,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zapi",
 ]
 
 [[package]]
@@ -23,6 +24,7 @@ name = "bgpd"
 version = "0.0.0"
 dependencies = [
  "common",
+ "policy",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -350,6 +352,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "ospfd"
+version = "0.0.0"
+dependencies = [
+ "common",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zapi",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -360,6 +373,15 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "policy"
+version = "0.0.0"
+dependencies = [
+ "common",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "ppv-lite86"
@@ -791,6 +813,15 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vty"
+version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "wait-timeout"

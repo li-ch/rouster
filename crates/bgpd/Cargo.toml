@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+policy = { workspace = true }
 common = { workspace = true }
 # io-util (AsyncReadExt/AsyncWriteExt) additive like zapi's; the
 # session loop's framing is read_exact/write_all based.

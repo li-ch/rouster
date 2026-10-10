@@ -1,0 +1,11 @@
+[package]
+name = "policy"
+description = "Rouster typed policy engine - BIRD-inspired compiled filters + route-map grammar"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
