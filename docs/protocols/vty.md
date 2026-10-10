@@ -212,13 +212,18 @@ writes it).
   then decide unix-socket endpoints per daemon vs one endpoint.
 - **TAB completion** — the tree already computes candidates;
   wiring is line-editor work (~an hour).
-- **More show sources** — `show ip route` / `show vrf` /
-  `show neighbour` stay PENDING sources per
-  docs/operator-surfaces.md §3 (do not implement against guessed
-  formats); each lands as: daemon publishes a run-dir file →
-  tolerant parser + fixture corpus → vty command.
+- **More show sources** — the W2-f round landed four of them over
+  `rousterd.status` (`show interface`/`show ip interface`, `show
+  neighbor`, `show vrf`, `show ip route summary`/`show rib summary`,
+  parsed by `ribparse.rs` with its own fixture corpus); still PENDING
+  per docs/operator-surfaces.md §3: per-route `show ip route` rows
+  and the bgpd/ospfd status writers.
 - **rousterctl/vty shared reader crate** — owner decision (see
   deviation 5).
-- **Smoke-script wiring** — W2-f's operator round; the pieces it
+- **Smoke-script wiring** — DONE by W2-f
+  (`scripts/test-vty-smoke.sh`: live rousterd+savd+bfdd+vtyd in one
+  container, content-asserted `--command` legs, liveness flip on
+  rousterd SIGTERM; auto-discovered by `scripts/run-smokes.sh`).
+  Remaining from the original note: the pieces it
   needs (fixed-port config, `--command` exit codes, SIGTERM) are
   pinned by tests here.
