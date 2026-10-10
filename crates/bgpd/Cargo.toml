@@ -1,0 +1,12 @@
+[package]
+name = "bgpd"
+description = "Rouster bgpd — see docs/architecture.md and the Phase-2 plan"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { workspace = true }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
