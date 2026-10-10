@@ -261,6 +261,12 @@ impl SessionHandle {
         self.snapshot.borrow().clone()
     }
 
+    /// The session's control channel (the daemon's echo reflector
+    /// uses it to deliver loopback refreshes).
+    pub fn ctl_sender(&self) -> &mpsc::Sender<SessionCtl> {
+        &self.ctl
+    }
+
     /// A fresh subscription to snapshot changes.
     pub fn subscribe(&self) -> watch::Receiver<SessionSnapshot> {
         self.snapshot.clone()

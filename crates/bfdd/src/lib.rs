@@ -22,6 +22,7 @@
 //! "single session per data protocol path" is the config model's
 //! one-peer-one-session invariant.
 
+pub mod daemon;
 pub mod packet;
 pub mod session;
 pub mod transport;
