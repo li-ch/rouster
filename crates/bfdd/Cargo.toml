@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 zapi = { workspace = true }
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
