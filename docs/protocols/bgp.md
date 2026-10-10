@@ -1,10 +1,12 @@
-# bgpd — the Rouster BGP daemon (Phase 2, stream P2-b)
+# bgpd — the Rouster BGP daemon (Phase 2 stream P2-b, W2-d)
 
-Status: v1 landed 2026-10-10 (commits `6068045`..`e52826c`). Scope:
+Status: v1 landed 2026-10-10 (P2-b, commits `6068045`..`e52826c`):
 RFC 4271 base + capabilities + MP-BGP v4/v6 unicast + route refresh +
 4-octet AS, a pure FSM, the §9.1 decision process, the ZAPI client
 edge, and a two-green-runs interop smoke against real FRR 10.2.2
-bgpd.
+bgpd. W2-d (2026-10-11, `f034b08`..) added the typed policy engine in
+the decision path, RPKI/ROV + OTC roles, ASPA verification, §6.8
+collision detection, and the policy interop smoke.
 
 ## Layout
 
@@ -12,14 +14,16 @@ bgpd.
 |---|---|
 | `message` | Header/OPEN/UPDATE/NOTIFICATION/KEEPALIVE/ROUTE-REFRESH framing (RFC 4271 §4; refresh RFC 2918 §3) |
 | `capability` | RFC 5492 capability triples; extended OPEN optional parameters per RFC 9072 |
-| `attr` | Path-attribute model: §4.3 flags, AS_PATH (RFC 6793 4-octet, AS_TRANS=23456 bridging), communities (RFC 1997), MP_REACH/MP_UNREACH (RFC 4760), unknown-transitive passthrough with the partial bit forced |
+| `attr` | Path-attribute model: §4.3 flags, AS_PATH (RFC 6793 4-octet, AS_TRANS=23456 bridging), communities (RFC 1997), MP_REACH/MP_UNREACH (RFC 4760), OTC (RFC 9234 type 35), unknown-transitive passthrough with the partial bit forced |
 | `fsm` | The §8 six-state machine, table-driven, pure and clock-injected |
-| `peer` | Session runtime: framed IO, hold/keepalive timers, §6.2 OPEN checks, §9.5 AS-loop rejection, RFC 2918 refresh answers, MRAI gate, Adj-RIB-In sink / Adj-RIB-Out source traits |
-| `rib` | Adj-RIBs-In + Loc-RIB, `best_path` = the §9.1.2.2 ladder, Import/Export policy seams (accept-all v1) |
+| `peer` | Session runtime: framed IO, hold/keepalive timers, §6.2 OPEN checks, §9.5 AS-loop rejection, RFC 2918 refresh answers (inbound requests + outbound soft-reset hook), MRAI gate, Adj-RIB-In sink / Adj-RIB-Out source traits, `SessionShared` (the §6.8 observability) |
+| `rib` | Adj-RIBs-In + Loc-RIB, `best_path` = the §9.1.2.2 ladder, Import/Export policy seams (§9.2.1 Phase 1/3) |
+| `policy_engine` | The typed-engine bridge: `PolicyView` (bgpd's `RouteView`), wire↔policy attribute conversion with replace-or-insert write-back, `ImportPipeline`/`ExportPipeline`, config→filter compilation |
+| `rov` | RPKI-derived validation: RFC 6811 §2 ROV, RFC 9234 §5 OTC ingress/egress by role, ASPA verification (draft-ietf-sidrops-aspa-verification-28 §5.5/§5.6), `vrp-file` fixture grammar, RTR table source |
 | `zedge` | ZAPI client edge: NHT for peer addresses (connector gate), interface mirror, best-path export to the zebra |
-| `daemon` | Listener (TCP 179 default, `listen-port` knob), per-neighbor connectors (§10 ConnectRetry, exponential 1 s→120 s), §6.8 first-wins collision admission, graceful stop |
-| `config` | `bgpd.conf` grammar (A11/B7 conventions) |
-| `bin/bgpd` | Thin shell (savd shape): config → Loc-RIB → zedge → daemon |
+| `daemon` | Listener (TCP 179 default, `listen-port` knob), per-neighbor connectors (§10 ConnectRetry, exponential 1 s→120 s), §6.8 collision resolution (BGP-ID tiebreak, Cease 6/7 to losers, challenger adoption via stream replay), graceful stop |
+| `config` | `bgpd.conf` grammar (A11/B7 conventions) + policy-stanza extraction + `rpki`/`aspa`/role knobs |
+| `bin/bgpd` | Thin shell (savd shape): config → filters/validation → Loc-RIB → zedge → daemon |
 
 ## Pinned design decisions
 
@@ -28,15 +32,76 @@ bgpd.
   the wire: FRR records `Notification received (Cease/Administrative
   Shutdown)`.
 - **SIGUSR1 → ROUTE-REFRESH** (RFC 2918) to every Established peer —
-  the on-demand refresh knob.
-- **MRAI default 0** (FRR parity; RFC 4271 §10 suggests 30 s eBGP /
-  5 s iBGP — tuning §Deferred). Coarse per-peer gate, clock-injected.
+  and since W2-d a true *soft inbound reset*: the peer's Adj-RIB-In is
+  cleared when the request is sent, so the re-advertised set rebuilds
+  against the current import policy (rejected or omitted prefixes
+  vanish). Runtime policy *reload* is still §Deferred (YANG/
+  rousterd-owned); the reset mechanism is the knob an operator uses
+  after a restart.
+- **MRAI default 0** (off) — modern practice: FRR ships MRAI disabled
+  (v1 parity, pinned in config.rs) and BIRD has no MRAI at all; the
+  delay trades convergence speed for message-rate smoothing and the
+  research line (JIT-MRAI) argues for per-prefix pacing instead.
+  RFC 4271 §10's 30 s eBGP / 5 s iBGP remain the documented tuning
+  anchor; per-prefix MRAI queues are §Deferred.
 - **§9.1.2.2 e) (interior cost) skipped** — the RFC allows skipping
   when no cost can be determined; no IGP exists yet.
 - **DelayOpen always FALSE**; Events 16/17 and 24/25 unified per
   identical table handling; Events 14/15 stay at the TCP layer.
-- **§6.8 collision: first-wins** at the daemon (one session per
-  neighbor); the BGP-ID tiebreak is §Deferred.
+- **§6.8 collision: BGP-Identifier tiebreak.** A second connection
+  for a busy neighbor triggers a resolver that reads the challenger's
+  OPEN and applies §6.8's rule verbatim — "the connection initiated
+  by the BGP speaker with the higher BGP Identifier MUST be retained"
+  — and never preempts an Established session. Losers receive
+  NOTIFICATION Cease with RFC 4486 subcode 7 (Collision Resolution
+  Failure), not a silent TCP close. A winning challenger is adopted
+  with its consumed OPEN frame replayed ahead of the live stream
+  (`ReplayStream`, split halves, no unsafe). Two peer-initiated
+  connections give the tiebreak nothing to decide — first-wins.
+
+### Policy in the decision path (W2-d)
+
+- **Import** (§9.2.1 Phase 1): every Adj-RIB-In route runs
+  `ValidationGate` → compiled `policy::Filter`. The seams return
+  transformed routes (`ImportPolicy::import`), so set-actions mutate
+  attributes *before* best-path (§9.1.1's degree-of-preference hook);
+  rejected prefixes never become candidates.
+- **Export** (Phase 3): `ExportPolicy::export` gates the Adj-RIB-Out —
+  including locally-originated `network` announcements (FRR neighbor
+  route-map semantics), with the §9.2.2 reflection floor kept.
+- **The bridge**: bgpd's wire model converts into the policy engine's
+  owned model once per evaluation (`PolicyView`, the W1-a §Deferred
+  "bgpd implements RouteView" anchor); edits splice back
+  replace-or-insert per attribute; NEXT_HOP/MP_REACH/passthrough
+  attributes are never touched. `metric` maps to MED (BIRD
+  `bgp_metric`; FRR's documented `set metric` behavior).
+- **Unconfigured = accept-all = v1 behavior** — both interop smokes
+  (the unmodified P2-b one and the policy one) run the same daemon.
+
+### RPKI (W2-d)
+
+- **ROV** (RFC 6811 §2): validity computed at import from the VRP
+  table (RTR cache session or `vrp-file` fixture), recorded on the
+  stored route (`Route.rov`, show-output surface) and enforced by
+  `reject-invalid` (default **true** — the RFC's recommended local
+  policy for Invalid; Valid/NotFound pass). ANP (augmented path
+  selection) is not implemented — validity does not alter the §9.1
+  ladder.
+- **OTC / roles** (RFC 9234 §4/§5): per-neighbor `role
+  customer|peer|provider`. Ingress: OTC from a customer is a route
+  leak (ineligible); OTC from a peer is ineligible unless it equals
+  the peer's AS; routes from providers/peers lacking OTC get OTC :=
+  the remote AS. Egress (eBGP): OTC := local AS is synthesized toward
+  customers and peers when absent; OTC-bearing routes are never
+  propagated to peers or providers; once set, preserved unchanged.
+  Validation only runs on eBGP-learned routes (validity is an edge
+  property).
+- **ASPA** (draft-ietf-sidrops-aspa-verification-28): verification at
+  import when the neighbor has a role (role → PeerRelation, §6.3);
+  `aspa advisory` (default v1) records the verdict on the path only;
+  `aspa enforce` additionally rejects Invalid. Unknown is never
+  rejected. No role → no verification (the procedure selection keys
+  off RFC 9234 roles).
 
 ## Config
 
@@ -49,12 +114,32 @@ router bgp 65000
  neighbor 192.0.2.9 remote-as 65001
  neighbor 192.0.2.9 passive
  neighbor 192.0.2.9 timers 10 30
- neighbor 192.0.2.9 mrai 5
+ neighbor 192.0.2.9 mrai 5              # default 0 (off)
+ neighbor 192.0.2.9 role peer           # RFC 9234: customer|peer|provider
  network 203.0.113.0/24
- network 2001:db8:1::/48
+ import INBOUND                         # names a route-map (below)
+ export OUTBOUND
+rpki
+ cache 192.0.2.10 3323                  # RTR session (RFC 8210) — or:
+ vrp-file /etc/rouster/vrps.conf        # static fixture (mutually exclusive)
+ reject-invalid true                    # default true (RFC 6811 §2)
+aspa advisory                           # advisory (default) | enforce
+route-map INBOUND permit 10
+ match ip address prefix-list CUST
+ set local-preference 200
+ip prefix-list CUST seq 5 permit 203.0.113.0/24
 ```
 
-## FRR interop notes (pinned by the smoke)
+Policy stanzas (`route-map`, `ip|ipv6 prefix-list`, `bgp as-path
+access-list`, `bgp community-list standard`) are extracted verbatim
+into a blank-padded fragment (file line numbers preserved) and
+compiled at startup by the W1-a grammar
+(`policy_engine::compile_named_policy`); unknown filter names and
+grammar errors are startup failures, never silent. The `vrp-file`
+grammar: `vrp <prefix> max <len> as <asn>` and
+`aspa <asn> provider <asn>...`, `#` comments, line-numbered errors.
+
+## FRR interop notes (pinned by the smokes)
 
 - FRR binds :179 only once a `router bgp` instance exists; a
   `vtysh -b` pushed before bgpd's zebra view is up silently drops the
@@ -66,10 +151,16 @@ router bgp 65000
 
 ## §Deferred anchors
 
-Collision BGP-ID tiebreak (§6.8) · per-prefix MRAI queues · MRAI
-defaults · the typed policy engine (Import/Export seams exist,
-accept-all ships) · route-server mode · route next-hop resolution
-(v1: single-hop peers only) · v6 listener side · the
-`experimental-savnet` BGP-signaling hook (trait seam absent by
+Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime
+policy/config reload (the soft-reset mechanism exists; reload is
+rousterd/YANG territory) · iBGP propagation of ROV/ASPA validity ·
+ROV-informed path selection (ANP) · RFC 9234 RS/RS-client roles (with
+route-server mode) and the role-mismatch NOTIFICATION (subcode 11) ·
+RFC 7606 treat-as-withdraw (malformed OTC currently notifies) ·
+full two-connection §6.8 daemon integration test (the verdict table,
+replay adapter, and session observability are tested; the accept-path
+dance is smoke-covered by its dormancy) · route-server mode · route
+next-hop resolution (v1: single-hop peers only) · v6 listener side ·
+the `experimental-savnet` BGP-signaling hook (trait seam absent by
 mission; anchor: `peer.rs` `on_message`) · graceful-restart ·
 ADD-PATH · interface up/down mirror tracking.
