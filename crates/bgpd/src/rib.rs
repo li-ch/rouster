@@ -419,9 +419,12 @@ impl crate::peer::OutRib for LocRibOut {
         afi: u16,
         safi: u8,
         next_hop: IpAddr,
+        to_peer: IpAddr,
         internal: bool,
     ) -> Vec<BgpUpdate> {
-        let mut updates = self.networks.advertisements(afi, safi, next_hop, internal);
+        let mut updates = self
+            .networks
+            .advertisements(afi, safi, next_hop, to_peer, internal);
         // Learned best paths: advertise to OTHER peers per policy.
         // v1 single-family guard: only v4-unicast re-advertisement is
         // wired (the smoke's shape); v6 learned paths ride their
@@ -434,7 +437,7 @@ impl crate::peer::OutRib for LocRibOut {
                 if !self.policy.advertise(
                     route,
                     &PeerInfo {
-                        address: next_hop,
+                        address: to_peer,
                         remote_as: 0,
                         bgp_id: None,
                     },

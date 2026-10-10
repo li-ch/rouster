@@ -115,12 +115,13 @@ impl PeerReachability for AlwaysReachable {
     }
 }
 
-/// Mirror-backed gating (the zapi-attached shape).
-pub struct MirrorReachability(pub Arc<Mutex<InterfaceMirror>>);
+/// NHT-backed gating (the zapi-attached shape): reachable when the
+/// latest NEXTHOP_UPDATE for the peer's address said resolved.
+pub struct NhtReachability(pub Arc<Mutex<std::collections::BTreeSet<IpAddr>>>);
 
-impl PeerReachability for MirrorReachability {
+impl PeerReachability for NhtReachability {
     fn reachable(&self, addr: IpAddr) -> bool {
-        self.0.lock().unwrap().on_link(addr)
+        self.0.lock().unwrap().contains(&addr)
     }
 }
 
@@ -137,6 +138,8 @@ fn peer_prefix(addr: IpAddr) -> IpPrefix {
 pub struct Zedge<IO> {
     client: ZapiClient<IO>,
     pub mirror: Arc<Mutex<InterfaceMirror>>,
+    /// Peer addresses whose latest NHT answer said resolved.
+    pub nht_resolved: Arc<Mutex<std::collections::BTreeSet<IpAddr>>>,
     peers: Vec<IpAddr>,
 }
 
@@ -148,6 +151,7 @@ where
         Self {
             client,
             mirror: Arc::new(Mutex::new(InterfaceMirror::default())),
+            nht_resolved: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             peers,
         }
     }
@@ -176,6 +180,20 @@ where
                     resolved = update.is_resolved(),
                     "bgpd: NHT answer"
                 );
+                // Map the answer back to the peer it gates: the
+                // registration was the peer's /32 or /128.
+                if let Some(peer) = self
+                    .peers
+                    .iter()
+                    .find(|p| peer_prefix(**p) == update.registered_prefix)
+                {
+                    let mut nht = self.nht_resolved.lock().unwrap();
+                    if update.is_resolved() {
+                        nht.insert(*peer);
+                    } else {
+                        nht.remove(peer);
+                    }
+                }
             }
             ZapiMessage::RouterIdUpdate(id) => {
                 debug!(?id.address, "bgpd: router-id update from zebra");
@@ -242,7 +260,7 @@ pub async fn spawn(
     socket: std::path::PathBuf,
     peers: Vec<IpAddr>,
 ) -> io::Result<(
-    Arc<Mutex<InterfaceMirror>>,
+    Arc<Mutex<std::collections::BTreeSet<IpAddr>>>,
     mpsc::UnboundedSender<ZedgeCommand>,
 )> {
     let mut client = None;
@@ -259,14 +277,14 @@ pub async fn spawn(
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "zebra socket never appeared"))?;
     let mut zedge = Zedge::new(client, peers);
     zedge.start().await?;
-    let mirror = Arc::clone(&zedge.mirror);
+    let nht = Arc::clone(&zedge.nht_resolved);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         if let Err(e) = zedge.run(rx).await {
             warn!(error = %e, "bgpd: zedge task exited");
         }
     });
-    Ok((mirror, tx))
+    Ok((nht, tx))
 }
 
 #[cfg(test)]

@@ -449,12 +449,17 @@ impl Fsm {
                         crate::error::error_code::CEASE,
                         cease_subcode::ADMIN_SHUTDOWN,
                     ),
+                    Action::ReleaseResources,
                     Action::CloseTcp,
                 ]
             }
             Event::HoldTimerExpires => {
                 self.established_teardown();
-                vec![Action::Notify(4, 0), Action::CloseTcp]
+                vec![
+                    Action::Notify(4, 0),
+                    Action::ReleaseResources,
+                    Action::CloseTcp,
+                ]
             }
             Event::KeepaliveTimerExpires => {
                 vec![Action::SendKeepalive, Action::RestartKeepalive]
@@ -464,7 +469,7 @@ impl Fsm {
             Event::TcpConnectionFails | Event::NotifMsg => {
                 // Withdraw, release, drop, → Idle.
                 self.established_teardown();
-                vec![Action::CloseTcp]
+                vec![Action::ReleaseResources, Action::CloseTcp]
             }
             // Process the UPDATE and restart the HoldTimer (§8.2.2.7
             // Event 27 row); route handling itself is the session
@@ -472,14 +477,22 @@ impl Fsm {
             Event::UpdateMsg => vec![Action::RestartHoldTimer],
             Event::UpdateMsgErr(code, subcode) => {
                 self.established_teardown();
-                vec![Action::Notify(code, subcode), Action::CloseTcp]
+                vec![
+                    Action::Notify(code, subcode),
+                    Action::ReleaseResources,
+                    Action::CloseTcp,
+                ]
             }
             // A second connection (16/17) is §6.8 territory: tracked
             // by the daemon, not a state change here.
             Event::TcpConnectionConfirmed => Vec::new(),
             _ => {
                 self.established_teardown();
-                vec![Action::Notify(5, 0), Action::CloseTcp]
+                vec![
+                    Action::Notify(5, 0),
+                    Action::ReleaseResources,
+                    Action::CloseTcp,
+                ]
             }
         }
     }
@@ -773,6 +786,7 @@ mod tests {
             actions,
             vec![
                 Action::Notify(error_code::CEASE, cease_subcode::ADMIN_SHUTDOWN),
+                Action::ReleaseResources,
                 Action::CloseTcp
             ]
         );
@@ -783,7 +797,14 @@ mod tests {
         let mut f = to(fsm(90), State::Established);
         let actions = f.fire(Event::HoldTimerExpires);
         assert_eq!(f.state(), State::Idle);
-        assert_eq!(actions, vec![Action::Notify(4, 0), Action::CloseTcp]);
+        assert_eq!(
+            actions,
+            vec![
+                Action::Notify(4, 0),
+                Action::ReleaseResources,
+                Action::CloseTcp
+            ]
+        );
     }
 
     #[test]
@@ -808,7 +829,14 @@ mod tests {
         let mut f = to(fsm(90), State::Established);
         let actions = f.fire(Event::UpdateMsgErr(3, 3));
         assert_eq!(f.state(), State::Idle);
-        assert_eq!(actions, vec![Action::Notify(3, 3), Action::CloseTcp]);
+        assert_eq!(
+            actions,
+            vec![
+                Action::Notify(3, 3),
+                Action::ReleaseResources,
+                Action::CloseTcp
+            ]
+        );
     }
 
     /// Session-identity facts: iBGP detection and AS_TRANS peers.

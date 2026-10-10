@@ -213,7 +213,7 @@ impl BgpOpen {
         })
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.version);
         put_u16(out, self.my_as);
         put_u16(out, self.hold_time);
@@ -230,7 +230,7 @@ impl BgpOpen {
         out.extend_from_slice(&params);
     }
 
-    fn decode(buf: &[u8]) -> BgpResult<Self> {
+    pub(crate) fn decode(buf: &[u8]) -> BgpResult<Self> {
         let mut r = Reader::new(buf);
         let open_err =
             |sub: u8, what: &str| BgpError::notify(error::error_code::OPEN_MESSAGE, sub, what);
@@ -383,6 +383,11 @@ pub struct BgpUpdate {
 }
 
 impl BgpUpdate {
+    /// Full encoded frame for this UPDATE alone (header + body).
+    pub fn encode_frame(&self, asn4: bool) -> BgpResult<Vec<u8>> {
+        BgpMessage::Update(self.clone()).encode(asn4)
+    }
+
     /// Convenience accessors over the attribute list.
     pub fn attr(&self, attr_type: u8) -> Option<&PathAttribute> {
         self.attrs.iter().find(|a| a.attr_type() == attr_type)
@@ -452,7 +457,7 @@ impl BgpUpdate {
         Ok(())
     }
 
-    fn encode(&self, out: &mut Vec<u8>, asn4: bool) -> BgpResult<()> {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>, asn4: bool) -> BgpResult<()> {
         let mut withdrawn = Vec::new();
         for prefix in &self.withdrawn {
             encode_prefix(&mut withdrawn, *prefix);
@@ -477,7 +482,7 @@ impl BgpUpdate {
         Ok(())
     }
 
-    fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
+    pub(crate) fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
         let mut r = Reader::new(buf);
         let withdrawn_len = r
             .u16()
@@ -541,13 +546,13 @@ impl BgpNotification {
         }
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.code);
         out.push(self.subcode);
         out.extend_from_slice(&self.data);
     }
 
-    fn decode(buf: &[u8]) -> BgpResult<Self> {
+    pub(crate) fn decode(buf: &[u8]) -> BgpResult<Self> {
         let mut r = Reader::new(buf);
         let code = r
             .u8()
@@ -571,13 +576,13 @@ pub struct BgpRouteRefresh {
 }
 
 impl BgpRouteRefresh {
-    fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         put_u16(out, self.afi);
         out.push(0); // Reserved: SHOULD be 0 (RFC 2918 §3)
         out.push(self.safi);
     }
 
-    fn decode(buf: &[u8]) -> BgpResult<Self> {
+    pub(crate) fn decode(buf: &[u8]) -> BgpResult<Self> {
         let mut r = Reader::new(buf);
         let afi = r
             .u16()

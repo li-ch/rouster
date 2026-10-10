@@ -28,8 +28,12 @@ use crate::config::{BgpdConfig, NeighborConfig};
 use crate::fsm::SessionConfig;
 use crate::peer::{OutRib, PeerInfo, PeerSession, RouteSink, SharedSink};
 
-/// The §10 suggested ConnectRetry default.
-const CONNECT_RETRY: Duration = Duration::from_secs(120);
+/// ConnectRetry, §10-shaped: 120 s is the RFC's suggested *initial*
+/// value; v1 backs off exponentially from 1 s to that cap (disclosed
+/// deviation — a freshly-started peer's listener can take a moment to
+/// bind, and the flat 120 s makes cold-start races look like
+/// outages). Each successful session resets the backoff.
+const CONNECT_RETRY_MAX: Duration = Duration::from_secs(120);
 /// How long the daemon waits for Cease messages to drain on shutdown.
 const SHUTDOWN_SETTLE: Duration = Duration::from_secs(2);
 
@@ -220,6 +224,7 @@ async fn connector_loop<S: RouteSink + 'static>(
     reach: Arc<dyn crate::zedge::PeerReachability>,
 ) {
     let target = SocketAddr::new(neighbor.address, config.listen_port);
+    let mut backoff = Duration::from_secs(1);
     loop {
         if *stop.borrow() {
             return;
@@ -270,12 +275,13 @@ async fn connector_loop<S: RouteSink + 'static>(
                 info!(peer = %neighbor.address, ?end, "bgpd: session ended");
                 ctx.busy.lock().unwrap().remove(&neighbor.address);
                 ctx.live.fetch_sub(1, Ordering::SeqCst);
-                // Re-dial immediately (a completed session is not a
-                // failed attempt; ConnectRetry gates failures only).
+                // A completed session is not a failed attempt:
+                // re-dial immediately with the backoff reset.
+                backoff = Duration::from_secs(1);
                 continue;
             }
             Err(e) => {
-                info!(%target, error = %e, "bgpd: connect failed, ConnectRetry backoff");
+                info!(%target, error = %e, wait = ?backoff, "bgpd: connect failed, ConnectRetry backoff");
             }
         }
         tokio::select! {
@@ -284,7 +290,9 @@ async fn connector_loop<S: RouteSink + 'static>(
                     return;
                 }
             }
-            _ = tokio::time::sleep(CONNECT_RETRY) => {}
+            _ = tokio::time::sleep(backoff) => {
+                backoff = (backoff * 2).min(CONNECT_RETRY_MAX);
+            }
         }
     }
 }

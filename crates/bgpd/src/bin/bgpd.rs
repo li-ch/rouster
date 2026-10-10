@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bgpd::peer::{ConfiguredNetworks, SharedSink};
 use bgpd::rib::{AcceptAll, LocRib, LocRibOut, RibSink};
-use bgpd::zedge::{self, AlwaysReachable, MirrorReachability, PeerReachability, ZedgeCommand};
+use bgpd::zedge::{self, AlwaysReachable, NhtReachability, PeerReachability, ZedgeCommand};
 use bgpd::{daemon, rib};
 use tracing::{error, info, warn};
 
@@ -82,7 +82,7 @@ fn main() {
             Some(socket) => {
                 let peers = config.neighbors.keys().copied().collect();
                 match zedge::spawn(socket, peers).await {
-                    Ok((mirror, tx)) => {
+                    Ok((nht, tx)) => {
                         // Export drainer: RibSink changes → ZAPI.
                         let drain_sink = sink.clone();
                         tokio::spawn(async move {
@@ -104,7 +104,7 @@ fn main() {
                                 tokio::time::sleep(Duration::from_millis(250)).await;
                             }
                         });
-                        Arc::new(MirrorReachability(mirror))
+                        Arc::new(NhtReachability(nht))
                     }
                     Err(e) => {
                         warn!(error = %e, "bgpd: running standalone (no zapi edge)");

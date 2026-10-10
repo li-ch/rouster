@@ -90,12 +90,15 @@ impl<T: RouteSink> RouteSink for SharedSink<T> {
 /// Adj-RIB-Out source: what this daemon advertises once Established
 /// (v1: locally-originated networks; M4 adds Loc-RIB bests).
 pub trait OutRib: Send + Sync {
-    /// The full advertisement set for one (AFI, SAFI).
+    /// The full advertisement set for one (AFI, SAFI) toward one
+    /// peer: `next_hop` is our session address (NEXT_HOP encoding),
+    /// `to_peer` the remote (reflection filtering).
     fn advertisements(
         &self,
         afi: u16,
         safi: u8,
         next_hop: IpAddr,
+        to_peer: IpAddr,
         internal: bool,
     ) -> Vec<BgpUpdate>;
     /// Families to advertise into.
@@ -349,6 +352,13 @@ where
             return self.end.clone();
         }
         if self.fsm.state() == State::Established && was != State::Established {
+            let n = self.fsm.negotiated();
+            info!(
+                peer = %self.peer.address,
+                remote_as = n.map(|x| x.peer_as).unwrap_or(0),
+                hold = n.map(|x| x.hold_time).unwrap_or(0),
+                "bgpd: session Established"
+            );
             if let Err(e) = self.on_established().await {
                 self.end = Some(SessionEnd::Transport(e.to_string()));
                 return self.end.clone();
@@ -394,8 +404,30 @@ where
                     let (code, sub) = err.notification.unwrap_or((3, 1));
                     return self.step(Event::UpdateMsgErr(code, sub), sink).await;
                 }
-                sink.announce(&self.peer, &update);
+                // §9.5: discard UPDATEs whose AS_PATH carries our own
+                // AS (loop); the connection itself is unaffected.
+                let local_as = self.local_as;
+                let loops = update.as_path().is_some_and(|p| {
+                    p.segments.iter().any(|seg| match seg {
+                        crate::attr::AsSegment::Set(v) | crate::attr::AsSegment::Sequence(v) => {
+                            v.contains(&local_as)
+                        }
+                    })
+                });
+                if loops {
+                    warn!(peer = %self.peer.address, "bgpd: UPDATE rejected, own AS in AS_PATH (§9.5)");
+                    return self.step(Event::UpdateMsg, sink).await;
+                }
+                let announced: Vec<String> =
+                    update.announced().iter().map(|p| p.to_string()).collect();
                 let withdrawn = update.withdrawn_all();
+                info!(
+                    peer = %self.peer.address,
+                    announced = announced.join(","),
+                    withdrawn = withdrawn.len(),
+                    "bgpd: UPDATE received"
+                );
+                sink.announce(&self.peer, &update);
                 sink.withdraw(&self.peer, &withdrawn);
                 self.step(Event::UpdateMsg, sink).await
             }
@@ -433,11 +465,14 @@ where
             warn!("bgpd: ROUTE-REFRESH without capability, ignored");
             return None;
         }
+        info!(peer = %self.peer.address, afi = rr.afi, safi = rr.safi,
+            "bgpd: ROUTE-REFRESH received, re-advertising");
         sink.refresh_requested(&self.peer, rr.afi, rr.safi);
         let next_hop = self.local_addr;
+        let to_peer = self.peer.address;
         let internal = self.fsm.negotiated().is_some_and(|n| n.internal);
         if let Some(rib) = self.out_rib.clone() {
-            for update in rib.advertisements(rr.afi, rr.safi, next_hop, internal) {
+            for update in rib.advertisements(rr.afi, rr.safi, next_hop, to_peer, internal) {
                 if let Err(e) = self.send_update(&update).await {
                     self.end = Some(SessionEnd::Transport(e.to_string()));
                     return self.end.clone();
@@ -454,9 +489,10 @@ where
             return Ok(());
         };
         let next_hop = self.local_addr;
+        let to_peer = self.peer.address;
         let internal = self.fsm.negotiated().is_some_and(|n| n.internal);
         for (afi, safi) in rib.families() {
-            for update in rib.advertisements(afi, safi, next_hop, internal) {
+            for update in rib.advertisements(afi, safi, next_hop, to_peer, internal) {
                 self.send_update(&update).await?;
             }
         }
@@ -649,6 +685,7 @@ impl OutRib for ConfiguredNetworks {
         afi: u16,
         _safi: u8,
         next_hop: IpAddr,
+        _to_peer: IpAddr,
         internal: bool,
     ) -> Vec<BgpUpdate> {
         self.networks
@@ -826,6 +863,7 @@ mod tests {
             _afi: u16,
             _safi: u8,
             nh: IpAddr,
+            _to_peer: IpAddr,
             internal: bool,
         ) -> Vec<BgpUpdate> {
             self.0
