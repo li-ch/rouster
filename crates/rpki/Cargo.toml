@@ -7,6 +7,17 @@ license.workspace = true
 
 [dependencies]
 common = { workspace = true }
-tokio.workspace = true
+# io-util (AsyncRead/WriteExt for the RTR session's TCP framing) rides
+# on top of the workspace tokio; no new crate, no root-table change.
+tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# ROV property tests (P2-c milestone 3) — dev-only, pinned in the
+# workspace table; the one pre-authorized usage for this stream.
+proptest.workspace = true
+# Session-client tests: paused-clock time control (`start_paused`)
+# needs tokio's test-util feature — dev-only, so the shipped library's
+# tokio feature set is unchanged (same pattern as sav's A10 tests).
+tokio = { workspace = true, features = ["test-util"] }
