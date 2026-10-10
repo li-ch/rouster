@@ -19,6 +19,7 @@
 pub mod attr;
 pub mod capability;
 pub mod error;
+pub mod fsm;
 pub mod message;
 pub mod wire;
 
