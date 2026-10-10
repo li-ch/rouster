@@ -53,6 +53,15 @@ pub trait RouteSink: Send {
     fn refresh_requested(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
         let _ = (peer, afi, safi);
     }
+
+    /// We are about to send ROUTE-REFRESH to the peer (RFC 2918 §3,
+    /// the SIGUSR1 path): the soft inbound reset begins here — the
+    /// RIB may clear the peer's Adj-RIB-In so the re-advertised set
+    /// is rebuilt against the current import policy, and prefixes
+    /// the new policy rejects (or the peer omits) vanish (W2-d).
+    fn refresh_sent(&mut self, peer: &PeerInfo) {
+        let _ = peer;
+    }
 }
 
 /// A no-op sink (sessions driven purely for their wire behavior).
@@ -84,6 +93,9 @@ impl<T: RouteSink> RouteSink for SharedSink<T> {
     }
     fn refresh_requested(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
         self.0.lock().unwrap().refresh_requested(peer, afi, safi);
+    }
+    fn refresh_sent(&mut self, peer: &PeerInfo) {
+        self.0.lock().unwrap().refresh_sent(peer);
     }
 }
 
@@ -148,6 +160,31 @@ const HOLD_LARGE: Duration = Duration::from_secs(240);
 /// Disarmed timers sleep here.
 const FAR: Duration = Duration::from_secs(86_400 * 365);
 
+/// Daemon-observable session state (the §6.8 collision machinery):
+/// the BGP Identifier learned from the peer's OPEN and whether the
+/// session reached Established — the two facts the collision verdict
+/// keys on.
+#[derive(Default)]
+pub struct SessionShared {
+    pub peer_bgp_id: std::sync::Mutex<Option<Ipv4Addr>>,
+    pub established: std::sync::atomic::AtomicBool,
+}
+
+impl SessionShared {
+    fn note_open(&self, bgp_id: Ipv4Addr) {
+        *self.peer_bgp_id.lock().unwrap() = Some(bgp_id);
+    }
+
+    fn note_established(&self) {
+        self.established
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_established(&self) -> bool {
+        self.established.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// One live BGP session over an established stream.
 pub struct PeerSession<IO> {
     io: IO,
@@ -169,6 +206,8 @@ pub struct PeerSession<IO> {
     next_advertisement: Option<Instant>,
     now: fn() -> Instant,
     end: Option<SessionEnd>,
+    /// Daemon-side observability (None in tests).
+    shared: Option<Arc<SessionShared>>,
 }
 
 impl<IO> PeerSession<IO>
@@ -208,7 +247,14 @@ where
             next_advertisement: None,
             now: Instant::now,
             end: None,
+            shared: None,
         }
+    }
+
+    /// Publish session state for the daemon's §6.8 collision logic.
+    pub fn with_shared(mut self, shared: Arc<SessionShared>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     /// Override the clock (tests).
@@ -318,6 +364,11 @@ where
                     }
                 }, if refresh.is_some() && self.fsm.state() == State::Established => {
                     if bumped {
+                        // The soft inbound reset (RFC 2918 §3, W2-d):
+                        // the RIB clears the Adj-RIB-In so the
+                        // re-advertised set rebuilds against the
+                        // current import policy.
+                        sink.refresh_sent(&self.peer);
                         if let Err(e) = self.send_refresh_requests().await {
                             self.end = Some(SessionEnd::Transport(e.to_string()));
                             return self.end.clone().unwrap();
@@ -359,6 +410,9 @@ where
                 hold = n.map(|x| x.hold_time).unwrap_or(0),
                 "bgpd: session Established"
             );
+            if let Some(shared) = &self.shared {
+                shared.note_established();
+            }
             if let Err(e) = self.on_established().await {
                 self.end = Some(SessionEnd::Transport(e.to_string()));
                 return self.end.clone();
@@ -396,6 +450,9 @@ where
                         .await;
                 }
                 self.peer.bgp_id = Some(open.bgp_id);
+                if let Some(shared) = &self.shared {
+                    shared.note_open(open.bgp_id);
+                }
                 self.step(Event::BgpOpen(open), sink).await
             }
             BgpMessage::Keepalive => self.step(Event::KeepAliveMsg, sink).await,

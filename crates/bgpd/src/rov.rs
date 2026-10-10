@@ -343,7 +343,7 @@ mod tests {
             aspa: AspaMode::Advisory,
             roles: roles
                 .iter()
-                .map(|(addr, asn, role)| (addr.parse().unwrap(), *role))
+                .map(|(addr, _asn, role)| (addr.parse().unwrap(), *role))
                 .collect(),
         }
     }

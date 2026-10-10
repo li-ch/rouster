@@ -354,6 +354,17 @@ impl LocRib {
         }
     }
 
+    /// The soft inbound reset (W2-d, RFC 2918 §3): drop the peer's
+    /// Adj-RIB-In entries ahead of the re-advertisement so the
+    /// rebuilt set reflects the *current* import policy — prefixes
+    /// the new policy rejects (or the peer no longer sends) vanish
+    /// instead of lingering.
+    pub fn soft_reset_peer(&mut self, peer: &PeerInfo) {
+        if let Some(rib) = self.adj_in.remove(&peer.address) {
+            info!(peer = %peer.address, routes = rib.len(), "bgpd: soft inbound reset, Adj-RIB-In cleared");
+        }
+    }
+
     /// Re-run the decision process over every known prefix; returns
     /// the best-path changes (for export and re-advertisement).
     pub fn recompute(&mut self) -> Vec<BestChange> {
@@ -443,6 +454,12 @@ impl RouteSink for RibSink {
     fn clear_peer(&mut self, peer: &PeerInfo) {
         let mut rib = self.rib.lock().unwrap();
         rib.clear_peer(peer);
+        self.changes.extend(rib.recompute());
+    }
+
+    fn refresh_sent(&mut self, peer: &PeerInfo) {
+        let mut rib = self.rib.lock().unwrap();
+        rib.soft_reset_peer(peer);
         self.changes.extend(rib.recompute());
     }
 }
@@ -891,6 +908,43 @@ mod tests {
         let entry = route_entry(&r).unwrap();
         assert_eq!(entry.prefix.to_string(), "203.0.113.0/24");
         assert_eq!(entry.protocol, RouteProtocol::Bgp);
+    }
+
+    /// The W2-d soft inbound reset (RFC 2918 §3): refreshing clears
+    /// the peer's Adj-RIB-In so a re-advertisement the (new) import
+    /// policy still rejects cannot linger from the old one.
+    #[test]
+    fn soft_reset_drops_stale_adj_rib_in_entries() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        rib.announce(
+            &p,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        rib.recompute();
+        assert_eq!(rib.route_count(), 1);
+        rib.soft_reset_peer(&p);
+        assert_eq!(rib.route_count(), 0, "Adj-RIB-In cleared");
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 1);
+        assert!(
+            changes[0].best.is_none(),
+            "best withdrawn until re-advertised"
+        );
+        // The re-advertisement re-populates (the RFC 2918 round trip).
+        rib.announce(
+            &p,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        assert!(rib.recompute()[0].best.is_some());
     }
 
     #[test]

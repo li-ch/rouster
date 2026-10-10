@@ -1,6 +1,18 @@
 //! The bgpd daemon: TCP 179 (or configured port) listener, per-neighbor
 //! connectors with the §10 ConnectRetry cadence, the session registry
-//! (§6.8 first-wins collision policy), and graceful start/stop.
+//! with §6.8 collision detection (BGP-Identifier tiebreak + Cease on
+//! the loser), and graceful start/stop.
+//!
+//! §6.8, W2-d M5: when a second connection arrives for a neighbor
+//! that already has one, the daemon reads the challenger's OPEN and
+//! applies the RFC's rule — "the connection initiated by the BGP
+//! speaker with the higher BGP Identifier MUST be retained" (a fully
+//! Established session is never preempted). The loser gets NOTIFICATION
+//! Cease with RFC 4486 subcode 7 (Collision Resolution Failure), not a
+//! silent TCP close. When the peer-initiated connection wins, the
+//! consumed OPEN frame is replayed to the adopted session through the
+//! [`ReplayStream`] adapter, so the session layer sees an untouched
+//! byte stream.
 //!
 //! Graceful stop, pinned to the RFC text: SIGTERM/SIGINT map to
 //! Event 2 (ManualStop) on every live session — in Established that
@@ -8,25 +20,32 @@
 //! close ("a BGP peer MAY choose, at any given time, to close its BGP
 //! connection by sending the NOTIFICATION message with the Error Code
 //! Cease"). SIGUSR1 sends ROUTE-REFRESH (RFC 2918 §3) to every
-//! Established peer — the on-demand knob the interop smoke uses.
+//! Established peer — the on-demand refresh knob (also the
+//! import-policy soft reset: re-request, re-apply).
 //!
 //! The ZAPI edge (NHT for peer addresses, RIB view) lives in `zedge`
 //! and is wired in by the binary when the config names a socket.
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::{BgpdConfig, NeighborConfig};
+use crate::error::{cease_subcode, error_code};
 use crate::fsm::SessionConfig;
-use crate::peer::{OutRib, PeerInfo, PeerSession, RouteSink, SharedSink};
+use crate::message::{BgpMessage, BgpNotification};
+use crate::peer::{OutRib, PeerInfo, PeerSession, RouteSink, SessionShared, SharedSink};
 
 /// ConnectRetry, §10-shaped: 120 s is the RFC's suggested *initial*
 /// value; v1 backs off exponentially from 1 s to that cap (disclosed
@@ -36,6 +55,100 @@ use crate::peer::{OutRib, PeerInfo, PeerSession, RouteSink, SharedSink};
 const CONNECT_RETRY_MAX: Duration = Duration::from_secs(120);
 /// How long the daemon waits for Cease messages to drain on shutdown.
 const SHUTDOWN_SETTLE: Duration = Duration::from_secs(2);
+/// How long the collision resolver waits for the challenger's OPEN.
+const COLLISION_PROBE: Duration = Duration::from_secs(5);
+/// How long an evicted incumbent gets to vacate the registry slot.
+const EVICT_WAIT: Duration = Duration::from_secs(3);
+
+/// The §6.8 verdict: does the challenger (the just-arrived,
+/// peer-initiated connection) replace the incumbent?
+///
+/// RFC 4271 §6.8: "the connection initiated by the BGP speaker with
+/// the higher BGP Identifier MUST be retained" — and an Established
+/// session is never preempted. The challenger always is peer-initiated
+/// (`incumbent_ours` distinguishes our connector's session from an
+/// earlier accepted one; two peer-initiated connections give the
+/// tiebreak nothing to decide, first-wins stands).
+pub fn collision_verdict(
+    our_id: Ipv4Addr,
+    peer_id: Ipv4Addr,
+    incumbent_ours: bool,
+    incumbent_established: bool,
+) -> bool {
+    if incumbent_established {
+        return false;
+    }
+    incumbent_ours && peer_id > our_id
+}
+
+/// The per-neighbor session registry entry.
+#[derive(Clone)]
+struct Incumbent {
+    /// Registry identity: cleanup only removes its own entry (a
+    /// winning challenger overwrites the slot before the evicted
+    /// incumbent finishes).
+    id: u64,
+    /// Whether this session was initiated by us (the connector).
+    ours: bool,
+    shared: Arc<SessionShared>,
+    evict: watch::Sender<bool>,
+}
+
+type Registry = Arc<Mutex<BTreeMap<IpAddr, Incumbent>>>;
+
+fn register(
+    registry: &Registry,
+    addr: IpAddr,
+    ours: bool,
+    next_id: &AtomicU64,
+) -> Option<(Arc<SessionShared>, watch::Receiver<bool>, u64)> {
+    let mut reg = registry.lock().unwrap();
+    if reg.contains_key(&addr) {
+        return None;
+    }
+    let id = next_id.fetch_add(1, Ordering::SeqCst);
+    let shared = Arc::new(SessionShared::default());
+    let (evict_tx, evict_rx) = watch::channel(false);
+    reg.insert(
+        addr,
+        Incumbent {
+            id,
+            ours,
+            shared: Arc::clone(&shared),
+            evict: evict_tx,
+        },
+    );
+    Some((shared, evict_rx, id))
+}
+
+/// Reserve the slot for the winning challenger: overwrites whatever
+/// entry exists (the evicted incumbent's cleanup is a no-op by id).
+fn re_register(
+    registry: &Registry,
+    addr: IpAddr,
+    next_id: &AtomicU64,
+) -> (Arc<SessionShared>, watch::Receiver<bool>, u64) {
+    let id = next_id.fetch_add(1, Ordering::SeqCst);
+    let shared = Arc::new(SessionShared::default());
+    let (evict_tx, evict_rx) = watch::channel(false);
+    registry.lock().unwrap().insert(
+        addr,
+        Incumbent {
+            id,
+            ours: false,
+            shared: Arc::clone(&shared),
+            evict: evict_tx,
+        },
+    );
+    (shared, evict_rx, id)
+}
+
+fn release(registry: &Registry, addr: IpAddr, id: u64) {
+    let mut reg = registry.lock().unwrap();
+    if reg.get(&addr).is_some_and(|inc| inc.id == id) {
+        reg.remove(&addr);
+    }
+}
 
 /// A bound, not-yet-running daemon.
 pub struct Daemon {
@@ -68,7 +181,8 @@ impl Daemon {
         refresh: watch::Receiver<u64>,
         reach: Arc<dyn crate::zedge::PeerReachability>,
     ) -> std::io::Result<()> {
-        let busy: Arc<Mutex<HashSet<IpAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+        let registry: Registry = Arc::new(Mutex::new(BTreeMap::new()));
+        let next_id = Arc::new(AtomicU64::new(1));
         let live = Arc::new(AtomicUsize::new(0));
 
         // Connectors for every non-passive neighbor (Events 1/3: the
@@ -81,7 +195,8 @@ impl Daemon {
             let ctx = SessionCtx {
                 sink: sink.clone(),
                 out_rib: Arc::clone(&out_rib),
-                busy: Arc::clone(&busy),
+                registry: Arc::clone(&registry),
+                next_id: Arc::clone(&next_id),
                 live: Arc::clone(&live),
             };
             let mut stop = stop.clone();
@@ -94,12 +209,13 @@ impl Daemon {
         }
 
         // The accept loop: match the remote address to a configured
-        // neighbor, apply the §6.8 first-wins admission, spawn the
-        // session.
+        // neighbor; a free slot runs the session directly, an occupied
+        // one goes to the §6.8 collision resolver.
         let config = self.config;
         let sink_accept = sink;
         let out_rib = Arc::clone(&out_rib);
-        let busy_accept = Arc::clone(&busy);
+        let registry_accept = Arc::clone(&registry);
+        let next_id_accept = Arc::clone(&next_id);
         let live_accept = Arc::clone(&live);
         let mut stop_accept = stop;
         let refresh_accept = refresh.clone();
@@ -119,22 +235,18 @@ impl Daemon {
                                 warn!(%peer, "bgpd: connection from unconfigured address, rejected");
                                 continue;
                             };
-                            if !admit(&busy_accept, peer.ip()) {
-                                warn!(%peer, "bgpd: second connection for peer dropped (§6.8 first-wins)");
-                                continue;
-                            }
                             let config = config.clone();
                             let ctx = SessionCtx {
                                 sink: sink_accept.clone(),
                                 out_rib: Arc::clone(&out_rib),
-                                busy: Arc::clone(&busy_accept),
+                                registry: Arc::clone(&registry_accept),
+                                next_id: Arc::clone(&next_id_accept),
                                 live: Arc::clone(&live_accept),
                             };
                             let stop = stop_accept.clone();
                             let refresh = refresh_accept.clone();
-                            live_accept.fetch_add(1, Ordering::SeqCst);
                             tokio::spawn(async move {
-                                run_accepted_session(
+                                accept_connection(
                                     stream, peer.ip(), &config, &neighbor, ctx, stop, refresh,
                                 )
                                 .await;
@@ -158,28 +270,9 @@ impl Daemon {
     }
 }
 
-/// One accepted session: the passive side (Events 4/5 shape) driven to
-/// termination.
-/// Shared session plumbing (registry + signals).
-struct SessionCtx<S: RouteSink> {
-    sink: SharedSink<S>,
-    out_rib: Arc<dyn OutRib>,
-    busy: Arc<Mutex<HashSet<IpAddr>>>,
-    live: Arc<AtomicUsize>,
-}
-
-impl<S: RouteSink> Clone for SessionCtx<S> {
-    fn clone(&self) -> Self {
-        Self {
-            sink: self.sink.clone(),
-            out_rib: Arc::clone(&self.out_rib),
-            busy: Arc::clone(&self.busy),
-            live: Arc::clone(&self.live),
-        }
-    }
-}
-
-async fn run_accepted_session<S: RouteSink>(
+/// One accepted connection: a free registry slot runs the session
+/// (Events 4/5 shape); an occupied one resolves the §6.8 collision.
+async fn accept_connection<S: RouteSink + 'static>(
     stream: TcpStream,
     peer_addr: IpAddr,
     config: &BgpdConfig,
@@ -188,29 +281,267 @@ async fn run_accepted_session<S: RouteSink>(
     stop: watch::Receiver<bool>,
     refresh: watch::Receiver<u64>,
 ) {
+    ctx.live.fetch_add(1, Ordering::SeqCst);
+    let local_addr = stream
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    match register(&ctx.registry, peer_addr, false, &ctx.next_id) {
+        Some((shared, evict, id)) => {
+            run_session(
+                stream,
+                peer_addr,
+                local_addr,
+                config,
+                neighbor,
+                ctx.clone(),
+                stop,
+                refresh,
+                shared,
+                evict,
+                id,
+            )
+            .await;
+        }
+        None => {
+            resolve_collision(
+                stream,
+                peer_addr,
+                local_addr,
+                config,
+                neighbor,
+                ctx.clone(),
+                stop,
+                refresh,
+            )
+            .await;
+        }
+    }
+    ctx.live.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// The §6.8 collision resolver: read the challenger's OPEN, apply the
+/// BGP-Identifier tiebreak, Cease the loser.
+async fn resolve_collision<S: RouteSink + 'static>(
+    mut stream: TcpStream,
+    peer_addr: IpAddr,
+    local_addr: IpAddr,
+    config: &BgpdConfig,
+    neighbor: &NeighborConfig,
+    ctx: SessionCtx<S>,
+    stop: watch::Receiver<bool>,
+    refresh: watch::Receiver<u64>,
+) {
+    let incumbent = ctx.registry.lock().unwrap().get(&peer_addr).cloned();
+    let Some(incumbent) = incumbent else {
+        return; // raced with teardown; nothing to collide with
+    };
+    // The challenger's OPEN, bounded.
+    let probe =
+        tokio::time::timeout(COLLISION_PROBE, crate::peer::read_frame(&mut stream, true)).await;
+    let open = match probe {
+        Ok(Ok(Ok(BgpMessage::Open(open)))) if open.peer_as4() == neighbor.remote_as => open,
+        _ => {
+            warn!(peer = %peer_addr, "bgpd: collision challenger sent no usable OPEN, dropped");
+            let _ = stream.shutdown().await;
+            return;
+        }
+    };
+    let our_id = config.router_id.unwrap_or(Ipv4Addr::LOCALHOST);
+    let keep_challenger = collision_verdict(
+        our_id,
+        open.bgp_id,
+        incumbent.ours,
+        incumbent.shared.is_established(),
+    );
+    if !keep_challenger {
+        info!(peer = %peer_addr, challenger_id = %open.bgp_id,
+            "bgpd: collision resolved for the incumbent (§6.8); Cease 6/7 to the challenger");
+        if send_cease_collision(&mut stream).await.is_err() {
+            // The challenger closed first; nothing to tell.
+        }
+        let _ = stream.shutdown().await;
+        return;
+    }
+    // The peer-initiated connection wins: evict the incumbent, adopt
+    // the challenger with its consumed OPEN frame replayed.
+    info!(peer = %peer_addr, challenger_id = %open.bgp_id, our_id = %our_id,
+        "bgpd: collision resolved for the challenger (peer BGP ID higher, §6.8); evicting our session");
+    let (shared, evict, id) = re_register(&ctx.registry, peer_addr, &ctx.next_id);
+    let _ = incumbent.evict.send(true);
+    // Bounded wait for the incumbent to vacate (its cleanup is id-safe
+    // either way — this only paces our own re-admission logging).
+    let deadline = tokio::time::Instant::now() + EVICT_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        let vacated = ctx
+            .registry
+            .lock()
+            .unwrap()
+            .get(&peer_addr)
+            .is_none_or(|i| i.id == id);
+        if vacated {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The consumed OPEN, re-encoded (the codec round trip is
+    // gold-tested) and replayed ahead of the live read half.
+    let replay = BgpMessage::Open(open).encode(true).unwrap_or_default();
+    let (read_half, write_half) = stream.into_split();
+    let io = ReplayStream {
+        head: replay,
+        pos: 0,
+        read: read_half,
+        write: write_half,
+    };
+    run_session(
+        io, peer_addr, local_addr, config, neighbor, ctx, stop, refresh, shared, evict, id,
+    )
+    .await;
+}
+
+/// NOTIFICATION Cease / Collision Resolution Failure (RFC 4486
+/// subcode 7) — what §6.8's losing connection is told.
+async fn send_cease_collision(stream: &mut TcpStream) -> io::Result<()> {
+    let notification = BgpMessage::Notification(BgpNotification {
+        code: error_code::CEASE,
+        subcode: cease_subcode::COLLISION_RESOLUTION_FAILURE,
+        data: Vec::new(),
+    });
+    let bytes = notification
+        .encode(true)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await
+}
+
+/// A split TCP stream with consumed bytes replayed ahead of the read
+/// half — hands the adopted challenger to the session layer as an
+/// untouched stream. No `unsafe` (Unpin projection only).
+struct ReplayStream {
+    head: Vec<u8>,
+    pos: usize,
+    read: tokio::net::tcp::OwnedReadHalf,
+    write: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl AsyncRead for ReplayStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos < this.head.len() {
+            let remaining = &this.head[this.pos..];
+            let n = remaining.len().min(buf.capacity());
+            buf.put_slice(&remaining[..n]);
+            this.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.read).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ReplayStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().write).poll_shutdown(cx)
+    }
+}
+
+/// Shared session plumbing (registry + signals).
+struct SessionCtx<S: RouteSink> {
+    sink: SharedSink<S>,
+    out_rib: Arc<dyn OutRib>,
+    registry: Registry,
+    next_id: Arc<AtomicU64>,
+    live: Arc<AtomicUsize>,
+}
+
+impl<S: RouteSink> Clone for SessionCtx<S> {
+    fn clone(&self) -> Self {
+        Self {
+            sink: self.sink.clone(),
+            out_rib: Arc::clone(&self.out_rib),
+            registry: Arc::clone(&self.registry),
+            next_id: Arc::clone(&self.next_id),
+            live: Arc::clone(&self.live),
+        }
+    }
+}
+
+/// One session over any stream: per-session stop = global stop OR
+/// eviction (§6.8), so the collision machinery can ManualStop exactly
+/// one session.
+async fn run_session<S, IO>(
+    io: IO,
+    peer_addr: IpAddr,
+    local_addr: IpAddr,
+    config: &BgpdConfig,
+    neighbor: &NeighborConfig,
+    ctx: SessionCtx<S>,
+    stop: watch::Receiver<bool>,
+    refresh: watch::Receiver<u64>,
+    shared: Arc<SessionShared>,
+    evict: watch::Receiver<bool>,
+    id: u64,
+) where
+    S: RouteSink,
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    // Per-session stop: the daemon's global stop OR this session's
+    // eviction.
+    let (session_stop_tx, session_stop) = watch::channel(false);
+    let mut global = stop;
+    let mut evict = evict;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = global.changed() => {
+                if *global.borrow() {
+                    let _ = session_stop_tx.send(true);
+                }
+            }
+            _ = evict.changed() => {
+                if *evict.borrow() {
+                    let _ = session_stop_tx.send(true);
+                }
+            }
+        }
+    });
+
     let peer = PeerInfo {
         address: peer_addr,
         remote_as: neighbor.remote_as,
         bgp_id: None,
     };
-    let local_addr = stream
-        .local_addr()
-        .map(|a| a.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     let session_config = session_config_for(config, neighbor);
     let mut session = PeerSession::new(
-        stream,
+        io,
         session_config,
         peer,
         local_addr,
         Some(ctx.out_rib),
         Duration::from_secs(neighbor.mrai),
-    );
+    )
+    .with_shared(shared);
     let mut sink = ctx.sink;
-    let end = session.run_with_signals(&mut sink, stop, refresh).await;
+    let end = session
+        .run_with_signals(&mut sink, session_stop, refresh)
+        .await;
     info!(peer = %peer_addr, ?end, "bgpd: session ended");
-    ctx.busy.lock().unwrap().remove(&peer_addr);
-    ctx.live.fetch_sub(1, Ordering::SeqCst);
+    release(&ctx.registry, peer_addr, id);
 }
 
 /// The active side: dial the neighbor, run the session, back off
@@ -244,36 +575,34 @@ async fn connector_loop<S: RouteSink + 'static>(
         }
         match TcpStream::connect(target).await {
             Ok(stream) => {
-                if !admit(&ctx.busy, neighbor.address) {
-                    // A passive session beat us to it (§6.8
-                    // first-wins): this connector stands down.
+                let Some((shared, evict, id)) =
+                    register(&ctx.registry, neighbor.address, true, &ctx.next_id)
+                else {
+                    // A passive session beat us to it (§6.8: the
+                    // peer-initiated connection is already registered;
+                    // if the tiebreak favors it, the resolver evicts
+                    // nothing of ours): this connector stands down.
                     return;
-                }
-                ctx.live.fetch_add(1, Ordering::SeqCst);
-                let peer = PeerInfo {
-                    address: neighbor.address,
-                    remote_as: neighbor.remote_as,
-                    bgp_id: None,
                 };
+                ctx.live.fetch_add(1, Ordering::SeqCst);
                 let local_addr = stream
                     .local_addr()
                     .map(|a| a.ip())
                     .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                let session_config = session_config_for(&config, &neighbor);
-                let mut session = PeerSession::new(
+                run_session(
                     stream,
-                    session_config,
-                    peer,
+                    neighbor.address,
                     local_addr,
-                    Some(Arc::clone(&ctx.out_rib)),
-                    Duration::from_secs(neighbor.mrai),
-                );
-                let mut sink = ctx.sink.clone();
-                let end = session
-                    .run_with_signals(&mut sink, stop.clone(), refresh.clone())
-                    .await;
-                info!(peer = %neighbor.address, ?end, "bgpd: session ended");
-                ctx.busy.lock().unwrap().remove(&neighbor.address);
+                    &config,
+                    &neighbor,
+                    ctx.clone(),
+                    stop.clone(),
+                    refresh.clone(),
+                    shared,
+                    evict,
+                    id,
+                )
+                .await;
                 ctx.live.fetch_sub(1, Ordering::SeqCst);
                 // A completed session is not a failed attempt:
                 // re-dial immediately with the backoff reset.
@@ -295,10 +624,6 @@ async fn connector_loop<S: RouteSink + 'static>(
             }
         }
     }
-}
-
-fn admit(busy: &Arc<Mutex<HashSet<IpAddr>>>, peer: IpAddr) -> bool {
-    busy.lock().unwrap().insert(peer)
 }
 
 /// Builds the FSM session config for a neighbor (per-neighbor timer
@@ -367,5 +692,137 @@ mod tests {
         assert_eq!(session_config_for(&config, &neighbor).hold_time, 30);
         neighbor.timers = None;
         assert_eq!(session_config_for(&config, &neighbor).hold_time, 90);
+    }
+
+    // ---- W2-d M5: §6.8 collision detection ------------------------
+
+    fn id(o1: u8, o2: u8, o3: u8, o4: u8) -> Ipv4Addr {
+        Ipv4Addr::new(o1, o2, o3, o4)
+    }
+
+    /// The §6.8 verdict table: "the connection initiated by the BGP
+    /// speaker with the higher BGP Identifier MUST be retained"; an
+    /// Established session is never preempted; the challenger is
+    /// always the peer-initiated connection.
+    #[test]
+    fn collision_verdict_table() {
+        let our = id(10, 0, 0, 1);
+        let higher_peer = id(10, 0, 0, 9);
+        let lower_peer = id(10, 0, 0, 0);
+
+        // Peer's id higher and the incumbent is our connector's:
+        // the peer-initiated challenger wins.
+        assert!(collision_verdict(our, higher_peer, true, false));
+        // Our id higher (or equal): our initiated connection stays.
+        assert!(!collision_verdict(our, lower_peer, true, false));
+        assert!(
+            !collision_verdict(our, our, true, false),
+            "no tiebreak on equal ids"
+        );
+        // An Established incumbent is never preempted, whatever the ids.
+        assert!(!collision_verdict(our, higher_peer, true, true));
+        // The incumbent is itself peer-initiated: the tiebreak has
+        // nothing to choose between (both connections are the peer's);
+        // first-wins.
+        assert!(!collision_verdict(our, higher_peer, false, false));
+    }
+
+    /// The adopted challenger sees an untouched byte stream: the
+    /// consumed OPEN frame replays ahead of the live half (real
+    /// loopback pair — the adapter wraps owned TCP halves).
+    #[tokio::test]
+    async fn replay_stream_replays_then_streams() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let a = TcpStream::connect(addr).await.unwrap();
+            a
+        });
+        let (b, _) = listener.accept().await.unwrap();
+        let a = client.await.unwrap();
+        let (read_half, write_half) = a.into_split();
+        let mut replay = ReplayStream {
+            head: vec![1, 2, 3],
+            pos: 0,
+            read: read_half,
+            write: write_half,
+        };
+        let mut b = b;
+        b.write_all(&[4, 5]).await.unwrap();
+        b.flush().await.unwrap();
+        let mut got = vec![0u8; 5];
+        replay.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, vec![1, 2, 3, 4, 5], "head first, stream second");
+        // Writes pass through to the peer.
+        replay.write_all(&[9]).await.unwrap();
+        replay.flush().await.unwrap();
+        let mut one = [0u8; 1];
+        b.read_exact(&mut one).await.unwrap();
+        assert_eq!(one[0], 9);
+    }
+
+    /// The session publishes the OPEN-learned BGP ID and the
+    /// Established transition (what the collision resolver reads).
+    #[tokio::test]
+    async fn session_publishes_collision_state() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let shared = Arc::new(SessionShared::default());
+        let (ours, mut theirs) = tokio::io::duplex(4096);
+        let mut session = PeerSession::new(
+            ours,
+            SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90),
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            None,
+            Duration::ZERO,
+        )
+        .with_shared(Arc::clone(&shared));
+        let sink = SharedSink(Arc::new(Mutex::new(crate::peer::NullSink)));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { session.run(&mut driver_sink).await });
+
+        // The peer's OPEN (BGP id 10.9.9.9), then the KEEPALIVE that
+        // completes the handshake.
+        let open = BgpMessage::Open(crate::message::BgpOpen::new(
+            65001,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![],
+        ))
+        .encode(true)
+        .unwrap();
+        theirs.write_all(&open).await.unwrap();
+        theirs.flush().await.unwrap();
+        // Consume our OPEN answer.
+        let mut hdr = [0u8; 19];
+        theirs.read_exact(&mut hdr).await.unwrap();
+        let len = u16::from_be_bytes([hdr[16], hdr[17]]) as usize;
+        let mut body = vec![0u8; len - 19];
+        theirs.read_exact(&mut body).await.unwrap();
+        let ka = BgpMessage::Keepalive.encode(true).unwrap();
+        theirs.write_all(&ka).await.unwrap();
+        theirs.flush().await.unwrap();
+        let mut established = false;
+        for _ in 0..100 {
+            if shared.is_established() {
+                established = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(established, "Established observed through SessionShared");
+        assert_eq!(
+            *shared.peer_bgp_id.lock().unwrap(),
+            Some("10.9.9.9".parse().unwrap()),
+            "OPEN-learned id published"
+        );
+        driver.abort();
     }
 }

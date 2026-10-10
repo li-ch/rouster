@@ -50,6 +50,9 @@ pub mod cease_subcode {
     pub const ADMIN_SHUTDOWN: u8 = 2;
     pub const PEER_DECONFIGURED: u8 = 3;
     pub const ADMIN_RESET: u8 = 4;
+    /// RFC 4486: "the BGP speaker decided to drop the connection due
+    /// to collision resolution" (RFC 4271 §6.8).
+    pub const COLLISION_RESOLUTION_FAILURE: u8 = 7;
 }
 
 /// A codec or protocol error. `notification` holds the (code, subcode)
