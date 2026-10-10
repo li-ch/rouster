@@ -215,6 +215,22 @@ docker exec "$R2" sh -c "printf '%s\n' \
 docker exec "$R1" vtysh -b
 docker exec "$R2" vtysh -b
 
+# M3 (neighbour-liveness gate on the NEXTHOP_UPDATE answer): bgpd
+# registers the peer's /32 and waits for an ACTIVE answer before it
+# will open the BGP connection — and the gate needs a confirmed
+# neighbour (lladdr) entry for the peer. Two quiescent containers never
+# ARP each other, so seed both directions the way any live deployment
+# would (traffic flowing): one ping each way teaches both eth0s the
+# peer's lladdr. Without this the session can never cold-start —
+# disclosed as a design tension of the M3 gate in the S5 report (real
+# zebra answers ACTIVE without consulting neighbours).
+docker exec "$R1" ping -c1 -W1 "$R2_IP" >/dev/null 2>&1 || true
+docker exec "$R2" ping -c1 -W1 "$R1_IP" >/dev/null 2>&1 || true
+docker exec "$R1" sh -c "ip neigh show $R2_IP dev eth0" | grep -q lladdr \
+    || fail "r1 has no lladdr neighbour for $R2_IP after warm-up ping"
+docker exec "$R2" sh -c "ip neigh show $R1_IP dev eth0" | grep -q lladdr \
+    || fail "r2 has no lladdr neighbour for $R1_IP after warm-up ping"
+
 echo "==> waiting for the iBGP session to establish (PEER)"
 wait_in r1 "r1 sees session Established" 60 \
     "vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'BGP state = Established'"
