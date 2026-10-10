@@ -1,1 +1,38 @@
-//! Rouster `vty` — scaffolded 2026-10-11 for the weekend program; see away/2026-10-11/weekend/PLAN.md
+//! Rouster `vty` — the vtysh-compatible VTY server, v1.
+//!
+//! An interactive Cisco-style command surface at the management
+//! edge (architecture invariant 1: compatibility adapters live at
+//! the edge, never in core abstractions). v1 is a plain TCP line
+//! protocol — disclosed, not a secret pty; real `vtysh` expects its
+//! own pty/unix-socket plumbing, which is §Deferred until a capture
+//! pins it. Every answer comes from the run-dir contract
+//! (`docs/operator-surfaces.md`): `savd.status`, `savd.pid`,
+//! `bfdd.status`, `bfdd.pid` — file reads only, no IPC inventions.
+//!
+//! Layout: [`tree`] is the table-driven Cisco command parser (word
+//! tree, abbreviated unambiguous commands, `?` help, ambiguity
+//! errors); [`session`] is the per-connection state machine (mode
+//! stack user/enable/configure-family); [`commands`] registers the
+//! v1 command table per mode; [`config`] is the parse-only session
+//! config tree (the quarantine-B7 observed frr.conf grammar subset,
+//! echoed by `show running-config`); [`savparse`]/[`bfdparse`]/
+//! [`liveness`] re-read the run dir tolerantly (the rousterctl S3
+//! conventions, kept in-crate so the two edge crates stay
+//! decoupled); [`render`] renders the `show` outputs; [`protocol`]
+//! pins the wire framing; [`server`]/[`client`] are the TCP halves;
+//! the `vtyd` binary wires config file, flags, and signals.
+
+pub mod bfdparse;
+pub mod client;
+pub mod commands;
+pub mod config;
+pub mod liveness;
+pub mod protocol;
+pub mod render;
+pub mod savparse;
+pub mod server;
+pub mod session;
+pub mod tree;
+
+/// The daemon's own version (the crate version).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
