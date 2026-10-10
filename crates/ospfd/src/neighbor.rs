@@ -133,6 +133,12 @@ pub struct NeighborFsm {
     /// comparison input — the daemon layer sets it from the packet
     /// header; tests set it directly).
     pub peer_id_larger_value: Option<bool>,
+    /// Whether our Database Summary list still has unsent DD
+    /// headers — the §10.6 ExchangeDone gate's "we have sent our
+    /// whole description" half. The daemon keeps it current;
+    /// `false` (the default) models the summary-fits-one-packet
+    /// assumption of the pure tests.
+    pub summary_pending: bool,
 }
 
 impl NeighborFsm {
@@ -145,6 +151,7 @@ impl NeighborFsm {
             last_dd: None,
             neighbor_options: None,
             peer_id_larger_value: None,
+            summary_pending: false,
         }
     }
 
@@ -329,8 +336,12 @@ impl NeighborFsm {
                     send_reply = true;
                 } else if !pkt.init && !pkt.master && pkt.dd_sequence == self.dd_sequence {
                     // The slave's acknowledgment of our ExStart DD:
-                    // we are master, negotiation done.
+                    // we are master, negotiation done. The master's
+                    // next DD (its first description chunk) goes out
+                    // one sequence ahead (§10.8: the master
+                    // increments; Figure 14's x+1 first full DD).
                     self.master = true;
+                    self.dd_sequence = self.dd_sequence.wrapping_add(1);
                     self.neighbor_options = Some(pkt.options.0);
                     events.push(E::NegotiationDone);
                     send_reply = true;
@@ -456,7 +467,7 @@ impl NeighborFsm {
     /// the DBD summary fits one packet; multi-packet DBDs are the
     /// daemon layer's §10.8 loop).
     fn exchange_send_complete(&self) -> bool {
-        true
+        !self.summary_pending
     }
 
     fn peer_id_larger(&self, _pkt: &DbDescription) -> bool {
@@ -930,18 +941,23 @@ mod tests {
         let r = m.process_dbd(&dd(1, false, false, false));
         assert!(r.accepted);
         assert!(m.master);
+        // The master's first description DD goes one ahead (§10.8 /
+        // Figure 14: negotiation at x, first full DD at x+1) — the
+        // Day-2 correction to the ExStart case-2 bump.
+        assert_eq!(m.dd_sequence, 2);
         m.fire(NeighborEvent::NegotiationDone);
         // Exchange: master expects its own seq echoed; wrong seq is a
         // SeqNumberMismatch.
         let bad = m.process_dbd(&dd(99, false, true, false));
         assert!(!bad.accepted);
         assert_eq!(bad.events, vec![NeighborEvent::SeqNumberMismatch]);
-        // The correct echo is accepted and the master bumps.
-        let ok = m.process_dbd(&dd(1, false, true, false));
+        // The correct echo (at the bumped sequence) is accepted and
+        // the master bumps again for its next round.
+        let ok = m.process_dbd(&dd(2, false, true, false));
         assert!(ok.accepted);
-        assert_eq!(m.dd_sequence, 2);
+        assert_eq!(m.dd_sequence, 3);
         // A duplicate of the last accepted: master discards silently.
-        let dup = m.process_dbd(&dd(1, false, true, false));
+        let dup = m.process_dbd(&dd(2, false, true, false));
         assert!(!dup.accepted);
         assert!(!dup.send_reply);
         assert!(dup.events.is_empty());

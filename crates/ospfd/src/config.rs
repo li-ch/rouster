@@ -19,10 +19,16 @@
 //! v1 semantic surface (the W2-e scope): one `router ospf` stanza,
 //! one area (the backbone or an area ID — multiple areas are
 //! §Deferred), interface stanzas carrying the §C.3 parameters SPF and
-//! Hello actually consume (cost, hello/dead intervals, priority),
-//! plus `network <prefix> area <id>` for the classic
-//! interface-by-address binding. `redistribute static` is collected
-//! for the M5 zapi edge.
+//! Hello actually consume (cost, hello/dead intervals, priority,
+//! network type, explicit address — the Day-2 daemon needs the
+//! interface's own address/mask for Hellos and router-LSA links, and
+//! v1 takes it from config rather than a zapi interface dump), plus
+//! `network <prefix> area <id>` for the classic interface-by-address
+//! binding. `redistribute static` is collected for the zapi edge.
+//!
+//! The socket layer note below is Day-1's record; socket2 WAS
+//! adopted for ospfd on Day 2 (owner decision A1, adopted
+//! 2026-10-11, extended to ospfd) — see `transport`.
 //!
 //! The socket layer is deliberately absent: OSPF runs over raw IP
 //! protocol 89 with IP_ADD_MEMBERSHIP on 224.0.0.5/224.0.0.6 — std
@@ -50,25 +56,42 @@ pub struct OspfdConfig {
     pub redistribute_static: bool,
 }
 
-/// Per-interface parameters (§C.3 subset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The network type (§C.3): p2p skips the DR election entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkType {
+    #[default]
+    Broadcast,
+    PointToPoint,
+}
+
+/// Per-interface parameters (§C.3 subset + the address binding).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceConfig {
     pub cost: u16,
     pub hello_interval: u16,
     pub dead_interval: u32,
     pub priority: u8,
+    /// The interface's own address/mask (v1: config-supplied — the
+    /// zapi interface dump is not requested).
+    pub address: Option<(Ipv4Addr, Ipv4Addr)>,
+    pub network_type: NetworkType,
+    /// Interface MTU (DD's MTU field).
+    pub mtu: u16,
 }
 
-impl Default for InterfaceConfig {
-    fn default() -> Self {
-        // §C.3 defaults: HelloInterval 10, RouterDeadInterval 40,
-        // cost 10 (FRR parity; RFC 2328 leaves cost to the operator),
-        // priority 1.
+impl InterfaceConfig {
+    /// §C.3 defaults: HelloInterval 10, RouterDeadInterval 40, cost
+    /// 10 (FRR parity; RFC 2328 leaves cost to the operator),
+    /// priority 1, MTU 1500, broadcast.
+    pub fn defaults() -> Self {
         Self {
             cost: 10,
             hello_interval: 10,
             dead_interval: 40,
             priority: 1,
+            address: None,
+            network_type: NetworkType::Broadcast,
+            mtu: 1500,
         }
     }
 }
@@ -217,7 +240,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                         }
                         if cfg
                             .interfaces
-                            .insert(words[1].to_string(), InterfaceConfig::default())
+                            .insert(words[1].to_string(), InterfaceConfig::defaults())
                             .is_some()
                         {
                             return Err(parse_error(line_no, "duplicate interface stanza"));
@@ -238,25 +261,59 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                         };
                         cfg.networks.push((net, len, u32::from(area)));
                     }
-                    "cost" | "hello-interval" | "dead-interval" | "priority" => {
+                    "cost" | "hello-interval" | "dead-interval" | "priority" | "address"
+                    | "network-type" | "mtu" => {
                         // Interface parameter inside the LAST interface
                         // stanza; BTreeMap order cannot express
                         // "last", so we require the parameter to
                         // follow its interface line directly — strict
                         // and deterministic.
-                        let Some((name, iface)) = cfg.interfaces.iter_mut().next_back() else {
+                        let Some((_, iface)) = cfg.interfaces.iter_mut().next_back() else {
                             return Err(parse_error(line_no, "parameter without an interface"));
                         };
-                        let _ = name;
-                        let value: u32 = words
-                            .get(1)
-                            .and_then(|v| v.parse().ok())
-                            .ok_or_else(|| parse_error(line_no, "expected a number"))?;
                         match first {
-                            "cost" => iface.cost = value as u16,
-                            "hello-interval" => iface.hello_interval = value as u16,
-                            "dead-interval" => iface.dead_interval = value,
-                            "priority" => iface.priority = value as u8,
+                            "address" => {
+                                let Some((net, len)) =
+                                    parse_prefix(words.get(1).copied().unwrap_or(""))
+                                else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: address <a.b.c.d/m>",
+                                    ));
+                                };
+                                // Keep the address bits, derive the mask.
+                                let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+                                // The interface's own address plus the
+                                // derived mask (host bits expected —
+                                // this is an address, not a network).
+                                iface.address = Some((Ipv4Addr::from(net), Ipv4Addr::from(mask)));
+                            }
+                            "network-type" => {
+                                iface.network_type = match words.get(1).copied() {
+                                    Some("broadcast") => NetworkType::Broadcast,
+                                    Some("point-to-point") => NetworkType::PointToPoint,
+                                    _ => {
+                                        return Err(parse_error(
+                                            line_no,
+                                            "expected: network-type <broadcast|point-to-point>",
+                                        ))
+                                    }
+                                };
+                            }
+                            "mtu" | "cost" | "hello-interval" | "dead-interval" | "priority" => {
+                                let value: u32 = words
+                                    .get(1)
+                                    .and_then(|v| v.parse().ok())
+                                    .ok_or_else(|| parse_error(line_no, "expected a number"))?;
+                                match first {
+                                    "cost" => iface.cost = value as u16,
+                                    "hello-interval" => iface.hello_interval = value as u16,
+                                    "dead-interval" => iface.dead_interval = value,
+                                    "priority" => iface.priority = value as u8,
+                                    "mtu" => iface.mtu = value as u16,
+                                    _ => unreachable!(),
+                                }
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -329,7 +386,7 @@ router ospf
     fn defaults_apply() {
         let cfg = parse("router ospf\n area 0.0.0.1\n  interface lo\n").unwrap();
         assert_eq!(cfg.area_id, 1);
-        assert_eq!(cfg.interfaces["lo"], InterfaceConfig::default());
+        assert_eq!(cfg.interfaces["lo"], InterfaceConfig::defaults());
     }
 
     #[test]
@@ -354,6 +411,32 @@ router ospf
         // Unindented router-level line.
         let err = parse("router ospf\nrouter-id 1.1.1.1\n").unwrap_err();
         assert!(err.to_string().contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn day2_knobs_parse() {
+        let cfg = parse(
+            "router ospf\n area 0.0.0.0\n  interface eth0\n   address 10.77.0.2/30\n   network-type point-to-point\n   mtu 1500\n",
+        )
+        .unwrap();
+        let eth0 = cfg.interfaces.get("eth0").unwrap();
+        assert_eq!(
+            eth0.address,
+            Some((
+                "10.77.0.2".parse().unwrap(),
+                "255.255.255.252".parse().unwrap()
+            ))
+        );
+        assert_eq!(eth0.network_type, NetworkType::PointToPoint);
+        assert_eq!(eth0.mtu, 1500);
+        // Bad network type and host-bits-set address carry line numbers.
+        let err = parse("router ospf\n area 0.0.0.0\n  interface eth0\n   network-type p2p\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("line 4"), "{err}");
+        // A bad address prefix carries its line number.
+        let err = parse("router ospf\n area 0.0.0.0\n  interface eth0\n   address 10.77.0.2/33\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("line 4"), "{err}");
     }
 
     #[test]

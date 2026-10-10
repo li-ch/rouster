@@ -358,9 +358,11 @@ name = "ospfd"
 version = "0.0.0"
 dependencies = [
  "common",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zapi",
 ]
 

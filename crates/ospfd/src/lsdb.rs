@@ -180,6 +180,11 @@ impl Lsdb {
 
     /// §13.2 install path. `now` is the injected clock (seconds).
     pub fn install(&mut self, lsa: Lsa, via_flooding: bool, now: u64) -> InstallOutcome {
+        // Locally built LSAs carry a zero header checksum/length (the
+        // codec fills them at encode); normalize once so the stored
+        // header — what DD summaries and LSAcks describe — is the
+        // wire truth (§A.4.1: the checksum "cannot be zero").
+        let lsa = normalize_local(&lsa);
         let key = lsa.key();
         match self.map.get_mut(&key) {
             None => {
@@ -235,9 +240,13 @@ impl Lsdb {
     /// MaxAge and the other not, length changed, or the body changed
     /// (seq/checksum excluded).
     pub fn contents_differ_with(&self, candidate: &Lsa) -> bool {
+        // Normalize the candidate the same way install does (a
+        // locally built LSA carries a zero length until encoded), so
+        // the §13.2 length comparison sees the wire truth.
+        let candidate = normalize_local(candidate);
         match self.map.get(&candidate.key()) {
             None => true,
-            Some(entry) => contents_differ(candidate, &entry.lsa),
+            Some(entry) => contents_differ(&candidate, &entry.lsa),
         }
     }
 
@@ -375,6 +384,16 @@ impl Lsdb {
 }
 
 /// §13.2's difference list as a predicate.
+/// A locally built LSA (zero checksum/length) normalized to its
+/// encoded form; already-normalized LSAs pass through.
+fn normalize_local(lsa: &Lsa) -> Lsa {
+    if lsa.header.checksum == 0 || lsa.header.length == 0 {
+        Lsa::decode(&lsa.encode()).unwrap_or_else(|_| lsa.clone())
+    } else {
+        lsa.clone()
+    }
+}
+
 fn contents_differ(new: &Lsa, old: &Lsa) -> bool {
     new.header.options != old.header.options
         || new.header.is_max_age() != old.header.is_max_age()
@@ -817,6 +836,9 @@ mod tests {
                     (rng.next() % 6) as u16,
                     (rng.next() % 2) as u16 * 5,
                 );
+                // Day-2: install normalizes the header (checksum/
+                // length filled) — model the same truth here.
+                let lsa = normalize_local(&lsa);
                 let hdr = lsa.header;
                 let _ = i;
                 db.install(lsa, true, 1000 + 10 * i); // spacing > MinLSArrival
