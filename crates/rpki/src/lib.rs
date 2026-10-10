@@ -18,8 +18,11 @@
 //! - [`aspa`]: the ASPA table and the up-ramp/down-ramp AS_PATH
 //!   verification procedures of
 //!   draft-ietf-sidrops-aspa-verification-28 §5.
+//! - [`client`]: the RTR session client (tokio, clock-injected) that
+//!   drives a cache connection into those tables.
 
 pub mod aspa;
+pub mod client;
 pub mod pdu;
 pub mod rov;
 pub mod vrp;
@@ -32,5 +35,6 @@ pub use aspa::{
     authorized, verify, verify_downstream, verify_upstream, AsPath, AspaTable, AspaValidity,
     Authorization, PeerRelation, PathSegment,
 };
+pub use client::{CacheState, ClientConfig, RtrClient, DEFAULT_CACHE_PORT};
 pub use rov::{validate, OriginAsn, Validity};
 pub use vrp::{Vrp, VrpTable};
