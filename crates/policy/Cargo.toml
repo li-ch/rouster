@@ -9,3 +9,9 @@ license.workspace = true
 common = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
+
+# W1-a M5: property suite (milestone requirement). proptest is a
+# workspace dev-dependency (W5B/M3 authorization); this extends it to
+# policy — disclosed in away/2026-10-11/weekend/reports/W1-a.md.
+[dev-dependencies]
+proptest = { workspace = true }
