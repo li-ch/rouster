@@ -281,6 +281,7 @@ async fn main() -> std::io::Result<()> {
             }
             _ = reconcile_tick.tick() => {
                 driver.rib.reconcile(&dp).await;
+                rousterd::status::publish(&driver.rib);
             }
             Some(command) = zapi_rx.recv() => {
                 // Apply the batch that arrived with this command, then

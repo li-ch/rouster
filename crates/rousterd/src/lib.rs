@@ -9,8 +9,11 @@
 //!   grepable; both daemon binaries call it).
 //! - [`staticd`]: the static-route daemon logic (FRR-shape: config → ZAPI
 //!   client of rousterd). The canonical static-route path since Z4.
+//! - [`status`]: the A21 run-dir status dump (`/run/rouster/
+//!   rousterd.status`), refreshed on the main loop's reconcile tick.
 
 pub mod config;
 pub mod driver;
 pub mod logging;
 pub mod staticd;
+pub mod status;
