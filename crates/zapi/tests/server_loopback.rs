@@ -106,6 +106,182 @@ async fn serve_replaces_stale_socket_file() {
     rx.close();
 }
 
+/// The W1-b BFD loop over a real socket: a client (bgpd-shaped) sends
+/// BFD_CLIENT_REGISTER (36) + a single-hop BFD_DEST_REGISTER (27); a
+/// second session claims the BFD-daemon role with the 4-byte REPLAY
+/// (30) — BEFORE the register, so the daemon's replay set is empty and
+/// the register must relay live — receives the forwarded register as
+/// command 27 with the pinned body, then reports the session Up with
+/// the 25-byte REPLAY form; the client receives the
+/// INTERFACE_BFD_DEST_UPDATE (26) push with the captured UP bytes.
+#[tokio::test]
+async fn bfd_register_relay_and_status_fanout_over_real_socket() {
+    let socket = temp_socket("bfd");
+    let (tx, mut rx) = mpsc::channel::<RibCommand>(32);
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move { zapi::serve(&socket, tx).await }
+    });
+
+    let mut daemon = TestClient::connect(&socket).await;
+    let mut client = TestClient::connect(&socket).await;
+    daemon.handshake().await;
+    client.handshake().await;
+
+    // The mini-driver: consume commands, apply rousterd's BFD logic
+    // (attach bookkeeping, relay, fan-out) by pushing straight back
+    // down the recorded push channels.
+    let mut pushes: std::collections::HashMap<u64, tokio::sync::mpsc::Sender<zapi::SessionPush>> =
+        std::collections::HashMap::new();
+    let mut bfd_clients: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut bfd_daemon: Option<u64> = None;
+
+    // Daemon claims the role first (replay set is empty — nothing to
+    // replay), THEN the client registers interest and the destination.
+    daemon
+        .send(&ZapiMessage::BfdDestReplay { pid: 30 }, 0)
+        .await;
+    client
+        .send(&ZapiMessage::BfdClientRegister { pid: 4242 }, 0)
+        .await;
+    let register = ZapiMessage::BfdDestRegister(zapi::ZapiBfdSessionCmd {
+        pid: 4242,
+        dst: "192.168.215.5".parse().unwrap(),
+        min_rx_ms: 100,
+        min_tx_ms: 100,
+        detection_multiplier: 3,
+        mhop: false,
+        src: "0.0.0.0".parse().unwrap(),
+        hops: 1,
+        ifname: None,
+        cbit: false,
+        profile: None,
+    });
+    client.send(&register, 0).await;
+
+    // Drive the commands until the register has been relayed.
+    let mut relayed = false;
+    while !relayed {
+        match rx.recv().await.expect("command") {
+            RibCommand::AttachSession { owner, push } => {
+                pushes.insert(owner, push);
+            }
+            RibCommand::SessionEstablished { .. } => {}
+            RibCommand::BfdDaemonAttached { owner, pid } => {
+                assert_eq!(pid, 30);
+                assert_ne!(owner, 0);
+                bfd_daemon = Some(owner);
+            }
+            RibCommand::BfdClientRegistered { owner } => {
+                bfd_clients.insert(owner);
+            }
+            RibCommand::RegisterBfdDest { cmd, .. } => {
+                let daemon = bfd_daemon.expect("daemon attached before the register");
+                pushes
+                    .get(&daemon)
+                    .expect("daemon push channel")
+                    .try_send(zapi::SessionPush::ForwardBfdRegister { cmd, update: false })
+                    .expect("relay queued");
+                relayed = true;
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    // The daemon receives the relay: command 27, the pinned body bytes.
+    let (header, body) = daemon.read_frame().await;
+    assert_eq!(
+        ZapiCommand::from_u16(header.command),
+        ZapiCommand::BfdDestRegister
+    );
+    let hex_body: String = body.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex_body, "000010920002c0a8d7050000006400000064030000020000000001000000",
+        "the register relays byte-identically (this test's pid 4242)"
+    );
+
+    // The daemon reports the session Up (25-byte REPLAY form, the
+    // Phase C pin) — including an ifindex now that zebra would have
+    // resolved one.
+    client
+        .send(
+            &ZapiMessage::BfdDestUpdate(match &register {
+                ZapiMessage::BfdDestRegister(cmd) => cmd.clone(),
+                _ => unreachable!(),
+            }),
+            0,
+        )
+        .await;
+    daemon
+        .send(
+            &ZapiMessage::BfdDaemonStatus {
+                pid: 30,
+                status: zapi::ZapiBfdDestStatus {
+                    ifindex: 2,
+                    dst: "192.168.215.5/32".parse().unwrap(),
+                    status: zapi::bfd_status::UP,
+                    src: "0.0.0.0/32".parse().unwrap(),
+                    remote_cbit: false,
+                },
+            },
+            0,
+        )
+        .await;
+
+    // Fan the 26 out to every BFD client.
+    let mut fanned = false;
+    while !fanned {
+        match rx.recv().await.expect("command") {
+            RibCommand::BfdDaemonStatusUpdate { status } => {
+                for owner in &bfd_clients {
+                    pushes
+                        .get(owner)
+                        .expect("client push channel")
+                        .try_send(zapi::SessionPush::BfdDestStatus(status))
+                        .expect("fan-out queued");
+                }
+                fanned = true;
+            }
+            RibCommand::RegisterBfdDest { cmd, update, .. } => {
+                // The UPDATE (29) relays like the register did - with
+                // its own command number.
+                let daemon = bfd_daemon.expect("daemon attached");
+                pushes
+                    .get(&daemon)
+                    .expect("daemon push channel")
+                    .try_send(zapi::SessionPush::ForwardBfdRegister { cmd, update })
+                    .expect("update relay queued");
+            }
+            RibCommand::SessionEstablished { .. }
+            | RibCommand::AttachSession { .. }
+            | RibCommand::BfdClientRegistered { .. } => {}
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    // The client receives the 26 with the captured UP bytes; the
+    // daemon received the 29 relay first (frame order per send order).
+    let (h_daemon, _) = daemon.read_frame().await;
+    assert_eq!(
+        ZapiCommand::from_u16(h_daemon.command),
+        ZapiCommand::BfdDestUpdate,
+        "the re-install relays under command 29"
+    );
+    let (header, body) = client.read_frame().await;
+    assert_eq!(
+        ZapiCommand::from_u16(header.command),
+        ZapiCommand::InterfaceBfdDestUpdate
+    );
+    let hex_body: String = body.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex_body, "0000000202c0a8d705200000000402000000002000",
+        "the captured UP push bytes"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&socket);
+    rx.close();
+}
 /// Two simultaneous sessions (bgpd-style: one daemon, several zclient
 /// connections) share the command queue; each gets a distinct owner id.
 #[tokio::test]

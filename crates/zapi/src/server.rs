@@ -49,8 +49,9 @@ use tracing::{debug, info, warn};
 use crate::client::route_type_from;
 use crate::header::{ZapiHeader, ZAPI_HEADER_LEN, ZAPI_VERSION};
 use crate::message::{
-    blackhole_type, nexthop_flag, route_type, ZapiInterface, ZapiInterfaceAddress, ZapiMessage,
-    ZapiNeighNotify, ZapiNexthop, ZapiNexthopUpdate, ZapiRoute, ZapiRouterIdUpdate,
+    blackhole_type, nexthop_flag, route_type, ZapiBfdDestStatus, ZapiBfdSessionCmd, ZapiInterface,
+    ZapiInterfaceAddress, ZapiMessage, ZapiNeighNotify, ZapiNexthop, ZapiNexthopUpdate, ZapiRoute,
+    ZapiRouterIdUpdate,
 };
 
 /// The table all default-VRF client routes land in tonight (RT_TABLE_MAIN).
@@ -168,6 +169,47 @@ pub enum RibCommand {
         afi: u16,
         interested: bool,
     },
+    /// ZEBRA_BFD_DEST_REGISTER (27) / UPDATE (29): a client armed a BFD
+    /// session for a destination (W1-b). The driver records the
+    /// interest and forwards the command to the attached BFD-daemon
+    /// session — real zebra's relay (source-inferred shape: the same
+    /// command reaches bfdd's zclient). No synchronous reply exists
+    /// (the pins: the answer is the later 26 push). `update` carries
+    /// which of the two commands the client sent (the relay keeps the
+    /// number).
+    RegisterBfdDest {
+        owner: u64,
+        vrf_id: u32,
+        cmd: ZapiBfdSessionCmd,
+        update: bool,
+    },
+    /// ZEBRA_BFD_DEST_DEREGISTER (28): drop the interest and forward
+    /// the withdrawal to the BFD daemon (also answerless).
+    UnregisterBfdDest {
+        owner: u64,
+        vrf_id: u32,
+        cmd: ZapiBfdSessionCmd,
+    },
+    /// ZEBRA_BFD_CLIENT_REGISTER (36): the client wants BFD state
+    /// pushes. The pin: updates fan out to EVERY such client, not just
+    /// a destination's registrant — the driver keeps the set.
+    BfdClientRegistered {
+        owner: u64,
+    },
+    /// ZEBRA_BFD_DEST_REPLAY (30, 4-byte pid form): the sender IS the
+    /// BFD daemon (zebra's identification rule, M1). The driver
+    /// replays every recorded registration to it.
+    BfdDaemonAttached {
+        owner: u64,
+        pid: u32,
+    },
+    /// ZEBRA_BFD_DEST_REPLAY (30, 25-byte form): the daemon reports a
+    /// session transition; the driver fans an
+    /// INTERFACE_BFD_DEST_UPDATE (26) push out to every registered
+    /// client (the fan-out pin).
+    BfdDaemonStatusUpdate {
+        status: ZapiBfdDestStatus,
+    },
 }
 
 /// Interface state snapshot the driver sends back to answer an
@@ -252,6 +294,22 @@ pub enum SessionPush {
     /// The withdrawal twin: ZEBRA_NEIGH_REMOVED (129), AF_UNSPEC body
     /// with ndm FAILED (the pinned encoder branch).
     NeighbourRemoved(ZapiNeighNotify),
+    /// A BFD registration forwarded to the BFD-daemon session (W1-b):
+    /// zebra's relay of a client's 27/29 to the daemon that will run
+    /// the session. Shape source-inferred (bfdd's zclient handles 27);
+    /// disclosed.
+    ForwardBfdRegister {
+        cmd: ZapiBfdSessionCmd,
+        /// True when the client sent UPDATE (29) — the relay keeps
+        /// the command number (wire fidelity to what zebra forwards).
+        update: bool,
+    },
+    /// The DEREGISTER (28) twin of the forward.
+    ForwardBfdDeregister(ZapiBfdSessionCmd),
+    /// A BFD state change (the daemon's 25-byte report under command
+    /// 30, W1-b Phase C) fanned out as ZEBRA_INTERFACE_BFD_DEST_UPDATE
+    /// (26) with the wire-pinned 21-byte body.
+    BfdDestStatus(ZapiBfdDestStatus),
 }
 
 /// Per-connection session state, established by the HELLO handshake.
@@ -292,6 +350,10 @@ pub struct ZapiSession {
     /// reconcile feedback the driver does not yet surface (deferred,
     /// pinned doc A5 section).
     pub route_notify: bool,
+    /// BFD_DEST_REGISTER (27/29) destinations this session armed,
+    /// keyed by destination address (W1-b) — the session-side interest
+    /// record; the driver keeps the global view.
+    pub bfd_destinations: BTreeMap<std::net::IpAddr, ZapiBfdSessionCmd>,
 }
 
 /// Accept loop for ZAPI clients. Runs until the task is stopped; every
@@ -792,8 +854,10 @@ impl ZapiSession {
                 // the BFD daemon; the sender (`bfd_client_sendmsg`,
                 // `lib/bfd.c`) fire-and-forgets without waiting. A
                 // guessed ack frame would deviate from zebra, so the
-                // recorded registration is the whole answer; BFD
-                // session signaling (26–30) is future work.
+                // recorded registration is the whole answer (W1-b:
+                // the driver additionally keeps the owner in the
+                // fan-out set — the pin says updates reach EVERY
+                // such client, not just a registrant).
                 self.bfd_client_reg_cnt = self.bfd_client_reg_cnt.saturating_add(1);
                 self.bfd_pid = Some(pid);
                 info!(
@@ -802,6 +866,76 @@ impl ZapiSession {
                     registrations = self.bfd_client_reg_cnt,
                     "zapi: BFD client registered (no reply, per zebra)"
                 );
+                if commands
+                    .send(RibCommand::BfdClientRegistered { owner: self.id })
+                    .await
+                    .is_err()
+                {
+                    return Err(channel_closed());
+                }
+                Ok(())
+            }
+            ZapiMessage::BfdDestRegister(cmd) => {
+                self.handle_bfd_dest(cmd, false, vrf_id, commands).await
+            }
+            ZapiMessage::BfdDestUpdate(cmd) => {
+                self.handle_bfd_dest(cmd, true, vrf_id, commands).await
+            }
+            ZapiMessage::BfdDestDeregister(cmd) => {
+                // DEREGISTER (28): answerless twin (the probe's
+                // mid-window deregister drew zero frames).
+                self.bfd_destinations.remove(&cmd.dst);
+                info!(id = self.id, dst = %cmd.dst, "zapi: BFD destination deregistered");
+                if commands
+                    .send(RibCommand::UnregisterBfdDest {
+                        owner: self.id,
+                        vrf_id,
+                        cmd,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Err(channel_closed());
+                }
+                Ok(())
+            }
+            ZapiMessage::BfdDestReplay { pid } => {
+                // The 4-byte form of REPLAY (30): the sender IS the BFD
+                // daemon (zebra's identification rule; bfdd's connect
+                // burst, Phase A). The driver replays every recorded
+                // registration to it. No reply (real zebra answers a
+                // daemon's replay with the registration relay itself).
+                info!(id = self.id, pid, "zapi: BFD daemon attached (replay form)");
+                if commands
+                    .send(RibCommand::BfdDaemonAttached {
+                        owner: self.id,
+                        pid,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Err(channel_closed());
+                }
+                Ok(())
+            }
+            ZapiMessage::BfdDaemonStatus { pid, status } => {
+                // The 25-byte form of REPLAY (30): a session state
+                // report from the daemon (Phase C). The driver fans the
+                // 26 push out to every BFD-registered client.
+                info!(
+                    id = self.id,
+                    pid,
+                    dst = %status.dst,
+                    status = status.status,
+                    "zapi: BFD daemon status report"
+                );
+                if commands
+                    .send(RibCommand::BfdDaemonStatusUpdate { status })
+                    .await
+                    .is_err()
+                {
+                    return Err(channel_closed());
+                }
                 Ok(())
             }
             ZapiMessage::RouteNotifyRequest { flag } => {
@@ -923,6 +1057,40 @@ impl ZapiSession {
     /// own registration metadata completes the picture (the NHT safi); a
     /// push for a prefix the session no longer tracks is dropped — the
     /// driver pruned its registration, so the client withdrew interest.
+    /// REGISTER (27) / UPDATE (29): arm or re-announce a BFD
+    /// destination. The pins: NO synchronous reply (the probe's
+    /// register drew zero frames back; the answer is the asynchronous
+    /// 26 push when the daemon reports state). The driver records the
+    /// interest and relays the command to the BFD daemon, keeping the
+    /// command number.
+    async fn handle_bfd_dest(
+        &mut self,
+        cmd: ZapiBfdSessionCmd,
+        update: bool,
+        vrf_id: u32,
+        commands: &mpsc::Sender<RibCommand>,
+    ) -> io::Result<()> {
+        self.bfd_destinations.insert(cmd.dst, cmd.clone());
+        info!(
+            id = self.id,
+            dst = %cmd.dst,
+            update,
+            mhop = cmd.mhop,
+            min_rx_ms = cmd.min_rx_ms,
+            "zapi: BFD destination command (no reply; relay to daemon)"
+        );
+        commands
+            .send(RibCommand::RegisterBfdDest {
+                owner: self.id,
+                vrf_id,
+                cmd,
+                update,
+            })
+            .await
+            .map_err(|_| channel_closed())?;
+        Ok(())
+    }
+
     async fn handle_push<W>(&mut self, push: SessionPush, io: &mut W) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
@@ -1072,6 +1240,43 @@ impl ZapiSession {
                     .map_err(encode_io_err)?;
                 io.write_all(&frame).await
             }
+
+            SessionPush::ForwardBfdRegister { cmd, update } => {
+                info!(id = self.id, dst = %cmd.dst, update, "zapi: relaying BFD command to daemon");
+                let frame = if update {
+                    ZapiMessage::BfdDestUpdate(cmd)
+                } else {
+                    ZapiMessage::BfdDestRegister(cmd)
+                }
+                .encode_frame(0)
+                .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::ForwardBfdDeregister(cmd) => {
+                info!(id = self.id, dst = %cmd.dst, "zapi: relaying BFD deregister to daemon");
+                let frame = ZapiMessage::BfdDestDeregister(cmd)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
+
+            SessionPush::BfdDestStatus(status) => {
+                // The fan-out push (26). Recipient selection is the
+                // driver's (it addresses exactly the sessions that
+                // sent BFD_CLIENT_REGISTER — the fan-out pin); the
+                // session just encodes the pinned body.
+                info!(
+                    id = self.id,
+                    dst = %status.dst,
+                    status = status.status,
+                    "zapi: pushing INTERFACE_BFD_DEST_UPDATE"
+                );
+                let frame = ZapiMessage::InterfaceBfdDestUpdate(status)
+                    .encode_frame(0)
+                    .map_err(encode_io_err)?;
+                io.write_all(&frame).await
+            }
         }
     }
 }
@@ -1134,6 +1339,11 @@ mod tests {
         Ifaces,
         RouterId,
         NeighbourInterest,
+        BfdClient,
+        BfdRegister,
+        BfdUnregister,
+        BfdDaemonAttach,
+        BfdStatus,
     }
 
     fn describe(cmd: &RibCommand) -> String {
@@ -1149,6 +1359,11 @@ mod tests {
             RibCommand::RequestInterfaces { .. } => "ifaces".to_string(),
             RibCommand::RequestRouterId { .. } => "router-id".to_string(),
             RibCommand::RegisterNeighbourInterest { .. } => "neighbour-interest".to_string(),
+            RibCommand::RegisterBfdDest { cmd, .. } => format!("bfd+ {}", cmd.dst),
+            RibCommand::UnregisterBfdDest { cmd, .. } => format!("bfd- {}", cmd.dst),
+            RibCommand::BfdClientRegistered { .. } => "bfd-client".to_string(),
+            RibCommand::BfdDaemonAttached { pid, .. } => format!("bfd-daemon {pid}"),
+            RibCommand::BfdDaemonStatusUpdate { .. } => "bfd-status".to_string(),
         }
     }
 
@@ -1226,6 +1441,11 @@ mod tests {
                     Seen::RouterId
                 }
                 RibCommand::RegisterNeighbourInterest { .. } => Seen::NeighbourInterest,
+                RibCommand::BfdClientRegistered { .. } => Seen::BfdClient,
+                RibCommand::RegisterBfdDest { .. } => Seen::BfdRegister,
+                RibCommand::UnregisterBfdDest { .. } => Seen::BfdUnregister,
+                RibCommand::BfdDaemonAttached { .. } => Seen::BfdDaemonAttach,
+                RibCommand::BfdDaemonStatusUpdate { .. } => Seen::BfdStatus,
             }
         }
     }
@@ -2271,14 +2491,21 @@ mod tests {
             header.command, 19,
             "no BFD reply frame may precede the HELLO echo"
         );
-        // The first HELLO's establish command is the whole command traffic.
-        assert!(matches!(
-            rx.recv().await.expect("establish command"),
-            RibCommand::SessionEstablished { .. }
-        ));
+        // The W1-b fan-out entry arrives with (in arrival order, before
+        // or after) the first HELLO's establish — the only command
+        // traffic. Drain until both are seen.
+        let mut establish = false;
+        let mut fanout = 0;
+        while !establish || fanout < 1 {
+            match rx.recv().await.expect("command") {
+                RibCommand::SessionEstablished { .. } => establish = true,
+                RibCommand::BfdClientRegistered { owner: 1 } => fanout += 1,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
         assert!(
             rx.try_recv().is_err(),
-            "registration is session state only, no further RibCommand"
+            "registration is session state plus the fan-out entry, nothing more"
         );
         drop(client);
         let session = task.await.unwrap().expect("connection survives");
@@ -2305,16 +2532,200 @@ mod tests {
         client.send(&staticd_hello(), 0).await;
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 19, "still nothing but the echo");
-        assert!(matches!(
-            rx.recv().await.expect("establish command"),
-            RibCommand::SessionEstablished { .. }
-        ));
+        // Two fan-out entries (one per registration) plus the establish,
+        // in arrival order.
+        let mut establish = false;
+        let mut fanout = 0;
+        while !establish || fanout < 2 {
+            match rx.recv().await.expect("command") {
+                RibCommand::SessionEstablished { .. } => establish = true,
+                RibCommand::BfdClientRegistered { .. } => fanout += 1,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
         assert!(rx.try_recv().is_err(), "no further RibCommand either time");
         drop(client);
         let session = task.await.unwrap().expect("connection survives");
         assert_eq!(session.bfd_client_reg_cnt, 2);
         assert_eq!(session.bfd_pid, Some(535), "latest pid wins");
         rx.close();
+    }
+
+    /// A bgpd-shaped register (27): recorded in the session, relayed as a
+    /// RegisterBfdDest command, NO reply frame (the Phase B pin — the
+    /// answer is the later asynchronous 26 push).
+    #[tokio::test]
+    async fn bfd_dest_register_relayed_without_reply() {
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        let cmd = ZapiBfdSessionCmd {
+            pid: 0x51,
+            dst: "198.51.100.9".parse().unwrap(),
+            min_rx_ms: 300,
+            min_tx_ms: 300,
+            detection_multiplier: 3,
+            mhop: true,
+            src: "192.168.215.4".parse().unwrap(),
+            hops: 255,
+            ifname: None,
+            cbit: false,
+            profile: None,
+        };
+        client
+            .send(&ZapiMessage::BfdDestRegister(cmd.clone()), 0)
+            .await;
+        client.send(&staticd_hello(), 0).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 19, "only the HELLO echo answers");
+        match rx.recv().await.expect("register relay") {
+            RibCommand::RegisterBfdDest {
+                owner,
+                vrf_id,
+                cmd: got,
+                update,
+            } => {
+                assert_eq!((owner, vrf_id, update), (1, 0, false));
+                assert_eq!(got, cmd);
+            }
+            other => panic!("not a register relay: {other:?}"),
+        }
+        drop(client);
+        let session = task.await.unwrap().expect("connection survives");
+        assert_eq!(
+            session
+                .bfd_destinations
+                .get(&"198.51.100.9".parse::<IpAddr>().unwrap()),
+            Some(&cmd),
+            "session-side interest recorded"
+        );
+        rx.close();
+    }
+
+    /// DEREGISTER (28): interest removed, UnregisterBfdDest relayed,
+    /// nothing on the wire back.
+    #[tokio::test]
+    async fn bfd_dest_deregister_relays_and_clears() {
+        let (mut client, mut rx, _push, task) = spawn_session(16);
+        let cmd = ZapiBfdSessionCmd {
+            pid: 7,
+            dst: "192.0.2.9".parse().unwrap(),
+            min_rx_ms: 100,
+            min_tx_ms: 100,
+            detection_multiplier: 3,
+            mhop: false,
+            src: "0.0.0.0".parse().unwrap(),
+            hops: 1,
+            ifname: None,
+            cbit: false,
+            profile: None,
+        };
+        client
+            .send(&ZapiMessage::BfdDestRegister(cmd.clone()), 0)
+            .await;
+        client.send(&ZapiMessage::BfdDestDeregister(cmd), 0).await;
+        client.send(&staticd_hello(), 0).await;
+        let (header, _) = client.read_frame().await;
+        assert_eq!(header.command, 19, "no reply to either");
+        assert!(matches!(
+            rx.recv().await.expect("register"),
+            RibCommand::RegisterBfdDest { .. }
+        ));
+        assert!(matches!(
+            rx.recv().await.expect("deregister"),
+            RibCommand::UnregisterBfdDest { .. }
+        ));
+        drop(client);
+        let session = task.await.unwrap().expect("connection survives");
+        assert!(
+            !session
+                .bfd_destinations
+                .contains_key(&"192.0.2.9".parse::<IpAddr>().unwrap())
+        );
+        rx.close();
+    }
+
+    /// The two REPLAY (30) forms route differently: 4 bytes = "I am the
+    /// daemon" (BfdDaemonAttached), 25 bytes = a state report
+    /// (BfdDaemonStatusUpdate) — the Phase A/C pins.
+    #[tokio::test]
+    async fn bfd_replay_forms_split_attach_from_status() {
+        let (mut client, mut rx, _push, _task) = spawn_session(16);
+        client
+            .send(&ZapiMessage::BfdDestReplay { pid: 30 }, 0)
+            .await;
+        assert!(matches!(
+            rx.recv().await.expect("attach"),
+            RibCommand::BfdDaemonAttached { owner: 1, pid: 30 }
+        ));
+        let status = ZapiBfdDestStatus {
+            ifindex: 2,
+            dst: "192.168.215.5/32".parse().unwrap(),
+            status: crate::message::bfd_status::UP,
+            src: "0.0.0.0/32".parse().unwrap(),
+            remote_cbit: false,
+        };
+        client
+            .send(&ZapiMessage::BfdDaemonStatus { pid: 30, status }, 0)
+            .await;
+        assert!(matches!(
+            rx.recv().await.expect("status report"),
+            RibCommand::BfdDaemonStatusUpdate { .. }
+        ));
+        drop(client);
+        rx.close();
+    }
+
+    /// The driver->session pushes: a forwarded register reaches the daemon
+    /// as command 27 with the pinned body; a state change reaches the
+    /// client as command 26 with the pinned 21-byte body.
+    #[tokio::test]
+    async fn bfd_pushes_encode_the_pinned_frames() {
+        let (mut client, _rx, push_tx, _task) = spawn_session(16);
+        let cmd = ZapiBfdSessionCmd {
+            pid: 0x3b,
+            dst: "192.168.215.5".parse().unwrap(),
+            min_rx_ms: 100,
+            min_tx_ms: 100,
+            detection_multiplier: 3,
+            mhop: false,
+            src: "0.0.0.0".parse().unwrap(),
+            hops: 1,
+            ifname: None,
+            cbit: false,
+            profile: None,
+        };
+        push_tx
+            .send(SessionPush::ForwardBfdRegister { cmd, update: false })
+            .await
+            .unwrap();
+        let (header, body) = client.read_frame().await;
+        assert_eq!(header.command, 27);
+        assert_eq!(
+            hex(&body),
+            "0000003b0002c0a8d7050000006400000064030000020000000001000000",
+            "the probe's accepted single-hop register bytes"
+        );
+
+        // The 26 push encodes the captured UP body (recipient selection
+        // is the driver's — the session encodes whatever it is handed).
+        let status = ZapiBfdDestStatus {
+            ifindex: 2,
+            dst: "192.168.215.5/32".parse().unwrap(),
+            status: crate::message::bfd_status::UP,
+            src: "0.0.0.0/32".parse().unwrap(),
+            remote_cbit: false,
+        };
+        push_tx
+            .send(SessionPush::BfdDestStatus(status))
+            .await
+            .unwrap();
+        let (header, body) = client.read_frame().await;
+        assert_eq!(header.command, 26);
+        assert_eq!(
+            hex(&body),
+            "0000000202c0a8d705200000000402000000002000",
+            "the captured UP push bytes"
+        );
+        drop(client);
     }
 
     #[tokio::test]

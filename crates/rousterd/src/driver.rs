@@ -103,6 +103,19 @@ pub struct RibDriver {
     /// scope). Neighbour events fan NEIGH_ADDED/REMOVED pushes out to
     /// exactly these (the `reevaluate_nht` pattern, M4).
     neighbour_interests: HashMap<u64, BTreeSet<u16>>,
+    /// BFD_CLIENT_REGISTER (36) senders per owner (W1-b): the pin says
+    /// state pushes fan out to EVERY such client, not just a
+    /// destination's registrant.
+    bfd_clients: BTreeSet<u64>,
+    /// The session that sent the 4-byte REPLAY (30) — the BFD daemon
+    /// (zebra's identification rule). Registrations relay to it;
+    /// a failed relay clears it (the next attach re-earns the replay
+    /// of everything recorded below).
+    bfd_daemon: Option<u64>,
+    /// Current BFD registrations keyed by destination (W1-b): the
+    /// replay set for a (re)attaching daemon; in-memory only, like
+    /// every driver registration.
+    bfd_registrations: BTreeMap<std::net::IpAddr, zapi::ZapiBfdSessionCmd>,
 }
 
 impl Default for RibDriver {
@@ -138,6 +151,9 @@ impl RibDriver {
             last_known: BTreeMap::new(),
             router_id_interests: HashMap::new(),
             neighbour_interests: HashMap::new(),
+            bfd_clients: BTreeSet::new(),
+            bfd_daemon: None,
+            bfd_registrations: BTreeMap::new(),
         }
     }
 
@@ -448,6 +464,73 @@ impl RibDriver {
                     if set.is_empty() {
                         self.neighbour_interests.remove(&owner);
                     }
+                }
+                false
+            }
+
+            RibCommand::BfdClientRegistered { owner } => {
+                // The fan-out set (the pin: every 36-sender receives
+                // updates for ANY destination).
+                self.bfd_clients.insert(owner);
+                debug!(owner, "zapi: BFD client in fan-out set");
+                false
+            }
+
+            RibCommand::RegisterBfdDest {
+                owner: _,
+                vrf_id: _,
+                cmd,
+                update,
+            } => {
+                // Record (the replay set) and relay to the daemon when
+                // one is attached — zebra's forwarding of the client's
+                // 27/29 to the BFD daemon. The relay keeps the command
+                // number (a 29 stays 29 on the wire).
+                self.bfd_registrations.insert(cmd.dst, cmd.clone());
+                self.relay_bfd(SessionPush::ForwardBfdRegister { cmd, update });
+                false
+            }
+
+            RibCommand::UnregisterBfdDest {
+                owner: _,
+                vrf_id: _,
+                cmd,
+            } => {
+                self.bfd_registrations.remove(&cmd.dst);
+                self.relay_bfd(SessionPush::ForwardBfdDeregister(cmd));
+                false
+            }
+
+            RibCommand::BfdDaemonAttached { owner, pid } => {
+                // A (re)attaching BFD daemon: it becomes the relay
+                // target and receives every recorded registration —
+                // zebra's replay answer to the 4-byte REPLAY.
+                self.bfd_daemon = Some(owner);
+                info!(
+                    owner,
+                    pid, "zapi: BFD daemon attached; replaying registrations"
+                );
+                let cmds: Vec<zapi::ZapiBfdSessionCmd> =
+                    self.bfd_registrations.values().cloned().collect();
+                for cmd in cmds {
+                    self.relay_bfd(SessionPush::ForwardBfdRegister { cmd, update: false });
+                }
+                false
+            }
+
+            RibCommand::BfdDaemonStatusUpdate { status } => {
+                // The daemon's 25-byte report: fan the 26 push out to
+                // every BFD_CLIENT_REGISTER'd client (the fan-out pin —
+                // including clients that never registered this
+                // destination).
+                info!(
+                    dst = %status.dst,
+                    status = status.status,
+                    clients = self.bfd_clients.len(),
+                    "zapi: BFD state change; fanning INTERFACE_BFD_DEST_UPDATE"
+                );
+                for owner in self.bfd_clients.clone() {
+                    self.push(owner, SessionPush::BfdDestStatus(status));
                 }
                 false
             }
@@ -887,10 +970,26 @@ impl RibDriver {
                 self.identities.remove(&owner);
                 self.router_id_interests.remove(&owner);
                 self.neighbour_interests.remove(&owner);
+                self.bfd_clients.remove(&owner);
+                if self.bfd_daemon == Some(owner) {
+                    self.bfd_daemon = None;
+                }
                 debug!(owner, "zapi: session gone; registries pruned");
                 false
             }
         }
+    }
+
+    /// Relays one message to the BFD daemon session; a dead daemon
+    /// channel clears the target (the registrations stay recorded for
+    /// the next attach's replay — the M6 remembered-redistribute
+    /// pattern, applied to BFD).
+    fn relay_bfd(&mut self, item: SessionPush) -> bool {
+        let Some(daemon) = self.bfd_daemon else {
+            debug!("zapi: BFD relay with no daemon attached; recorded only");
+            return false;
+        };
+        self.push(daemon, item)
     }
 
     /// Waits for one command, then drains everything else that arrived
@@ -2502,5 +2601,181 @@ mod tests {
             "a bridge slave is not vrf-scoped"
         );
         assert_eq!(by_name("dummy0").master_ifindex, Some(3));
+    }
+
+    /// The W1-b BFD machinery: a client registers a destination BEFORE
+    /// any daemon attaches (recorded only); the daemon's attach replays
+    /// everything to it; later registrations relay live; the daemon's
+    /// status report fans out to EVERY BFD-registered client — including
+    /// one that never registered that destination (the fan-out pin).
+    #[tokio::test]
+    async fn bfd_replay_relay_and_fanout() {
+        let mut driver = RibDriver::new();
+        let (push1, mut rx1) = mpsc::channel(16);
+        let (push2, mut rx2) = mpsc::channel(16);
+        let (pushd, mut rxd) = mpsc::channel(16);
+        driver.apply(RibCommand::AttachSession {
+            owner: 1,
+            push: push1,
+        });
+        driver.apply(RibCommand::AttachSession {
+            owner: 2,
+            push: push2,
+        });
+        driver.apply(RibCommand::AttachSession {
+            owner: 9,
+            push: pushd,
+        });
+
+        let cmd = |dst: &str| zapi::ZapiBfdSessionCmd {
+            pid: 4242,
+            dst: dst.parse().unwrap(),
+            min_rx_ms: 100,
+            min_tx_ms: 100,
+            detection_multiplier: 3,
+            mhop: false,
+            src: "0.0.0.0".parse().unwrap(),
+            hops: 1,
+            ifname: None,
+            cbit: false,
+            profile: None,
+        };
+
+        // Two clients say 36; one registers a destination before any
+        // daemon exists — recorded, nothing relayed (the daemon channel
+        // sees nothing yet).
+        driver.apply(RibCommand::BfdClientRegistered { owner: 1 });
+        driver.apply(RibCommand::BfdClientRegistered { owner: 2 });
+        driver.apply(RibCommand::RegisterBfdDest {
+            owner: 1,
+            vrf_id: 0,
+            cmd: cmd("192.0.2.9"),
+            update: false,
+        });
+        assert!(rxd.try_recv().is_err(), "no daemon attached yet");
+
+        // The daemon attaches (4-byte REPLAY): it earns a replay of
+        // the recorded registration as a 27 relay.
+        driver.apply(RibCommand::BfdDaemonAttached { owner: 9, pid: 30 });
+        match rxd.recv().await.expect("replayed registration") {
+            SessionPush::ForwardBfdRegister { cmd, update } => {
+                assert_eq!(cmd.dst, "192.0.2.9".parse::<std::net::IpAddr>().unwrap());
+                assert!(!update, "the replay re-sends as REGISTER");
+            }
+            other => panic!("not a replay: {other:?}"),
+        }
+
+        // A live registration relays immediately; a deregister relays
+        // as the withdrawal.
+        driver.apply(RibCommand::RegisterBfdDest {
+            owner: 2,
+            vrf_id: 0,
+            cmd: cmd("198.51.100.9"),
+            update: true,
+        });
+        match rxd.recv().await.expect("live relay") {
+            SessionPush::ForwardBfdRegister { cmd, update } => {
+                assert_eq!(cmd.dst, "198.51.100.9".parse::<std::net::IpAddr>().unwrap());
+                assert!(update, "a 29 relays as 29");
+            }
+            other => panic!("not a relay: {other:?}"),
+        }
+        driver.apply(RibCommand::UnregisterBfdDest {
+            owner: 2,
+            vrf_id: 0,
+            cmd: cmd("198.51.100.9"),
+        });
+        assert!(matches!(
+            rxd.recv().await.expect("withdrawal relay"),
+            SessionPush::ForwardBfdDeregister(_)
+        ));
+
+        // A status report reaches BOTH 36-senders — client 2 never
+        // registered 192.0.2.9 (the fan-out pin).
+        let status = zapi::ZapiBfdDestStatus {
+            ifindex: 2,
+            dst: "192.0.2.9/32".parse().unwrap(),
+            status: zapi::bfd_status::UP,
+            src: "0.0.0.0/32".parse().unwrap(),
+            remote_cbit: false,
+        };
+        driver.apply(RibCommand::BfdDaemonStatusUpdate { status });
+        assert!(matches!(
+            rx1.recv().await.expect("client 1 fan-out"),
+            SessionPush::BfdDestStatus(s) if s.status == zapi::bfd_status::UP
+        ));
+        assert!(matches!(
+            rx2.recv()
+                .await
+                .expect("client 2 fan-out (not a registrant)"),
+            SessionPush::BfdDestStatus(_)
+        ));
+        assert!(
+            rxd.try_recv().is_err(),
+            "the daemon is not a fan-out target"
+        );
+    }
+
+    /// A dead daemon channel clears the relay target; the recorded
+    /// registrations survive for the NEXT attach's replay (the M6
+    /// remembered-redistribute pattern, applied to BFD).
+    #[tokio::test]
+    async fn bfd_daemon_death_and_reattach() {
+        let mut driver = RibDriver::new();
+        let (pushd, mut rxd) = mpsc::channel(16);
+        let (pushd2, mut rxd2) = mpsc::channel(16);
+        driver.apply(RibCommand::AttachSession {
+            owner: 7,
+            push: pushd,
+        });
+        driver.apply(RibCommand::BfdDaemonAttached { owner: 7, pid: 30 });
+        let cmd = zapi::ZapiBfdSessionCmd {
+            pid: 4242,
+            dst: "192.0.2.9".parse().unwrap(),
+            min_rx_ms: 100,
+            min_tx_ms: 100,
+            detection_multiplier: 3,
+            mhop: false,
+            src: "0.0.0.0".parse().unwrap(),
+            hops: 1,
+            ifname: None,
+            cbit: false,
+            profile: None,
+        };
+        driver.apply(RibCommand::RegisterBfdDest {
+            owner: 1,
+            vrf_id: 0,
+            cmd: cmd.clone(),
+            update: false,
+        });
+        assert!(matches!(
+            rxd.recv().await.expect("relay to the attached daemon"),
+            SessionPush::ForwardBfdRegister { .. }
+        ));
+
+        // The daemon's channel dies (receiver dropped; the driver's
+        // sender clone stays): the next relay finds it closed, prunes
+        // the target, and the registration stays recorded.
+        drop(rxd);
+        driver.apply(RibCommand::RegisterBfdDest {
+            owner: 1,
+            vrf_id: 0,
+            cmd: cmd.clone(),
+            update: true,
+        });
+
+        // A new daemon attaches and earns the full replay.
+        driver.apply(RibCommand::AttachSession {
+            owner: 8,
+            push: pushd2,
+        });
+        driver.apply(RibCommand::BfdDaemonAttached { owner: 8, pid: 31 });
+        match rxd2.recv().await.expect("replay to the new daemon") {
+            SessionPush::ForwardBfdRegister { cmd: got, update } => {
+                assert_eq!(got, cmd);
+                assert!(!update, "replays are REGISTERs");
+            }
+            other => panic!("not a replay: {other:?}"),
+        }
     }
 }

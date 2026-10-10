@@ -55,6 +55,11 @@ BFD_PEER2=198.51.100.10
 
 mkdir -p "$QUARANTINE"
 
+# IPv4 address of eth0 inside a container (docker default bridge).
+bridge_ip() {
+    docker exec "$1" sh -c "ip -4 addr show dev eth0" | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1
+}
+
 # Phase selector: `a` (masquerade only), `b` (real stack only), default
 # both. Phase B's probe carries Phase A's pinned register bytes, so the
 # first bring-up runs A, bakes the bytes into zapi-bfd-probe, then B.
@@ -163,9 +168,6 @@ docker run -d --name "$CB2" --init \
 docker cp "target/$MUSL_TARGET/release/zapi-bfd-probe" "$CB1:/usr/local/bin/"
 docker cp "target/$MUSL_TARGET/release/bfdd" "$CB2:/usr/local/bin/"
 
-bridge_ip() {
-    docker exec "$1" sh -c "ip -4 addr show dev eth0" | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1
-}
 B1_IP=$(bridge_ip "$CB1")
 B2_IP=$(bridge_ip "$CB2")
 echo "==> bridge addresses: b1=$B1_IP (FRR) b2=$B2_IP (rouster peer)"
@@ -231,4 +233,71 @@ docker cp "$CB2:/tmp/bfdd.status" "$QUARANTINE/phase-b-rouster-bfdd.status" 2>/d
 docker cp "$CB2:/tmp/bfdd.log" "$QUARANTINE/phase-b-rouster-bfdd.log" 2>/dev/null || true
 
 echo "Phase B: DONE (analyze $QUARANTINE/phase-b-probe.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase C — bfdd's own session-state messages (masquerade + live peer)
+# ---------------------------------------------------------------------------
+if [[ "$PHASES" == *c* ]]; then
+echo "==> building zapi-sniff + bfdd ($MUSL_TARGET, release)"
+cargo build --release --target "$MUSL_TARGET" --bin zapi-sniff --bin bfdd
+echo "==> Phase C: masquerade zebra + real bfdd (c1) + rouster bfdd peer (c2)"
+docker run -d --name "$CB1" --init \
+    --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+    --entrypoint sleep "$IMAGE" infinity >/dev/null
+docker run -d --name "$CB2" --init \
+    --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+    --entrypoint sleep "$IMAGE" infinity >/dev/null
+docker cp "target/$MUSL_TARGET/release/zapi-sniff" "$CB1:/usr/local/bin/"
+docker cp "target/$MUSL_TARGET/release/bfdd" "$CB2:/usr/local/bin/"
+C1_IP=$(bridge_ip "$CB1")
+C2_IP=$(bridge_ip "$CB2")
+echo "==> bridge addresses: c1=$C1_IP (FRR bfdd) c2=$C2_IP (rouster peer)"
+
+docker exec -d "$CB1" sh -c "zapi-sniff --socket /tmp/zserv.api --log /root/sniff.log --respond-hello --hello-cmd 19 --respond-labelmgr"
+sleep 1
+docker exec -i "$CB1" sh -c 'cat > /etc/frr/bfdd.conf' <<EOF
+frr version 10.2
+frr defaults traditional
+hostname w1b-c1
+bfd
+ peer $C2_IP
+  detect-multiplier 3
+  transmit-interval 100
+  receive-interval 100
+EOF
+docker exec "$CB1" sh -c "/usr/lib/frr/bfdd -d -f /etc/frr/bfdd.conf -z /tmp/zserv.api --log file:/root/bfdd.log --log-level debug"
+for _ in $(seq 1 20); do
+    docker exec "$CB1" sh -c "test -S /var/run/frr/bfdd.vty" && break
+    sleep 1
+done
+
+docker exec -i "$CB2" sh -c 'cat > /tmp/bfdd.conf' <<EOF
+peer $C1_IP
+  transmit-interval 100
+  receive-interval 100
+EOF
+docker exec -d "$CB2" sh -c "bfdd --config /tmp/bfdd.conf --pidfile /tmp/bfdd.pid --status-file /tmp/bfdd.status > /tmp/bfdd.log 2>&1"
+for _ in $(seq 1 15); do
+    docker exec "$CB2" sh -c "test -f /tmp/bfdd.status" && break
+    sleep 1
+done
+
+echo "==> C: waiting for the session to come Up, then killing the peer"
+for _ in $(seq 1 30); do
+    docker exec "$CB1" sh -c "vtysh -d bfdd -c 'show bfd peers' | grep -q 'Status: up'" && break
+    sleep 1
+done
+sleep 5
+docker exec "$CB1" sh -c "vtysh -d bfdd -c 'show bfd peers'" > "$QUARANTINE/phase-c-peers-up.txt" || true
+docker kill "$CB2" >/dev/null
+sleep 8
+docker exec "$CB1" sh -c "vtysh -d bfdd -c 'show bfd peers'" > "$QUARANTINE/phase-c-peers-down.txt" || true
+sleep 2
+
+echo "==> C: capture evidence"
+docker cp "$CB1:/root/sniff.log" "$QUARANTINE/phase-c-sniff.log"
+docker cp "$CB1:/root/bfdd.log" "$QUARANTINE/phase-c-frr-bfdd.log" || true
+docker cp "$CB2:/tmp/bfdd.log" "$QUARANTINE/phase-c-rouster-bfdd.log" 2>/dev/null || true
+echo "Phase C: DONE (analyze $QUARANTINE/phase-c-sniff.log)"
 fi

@@ -84,7 +84,7 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 27 | ZEBRA_BFD_DEST_REGISTER | B, **E** | **W1-b-fix**: bgpd multihop frame pinned; single-hop pinned by Phase B acceptance |
 | 28 | ZEBRA_BFD_DEST_DEREGISTER | B, SRC | **W1-b**: no daemon observed sending one; body source-pinned (same layout); zebra sends no reply |
 | 29 | ZEBRA_BFD_DEST_UPDATE | B, **E** | **W1-b-fix**: bgpd re-install frame pinned (byte-identical to its REGISTER body); as zebra→client never observed (26 is the push) |
-| 30 | ZEBRA_BFD_DEST_REPLAY | B, **E** | **W1-b-fix**: bfdd sends it at connect, body = pid u32 |
+| 30 | ZEBRA_BFD_DEST_REPLAY | B, **E** | **W1-b-fix**: bfdd sends it at connect with body = pid u32, AND on every session transition with body = pid + the 26-tuple (Phase C) |
 | 31 | ZEBRA_REDISTRIBUTE_ROUTE_ADD | B | zebra→client |
 | 32 | ZEBRA_REDISTRIBUTE_ROUTE_DEL | B | zebra→client |
 | 33 | ZEBRA_VRF_ADD | B | zebra pushed 1 in oracle run |
@@ -711,13 +711,35 @@ ACCEPTANCE in Phase B (the probe's 30-byte single-hop register created
 a live session), not by a bgpd-emitted capture (see deviations below).
 The timers are MILLISECONDS on the wire (300 = 300 ms).
 
-### ZEBRA_BFD_DEST_REPLAY (30) — bfdd→zebra — E
+### ZEBRA_BFD_DEST_REPLAY (30) — bfdd→zebra — E, both forms
 
-bfdd's connect burst is HELLO + INTERFACE_ADD (empty) + this, 4-byte
-body = the daemon's pid as u32 BE (`0000001e`, bfdd was pid 30). Zebra
-uses the sender of this command as "the BFD daemon" to forward
-registrations to (the M1 server note: registrations replay to it on
-client reconnect).
+bfdd's connect burst is HELLO (body `1a 0000 00000000 00` — redist
+byte 0x1a = ZEBRA_ROUTE_BFD) + INTERFACE_ADD (empty) + this with a
+4-byte body = the daemon's pid as u32 BE (`0000001e`, bfdd was pid
+30). Zebra uses the sender of this command as "the BFD daemon" to
+forward registrations to (the M1 server note: registrations replay to
+it on client reconnect).
+
+**Phase C (W1-b)** pinned the SAME command carrying session state:
+on every transition bfdd sends 30 with a **25-byte body = pid u32 +
+the exact INTERFACE_BFD_DEST_UPDATE (26) tuple** (ifindex, dst u8-
+family prefix, status bitmask, src prefix, remote_cbit). A live
+Up→Down cycle captured both bodies verbatim:
+
+```text
+UP   : 0000001a 00000000 02 c0a8d705 20 00000004 02 00000000 20 00
+DOWN : 0000001a 00000000 02 c0a8d705 20 00000002 02 00000000 20 00
+       |        |         |  |         |  |         |  |         +-- remote_cbit u8
+       |        |         |  |         |  |         |  +-- src.plen u8 = 32
+       |        |         |  |         |  |         +-- src = 0.0.0.0
+       |        |         |  |         |  +-- src.family u8 = AF_INET
+       |        |         |  |         +-- status u32 BE (the bitmask; 4 = UP, 2 = DOWN)
+       |        |         |  +-- dst.plen u8 = 32
+       |        |         +-- dst = 192.168.215.5 (the peer)
+       |         +-- dst.family u8 = AF_INET
+       +-- ifindex u32 = 0 (bfdd-side reports never resolved one)
+       +-- pid u32 = 0x1a (bfdd's pid — the daemon that owns the report)
+```
 
 ### ZEBRA_INTERFACE_BFD_DEST_UPDATE (26) — zebra→client — E
 

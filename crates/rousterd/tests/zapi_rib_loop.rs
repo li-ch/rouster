@@ -165,6 +165,11 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
             false
         }
         RibCommand::RegisterNeighbourInterest { .. } => false,
+        RibCommand::RegisterBfdDest { .. }
+        | RibCommand::UnregisterBfdDest { .. }
+        | RibCommand::BfdClientRegistered { .. }
+        | RibCommand::BfdDaemonAttached { .. }
+        | RibCommand::BfdDaemonStatusUpdate { .. } => false,
         RibCommand::RequestInterfaces { reply } => {
             let mirror: Vec<InterfaceMirror> = rib
                 .interfaces()

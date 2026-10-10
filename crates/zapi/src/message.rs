@@ -2442,6 +2442,15 @@ pub enum ZapiMessage {
     BfdDestReplay {
         pid: u32,
     },
+    /// ZEBRA_BFD_DEST_REPLAY (30) carrying SESSION STATE — the same
+    /// command with a 25-byte body = pid u32 + the exact 26 tuple. E
+    /// (W1-b Phase C): a live Up→Down cycle, both bodies verbatim.
+    /// Body length distinguishes the forms (the INTERFACE_ADD
+    /// request/dump pattern).
+    BfdDaemonStatus {
+        pid: u32,
+        status: ZapiBfdDestStatus,
+    },
     /// ZEBRA_INTERFACE_BFD_DEST_UPDATE (26), zebra→client: BFD state
     /// push for a registered destination. E (W1-b Phase B): captured in
     /// three states (DOWN@register / UP / DOWN@failure).
@@ -2548,10 +2557,13 @@ impl ZapiMessage {
             ZapiCommand::BfdDestReplay => {
                 let mut b = body;
                 let pid = take_be_u32(&mut b)?;
-                if !b.is_empty() {
-                    return Err(ZapiCodecError::TrailingBytes(b.len()));
+                if b.is_empty() {
+                    return Ok(Self::BfdDestReplay { pid });
                 }
-                Ok(Self::BfdDestReplay { pid })
+                // The 25-byte session-state form (Phase C): pid + the
+                // exact 26 tuple.
+                let status = ZapiBfdDestStatus::decode(b)?;
+                Ok(Self::BfdDaemonStatus { pid, status })
             }
             ZapiCommand::InterfaceBfdDestUpdate => Ok(Self::InterfaceBfdDestUpdate(
                 ZapiBfdDestStatus::decode(body)?,
@@ -2617,6 +2629,7 @@ impl ZapiMessage {
             Self::BfdDestDeregister(_) => 28,
             Self::BfdDestUpdate(_) => 29,
             Self::BfdDestReplay { .. } => 30,
+            Self::BfdDaemonStatus { .. } => 30,
             Self::InterfaceBfdDestUpdate(_) => 26,
             Self::LabelManagerConnect { .. } => 49,
             Self::LabelManagerConnectResult { .. } => 49,
@@ -2690,6 +2703,11 @@ impl ZapiMessage {
             }
             Self::BfdDestReplay { pid } => {
                 buf.put_u32(*pid);
+                Ok(())
+            }
+            Self::BfdDaemonStatus { pid, status } => {
+                buf.put_u32(*pid);
+                status.encode(buf);
                 Ok(())
             }
             Self::InterfaceBfdDestUpdate(update) => {
@@ -3070,10 +3088,43 @@ mod tests {
         let msg = ZapiMessage::decode(30, &hex("0000001e")).unwrap();
         assert_eq!(msg, ZapiMessage::BfdDestReplay { pid: 30 });
         assert_eq!(roundtrip(&msg), hex("0000001e"));
-        assert_eq!(
+        assert!(matches!(
             ZapiMessage::decode(30, &hex("0000001e00")),
-            Err(ZapiCodecError::TrailingBytes(1))
+            Err(ZapiCodecError::Truncated { .. })
+        ));
+    }
+
+    /// Phase C goldens: the SAME command 30 carrying session state —
+    /// 25-byte body = pid + the exact 26 tuple, captured live for a
+    /// session going Up and (peer killed) Down.
+    #[test]
+    fn bfd_daemon_status_decodes_the_captured_up_down_cycle() {
+        let up = hex("0000001a0000000002c0a8d705200000000402000000002000");
+        let msg = ZapiMessage::decode(30, &up).unwrap();
+        let status = ZapiBfdDestStatus {
+            ifindex: 0,
+            dst: "192.168.215.5/32".parse().unwrap(),
+            status: bfd_status::UP,
+            src: "0.0.0.0/32".parse().unwrap(),
+            remote_cbit: false,
+        };
+        assert_eq!(msg, ZapiMessage::BfdDaemonStatus { pid: 0x1a, status });
+        assert_eq!(msg.command(), 30);
+        assert_eq!(roundtrip(&msg), up);
+
+        let down = hex("0000001a0000000002c0a8d705200000000202000000002000");
+        let msg = ZapiMessage::decode(30, &down).unwrap();
+        assert_eq!(
+            msg,
+            ZapiMessage::BfdDaemonStatus {
+                pid: 0x1a,
+                status: ZapiBfdDestStatus {
+                    status: bfd_status::DOWN,
+                    ..status
+                }
+            }
         );
+        assert_eq!(roundtrip(&msg), down);
     }
 
     /// W1-b Phase B goldens: the three INTERFACE_BFD_DEST_UPDATE (26)
