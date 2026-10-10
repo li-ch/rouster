@@ -21,7 +21,14 @@
 //! 8. refresh keep-alive + expire — §6: the refresh poll doubles as
 //!    keep-alive, then a silent cache past the Expire Interval
 //!    flushes the data;
-//! 9. session-id mismatch — §5.1: code-0 teardown with a flush.
+//! 9. session-id mismatch — §5.1: a Serial Notify carrying a foreign
+//!    Session ID is itself the mismatch ("at any time ... either party
+//!    finds that the value of the Session ID is not the same");
+//!    code-0 teardown with a flush. (Delivered via notify on purpose:
+//!    the mock performs no blocking read after End of Data — under
+//!    the paused clock each mock read-park lets auto-advance fire one
+//!    client timer, and a chain of two such parks reaches the Expire
+//!    Interval, which would legitimately flush mid-conversation.)
 //!
 //! Clock: every test runs tokio's paused clock (`start_paused`), so
 //! the RFC's default intervals (retry 600 s, expire 7200 s) elapse
@@ -40,6 +47,18 @@ use rpki::{
 };
 
 type Tables = Arc<Mutex<CacheTables>>;
+
+/// The scenarios are timing-shaped conversations against tokio's
+/// paused clock; a contention-induced scheduling change in a parallel
+/// run can reorder which side parks first and let auto-advance fire
+/// client timers mid-conversation (a legitimate refresh poll landing
+/// between mock writes). Serializing the binary makes the schedule
+/// deterministic; unit and property tests stay parallel.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ---- mock-cache plumbing ---------------------------------------------
 
@@ -70,7 +89,7 @@ impl Fixture {
         sock
     }
 
-    async fn stop(mut self) {
+    async fn stop(self) {
         self.shutdown.send(true).unwrap();
         self.handle.await.unwrap();
     }
@@ -90,8 +109,8 @@ async fn read_one(sock: &mut TcpStream) -> Vec<u8> {
 
 /// Read one PDU, skipping refresh-interval Serial Queries the client
 /// legitimately emits while the paused clock auto-advances (RFC 8210
-/// §6: refresh polls are the keep-alive; under `start_paused` they
-/// can land between any two mock writes).
+/// §6 keep-alive). Safe for awaiting a specific reply because that
+/// reply is always written before any reconnect-era query could be.
 async fn read_skipping_refresh_queries(sock: &mut TcpStream, sid: u16, serial: u32) -> Pdu {
     loop {
         let raw = read_one(sock).await;
@@ -215,6 +234,7 @@ async fn wait_until(t: &Tables, ok: impl Fn(&Snap) -> bool) -> Snap {
 
 #[tokio::test(start_paused = true)]
 async fn full_refresh_populates_tables() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
 
@@ -266,6 +286,7 @@ async fn full_refresh_populates_tables() {
 
 #[tokio::test(start_paused = true)]
 async fn serial_notify_drives_incremental_update() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -325,6 +346,7 @@ async fn serial_notify_drives_incremental_update() {
 
 #[tokio::test(start_paused = true)]
 async fn cache_reset_after_serial_mismatch_falls_back_to_reset_query() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut first = fx.accept().await;
     expect(&mut first, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -372,6 +394,7 @@ async fn cache_reset_after_serial_mismatch_falls_back_to_reset_query() {
 
 #[tokio::test(start_paused = true)]
 async fn fatal_error_report_drops_and_flushes() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -398,6 +421,7 @@ async fn fatal_error_report_drops_and_flushes() {
 
 #[tokio::test(start_paused = true)]
 async fn unsupported_version_downgrades_to_cache_version() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
 
@@ -426,6 +450,7 @@ async fn unsupported_version_downgrades_to_cache_version() {
 
 #[tokio::test(start_paused = true)]
 async fn no_data_available_marks_state_and_retries() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
 
@@ -455,6 +480,7 @@ async fn no_data_available_marks_state_and_retries() {
 
 #[tokio::test(start_paused = true)]
 async fn duplicate_announcement_reports_code7_and_flushes() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -491,6 +517,7 @@ async fn duplicate_announcement_reports_code7_and_flushes() {
 
 #[tokio::test(start_paused = true)]
 async fn refresh_keepalive_then_expiry_flushes() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -530,6 +557,7 @@ async fn refresh_keepalive_then_expiry_flushes() {
 
 #[tokio::test(start_paused = true)]
 async fn session_id_change_terminates_with_code0_and_flushes() {
+    let _serial = serial();
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -539,28 +567,18 @@ async fn session_id_change_terminates_with_code0_and_flushes() {
     send(&mut cache, &eod(VERSION_2, sid, 5, Timing::DEFAULT)).await;
     wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
 
-    // Trigger a query, then answer it from a "different cache
-    // instance" (new Session ID): §5.1 demands immediate termination
-    // with Error Code 0 and a full flush.
+    // A notify from a "different cache instance" (new Session ID):
+    // §5.1 demands immediate termination with Error Code 0 and a full
+    // flush.
     send(
         &mut cache,
         &Pdu::SerialNotify {
             version: VERSION_2,
-            session_id: sid,
+            session_id: 0x9999,
             serial: 6,
         },
     )
     .await;
-    expect(
-        &mut cache,
-        Pdu::SerialQuery {
-            version: VERSION_2,
-            session_id: sid,
-            serial: 5,
-        },
-    )
-    .await;
-    send(&mut cache, &cache_response(VERSION_2, 0x9999)).await;
 
     let report = read_skipping_refresh_queries(&mut cache, sid, 5).await;
     let Pdu::ErrorReport { error_code, .. } = &report else {

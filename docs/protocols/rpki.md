@@ -117,8 +117,9 @@ Client implementation notes (`crates/rpki/src/client.rs`):
   tables before applying (§5.5: it "sends the set of all data records
   it has"); a response to a Serial Query applies deltas.
 - Session-ID change on a serial exchange = Error Code 0 + drop + full
-  flush (§5.1); End-of-Data's Session ID must equal the Cache
-  Response's (§5.8).
+  flush (§5.1); this holds for *any* PDU once the version is
+  negotiated, including a Serial Notify carrying a foreign Session ID;
+  End-of-Data's Session ID must equal the Cache Response's (§5.8).
 - Cache Reset (§8.3): re-query with Reset Query on the same
   connection. No Data Available (§8.4): mark `NoData`, retry with
   Reset Query after the Retry Interval. Cache Restart/Shutdown
@@ -216,7 +217,11 @@ is bgpd's call; Unknown ranks with Valid.
    in reply to a Serial Query is handled the same way rather than
    dropped).
 4. `Timing` values are honored as given (no §6 range clamping); the
-   v0 fallback timing is the §6 defaults.
+   v0 fallback timing is the §6 defaults. The refresh countdown
+   restarts only at End-of-Data receipt (§6's "Countdown for this
+   timer starts upon receipt of the containing End Of Data PDU"), so
+   an unanswered poll is bounded by the expire deadline rather than a
+   send-time re-arm.
 
 ## §Deferred (owner-authorized follow-ups)
 

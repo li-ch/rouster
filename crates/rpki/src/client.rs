@@ -348,7 +348,11 @@ impl RtrClient {
                                 break;
                             }
                             pending_query = Some(QueryKind::Serial);
-                            refresh_at = Some(Instant::now() + refresh);
+                            // §6: "Countdown for this timer starts upon
+                            // receipt of the containing End Of Data PDU"
+                            // — no restart at send time; a response-less
+                            // poll is covered by the expire deadline.
+                            let _ = refresh;
                         }
                     }
                 }
@@ -411,9 +415,25 @@ impl RtrClient {
                                     (t.session_id, t.serial, version)
                                 };
                                 if let (Some(sid), Some(s), Some(v)) = (sid, held_serial, v) {
-                                    // Only react when the notify's session
-                                    // matches ours (§5.2) and carries news.
-                                    if session_id == sid && serial != s {
+                                    if session_id != sid {
+                                        // §5.1: any session-id mismatch,
+                                        // on any PDU, means the cache
+                                        // instance changed — terminate
+                                        // with code 0 and flush.
+                                        let _ = send_error(
+                                            &mut tx_half,
+                                            v,
+                                            ErrorCode::CorruptData,
+                                            &raw,
+                                            Some("serial notify session id mismatch"),
+                                        )
+                                        .await;
+                                        end = SessionEnd::Fatal("notify session id mismatch");
+                                        break;
+                                    }
+                                    // §5.2: a matching notify with news
+                                    // may trigger an immediate query.
+                                    if serial != s {
                                         let q = Pdu::SerialQuery {
                                             version: v,
                                             session_id: sid,
