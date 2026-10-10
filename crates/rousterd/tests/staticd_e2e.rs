@@ -138,6 +138,18 @@ async fn staticd_e2e_install_nht_filter_and_withdrawal() {
         ifindex: 2,
         prefix: "192.0.2.1/24".parse().unwrap(),
     });
+    // M3: the NHT answer is neighbour-gated — the on-subnet gateway needs
+    // a confirmed neighbour entry for its registration to answer
+    // resolved (what the kernel's ARP table would hold on a live box).
+    driver.rib.apply_event(&DataplaneEvent::NeighbourNew {
+        entry: common::NeighbourEntry::from_rtnetlink(
+            "192.0.2.9".parse().unwrap(),
+            2,
+            Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x09]),
+            0x80, // NUD_PERMANENT
+            0,
+        ),
+    });
 
     // The staticd daemon logic, fed by the same parser rousterd uses.
     let config = rousterd::config::parse_config(CONFIG_TEXT).expect("config parses");

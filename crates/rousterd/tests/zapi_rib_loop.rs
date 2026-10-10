@@ -524,6 +524,17 @@ async fn nht_flip_on_address_add_pushed_over_real_socket() {
         ifindex: 2,
         prefix: "10.9.9.1/24".parse().unwrap(),
     });
+    // M3: connected is not enough — the gateway's neighbour entry must be
+    // confirmed before the answer flips (what ARP resolution does live).
+    driver.apply_event(&DataplaneEvent::NeighbourNew {
+        entry: common::NeighbourEntry::from_rtnetlink(
+            "10.9.9.9".parse().unwrap(),
+            2,
+            Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x09]),
+            0x80, // NUD_PERMANENT
+            0,
+        ),
+    });
 
     // The flip arrives on its own — no request in flight.
     let (header, body) = client.read_frame().await;
@@ -569,6 +580,16 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 3,
         prefix: "192.0.2.1/24".parse().unwrap(),
+    });
+    // M3: a confirmed neighbour makes the registration answer resolved.
+    driver.apply_event(&DataplaneEvent::NeighbourNew {
+        entry: common::NeighbourEntry::from_rtnetlink(
+            "192.0.2.9".parse().unwrap(),
+            3,
+            Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x09]),
+            0x80, // NUD_PERMANENT
+            0,
+        ),
     });
 
     client.send(&nht_register("192.0.2.9/32")).await;

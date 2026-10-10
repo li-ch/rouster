@@ -452,6 +452,15 @@ impl RibDriver {
                     .and_then(|(_, _, before)| before.clone());
                 self.push_best_change(table, prefix, before);
             }
+        } else if matches!(
+            ev,
+            DataplaneEvent::NeighbourNew { .. } | DataplaneEvent::NeighbourDel { .. }
+        ) {
+            // Neighbour events never touch the interface mirror (no
+            // router-id or connected-table work), but the NHT answer is
+            // neighbour-gated (M3): a confirmed neighbour appearing or
+            // disappearing flips a gateway's answer.
+            self.reevaluate_nht();
         }
     }
 
@@ -866,6 +875,20 @@ mod tests {
         )
     }
 
+    /// A confirmed (PERMANENT, lladdr-holding) neighbour event — the M3
+    /// liveness evidence for an on-link gateway.
+    fn neighbour_confirmed(ip: &str, ifindex: u32, last: u8) -> DataplaneEvent {
+        DataplaneEvent::NeighbourNew {
+            entry: common::NeighbourEntry::from_rtnetlink(
+                ip.parse().unwrap(),
+                ifindex,
+                Some(vec![0x02, 0x00, 0x00, 0x00, 0x00, last]),
+                0x80, // NUD_PERMANENT
+                0,
+            ),
+        }
+    }
+
     fn link_up(ifindex: u32) -> DataplaneEvent {
         link_up_named(ifindex, &format!("eth{ifindex}"))
     }
@@ -962,6 +985,7 @@ mod tests {
         // one (still connected-only over 0.0.0.0) does not.
         driver.apply_event(&link_up(3));
         driver.apply_event(&addr_new(3, "198.51.100.2/24"));
+        driver.apply_event(&neighbour_confirmed("198.51.100.1", 3, 0x01));
         match ospfd.try_recv().expect("flip pushed") {
             SessionPush::NexthopResolution { prefix, resolution } => {
                 assert_eq!(prefix, "0.0.0.0/0".parse().unwrap());
@@ -995,6 +1019,13 @@ mod tests {
         );
 
         driver.apply_event(&addr_new(2, "10.9.9.1/24"));
+        // Connected now, but the neighbour gate holds the answer
+        // unresolved until the gateway's ARP entry is confirmed (M3).
+        assert!(
+            pushes.try_recv().is_err(),
+            "address alone no longer flips: neighbour unconfirmed"
+        );
+        driver.apply_event(&neighbour_confirmed("10.9.9.9", 2, 0x09));
         match pushes.try_recv().expect("flip pushed") {
             SessionPush::NexthopResolution { prefix, resolution } => {
                 assert_eq!(prefix, "10.9.9.9/32".parse().unwrap());
@@ -1021,12 +1052,13 @@ mod tests {
         let mut pushes = attach(&mut driver, 1);
         driver.apply_event(&link_up(3));
         driver.apply_event(&addr_new(3, "192.0.2.1/24"));
+        driver.apply_event(&neighbour_confirmed("192.0.2.9", 3, 0x09));
 
         let answer = register_nht(&mut driver, 1, "192.0.2.9/32", false);
         assert_eq!(
             answer,
             Some(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 3)),
-            "resolved at registration time"
+            "resolved at registration time: connected AND confirmed"
         );
         assert!(pushes.try_recv().is_err(), "registration answers directly");
 
@@ -1071,19 +1103,29 @@ mod tests {
         );
     }
 
-    /// Neighbour events are read-only awareness (W3): even a neighbour for
-    /// the tracked gateway IP appearing/disappearing must not look like a
-    /// resolution flip — resolution stays prefix-based.
+    /// M3: the NHT answer is neighbour-gated, so neighbour events DO
+    /// re-evaluate registered interests — a confirmed neighbour appearing
+    /// flips the answer to resolved (one NEXTHOP_UPDATE push), its
+    /// deletion flips back. (W3 pinned the opposite — "neighbour events
+    /// do not re-evaluate NHT" — for the prefix-based resolution of its
+    /// era; the liveness gate is M3's semantic, honestly.) Route events
+    /// still never re-evaluate (their re-eval is §Deferred — see the S1
+    /// report).
     #[test]
-    fn neighbour_events_do_not_re_evaluate_nht() {
+    fn neighbour_events_flip_the_gated_nht_answer() {
         use common::NeighbourEntry;
 
         let mut driver = RibDriver::new();
         let mut pushes = attach(&mut driver, 1);
         driver.apply_event(&link_up(2));
         driver.apply_event(&addr_new(2, "203.0.113.1/24"));
-        assert!(register_nht(&mut driver, 1, "203.0.113.9/32", false).is_some());
+        // Registration answers unresolved: connected, but no confirmed
+        // neighbour for the gateway (the M3 gate).
+        assert!(register_nht(&mut driver, 1, "203.0.113.9/32", false).is_none());
+        assert!(pushes.try_recv().is_err());
 
+        // A confirmed neighbour appearing IS a resolution flip now: one
+        // NEXTHOP_UPDATE push.
         driver.apply_event(&DataplaneEvent::NeighbourNew {
             entry: NeighbourEntry::from_rtnetlink(
                 "203.0.113.9".parse().unwrap(),
@@ -1093,14 +1135,29 @@ mod tests {
                 0,
             ),
         });
+        match pushes.try_recv().expect("neighbour-confirmed flip pushed") {
+            SessionPush::NexthopResolution { prefix, resolution } => {
+                assert_eq!(prefix, "203.0.113.9/32".parse().unwrap());
+                assert_eq!(
+                    resolution,
+                    Some(Nexthop::Ipv4If("203.0.113.9".parse().unwrap(), 2))
+                );
+            }
+            other => panic!("expected NexthopResolution, got {other:?}"),
+        }
+
+        // Deletion flips back to unresolved.
         driver.apply_event(&DataplaneEvent::NeighbourDel {
             ip: "203.0.113.9".parse().unwrap(),
             link_ifindex: 2,
         });
-        assert!(
-            pushes.try_recv().is_err(),
-            "neighbour events are not resolution flips"
-        );
+        match pushes.try_recv().expect("neighbour-gone flip pushed") {
+            SessionPush::NexthopResolution { resolution, .. } => {
+                assert_eq!(resolution, None);
+            }
+            other => panic!("expected NexthopResolution, got {other:?}"),
+        }
+        assert!(pushes.try_recv().is_err(), "one push per flip");
         // The mirror itself did update through the same driver path.
         assert!(driver
             .rib
