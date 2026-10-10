@@ -3,6 +3,7 @@ name = "netlink-dp"
 description = "Rouster dataplane backend: Linux kernel via rtnetlink"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 common.workspace = true

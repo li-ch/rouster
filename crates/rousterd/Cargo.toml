@@ -3,6 +3,7 @@ name = "rousterd"
 description = "Rouster main daemon"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 common.workspace = true

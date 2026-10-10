@@ -120,5 +120,4 @@ workstream rules, risks, and the append-only status log in its Appendix C).
 
 ## License
 
-Not yet chosen — a LICENSE file lands before this repository is published.
-Until then, no license is granted for reuse.
+MIT — see [LICENSE](LICENSE).

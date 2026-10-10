@@ -3,6 +3,7 @@ name = "zapi"
 description = "Rouster ZAPI codec and server: FRR zebra-protocol interop edge"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 common.workspace = true

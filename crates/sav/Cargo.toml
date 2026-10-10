@@ -3,6 +3,7 @@ name = "sav"
 description = "Rouster SAV: SIB, validation-mode rule model, uRPF rule generation, SAV table manager, savd daemon"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 common.workspace = true
