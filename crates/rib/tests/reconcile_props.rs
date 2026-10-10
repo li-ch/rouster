@@ -245,12 +245,76 @@ fn model_reload_static(model: &mut Model, routes: &[RouteEntry]) {
 }
 
 /// A hop is eligible for programming exactly when it carries an ifindex
-/// or is a blackhole; bare gateways never resolve against a bare Rib.
+/// or is a blackhole; bare gateways go through the model's recursive
+/// resolver below (the M2 walk mirrored).
 fn hop_eligible(hop: Nexthop) -> bool {
     matches!(
         hop,
         Nexthop::IfIndex(_) | Nexthop::Ipv4If(..) | Nexthop::Ipv6If(..) | Nexthop::Blackhole
     )
+}
+
+/// `Rib::resolve_nexthop` mirrored onto the model's own tables. There is
+/// no interface mirror in these scenarios, so the on-link arm is always
+/// empty; the walk is exactly `Rib::covering_route`'s: main-table keys
+/// only, non-default prefixes, best candidate per key, longest prefix
+/// then lowest (distance, metric), first hop drives the resolution —
+/// ifindex adopts, ifindex-carrying passes through, blackhole and empty
+/// (held) terminate unresolved, bare gateways recurse with a visited
+/// set guarding cycles.
+fn model_resolve(model: &Model, gw: std::net::IpAddr) -> Option<Nexthop> {
+    model_resolve_visited(model, gw, &mut BTreeSet::new())
+}
+
+fn model_resolve_visited(
+    model: &Model,
+    gw: std::net::IpAddr,
+    visited: &mut BTreeSet<std::net::IpAddr>,
+) -> Option<Nexthop> {
+    if !visited.insert(gw) {
+        return None;
+    }
+    let mut candidates: Vec<(u8, &RouteEntry)> = Vec::new();
+    for (&(table, prefix), cands) in model {
+        if table != 254 {
+            continue;
+        }
+        let len = match (prefix, gw) {
+            (IpPrefix::V4(p), std::net::IpAddr::V4(a)) if p.contains(a) => p.prefix_len(),
+            (IpPrefix::V6(p), std::net::IpAddr::V6(a)) if p.contains(a) => p.prefix_len(),
+            _ => continue,
+        };
+        if len == 0 {
+            continue;
+        }
+        let best = cands
+            .iter()
+            .min_by_key(|e| (e.protocol.admin_distance(), e.metric))
+            .unwrap();
+        candidates.push((len, best));
+    }
+    let (_, entry) = candidates.into_iter().max_by_key(|&(len, e)| {
+        (
+            len,
+            std::cmp::Reverse(e.protocol.admin_distance()),
+            std::cmp::Reverse(e.metric),
+        )
+    })?;
+    match entry.nexthops.hops().first() {
+        Some((Nexthop::IfIndex(ifindex), _)) => Some(match gw {
+            std::net::IpAddr::V4(a) => Nexthop::Ipv4If(a, *ifindex),
+            std::net::IpAddr::V6(a) => Nexthop::Ipv6If(a, *ifindex),
+        }),
+        Some((hop @ (Nexthop::Ipv4If(..) | Nexthop::Ipv6If(..)), _)) => Some(*hop),
+        Some((Nexthop::Blackhole, _)) => None,
+        Some((Nexthop::Ipv4(next), _)) => {
+            model_resolve_visited(model, std::net::IpAddr::V4(*next), visited)
+        }
+        Some((Nexthop::Ipv6(next), _)) => {
+            model_resolve_visited(model, std::net::IpAddr::V6(*next), visited)
+        }
+        None => None,
+    }
 }
 
 /// The desired set the way `reconcile` computes it: per key the best
@@ -266,8 +330,19 @@ fn model_desired(model: &Model) -> BTreeMap<Key, RouteEntry> {
             .unwrap();
         let mut resolved = NexthopGroup::new();
         for &(hop, weight) in best.nexthops.hops() {
-            if hop_eligible(hop) {
-                resolved.add(hop, weight);
+            match hop {
+                _ if hop_eligible(hop) => resolved.add(hop, weight),
+                Nexthop::Ipv4(g) => {
+                    if let Some(hop) = model_resolve(model, std::net::IpAddr::V4(g)) {
+                        resolved.add(hop, weight);
+                    }
+                }
+                Nexthop::Ipv6(g) => {
+                    if let Some(hop) = model_resolve(model, std::net::IpAddr::V6(g)) {
+                        resolved.add(hop, weight);
+                    }
+                }
+                _ => {}
             }
         }
         if resolved.is_empty() {

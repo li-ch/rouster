@@ -4,6 +4,7 @@
 //! first-class objects; best-path selection uses administrative distance then
 //! metric; the selected route is what gets programmed into the dataplane.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -82,8 +83,7 @@ impl Table {
 /// The RIB: a set of typed routing tables, a mirror of the kernel FIB, and
 /// mirrored interface/neighbour state.
 ///
-/// TODO(phase-1): recursive (multi-hop) nexthop resolution; redistribution
-/// channels between tables (BIRD-style).
+/// TODO(phase-1): redistribution channels between tables (BIRD-style).
 #[derive(Debug, Default)]
 pub struct Rib {
     tables: BTreeMap<TableId, Table>,
@@ -298,9 +298,32 @@ impl Rib {
     /// routes using it are held in the RIB but not programmed
     /// (see [`Rib::reconcile`]).
     ///
-    /// Recursive (multi-hop) resolution is deliberately not implemented
-    /// yet; a gateway only reachable through another route stays `None`.
+    /// This is the DIRECT surface: on-link only. The routing consumer
+    /// ([`Rib::resolve_nexthop_recursive`]) additionally walks the route
+    /// tables for multi-hop chains; this plain form stays conservative
+    /// so egress-derivation consumers (the SAV SIB ingest) keep a
+    /// connectivity-check answer that does not depend on route state.
     pub fn resolve_nexthop(&self, gw: IpAddr) -> Option<Nexthop> {
+        self.resolve_on_link(gw)
+    }
+
+    /// The routing-consumer resolver: on-link first, then the
+    /// multi-hop walk of [`Rib::covering_route`] — a gateway reachable
+    /// only through another route resolves through that route's own next
+    /// hop, chaining until the chain lands on-link (FRR `nexthop_active`,
+    /// frr-10.2.2 `zebra/zebra_nhg.c`). Cycles terminate the chain
+    /// unresolved; so do a blackhole candidate and a candidate whose own
+    /// gateway is held (see [`Rib::covering_route`] for the walk's exact
+    /// scope and disclosed deviations). This is what reconcile's
+    /// programming form, the NHT tracking table, and the ZAPI
+    /// NEXTHOP_UPDATE answers resolve through.
+    pub fn resolve_nexthop_recursive(&self, gw: IpAddr) -> Option<Nexthop> {
+        self.resolve_with_visited(gw, &mut BTreeSet::new())
+    }
+
+    /// The on-link arm of resolution: the longest address-mirror prefix on
+    /// an UP interface containing `gw` (direct, single-hop).
+    fn resolve_on_link(&self, gw: IpAddr) -> Option<Nexthop> {
         let mut best: Option<(u8, u32)> = None;
         for (&ifindex, iface) in &self.interfaces {
             if !iface.is_up {
@@ -325,30 +348,126 @@ impl Rib {
         })
     }
 
+    /// Resolution with a visited set (the recursion's cycle guard: a chain
+    /// that revisits a gateway terminates unresolved). On-link first, then
+    /// one walk candidate — see [`Rib::covering_route`].
+    fn resolve_with_visited(&self, gw: IpAddr, visited: &mut BTreeSet<IpAddr>) -> Option<Nexthop> {
+        if let Some(hop) = self.resolve_on_link(gw) {
+            return Some(hop);
+        }
+        if !visited.insert(gw) {
+            return None; // cycle: gateway already on this chain
+        }
+        let candidate = self.covering_route(gw)?;
+        match candidate.nexthops.hops().first() {
+            // A device route adopts its ifindex for the gateway (FRR's
+            // connected-match behavior, `zebra_nhg_connected_ifindex` in
+            // the frr-10.2.2 source fetched 2026-10-10).
+            Some((Nexthop::IfIndex(ifindex), _)) => Some(match gw {
+                IpAddr::V4(a) => Nexthop::Ipv4If(a, *ifindex),
+                IpAddr::V6(a) => Nexthop::Ipv6If(a, *ifindex),
+            }),
+            // Already ifindex-carrying: the matched route's own hop IS the
+            // resolution (the observed gateway on the observed device).
+            Some((hop @ (Nexthop::Ipv4If(..) | Nexthop::Ipv6If(..)), _)) => Some(*hop),
+            // A blackhole match terminates the chain unresolved — the
+            // gateway's traffic would be dropped, and rewriting a
+            // `via <gw>` route into a blackhole would silently change its
+            // forwarding semantics.
+            Some((Nexthop::Blackhole, _)) => None,
+            // A bare gateway recurses one level deeper.
+            Some((Nexthop::Ipv4(next), _)) => self.resolve_with_visited(IpAddr::V4(*next), visited),
+            Some((Nexthop::Ipv6(next), _)) => self.resolve_with_visited(IpAddr::V6(*next), visited),
+            // No usable hop: the candidate itself is held (its gateway
+            // never resolved). Held terminates the chain unresolved.
+            None => None,
+        }
+    }
+
+    /// The best non-default route covering `ip`, across the main table's
+    /// three candidate sources — the per-protocol tables, the CONNECT
+    /// table, and the kernel FIB mirror — chosen by longest prefix, then
+    /// lowest (admin distance, metric). This mirrors zebra's RIB walk for
+    /// nexthop resolution (`nexthop_active`, frr-10.2.2 `zebra/zebra_nhg.c`:
+    /// a matched route's nexthops drive the resolution, connected matches
+    /// adopt the ifindex, kernel/system matches count when the interface
+    /// is up), with two disclosed deviations:
+    ///
+    /// 1. **No fall-through.** Exactly one candidate is consulted (the
+    ///    best covering one); if its resolution fails (held/blackhole),
+    ///    the walk does NOT continue to shorter prefixes — zebra's
+    ///    `route_node_match` walks up the trie on an unusable node. The
+    ///    single-candidate form is deterministic and pins the
+    ///    held/blackhole-terminate semantics the mission names.
+    /// 2. **The default prefix never answers this walk.** FRR gates the
+    ///    default prefix on the registration's
+    ///    `ZEBRA_NHT_RESOLVE_VIA_DEFAULT` flag (`zebra_rnh.c`, pinned in
+    ///    docs/interop/zapi-10.2-pinned.md); Rouster applies that gate to
+    ///    the whole resolver — the programming form and the NHT answer
+    ///    can never disagree, and a gateway can only recurse into a
+    ///    default route through the explicit flag-set surface
+    ///    ([`Rib::lookup_nexthop_routed`]). FRR's route-nexthop recursion
+    ///    itself is not so restricted; this is the conservative choice.
+    fn covering_route(&self, ip: IpAddr) -> Option<&RouteEntry> {
+        let sources = [
+            self.tables.get(&MAIN_TABLE),
+            self.connected.get(&MAIN_TABLE),
+            self.kernel_mirror.get(&MAIN_TABLE),
+        ];
+        let mut candidates: Vec<(u8, &RouteEntry)> = Vec::new();
+        for table in sources.into_iter().flatten() {
+            for (prefix, _) in table.iter() {
+                let len = match (prefix, ip) {
+                    (IpPrefix::V4(p), IpAddr::V4(a)) if p.contains(a) => p.prefix_len(),
+                    (IpPrefix::V6(p), IpAddr::V6(a)) if p.contains(a) => p.prefix_len(),
+                    _ => continue,
+                };
+                // The default prefix never answers this walk (deviation 2).
+                if len == 0 {
+                    continue;
+                }
+                if let Some(best) = table.best(prefix) {
+                    candidates.push((len, best));
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .max_by_key(|&(len, entry)| {
+                (
+                    len,
+                    Reverse(entry.protocol.admin_distance()),
+                    Reverse(entry.metric),
+                )
+            })
+            .map(|(_, entry)| entry)
+    }
+
     /// NHT query API — the stable surface the ZAPI server answers
     /// `NEXTHOP_UPDATE` from: the resolved hop for an arbitrary IP (not
-    /// just tracked gateways), computed directly by
-    /// [`Rib::resolve_nexthop`]. `None` = unresolved.
+    /// just tracked gateways), computed by
+    /// [`Rib::resolve_nexthop_recursive`] (on-link, then the routed
+    /// walk). `None` = unresolved.
     pub fn lookup_nexthop(&self, ip: IpAddr) -> Option<Nexthop> {
-        self.resolve_nexthop(ip)
+        self.resolve_nexthop_recursive(ip)
     }
 
     /// NHT query with the routing-table fallback zebra's RNH resolution
     /// has (`zebra_rnh_resolve_nexthop_entry` matches the RIB tables, not
-    /// just connected prefixes). Gated on the client's
+    /// just connected prefixes): the routed walk of
+    /// [`Rib::resolve_nexthop`] (on-link first, then non-default route
+    /// candidates), plus the default-prefix arm gated on the client's
     /// `resolve_via_default` registration flag — the semantic ospfd sets
     /// for its NSSA default import check (`area <id> nssa
-    /// default-information-originate` registers 0.0.0.0/0): on-link first
-    /// (unchanged), then a longest-prefix match over the observed kernel
-    /// mirror in the main table. Zebra lets the default prefix answer
-    /// exactly flag-set registrations; flag-unset clients (staticd's
-    /// gateway NHT, bgpd's neighbor NHT — both pinned fixtures send 0)
-    /// keep the connected-only answer, an under-approximation disclosed
-    /// in docs/interop/zapi-10.2-pinned.md. A matched route answers with
-    /// its own observed hop; a bare-gateway hop needs one on-link level
-    /// to become usable (full recursion is future work).
+    /// default-information-originate` registers 0.0.0.0/0). Zebra lets
+    /// the default prefix answer exactly flag-set registrations
+    /// (`zebra_rnh.c`, pinned in docs/interop/zapi-10.2-pinned.md);
+    /// flag-unset clients (staticd's gateway NHT, bgpd's neighbor NHT —
+    /// both pinned fixtures send 0) never resolve through a default
+    /// route. A matched default answers with its own observed hop; a
+    /// bare-gateway hop recurses through the full resolver.
     pub fn lookup_nexthop_routed(&self, ip: IpAddr, resolve_via_default: bool) -> Option<Nexthop> {
-        if let Some(hop) = self.resolve_nexthop(ip) {
+        if let Some(hop) = self.resolve_nexthop_recursive(ip) {
             return Some(hop);
         }
         if !resolve_via_default {
@@ -377,9 +496,9 @@ impl Rib {
                 | Nexthop::Ipv4If(..)
                 | Nexthop::Ipv6If(..)
                 | Nexthop::Blackhole => Some(hop),
-                // Bare gateway: one on-link level of recursion, no deeper.
-                Nexthop::Ipv4(g) => self.resolve_nexthop(IpAddr::V4(g)),
-                Nexthop::Ipv6(g) => self.resolve_nexthop(IpAddr::V6(g)),
+                // Bare gateway: full recursion through the resolver.
+                Nexthop::Ipv4(g) => self.resolve_nexthop_recursive(IpAddr::V4(g)),
+                Nexthop::Ipv6(g) => self.resolve_nexthop_recursive(IpAddr::V6(g)),
             })
     }
 
@@ -408,7 +527,7 @@ impl Rib {
         let nht = gateways
             .into_iter()
             .map(|gw| {
-                let resolution = self.resolve_nexthop(gw);
+                let resolution = self.resolve_nexthop_recursive(gw);
                 (gw, resolution)
             })
             .collect();
@@ -427,14 +546,14 @@ impl Rib {
         let mut resolved = NexthopGroup::new();
         for &(hop, weight) in entry.nexthops.hops() {
             let hop = match hop {
-                Nexthop::Ipv4(g) => match self.resolve_nexthop(IpAddr::V4(g)) {
+                Nexthop::Ipv4(g) => match self.resolve_nexthop_recursive(IpAddr::V4(g)) {
                     Some(resolved_hop) => resolved_hop,
                     // Unresolved gateway: excluded from the programmed
                     // subset; if it was the only hop, the group is empty
                     // and the route is not programmed at all.
                     None => continue,
                 },
-                Nexthop::Ipv6(g) => match self.resolve_nexthop(IpAddr::V6(g)) {
+                Nexthop::Ipv6(g) => match self.resolve_nexthop_recursive(IpAddr::V6(g)) {
                     Some(resolved_hop) => resolved_hop,
                     None => continue,
                 },
@@ -483,28 +602,28 @@ impl Rib {
                 iface.flags = *flags;
                 iface.vrf_table = *vrf_table;
                 iface.master_ifindex = *master_ifindex;
-                self.rebuild_nht();
                 self.sync_connected();
+                self.rebuild_nht();
             }
             DataplaneEvent::LinkDel { ifindex } => {
                 self.interfaces.remove(ifindex);
-                self.rebuild_nht();
                 self.sync_connected();
+                self.rebuild_nht();
             }
             DataplaneEvent::AddressNew { ifindex, prefix } => {
                 let iface = self.interfaces.entry(*ifindex).or_default();
                 if !iface.addresses.contains(prefix) {
                     iface.addresses.push(*prefix);
                 }
-                self.rebuild_nht();
                 self.sync_connected();
+                self.rebuild_nht();
             }
             DataplaneEvent::AddressDel { ifindex, prefix } => {
                 if let Some(iface) = self.interfaces.get_mut(ifindex) {
                     iface.addresses.retain(|p| p != prefix);
                 }
-                self.rebuild_nht();
                 self.sync_connected();
+                self.rebuild_nht();
             }
             DataplaneEvent::RouteNew {
                 table,
@@ -574,7 +693,7 @@ impl Rib {
     pub fn add_route(&mut self, entry: RouteEntry) {
         let table_id = entry.table;
         for gw in gateway_ips(&entry.nexthops) {
-            let resolved = self.resolve_nexthop(gw);
+            let resolved = self.resolve_nexthop_recursive(gw);
             self.nht.entry(gw).or_insert(resolved);
         }
         self.table_mut(table_id).add(entry);
@@ -1808,6 +1927,190 @@ mod tests {
         assert!(dp.removed_prefixes().is_empty());
     }
 
+    // --- Recursive multi-hop resolution (the routed walk) ---
+
+    fn mirror_route(prefix: &str, gw: &str, oif: u32) -> DataplaneEvent {
+        DataplaneEvent::RouteNew {
+            table: MAIN_TABLE,
+            prefix: prefix.parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: Some(ip(gw)),
+            oif: Some(oif),
+        }
+    }
+
+    /// 1-, 2- and 3-hop chains all resolve through the walk to the
+    /// ultimate on-link hop; every chain member's own route stays a bare
+    /// `via <gw>` candidate while the RESOLVED forms carry the ifindex.
+    #[test]
+    fn recursive_resolution_chains_one_two_three_hops() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.1.1/24", true));
+
+        // 1-hop: 10.9.0.0/16 via 10.99.0.1 (off-link), covered by a
+        // mirror route to 10.99.0.0/24 via the on-link 10.1.1.9.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: MAIN_TABLE,
+            prefix: "10.99.0.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: Some(ip("10.1.1.9")),
+            oif: Some(2),
+        });
+        rib.add_route(gw_entry("10.9.0.0/16", "10.99.0.1"));
+        assert_eq!(
+            rib.resolve_nexthop_recursive(ip("10.99.0.1")),
+            Some(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2)),
+            "1-hop: the covering route's own observed hop"
+        );
+        // And the off-link-gateway route is programmable through it.
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        let installed = dp.installed.lock().unwrap();
+        assert!(installed.iter().any(|e| {
+            e.prefix == "10.9.0.0/16".parse().unwrap()
+                && e.nexthops.hops() == [(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2), 1)]
+        }));
+
+        // 2-hop: 198.18.0.1 covered by a static via 10.99.0.2 (bare),
+        // which is itself covered by the mirror 10.99.0.0/24 route.
+        rib.add_route(gw_entry("203.0.113.0/24", "198.18.0.1"));
+        rib.add_route(gw_entry("198.18.0.0/15", "10.99.0.2"));
+        assert_eq!(
+            rib.resolve_nexthop_recursive(ip("198.18.0.1")),
+            Some(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2))
+        );
+
+        // 3-hop: 100.64.0.1 via chain 100.64.0.0/10 -> 172.16.0.0/12 ->
+        // the 198.18.0.0/15 static -> the mirror route -> on-link.
+        rib.add_route(gw_entry("100.64.0.0/10", "172.16.0.1"));
+        rib.add_route(gw_entry("172.16.0.0/12", "198.18.0.254"));
+        assert_eq!(
+            rib.resolve_nexthop_recursive(ip("100.64.0.1")),
+            Some(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2)),
+            "3-hop chain lands on the same ultimate hop"
+        );
+
+        // The plain surface stays direct (on-link only) for the same IP.
+        assert_eq!(rib.resolve_nexthop(ip("100.64.0.1")), None);
+    }
+
+    /// Cycles terminate the chain unresolved: a two-gateway loop and a
+    /// route whose gateway sits inside its own covering prefix never
+    /// resolve.
+    #[test]
+    fn recursive_resolution_cycles_terminate_unresolved() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.1.1/24", true));
+
+        // A -> B -> A: both routes cover each other's gateway.
+        rib.add_route(gw_entry("10.2.0.0/16", "10.3.0.1"));
+        rib.add_route(gw_entry("10.3.0.0/16", "10.2.0.1"));
+        assert_eq!(rib.resolve_nexthop_recursive(ip("10.2.0.1")), None);
+        assert_eq!(rib.resolve_nexthop_recursive(ip("10.3.0.1")), None);
+
+        // Self-covering: 10.4.0.0/16 via 10.4.0.1 — the route's own
+        // prefix is the best cover of its gateway, recursing into
+        // itself; the visited set halts it.
+        rib.add_route(gw_entry("10.4.0.0/16", "10.4.0.1"));
+        assert_eq!(rib.resolve_nexthop_recursive(ip("10.4.0.1")), None);
+    }
+
+    /// A blackhole candidate terminates the chain unresolved, and the
+    /// walk does NOT fall through to a shorter covering prefix (the
+    /// disclosed no-fall-through deviation, pinned).
+    #[test]
+    fn blackhole_candidate_terminates_without_fallthrough() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.1.1/24", true));
+
+        // Longest cover is a blackhole; a shorter cover would resolve.
+        rib.add_route(RouteEntry::new(
+            "10.9.9.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(Nexthop::Blackhole),
+            0,
+        ));
+        rib.apply_event(&mirror_route("10.9.0.0/16", "10.1.1.9", 2));
+        assert_eq!(
+            rib.resolve_nexthop_recursive(ip("10.9.9.7")),
+            None,
+            "blackhole terminates the chain; no fall-through to the /16"
+        );
+    }
+
+    /// A held candidate (its own gateway unresolved) terminates the chain
+    /// unresolved — again without falling through to shorter prefixes.
+    #[test]
+    fn held_candidate_terminates_without_fallthrough() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.1.1/24", true));
+
+        // Longest cover's gateway is nowhere reachable (held); a shorter
+        // cover exists and would resolve.
+        rib.add_route(gw_entry("10.9.9.0/24", "100.64.0.1"));
+        rib.apply_event(&mirror_route("10.9.0.0/16", "10.1.1.9", 2));
+        assert_eq!(rib.resolve_nexthop_recursive(ip("10.9.9.7")), None);
+
+        // The moment the held candidate's gateway comes on-link, the
+        // chain completes.
+        rib.apply_event(&link(3, "eth1", true));
+        rib.apply_event(&address(3, "100.64.0.1/32", true));
+        assert_eq!(
+            rib.resolve_nexthop_recursive(ip("10.9.9.7")),
+            Some(Nexthop::Ipv4If("100.64.0.1".parse().unwrap(), 3))
+        );
+    }
+
+    /// The default prefix never answers the walk — a gateway covered only
+    /// by a default route stays unresolved to the plain resolver, and the
+    /// flag-set NHT surface (`lookup_nexthop_routed`) is the one path
+    /// where the default may answer (A23 semantics, unchanged).
+    #[test]
+    fn default_prefix_answers_only_the_flag_set_surface() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.1.1/24", true));
+        rib.apply_event(&mirror_route("0.0.0.0/0", "10.1.1.9", 2));
+
+        // 100.64.0.1 is covered only by the default route.
+        assert_eq!(rib.resolve_nexthop_recursive(ip("100.64.0.1")), None);
+        assert_eq!(rib.lookup_nexthop_routed(ip("100.64.0.1"), false), None);
+        assert_eq!(
+            rib.lookup_nexthop_routed(ip("100.64.0.1"), true),
+            Some(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2))
+        );
+    }
+
+    /// A kernel-mirror device route (oif-only hop) participates in the
+    /// walk and adopts its ifindex for the gateway — the FRR
+    /// connected-match behavior.
+    #[test]
+    fn mirror_device_route_adopts_its_ifindex() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.1.1/24", true));
+        // A mirror route with oif only (device route): IfIndex hop.
+        rib.apply_event(&DataplaneEvent::RouteNew {
+            table: MAIN_TABLE,
+            prefix: "10.99.0.0/24".parse().unwrap(),
+            protocol: RouteProtocol::Kernel,
+            metric: 0,
+            gateway: None,
+            oif: Some(7),
+        });
+        assert_eq!(
+            rib.resolve_nexthop_recursive(ip("10.99.0.1")),
+            Some(Nexthop::Ipv4If("10.99.0.1".parse().unwrap(), 7)),
+            "the device route's ifindex is adopted for the gateway"
+        );
+    }
+
     #[test]
     fn unresolved_gateways_prune_on_reload() {
         let mut rib = Rib::new();
@@ -1823,11 +2126,14 @@ mod tests {
         rib.apply_event(&address(2, "192.0.2.1/24", true));
         rib.add_route(gw_entry("203.0.113.0/24", "192.0.2.7"));
         assert_eq!(rib.unresolved_gateways().count(), 0);
-        // Tracked-but-unresolved and resolved gateways coexist.
-        rib.add_route(gw_entry("198.51.100.0/24", "203.0.113.7"));
+        // Tracked-but-unresolved and resolved gateways coexist. (M2 note:
+        // a gateway inside another route's prefix now resolves THROUGH
+        // that route — the recursive-resolver milestone — so the
+        // stays-unresolved exemplar is a gateway nothing covers.)
+        rib.add_route(gw_entry("198.51.100.0/24", "100.64.0.1"));
         assert_eq!(
             rib.unresolved_gateways().collect::<Vec<_>>(),
-            vec![ip("203.0.113.7")]
+            vec![ip("100.64.0.1")]
         );
     }
 
