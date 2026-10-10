@@ -13,10 +13,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Add the Linux cfg clippy target
+        run: rustup target add aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # netlink-dp's linux.rs is cfg-gated off non-Linux hosts — the
+      # musl leg is what actually compiles it (the W3+ house rule).
+      - run: cargo clippy -p netlink-dp --all-targets --target aarch64-unknown-linux-musl -- -D warnings
       - run: cargo test --workspace
+      - name: Smoke scripts syntax check
+        run: |
+          shopt -s nullglob
+          for s in scripts/test-*.sh scripts/run-smokes.sh; do bash -n "$s"; done
 
   integration-phase0:
     runs-on: ubuntu-latest
