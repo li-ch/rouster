@@ -50,7 +50,7 @@ impl SpoofMonitor {
     /// would log and a drop action would have dropped; unknown never
     /// counts toward spoof (unknown ≠ invalid).
     pub fn observe(&mut self, source: IpAddr, ingress: u32) -> Verdict {
-        let verdict = evaluate(&self.ops, source, ingress);
+        let verdict = evaluate(&self.ops, source, ingress).verdict;
         match verdict {
             Verdict::Invalid => self.counts.invalid += 1,
             Verdict::Valid => self.counts.valid += 1,

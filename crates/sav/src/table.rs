@@ -624,8 +624,25 @@ fn subtract_bits<B>(
     );
 }
 
+/// The result of one evaluation: the verdict plus the op that decided
+/// it. GSC §4's optional "count" monitor policy is *per-rule*
+/// ("Count: ... per-rule counters"), so a counting surface needs to
+/// know WHICH op spoke — the [`Verdict`] alone cannot attribute a
+/// tally. `op` is `None` exactly when `verdict` is
+/// [`Verdict::Unknown`] (no op judged the packet); every decided
+/// verdict names its deciding op, `Invalid` included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decision<'a> {
+    /// What the four-step pipeline concluded.
+    pub verdict: Verdict,
+    /// The op that produced `verdict` — the op a per-rule counter
+    /// tallies against; `None` iff the verdict is `Unknown`.
+    pub op: Option<&'a SavOp>,
+}
+
 /// Reference semantics of a compiled op list: the GSC §3 four-step
-/// pipeline over one (source, arrival interface) pair.
+/// pipeline over one (source, arrival interface) pair, returning the
+/// [`Decision`] (verdict + the op that decided) — W6 §Deferred 4.
 ///
 /// 1. Record the packet's source and incoming interface; state starts
 ///    "valid".
@@ -637,34 +654,41 @@ fn subtract_bits<B>(
 /// 3. *IBB*: a matched blocklist prefix ⇒ [`Verdict::Invalid`]; a
 ///    non-match is "valid" only provisionally — GSC §3: "the traffic
 ///    must also be checked against PBA-SAV or PBB-SAV if those modes
-///    are applicable", so evaluation falls through.
+///    are applicable", so evaluation falls through *without* an IBB
+///    decision (the IBB op is not the decider).
 /// 4. *PBA/PBB*: the longest covering protected prefix's op decides
 ///    (PBA: arrival ∈ interface set ? Valid : Invalid; PBB: arrival ∈
 ///    interface set ? Invalid : Valid). No covering protected prefix ⇒
-///    [`Verdict::Unknown`] — no mode judged this packet.
+///    [`Verdict::Unknown`] with no op — no mode judged this packet.
 ///
 /// Longest-covering-prefix selection is deterministic: at most one
 /// prefix per (family, length) can contain a given address, and
 /// compile de-duplicates per prefix.
-pub fn evaluate(ops: &[SavOp], source: IpAddr, ingress: u32) -> Verdict {
+pub fn evaluate(ops: &[SavOp], source: IpAddr, ingress: u32) -> Decision<'_> {
     // Step 2 — IBA is decisive for its interface.
-    if let Some(SavOp::IbaPermit { prefixes, .. }) = ops
+    if let Some(op @ SavOp::IbaPermit { prefixes, .. }) = ops
         .iter()
         .find(|op| matches!(op, SavOp::IbaPermit { ifindex, .. } if *ifindex == ingress))
     {
-        return if prefixes.iter().any(|p| prefix_contains(*p, source)) {
-            Verdict::Valid
-        } else {
-            Verdict::Invalid
+        return Decision {
+            verdict: if prefixes.iter().any(|p| prefix_contains(*p, source)) {
+                Verdict::Valid
+            } else {
+                Verdict::Invalid
+            },
+            op: Some(op),
         };
     }
     // Step 3 — IBB match is invalid; a non-match falls through.
-    if let Some(SavOp::IbbBlock { prefixes, .. }) = ops
+    if let Some(op @ SavOp::IbbBlock { prefixes, .. }) = ops
         .iter()
         .find(|op| matches!(op, SavOp::IbbBlock { ifindex, .. } if *ifindex == ingress))
     {
         if prefixes.iter().any(|p| prefix_contains(*p, source)) {
-            return Verdict::Invalid;
+            return Decision {
+                verdict: Verdict::Invalid,
+                op: Some(op),
+            };
         }
     }
     // Step 4 — the longest covering router-scale op decides.
@@ -678,21 +702,26 @@ pub fn evaluate(ops: &[SavOp], source: IpAddr, ingress: u32) -> Verdict {
         })
         .max_by_key(|op| prefix_len(op_prefix(op)));
     match covering {
-        Some(SavOp::PbaPermit { ifindexes, .. }) => {
-            if ifindexes.contains(&ingress) {
+        Some(op @ SavOp::PbaPermit { ifindexes, .. }) => Decision {
+            verdict: if ifindexes.contains(&ingress) {
                 Verdict::Valid
             } else {
                 Verdict::Invalid
-            }
-        }
-        Some(SavOp::PbbBlock { ifindexes, .. }) => {
-            if ifindexes.contains(&ingress) {
+            },
+            op: Some(op),
+        },
+        Some(op @ SavOp::PbbBlock { ifindexes, .. }) => Decision {
+            verdict: if ifindexes.contains(&ingress) {
                 Verdict::Invalid
             } else {
                 Verdict::Valid
-            }
-        }
-        _ => Verdict::Unknown,
+            },
+            op: Some(op),
+        },
+        _ => Decision {
+            verdict: Verdict::Unknown,
+            op: None,
+        },
     }
 }
 
@@ -870,7 +899,7 @@ mod tests {
         for (mode, source, ingress, expected, why) in cases {
             let rules = generate_urpf(mode, &sib, &rib, &cfg);
             let ops = compile(&rules, &cfg);
-            let got = evaluate(&ops, ip(source), ingress);
+            let got = evaluate(&ops, ip(source), ingress).verdict;
             assert_eq!(
                 got, expected,
                 "{mode} src {source} ingress {ingress}: {why}"
@@ -887,12 +916,123 @@ mod tests {
         let rules = generate_urpf(UrpfMode::Strict, &sib, &rib, &cfg);
         let ops = compile(&rules, &cfg);
         // Interface 9 has no mode enabled: no opinion.
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 9), Verdict::Unknown);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 9).verdict,
+            Verdict::Unknown
+        );
 
         // With no ops at all everything is unknown.
-        assert_eq!(evaluate(&[], ip("198.51.100.9"), 2), Verdict::Unknown);
+        assert_eq!(
+            evaluate(&[], ip("198.51.100.9"), 2).verdict,
+            Verdict::Unknown
+        );
         let empty = compile(&RuleSet::default(), &SavConfig::new());
         assert!(empty.is_empty());
+    }
+
+    /// W6 §Deferred 4 (verdict provenance): a decided verdict names the
+    /// op element that decided it — pointer-identity with the ops slice,
+    /// not just an equal value — for every step of the GSC §3 pipeline:
+    /// IBA (valid and invalid alike, IBA is decisive either way), PBA,
+    /// and PBB. Per-rule counters (GSC §4 "count") attribute against
+    /// exactly this op.
+    #[test]
+    fn decision_names_the_op_that_decided() {
+        // IBA: the matched and the unmatched source alike are decided
+        // by the arrival interface's own IbaPermit op.
+        let ops = vec![
+            SavOp::IbaPermit {
+                ifindex: 2,
+                prefixes: vec!["198.51.100.0/24".parse().unwrap()],
+                action: SavAction::Monitor,
+                origin: None,
+            },
+            SavOp::IbaPermit {
+                ifindex: 3,
+                prefixes: vec![],
+                action: SavAction::Monitor,
+                origin: None,
+            },
+        ];
+        let valid = evaluate(&ops, ip("198.51.100.9"), 2);
+        assert_eq!(valid.verdict, Verdict::Valid);
+        assert!(std::ptr::eq(valid.op.unwrap(), &ops[0]));
+        let invalid = evaluate(&ops, ip("198.51.100.9"), 3);
+        assert_eq!(invalid.verdict, Verdict::Invalid);
+        assert!(std::ptr::eq(invalid.op.unwrap(), &ops[1]));
+
+        // Router scale: the longest covering op decides and is named.
+        let router = vec![
+            SavOp::PbaPermit {
+                prefix: "10.0.0.0/8".parse().unwrap(),
+                ifindexes: vec![2],
+                action: SavAction::Monitor,
+                origin: None,
+            },
+            SavOp::PbbBlock {
+                prefix: "10.1.0.0/16".parse().unwrap(),
+                ifindexes: vec![3],
+                action: SavAction::Monitor,
+                origin: None,
+            },
+        ];
+        let pba_decided = evaluate(&router, ip("10.9.9.9"), 4);
+        assert_eq!(pba_decided.verdict, Verdict::Invalid);
+        assert!(std::ptr::eq(pba_decided.op.unwrap(), &router[0]));
+        let pbb_decided = evaluate(&router, ip("10.1.2.3"), 2);
+        assert_eq!(pbb_decided.verdict, Verdict::Valid);
+        assert!(std::ptr::eq(pbb_decided.op.unwrap(), &router[1]));
+    }
+
+    /// W6 §Deferred 4, the IBB fall-through case: an IBB op that does
+    /// NOT match is *not* the decider — GSC §3 sends the traffic on to
+    /// the router-scale modes, so the decision names the PBA/PBB op (or
+    /// no op at all); an IBB match is decided by the IBB op itself.
+    #[test]
+    fn ibb_non_match_leaves_the_decision_to_router_scale() {
+        let ops = vec![
+            SavOp::IbbBlock {
+                ifindex: 3,
+                prefixes: vec!["192.0.2.0/24".parse().unwrap()],
+                action: SavAction::Monitor,
+                origin: None,
+            },
+            SavOp::PbaPermit {
+                prefix: "198.51.100.0/24".parse().unwrap(),
+                ifindexes: vec![2],
+                action: SavAction::Monitor,
+                origin: None,
+            },
+        ];
+        // IBB match: the IBB op decided the Invalid.
+        let blocked = evaluate(&ops, ip("192.0.2.7"), 3);
+        assert_eq!(blocked.verdict, Verdict::Invalid);
+        assert!(std::ptr::eq(blocked.op.unwrap(), &ops[0]));
+        // IBB non-match on a PBA-protected source: the PBA op decided
+        // (ingress 3 is not in its allowlist), not the IBB op.
+        let fell_through = evaluate(&ops, ip("198.51.100.9"), 3);
+        assert_eq!(fell_through.verdict, Verdict::Invalid);
+        assert!(std::ptr::eq(fell_through.op.unwrap(), &ops[1]));
+    }
+
+    /// W6 §Deferred 4, the no-opinion case: `Unknown` never names an op
+    /// — no op judged the packet, so no per-rule counter is attributed.
+    #[test]
+    fn unknown_names_no_op() {
+        let ops = vec![SavOp::IbaPermit {
+            ifindex: 2,
+            prefixes: vec!["198.51.100.0/24".parse().unwrap()],
+            action: SavAction::Monitor,
+            origin: None,
+        }];
+        // Interface 9 has no mode: unjudged.
+        let unjudged = evaluate(&ops, ip("198.51.100.9"), 9);
+        assert_eq!(unjudged.verdict, Verdict::Unknown);
+        assert!(unjudged.op.is_none());
+        // No ops at all: unjudged, still no op.
+        let empty = evaluate(&[], ip("198.51.100.9"), 2);
+        assert_eq!(empty.verdict, Verdict::Unknown);
+        assert!(empty.op.is_none());
     }
 
     /// GSC §2.1: "Only the source prefixes recorded in the list will be
@@ -924,7 +1064,10 @@ mod tests {
             ],
             "both IBA-enabled interfaces keep an (empty) allowlist op"
         );
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Invalid);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 2).verdict,
+            Verdict::Invalid
+        );
     }
 
     /// GSC §2.2: an IBB-listed source is invalid on the listed
@@ -945,14 +1088,14 @@ mod tests {
                 origin: None,
             }]
         );
-        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 3), Verdict::Invalid);
+        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 3).verdict, Verdict::Invalid);
         assert_eq!(
-            evaluate(&ops, ip("198.51.100.9"), 3),
+            evaluate(&ops, ip("198.51.100.9"), 3).verdict,
             Verdict::Unknown,
             "unlisted source falls through with no router rules"
         );
         assert_eq!(
-            evaluate(&ops, ip("192.0.2.7"), 2),
+            evaluate(&ops, ip("192.0.2.7"), 2).verdict,
             Verdict::Unknown,
             "other interfaces are not IBB's business"
         );
@@ -975,11 +1118,20 @@ mod tests {
                 origin: None,
             }]
         );
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 3), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 4), Verdict::Invalid);
         assert_eq!(
-            evaluate(&ops, ip("203.0.113.5"), 4),
+            evaluate(&ops, ip("198.51.100.9"), 2).verdict,
+            Verdict::Valid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 3).verdict,
+            Verdict::Valid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 4).verdict,
+            Verdict::Invalid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("203.0.113.5"), 4).verdict,
             Verdict::Unknown,
             "source outside the protected prefix: no judgment"
         );
@@ -992,9 +1144,18 @@ mod tests {
         let cfg = SavConfig::new();
         let rules = RuleSet::from_rules([pbb("198.51.100.0/24", &[4])]);
         let ops = compile(&rules, &cfg);
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 4), Verdict::Invalid);
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("203.0.113.5"), 4), Verdict::Unknown);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 4).verdict,
+            Verdict::Invalid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 2).verdict,
+            Verdict::Valid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("203.0.113.5"), 4).verdict,
+            Verdict::Unknown
+        );
     }
 
     /// GSC §3: "If an interface has IBA-SAV enabled, traffic on that
@@ -1016,13 +1177,19 @@ mod tests {
         rules.push(pba("198.51.100.0/24", &[3]));
         let all = RuleSet::from_rules(rules);
         let ops = compile(&all, &cfg2);
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 3), Verdict::Invalid);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 3).verdict,
+            Verdict::Invalid
+        );
         // Without any interface mode enabled, PBA judges the same
         // packet Valid (only IBA short-circuits it, not the other way
         // round).
         let only_pba = RuleSet::from_rules([pba("198.51.100.0/24", &[3])]);
         let ops2 = compile(&only_pba, &SavConfig::new());
-        assert_eq!(evaluate(&ops2, ip("198.51.100.9"), 3), Verdict::Valid);
+        assert_eq!(
+            evaluate(&ops2, ip("198.51.100.9"), 3).verdict,
+            Verdict::Valid
+        );
     }
 
     /// GSC §3: "IBA-SAV and IBB-SAV ... must not be enabled on same
@@ -1041,7 +1208,7 @@ mod tests {
         // IbbBlock op exists.
         assert!(ops.iter().all(|op| !matches!(op, SavOp::IbbBlock { .. })));
         assert_eq!(ops.len(), 2);
-        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 2), Verdict::Invalid);
+        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 2).verdict, Verdict::Invalid);
     }
 
     /// GSC §3: "PBA-SAV and PBB-SAV ... are also mutually exclusive" —
@@ -1054,7 +1221,10 @@ mod tests {
         let ops = compile(&rules, &cfg);
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], SavOp::PbaPermit { .. }));
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 2).verdict,
+            Verdict::Valid
+        );
     }
 
     /// GSC §3 merge-by-subtraction, interface axis: IBB prefixes
@@ -1095,21 +1265,30 @@ mod tests {
             "v6 halves along the /33 boundary"
         );
         // Merged verdicts on ifindex 2.
-        assert_eq!(evaluate(&ops, ip("10.0.0.1"), 2), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("10.0.0.1"), 2).verdict, Verdict::Valid);
         assert_eq!(
-            evaluate(&ops, ip("10.0.200.1"), 2),
+            evaluate(&ops, ip("198.51.100.9"), 2).verdict,
+            Verdict::Valid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("10.0.200.1"), 2).verdict,
             Verdict::Invalid,
             "inside the carved-out /17 half"
         );
         assert_eq!(
-            evaluate(&ops, ip("192.0.2.7"), 2),
+            evaluate(&ops, ip("192.0.2.7"), 2).verdict,
             Verdict::Invalid,
             "entry fully covered by the blocklist"
         );
         // And the v6 boundary on ifindex 3.
-        assert_eq!(evaluate(&ops, ip("2001:db8:7fff::1"), 3), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("2001:db8:8000::1"), 3), Verdict::Invalid);
+        assert_eq!(
+            evaluate(&ops, ip("2001:db8:7fff::1"), 3).verdict,
+            Verdict::Valid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("2001:db8:8000::1"), 3).verdict,
+            Verdict::Invalid
+        );
         // Contrast: the default policy ignores the colliding IBB rules.
         let ignored = compile(&rules, &cfg);
         assert_eq!(prefixes_of(&ignored, 2).len(), 3);
@@ -1148,17 +1327,26 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 2), Verdict::Valid);
         assert_eq!(
-            evaluate(&ops, ip("198.51.100.9"), 3),
+            evaluate(&ops, ip("198.51.100.9"), 2).verdict,
+            Verdict::Valid
+        );
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 3).verdict,
             Verdict::Invalid,
             "ifindex 3 subtracted from the allowlist"
         );
-        assert_eq!(evaluate(&ops, ip("198.51.100.9"), 4), Verdict::Valid);
+        assert_eq!(
+            evaluate(&ops, ip("198.51.100.9"), 4).verdict,
+            Verdict::Valid
+        );
         // Contrast: the default policy keeps the whole allowlist —
         // ingress 3 is valid there because the PBB rule was ignored.
         let ignored = compile(&rules, &cfg);
-        assert_eq!(evaluate(&ignored, ip("198.51.100.9"), 3), Verdict::Valid);
+        assert_eq!(
+            evaluate(&ignored, ip("198.51.100.9"), 3).verdict,
+            Verdict::Valid
+        );
     }
 
     /// Property (fixed probe grid): under [`CollisionPolicy::Subtract`]
@@ -1228,7 +1416,7 @@ mod tests {
                     Verdict::Unknown
                 };
                 assert_eq!(
-                    evaluate(&ops, src, ingress),
+                    evaluate(&ops, src, ingress).verdict,
                     expected,
                     "src {src} ingress {ingress}"
                 );
@@ -1249,12 +1437,12 @@ mod tests {
         ]);
         let ops = compile(&rules, &cfg);
         assert_eq!(
-            evaluate(&ops, ip("198.51.100.9"), 3),
+            evaluate(&ops, ip("198.51.100.9"), 3).verdict,
             Verdict::Invalid,
             "IBB says valid, PBA rejects ingress 3"
         );
         assert_eq!(
-            evaluate(&ops, ip("203.0.113.5"), 3),
+            evaluate(&ops, ip("203.0.113.5"), 3).verdict,
             Verdict::Unknown,
             "IBB valid + no covering router rule = unknown"
         );
@@ -1382,9 +1570,9 @@ mod tests {
             panic!("expected iba op");
         };
         assert_eq!(prefixes.len(), 2, "both prefixes on the list");
-        assert_eq!(evaluate(&ops, ip("10.1.2.3"), 2), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("10.9.9.9"), 2), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("192.0.2.1"), 2), Verdict::Invalid);
+        assert_eq!(evaluate(&ops, ip("10.1.2.3"), 2).verdict, Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("10.9.9.9"), 2).verdict, Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("192.0.2.1"), 2).verdict, Verdict::Invalid);
     }
 
     /// Router-scale longest-covering-prefix wins when protected
@@ -1396,10 +1584,10 @@ mod tests {
         let rules = RuleSet::from_rules([pba("10.0.0.0/8", &[2]), pbb("10.1.0.0/16", &[3])]);
         let ops = compile(&rules, &cfg);
         // 10.1.2.3: the /16 PBB wins over the /8 PBA.
-        assert_eq!(evaluate(&ops, ip("10.1.2.3"), 3), Verdict::Invalid);
-        assert_eq!(evaluate(&ops, ip("10.1.2.3"), 2), Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("10.1.2.3"), 3).verdict, Verdict::Invalid);
+        assert_eq!(evaluate(&ops, ip("10.1.2.3"), 2).verdict, Verdict::Valid);
         // 10.9.9.9: only the /8 covers it.
-        assert_eq!(evaluate(&ops, ip("10.9.9.9"), 4), Verdict::Invalid);
+        assert_eq!(evaluate(&ops, ip("10.9.9.9"), 4).verdict, Verdict::Invalid);
     }
 
     /// Hand-built bindings through the whole pipe (config origin):
@@ -1418,7 +1606,7 @@ mod tests {
         let rib = rib::Rib::new();
         let rules = generate_urpf(UrpfMode::Strict, &sib, &rib, &cfg);
         let ops = compile(&rules, &cfg);
-        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 3), Verdict::Valid);
-        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 2), Verdict::Invalid);
+        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 3).verdict, Verdict::Valid);
+        assert_eq!(evaluate(&ops, ip("192.0.2.7"), 2).verdict, Verdict::Invalid);
     }
 }
