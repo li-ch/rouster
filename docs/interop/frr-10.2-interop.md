@@ -433,3 +433,49 @@ findings worth keeping beside the z5-era notes above:
   live UP frame carries 4.
 - zapi-sniff also gained `--respond-iface`/`--respond-nht` (codec-
   built answers) as capture drivers for the above.
+
+## W2-d interop (2026-10-11): bgpd policy/RPKI/ASPA decision path
+
+`scripts/test-bgp-policy-interop.sh` (exit 0 three times; report:
+`away/2026-10-11/weekend/reports/W2-d.md`, captures under
+`away/2026-10-11/weekend/quarantine/bgp-policy/`): the P2-b
+two-container topology (rousterd zebras both sides, real FRR 10.2.2
+bgpd on r1) with the decision-path features live. Machine-checked:
+PEER-BOTH Established; RPKI-INVALID-REJECTED (our bgpd logs the
+reject, the prefix absent from r2's kernel, rousterd programmed
+nothing); RPKI-VALID-INSTALLED (kernel `proto bgp`); EXPORT-FILTER
+(FRR's table holds the permitted one of our two networks, not the
+denied one); TEARDOWN Cease. FRR-side facts kept for reuse:
+
+- A `vrp-file`-fed peer rejects Invalid origins outright at import
+  when `reject-invalid` is on — the reject is observable only on the
+  rouster side (no NOTIFICATION; the route silently never lands).
+- The unconfigured daemon is behavior-identical to P2-b's (accept-all
+  default) — both smokes run the same binary, pinned by unit test.
+
+## W2-e interop (2026-10-10/11): ospfd — adjacency + both redistributes
+
+`scripts/test-ospf-frr-interop.sh` (exit 0 twice back-to-back;
+report: `away/2026-10-11/weekend/reports/W2-e.md`, captures under
+`away/2026-10-11/weekend/quarantine/ospf/`): full adjacency with
+real FRR 10.2.2 ospfd on a p2p link in ~0.5 s, LSDB convergence both
+ways, 30 s soak with zero zapi reconnects. REDIST-OUT: staticd
+static → rousterd push → our type-5 → FRR's LSDB and kernel
+`via <us>`. REDIST-IN: FRR blackhole static → FRR type-5 → our
+§16.4 → our kernel `via <FRR>` through rousterd. FRR-side facts
+kept for reuse:
+
+- FRR 10.2.2 rejects any DBD whose summary section carries trailing
+  bytes ("undersized (2 B) trailing LSA header") — an empty ExStart
+  DD is exactly 32 bytes (§A.3.3 has NO padding before the DD
+  sequence; found live, golden-pinned in the codec tests).
+- vtysh `show ip route` errors without an FRR zebra running — read
+  kernel `ip route show proto ospf` instead when rousterd owns the
+  RIB.
+- The FILTERED `show ip ospf database external` prints the detail
+  form (one field per line); pipe-greps need the unfiltered summary
+  table.
+- FRR sets a redistributed static's type-5 forwarding address to the
+  static's nexthop (§12.4.3) — the reverse (REDIST-IN) direction
+  uses a blackhole static (FA 0.0.0.0) so the two routers don't
+  loop through each other.

@@ -249,3 +249,33 @@ The phase text above is unchanged; this block is status only.
   accepted (J2); vtyd apply direction = config-manager target,
   file+SIGHUP interim (K3); CI = private GitHub + Linux Actions (D1 —
   workflow staged, repo creation is the owner's).
+
+- 2026-10-11/12 (weekend program, closed by the W3 integration pass) —
+  six streams COMPLETE-VERIFIED at HEAD `ea8e9dc` (baseline `4837f67`,
+  640/0): the `policy` crate — typed filter engine (BIRD-cited
+  semantics), sets-as-data, the FRR AS-path regex as a dependency-free
+  NFA, route-map grammar→compiler, property suite (W1-a); the ZAPI BFD
+  family pinned against real 10.2.2 speakers both directions + codec
+  arms + rousterd relay/fan-out + `bfdd --zapi` dynamic sessions +
+  live smoke (W1-b); vtyd v1, the vtysh-compatible VTY server
+  (word-tree grammar, Cisco modes, B7 config subset parse-only)
+  (W1-c); bgpd's decision path — the policy engine live via
+  `RouteView` (import/export mutating seams), ROV + OTC/roles (RFC
+  6811/9234), ASPA verification, §6.8 collision detection, RFC 2918
+  soft reset, policy interop smoke vs real FRR (W2-d); ospfd Phase 3 —
+  LSA codec, LSDB (§13), two-stage SPF (§16.1), adjacency/flooding
+  cores, then Day 2: raw-socket transport, the daemon, and FRR
+  interop (Full adjacency + both redistribute directions; six
+  wire-found bugs fixed and pinned) (W2-e); operator surfaces round 2
+  — the rousterd.status dump + rousterctl/vty consumers + live smoke
+  (W2-f). Integration gate re-run by W3-h: fmt + clippy -D warnings
+  clean, workspace 1052/0 three consecutive runs (no flakes), smokes
+  23/23 (baseline 18 + bfd-zapi-pin-capture, bfd-zapi,
+  bgp-policy-interop, ospf-frr-interop, vty-smoke). Docs folded:
+  index rows for policy/vty/ospf + the operator-surfaces v2 row,
+  interop-doc sections for the two new FRR legs. Owner-decision delta
+  to ratify: A1's scope was read as dependency-level and extended to
+  ospfd (raw proto 89 + multicast joins) per W2-e's Day-1 STOP
+  recommendation — zero lock changes. Evidence:
+  away/2026-10-11/weekend/reports/ (W1-a, W1-b, W1-c, W2-d, W2-e,
+  W2-f, W3-integration).
