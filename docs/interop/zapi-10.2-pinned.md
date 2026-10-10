@@ -80,11 +80,11 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 23 | ZEBRA_NEXTHOP_UPDATE | B | zebra→client |
 | 24 | ZEBRA_INTERFACE_NBR_ADDRESS_ADD | B | |
 | 25 | ZEBRA_INTERFACE_NBR_ADDRESS_DELETE | B | |
-| 26 | ZEBRA_INTERFACE_BFD_DEST_UPDATE | B | |
-| 27 | ZEBRA_BFD_DEST_REGISTER | B | |
-| 28 | ZEBRA_BFD_DEST_DEREGISTER | B | |
-| 29 | ZEBRA_BFD_DEST_UPDATE | B | |
-| 30 | ZEBRA_BFD_DEST_REPLAY | B | |
+| 26 | ZEBRA_INTERFACE_BFD_DEST_UPDATE | B, **E** | **W1-b-fix**: zebra→client BFD state push, body PINNED by wire capture in three states (DOWN/UP/DOWN) — see the W1-b addendum |
+| 27 | ZEBRA_BFD_DEST_REGISTER | B, **E** | **W1-b-fix**: bgpd multihop frame pinned; single-hop pinned by Phase B acceptance |
+| 28 | ZEBRA_BFD_DEST_DEREGISTER | B, SRC | **W1-b**: no daemon observed sending one; body source-pinned (same layout); zebra sends no reply |
+| 29 | ZEBRA_BFD_DEST_UPDATE | B, **E** | **W1-b-fix**: bgpd re-install frame pinned (byte-identical to its REGISTER body); as zebra→client never observed (26 is the push) |
+| 30 | ZEBRA_BFD_DEST_REPLAY | B, **E** | **W1-b-fix**: bfdd sends it at connect, body = pid u32 |
 | 31 | ZEBRA_REDISTRIBUTE_ROUTE_ADD | B | zebra→client |
 | 32 | ZEBRA_REDISTRIBUTE_ROUTE_DEL | B | zebra→client |
 | 33 | ZEBRA_VRF_ADD | B | zebra pushed 1 in oracle run |
@@ -657,6 +657,130 @@ pushed to the vrf-0 static-registered probe:
   within the window) — the TABLEID-carrying push shape for non-main
   tables remains UNPINNED (no client registered in that VRF; the probe
   would need a vrf-3-scoped REDISTRIBUTE_ADD).
+
+## W1-b addendum (2026-10-10/11): the BFD message family, wire-pinned both directions
+
+Method, phase by phase (`scripts/test-bfd-zapi-pin-capture.sh`; evidence
+under `away/2026-10-11/weekend/quarantine/bfd-zapi/`, absolute — the S5
+lesson):
+
+- **Phase A** (client→zebra side): zapi-sniff masquerades as zebra; a
+  REAL bfdd and a REAL bgpd attach via `-z`, configs delivered via each
+  daemon's own `-f` file (vtysh `-b` pushes do not stick without mgmtd —
+  finding 4; and bgpd config apply additionally blocks on a silent
+  LABEL_MANAGER_CONNECT — finding 3, now driven by zapi-sniff's
+  `--respond-labelmgr` reply). Capture `phase-a-sniff.log`.
+- **Phase B** (zebra→client side): real zebra + mgmtd + real bfdd in one
+  container, the rouster bfdd (musl) as the UDP peer in a second; the
+  NEW client twin `crates/zapi/src/bin/zapi-bfd-probe.rs` connects to
+  the real zserv socket, sends HELLO + BFD_CLIENT_REGISTER (36) + a
+  single-hop BFD_DEST_REGISTER (27) for the peer container's address,
+  and records every push. Captures `phase-b-probe.log` (up/down cycle)
+  and `phase-b-probe-dereg.log` (deregister window).
+
+### ZEBRA_BFD_DEST_REGISTER (27) / BFD_DEST_UPDATE (29) — client→zebra — E
+
+bgpd, multihop neighbor (`neighbor 198.51.100.9 ebgp-multihop 5`,
+`update-source <eth0>`, `neighbor ... bfd`), 30-byte body, captured
+twice — as 27 at config apply and as the byte-identical body under 29
+when the bfd command re-fires on the already-installed session:
+
+```text
+body = 00000052 0002 c6336409 0000012c 0000012c 03 01 0002 c0a8d704 ff 00 00 00
+       |        |    |         |         |        |  |  |    |        |  |  |  +-- profilelen u8 = 0
+       |        |    |         |         |        |  |  |    |        |  |  +-- cbit u8 = 0
+       |        |    |         |         |        |  |  |    |        |  +----- ifnamelen u8 = 0 (mhop suppresses)
+       |        |    |         |         |        |  |  |    |        +-------- hops u8 = 255 (p->ttl)
+       |        |    |         |         |        |  |  |    +-- src = 192.168.215.4 (update-source)
+       |        |    |         |         |        |  |  +-- family u16 = 2 (again)
+       |        |    |         |         |        |  +-- mhop u8 = 1
+       |        |    |         |         |        +-- detection_multiplier u8 = 3
+       |        |    |         |         +-- min_tx u32 ms = 300 (BFD_DEF_MIN_TX)
+       |        |    |         +-- min_rx u32 ms = 300
+       |        |    +-- dst = 198.51.100.9
+       |        +-- family u16 = AF_INET
+       +-- pid u32 = 0x52 (bgpd's getpid(); zebra keys the fan-out on it)
+```
+
+Layout cross-verified against `zclient_bfd_command` (frr-10.2.2
+`lib/bfd.c`, HAVE_BFDD>0 variant — every field, in order, big-endian).
+The single-hop form differs only in mhop=0, src=0.0.0.0, hops=1, and
+ifnamelen>0 + name when the client knows the egress interface — the
+encoder branch is source-read; the single-hop frame is pinned by
+ACCEPTANCE in Phase B (the probe's 30-byte single-hop register created
+a live session), not by a bgpd-emitted capture (see deviations below).
+The timers are MILLISECONDS on the wire (300 = 300 ms).
+
+### ZEBRA_BFD_DEST_REPLAY (30) — bfdd→zebra — E
+
+bfdd's connect burst is HELLO + INTERFACE_ADD (empty) + this, 4-byte
+body = the daemon's pid as u32 BE (`0000001e`, bfdd was pid 30). Zebra
+uses the sender of this command as "the BFD daemon" to forward
+registrations to (the M1 server note: registrations replay to it on
+client reconnect).
+
+### ZEBRA_INTERFACE_BFD_DEST_UPDATE (26) — zebra→client — E
+
+The push a registered client receives when a destination's state
+changes. 21-byte body, captured in THREE states by the Phase B probe
+(register → DOWN, session Up → UP, peer container killed → DOWN):
+
+```text
+DOWN @register : 00000000 02 c0a8d705 20 00000002 02 00000000 20 00
+UP             : 00000002 02 c0a8d705 20 00000001 02 00000000 20 00
+DOWN @failure  : 00000002 02 c0a8d705 20 00000002 02 00000000 20 00
+                |        |  |         |  |         |  |         |  +-- remote_cbit u8
+                |        |  |         |  |         |  |         +-- src.plen u8 = 32
+                |        |  |         |  |         |  +-- src = 0.0.0.0 (single-hop wildcard)
+                |        |  |         |  |         +-- src.family u8 = AF_INET
+                |        |  |         |  +-- status u32 BE: 2 = BFD_STATUS_DOWN, 1 = BFD_STATUS_UP
+                |        |  |         +-- dst.plen u8 = 32
+                |        |  +-- dst = 192.168.215.5 (the registered destination)
+                |        +-- dst.family u8 = AF_INET
+                +-- ifindex u32: 0 at register time, 2 (egress eth0) once zebra resolved it
+```
+
+Layout cross-verified against `bfd_get_peer_info` (frr-10.2.2
+`lib/bfd.c`) — note the prefix families are u8 here (NOT the u16 of the
+register) and addresses are full family-length. ZEBRA_BFD_DEST_UPDATE
+(29) in the zebra→client direction was never observed — every push was
+command 26.
+
+Pinned behaviors:
+
+1. **Registration acceptance is timer-faithful**: the probe's register
+   (100 ms × 3) produced an FRR bfdd dynamic session showing exactly
+   those timers (`vtysh -d bfdd 'show bfd peers'`: `Peer Type:
+   dynamic`, local timers 100/100/3).
+2. **Fan-out is per-client, not per-registrant**: every client that
+   sent BFD_CLIENT_REGISTER (36) receives updates for ANY destination —
+   probe 1 (still connected, registered for .5) received the DOWN push
+   for probe 2's freshly-registered 203.0.113.9.
+3. **DEREGISTER (28) draws no reply** — the probe's mid-window
+   deregister (source-shaped body, byte-same layout as the register)
+   produced zero frames back in the 12 s remainder of its window. 28
+   stays E-absent: no FRR daemon was observed SENDING one in any
+   capture window (the `no neighbor ... bfd` vtysh toggle never emitted
+   one — bgpd appears to keep the session armed); the body layout is
+   source-pinned (`zclient_bfd_command` sends the identical tail for
+   all three commands).
+
+### Trigger conditions for bgpd's REGISTER (live findings)
+
+- bgpd arms BFD at config-apply time ONLY when `_bfd_sess_valid`
+  passes: multihop REQUIRES a local address (i.e. `update-source`
+  configured or a learned `su_local`); without it bgpd logs
+  `_bfd_sess_valid: multi hop but no local address provided` and sends
+  nothing.
+- Against a masquerade zebra, bgpd classified even an on-link neighbor
+  (`neighbor <bridge-gw> bfd`) as multi-hop until NHT resolved — with
+  interface dumps (`--respond-iface`) AND NHT answers
+  (`--respond-nht`), plus `bgp router-id` set, bgpd still showed
+  `BFD: Type: multi hop` for the on-link neighbor in-window; the
+  bgpd-emitted single-hop REGISTER frame therefore remains unpinned
+  (source-read + Phase B acceptance only — disclosed). bgpd without a
+  router-id refuses connections (`bgp_connect: BGP identifier is
+  missing`) but this does not block the REGISTER.
 
 ## A5 addendum (2026-10-09): ROUTE_NOTIFY_OWNER (11) wire-captured
 
