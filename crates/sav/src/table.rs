@@ -43,7 +43,7 @@ use crate::{prefix_contains, prefix_len};
 /// observation 5): [`SavOp::origin`] is the single [`RuleOrigin`]
 /// every contributing rule shared, or `None` when they disagreed or
 /// none said — data for W7/W8 logging, never an enforcement input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SavOp {
     /// IBA-SAV on one interface (GSC §2.1): a packet arriving on
     /// `ifindex` is valid iff its source is inside some prefix of

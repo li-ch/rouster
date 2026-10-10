@@ -33,7 +33,7 @@ use std::fmt;
 /// handling, scoped to the two policies Rouster's first milestone
 /// needs; rate-limit/redirect are noted there as FlowSpec-like
 /// extensions). Default: [`SavAction::Monitor`] — log, do not drop.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SavAction {
     /// Log/monitor only (the default until an operator opts into
     /// dropping): the workspace rule "enforcement defaults to

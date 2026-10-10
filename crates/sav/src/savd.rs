@@ -958,6 +958,16 @@ where
         }
         let (source, counts) = self.last_counts;
         out.push_str(&format!("monitor source {source} {counts}\n"));
+        // GSC §4 "count", per-rule: the simulation's per-op verdict
+        // tallies (no landed backend reports per-rule counters — the
+        // aggregate `monitor` line above is the backend view). Only
+        // ops that have judged anything render; ops are in effective
+        // order (ifindex/prefix ascending).
+        for (op, tallies) in self.monitor.per_op() {
+            if tallies_judged(tallies) {
+                out.push_str(&format!("count {op} {tallies}\n"));
+            }
+        }
         out
     }
 
@@ -1471,6 +1481,20 @@ where
             unknown = counts.unknown,
             "savd: monitor counts (invalid = spoof counter)"
         );
+        // Per-rule verdict tallies (GSC §4 "count"), the periodic debug
+        // line: one per op that has judged anything, simulation-sourced
+        // (the same tallies `status_text` renders).
+        for (op, tallies) in self.monitor.per_op() {
+            if tallies_judged(tallies) {
+                debug!(
+                    rule = %op,
+                    invalid = tallies.invalid,
+                    valid = tallies.valid,
+                    unknown = tallies.unknown,
+                    "savd: per-rule monitor tallies (GSC §4 count; simulation)"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1491,6 +1515,12 @@ where
 
 fn dp_err(err: DataplaneError) -> std::io::Error {
     std::io::Error::other(err.to_string())
+}
+
+/// Whether a per-op tally row has judged anything (the status/log
+/// render filter: zero rows are noise).
+fn tallies_judged(tallies: &SavMonitorCounts) -> bool {
+    tallies.invalid + tallies.valid + tallies.unknown > 0
 }
 
 #[cfg(test)]
@@ -2675,6 +2705,58 @@ mod tests {
                 .contains("monitor source simulation invalid=1"),
             "the counts move with the daemon's state"
         );
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// GSC §4 "count" per-rule tallies in the status surface: spoof
+    /// observations attribute to the deciding op's `count` line (the
+    /// effective ops' own rendering, provenance included), unjudged
+    /// observations attribute nowhere, ops that judged nothing render
+    /// no line, and a byte-identical regeneration keeps the tallies.
+    #[tokio::test]
+    async fn status_carries_per_rule_count_lines() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        let before = daemon.status_text(4242);
+        assert!(
+            !before.contains("count "),
+            "pre-observation: no count lines (nothing judged)"
+        );
+
+        // Two spoofs on eth3's deny-all, one legit on eth2, one unjudged
+        // on ifindex 9 (no mode).
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3));
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3));
+        daemon.apply_event(&neighbour_new("198.51.100.9", 2));
+        daemon.apply_event(&neighbour_new("203.0.113.5", 9));
+        daemon.evaluate(&dp).await.unwrap();
+        let after = daemon.status_text(4242);
+        assert!(
+            after.contains(
+                "count iba permit #2 [198.51.100.0/24] monitor (from fib) invalid=0 valid=1 unknown=0"
+            ),
+            "the deciding op's own line carries its valid tally: {after}"
+        );
+        assert!(
+            after.contains("count iba permit #3 [] monitor invalid=2 valid=0 unknown=0"),
+            "the spoofed arrivals attribute to the deny-all op: {after}"
+        );
+        assert_eq!(
+            after.matches("count ").count(),
+            2,
+            "only ops that judged something render a count line"
+        );
+
+        // A byte-identical regeneration keeps both tallies.
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(daemon
+            .status_text(4242)
+            .contains("count iba permit #3 [] monitor invalid=2 valid=0 unknown=0"));
         drop(daemon);
         let _ = server.await;
     }
