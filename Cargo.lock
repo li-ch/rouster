@@ -380,6 +380,7 @@ name = "policy"
 version = "0.0.0"
 dependencies = [
  "common",
+ "proptest",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -822,6 +823,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

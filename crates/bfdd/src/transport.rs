@@ -5,22 +5,30 @@
 //! transmit sockets with RFC 5881 §4's 49152–65535 source ports and
 //! §5's TTL 255.
 //!
-//! Deviations, both fences:
+//! W1-b (M6, socket2 adopted — owner decision A1) closes P2-a's
+//! deviation list where a SAFE API exists:
 //!
-//! - **Received-TTL validation is not enforced.** RFC 5881 §5 says a
-//!   receiver SHOULD check TTL 255; reading the received TTL needs
-//!   recvmsg ancillary data (IP_RECVTTL/IP_HOPLIMIT), which neither
-//!   std nor tokio UDP sockets expose, and the no-unsafe/no-new-deps
-//!   fence excludes libc/socket2. Transmit carries TTL 255 on every
-//!   v4 socket (what the RFC mandates and what FRR's receive side
-//!   checks); the receive-side check is §Deferred to a socket2 edge
-//!   if the owner ever lifts the fence.
-//! - **IPv6 transmit hop limit is the OS default, not 255.** The v6
-//!   half of the same §5 rule needs IPV6_UNICAST_HOPS, which
-//!   std/tokio/mio do not expose (verified: mio's set_ttl is IP_TTL
-//!   only). v6 single-hop sessions against strict TTL checkers
-//!   (FRR) will not establish; v6 multihop and v4 are unaffected.
-//!   Same §Deferred socket2 edge covers it.
+//! - **IPv6 transmit hop limit is 255** (RFC 5881 §5) — CLOSED via
+//!   `IPV6_UNICAST_HOPS` on every v6 transmit socket (std/mio reach
+//!   IP_TTL only; P2-a's deviation (b) is gone).
+//! - **Receive-side TTL/hop-limit checks remain fenced, disclosed
+//!   with the exact wall**: reading the received TTL needs the
+//!   recvmsg cmsg. socket2 0.6.5 can ARM reception
+//!   (`set_recv_hoplimit_v6`), but hands the control buffer back as
+//!   `&mut [MaybeUninit<u8>]` with no safe initialized-prefix read,
+//!   ships no cmsg parser and no `set_recv_ttl_v4`; libc's
+//!   `setsockopt` + a hand-rolled `cmsghdr` cast are both unsafe —
+//!   and the no-unsafe fence stands. The SAFE half is landed and
+//!   unit-tested below ([`parse_cmsgs`], [`received_hop_limit`]) so
+//!   a fence-lift is a wiring change, not a rewrite; v4 receive
+//!   stays fail-open (transmit TTL 255 is proven by FRR's checker,
+//!   P2-a's smoke).
+//! - **Authentication at the socket layer**: nothing to wire — RFC
+//!   5880's keyed digests live IN the packet (§6.7), not in socket
+//!   options; the codec models the auth sections and refuses
+//!   unverifiable keying (P2-a's fence stands: MD5/SHA1 primitives
+//!   are new dependencies).
+//!
 //! - **Echo loopback is UDP-level, both AFs.** RFC 5880 §5.7 makes
 //!   the echo payload a local matter and §6.8.9 demultiplexes by the
 //!   sender's own content; FRR-Linux reflects v4 echo in the
@@ -196,14 +204,14 @@ pub fn bind_control_tx(spec: &PeerSpec) -> io::Result<UdpSocket> {
         match std::net::UdpSocket::bind(SocketAddr::new(local, rng.source_port())) {
             Ok(std_sock) => {
                 // RFC 5881 §5: TTL 255 on transmit, set before the
-                // socket carries anything. IPv4 only, disclosed:
-                // std/tokio/mio expose IP_TTL alone — the v6
-                // IPV6_UNICAST_HOPS option needs socket2/libc, which
-                // the no-new-deps fence excludes, so v6 transmits
-                // ride the OS default hop limit (§Deferred: a
-                // socket2 edge if the fence is ever lifted).
+                // socket carries anything. IPv4 via std's IP_TTL;
+                // IPv6 via IPV6_UNICAST_HOPS on the socket2 edge
+                // (W1-b M6, owner decision A1 — std/tokio/mio reach
+                // IP_TTL only).
                 if matches!(local, IpAddr::V4(_)) {
                     std_sock.set_ttl(TX_TTL)?;
+                } else {
+                    socket2::SockRef::from(&std_sock).set_unicast_hops_v6(TX_TTL)?;
                 }
                 std_sock.connect(dst)?; // UDP connect: records the peer, filters inbound
                 std_sock.set_nonblocking(true)?;
@@ -606,6 +614,78 @@ pub fn spawn_socket_pump(socket: UdpSocket, feed: mpsc::Sender<InboundPacket>) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// The receive-side TTL/hop-limit check: the safe half (W1-b M6)
+// ---------------------------------------------------------------------------
+
+/// cmsg constants for the hop-limit lookup: `IPPROTO_IPV6` and the
+/// `IPV6_HOPLIMIT` cmsg type. Stable kernel ABI on Linux, macOS and
+/// the BSDs (socket2 exposes no constants for the cmsg walk itself).
+const IPPROTO_IPV6_CMSG: u32 = 41;
+const IPV6_HOPLIMIT_CMSG: u32 = 51;
+
+/// One parsed control message: level, type, and the data bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCmsg<'a> {
+    pub level: u32,
+    pub kind: u32,
+    pub data: &'a [u8],
+}
+
+/// Walks a recvmsg control buffer, safely: the `cmsghdr` fields are
+/// read bytewise (`from_ne_bytes` — no pointer casts, no unsafe).
+/// Layout on the unix targets: `cmsg_len` usize (8), `cmsg_level`
+/// and `cmsg_type` u32 (4+4), then the data; the next header starts
+/// at `cmsg_len` rounded up to the usize alignment.
+///
+/// The SAFE half of the RFC 5881 §5 receive check: arming the socket
+/// is safe (`Socket::set_recv_hoplimit_v6`), but socket2 0.6.5 hands
+/// the control buffer back as `&mut [MaybeUninit<u8>]` with no safe
+/// initialized-prefix read — landing the kernel half needs the
+/// no-unsafe fence lifted (module docs). Published and unit-tested so
+/// that lift is a wiring change, not a rewrite.
+pub fn parse_cmsgs(mut ctrl: &[u8]) -> Vec<RawCmsg<'_>> {
+    let mut out = Vec::new();
+    const HDR: usize = 8 + 4 + 4;
+    const ALIGN: usize = std::mem::size_of::<usize>();
+    loop {
+        if ctrl.len() < HDR {
+            break;
+        }
+        let cmsg_len = usize::from_ne_bytes(ctrl[..8].try_into().expect("8 bytes"));
+        if cmsg_len < HDR || cmsg_len > ctrl.len() {
+            break; // malformed tail: stop walking
+        }
+        let level = u32::from_ne_bytes(ctrl[8..12].try_into().expect("4 bytes"));
+        let kind = u32::from_ne_bytes(ctrl[12..16].try_into().expect("4 bytes"));
+        out.push(RawCmsg {
+            level,
+            kind,
+            data: &ctrl[HDR..cmsg_len],
+        });
+        let step = cmsg_len.div_ceil(ALIGN) * ALIGN;
+        if step >= ctrl.len() {
+            break;
+        }
+        ctrl = &ctrl[step..];
+    }
+    out
+}
+
+/// Extracts the received IPv6 hop limit from a control buffer
+/// (RFC 3542 §6: a u32 in network byte order). `None` when the
+/// buffer carries no hop-limit cmsg. The RFC 5881 §5 single-hop rule
+/// then drops when `Some(hl) < 255`.
+pub fn received_hop_limit(ctrl: &[u8]) -> Option<u32> {
+    parse_cmsgs(ctrl)
+        .into_iter()
+        .find(|c| c.level == IPPROTO_IPV6_CMSG && c.kind == IPV6_HOPLIMIT_CMSG)
+        .and_then(|c| {
+            let raw: [u8; 4] = c.data.try_into().ok()?;
+            Some(u32::from_be_bytes(raw))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,8 +732,55 @@ mod tests {
             (SOURCE_PORT_MIN..=SOURCE_PORT_MAX).contains(&sock.local_addr().unwrap().port()),
             "v6 source port outside the range"
         );
-        // v6 hop limit: the disclosed deviation — no settable
-        // IPV6_UNICAST_HOPS under the fence; nothing to assert.
+        // RFC 5881 §5's v6 half, CLOSED (W1-b M6): the transmit hop
+        // limit is 255, read back through the socket2 edge that set
+        // it (std has no getter either — mio's is IP_TTL only).
+        assert_eq!(
+            socket2::SockRef::from(&sock).unicast_hops_v6().unwrap(),
+            TX_TTL,
+            "v6 transmits carry hop limit 255 (P2-a deviation (b) closed)"
+        );
+    }
+
+    /// The cmsg walk (the safe half of the §5 receive check): a
+    /// hop-limit cmsg parses with its big-endian u32, other ancillaries
+    /// pass through untouched, and the alignment walk survives a
+    /// padded two-message buffer.
+    #[test]
+    fn cmsg_parser_walks_the_hop_limit() {
+        // One IPV6_HOPLIMIT cmsg: len 20 (16 hdr + 4 data), level 41,
+        // type 51, data 00 00 00 ff (=255, network order).
+        let mut ctrl = Vec::new();
+        ctrl.extend_from_slice(&20usize.to_ne_bytes());
+        ctrl.extend_from_slice(&41u32.to_ne_bytes());
+        ctrl.extend_from_slice(&51u32.to_ne_bytes());
+        ctrl.extend_from_slice(&[0, 0, 0, 0xff]);
+        assert_eq!(received_hop_limit(&ctrl), Some(255), "a correct 255 passes");
+
+        // Degraded: 254 — the §5 drop case.
+        let mut degraded = ctrl.clone();
+        let last = degraded.len() - 1;
+        degraded[last] = 0xfe;
+        assert_eq!(received_hop_limit(&degraded), Some(254));
+
+        // Two messages with padding: hoplimit first (len 20 → padded
+        // step 24), then a 16-byte empty one; the walk finds both and
+        // does not run off the buffer.
+        let mut two = ctrl.clone();
+        two.resize(24, 0); // pad to the alignment boundary
+        two.extend_from_slice(&16usize.to_ne_bytes());
+        two.extend_from_slice(&0u32.to_ne_bytes());
+        two.extend_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(parse_cmsgs(&two).len(), 2);
+        assert_eq!(received_hop_limit(&two), Some(255));
+
+        // Truncated and empty buffers parse to nothing.
+        assert!(parse_cmsgs(&ctrl[..10]).is_empty());
+        assert!(parse_cmsgs(&[]).is_empty());
+        // A cmsg_len below the header size stops the walk (defensive).
+        let mut bad = ctrl.clone();
+        bad[..8].copy_from_slice(&4usize.to_ne_bytes());
+        assert!(parse_cmsgs(&bad).is_empty());
     }
 
     /// The destination ports: 3784 single-hop, 4784 multihop (RFC

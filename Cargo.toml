@@ -40,6 +40,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-socket2 = "0.6"
+# W1-b (M6): the "all" feature unlocks Socket::set_recv_hoplimit_v6
+# (IPV6_RECVHOPLIMIT) - the v6 half of the RFC 5881 SS5 receive check;
+# no new crates.
+socket2 = { version = "0.6", features = ["all"] }
 rtnetlink = "0.18"
 netlink-packet-route = "0.25"

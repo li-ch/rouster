@@ -2,12 +2,15 @@
 
 Status: Phase 2 stream P2-a, delivered 2026-10-10 (commits
 `af2e58f` codec → `5d6c7f3` state machine → `51b17d7` transports →
-`900a65d` daemon → smoke). RFCs implemented: **5880** (base),
+`900a65d` daemon → smoke); W1-b (2026-10-10/11) added the zapi edge
+(dynamic sessions, `--zapi`) and the socket2 transmit-hop-limit fix.
+RFCs implemented: **5880** (base),
 **5881** (IPv4/IPv6 single hop),**5882** (application of BFD — the
 shutdown rule and the one-session-per-path model),
 **5883** (multihop). Positioning: BIRD-style pure core, FRR
 compatibility at the wire (this protocol *is* its own wire — no FRR
-surface needed beyond behaving identically on UDP).
+surface needed beyond behaving identically on UDP, plus the zapi
+daemon protocol W1-b pinned).
 
 ## Layer map
 
@@ -17,7 +20,9 @@ surface needed beyond behaving identically on UDP).
 | Session state machine | `crates/bfdd/src/session.rs` | 5880 §6.1, §6.5, §6.6, §6.8.1–§6.8.9, App. A |
 | UDP transports + session loop | `crates/bfdd/src/transport.rs` | 5881 §4/§5, 5883 §3, 5880 §6.8.2/§6.8.7 |
 | Daemon (config, listeners, status) | `crates/bfdd/src/daemon.rs`, `src/bin/bfdd.rs` | 5882 §2/§8, A21 conventions |
-| Interop smoke | `scripts/test-bfd-frr-interop.sh` | both directions vs FRR 10.2.2 bfdd |
+| ZAPI edge (dynamic sessions) | `crates/bfdd/src/zapi.rs` | the W1-b pins (`docs/interop/zapi-10.2-pinned.md`) |
+| Interop smoke (peer-to-peer) | `scripts/test-bfd-frr-interop.sh` | both directions vs FRR 10.2.2 bfdd |
+| Interop smoke (zapi) | `scripts/test-bfd-zapi.sh` | bgpd → rousterd → dynamic session → bgpd |
 
 The state machine is pure and clock-free (`SessionSm`); the session
 loop owns every timer; the daemon owns sockets and the operator
@@ -90,24 +95,31 @@ reload.
 
 ## Deviations (fences, disclosed)
 
-1. **Receive-side TTL check not enforced** (5881 §5 SHOULD): reading
-   the received TTL needs recvmsg ancillary data; std/tokio/mio
-   expose no path, and the no-unsafe/no-new-deps fence excludes
-   libc/socket2. Transmit carries TTL 255 (checked by FRR's receive
-   side — the interop smoke proves it).
-2. **IPv6 transmit hop limit is the OS default, not 255** (the v6
-   half of the same §5 rule): `IPV6_UNICAST_HOPS` is not exposed by
-   mio's `set_ttl` (IP_TTL only). v6 single-hop against strict TTL
-   checkers (FRR) will not establish; v6 multihop and all of v4 are
-   unaffected.
-3. **Keyed digest auth unimplemented** (above).
-4. **No dynamic session creation:** sessions come from config peer
-   stanzas (FRR's `peer` model). Demand-mode/echo negotiated on the
-   wire, but nobody may ask this daemon to create a session at
-   runtime until the zapi edge lands (§Deferred).
-
-Both socket deviations resolve with one socket2 edge if the owner
-lifts the no-new-deps fence.
+1. **Receive-side TTL/hop-limit check not enforced** (5881 §5
+   SHOULD): reading the received TTL needs the recvmsg cmsg.
+   socket2 (adopted, owner decision A1) can ARM reception
+   (`set_recv_hoplimit_v6`) but 0.6.5 hands the control buffer back
+   as `&mut [MaybeUninit<u8>]` with no safe initialized-prefix read,
+   ships no cmsg parser and no `set_recv_ttl_v4`; libc's setsockopt +
+   a hand-rolled cmsghdr cast are both unsafe — the no-unsafe fence
+   stands. The SAFE half is landed and unit-tested
+   (`transport.rs`: `parse_cmsgs`, `received_hop_limit`); a fence
+   lift makes it a wiring change. v4 receive is fail-open; transmit
+   TTL 255 is proven by FRR's checker (the interop smoke).
+2. **Keyed digest auth unimplemented** (RFC 5880 §6.7.3–§6.7.6):
+   parses and accounts exactly but never verifies — MD5/SHA1
+   primitives would be new dependencies (fence); a session configured
+   for one is refused rather than silently not verifying. Nothing to
+   wire at the socket layer: 5880's keyed digests live IN the packet,
+   not in socket options.
+3. **IPv6 transmit hop limit: CLOSED** (W1-b, M6) — every v6
+   transmit socket now carries `IPV6_UNICAST_HOPS` = 255 via socket2
+   (std/mio reach IP_TTL only); asserted by read-back.
+4. **No static-config growth from zapi sessions:** dynamic
+   (client-created) sessions arrive through the zapi edge (below) and
+   live outside `bfd.conf`; a config reload does not remove them
+   (their lifetime is the registrant's DEREGISTER or the edge's
+   disconnect).
 
 ## Config (`bfd.conf`-shaped)
 
@@ -156,21 +168,41 @@ guard); `docker kill` of the Rouster container leaves FRR at
 `Status: down / Diagnostics: control detection time expired`
 (§6.8.8). Captures under `away/2026-10-11/quarantine/bfd/`.
 
+## The zapi edge (W1-b): dynamic sessions over the pinned daemon protocol
+
+`bfdd --zapi <SOCKET>` (default off) connects to a rousterd (the
+savd shape) and speaks the wire-pinned BFD daemon protocol
+(`docs/interop/zapi-10.2-pinned.md`, W1-b addendum): the connect
+burst is HELLO (redist byte 0x1a) + the empty INTERFACE_ADD + the
+4-byte REPLAY that claims the daemon role; forwarded
+REGISTER/UPDATE/DEREGISTER (27/29/28) become dynamic sessions
+(timers, multihop and source address straight off the wire; an
+UPDATE restarts with the new parameters — the reload rule); every
+state transition is reported back as the 25-byte REPLAY form (pid +
+the 26 tuple: dst at host length, the lib/bfd.h status bitmask,
+wildcard src, ifindex 0). Reconnect re-sends the burst, so a
+restarted rousterd replays what it remembers.
+
+`scripts/test-bfd-zapi.sh` (exit 0 twice): rousterd + rouster bfdd
+--zapi + a REAL FRR bgpd in one container, a real FRR bfdd as the
+peer in another — bgpd's `neighbor ... bfd` (multihop +
+update-source form, the pinned trigger) registers through rousterd
+to the dynamic session, both BFD sides reach Up, bgpd's neighbor
+carries live BFD state, and killing the peer container lands the
+DOWN report in bgpd through the 26 fan-out.
+
 ## §Deferred
 
-- **zapi integration** (ZEBRA_BFD_DEST_* registrations so FRR/other
-  clients can create sessions dynamically): needs fresh pins from a
-  live FRR bfdd. Capture recipe (the z5b raw-marker pattern, since
-  zserv.api is a unix socket tcpdump cannot see): run FRR zebra +
-  bfdd in the frr-testbed container against a rousterd whose ZAPI
-  server logs every unknown marker byte-for-byte, bring a peer up
-  and down, and read the pin sequence (HELLO → INTERFACE_ADD regs →
-  BFD_DEST_REGISTERUPDATE with the peer/mhop/ timers body); decode
-  against `lib/zclient.h` (the 10.2 header — `bfdd/zclient.c` is
-  the writer). Roughly a W-sized slice: pins, server handling, a
-  client registrar, one interop smoke leg.
-- **Receive-TTL + v6 hop limit** via a socket2 edge (owner decision:
-  lift the no-new-deps fence for `socket2`, ~2 h including tests).
+- ~~zapi integration~~ — LANDED (W1-b): pins in the 10.2 pinned doc,
+  codec arms, rousterd relay + fan-out, `bfdd --zapi`, the
+  `test-bfd-zapi.sh` smoke (the section above).
+- **Receive-TTL check on v4** (the §5 SHOULD): the safe half is
+  landed (`parse_cmsgs`/`received_hop_limit`, unit-tested); landing
+  the kernel half needs the no-unsafe fence lifted (socket2 0.6.5
+  has no safe cmsg read-back — deviation 1 above).
+- **bgpd-emitted single-hop REGISTER frame**: pinned only by source
+  + Phase B acceptance (bgpd classifies NHT-unresolved neighbors as
+  multihop; the pinned doc's W1-b addendum has the finding).
 - **Soft timer update on reload** (announce via §6.8.2 poll sequence
   instead of restarting the session; ~1 h at
   `crates/bfdd/src/daemon.rs` reload).
