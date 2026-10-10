@@ -63,8 +63,9 @@ async fn two_speakers_over_tcp_reach_established_and_exchange_a_prefix() {
     let (stop_tx, stop_rx) = watch::channel(false);
     let (_refresh_tx, refresh_rx) = watch::channel(0u64);
     let daemon_task = tokio::spawn(async move {
+        let reach: Arc<dyn bgpd::zedge::PeerReachability> = Arc::new(bgpd::zedge::AlwaysReachable);
         daemon
-            .run(sink, out_rib, stop_rx, refresh_rx)
+            .run(sink, out_rib, stop_rx, refresh_rx, reach)
             .await
             .unwrap();
     });

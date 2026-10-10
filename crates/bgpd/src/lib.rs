@@ -24,7 +24,9 @@ pub mod error;
 pub mod fsm;
 pub mod message;
 pub mod peer;
+pub mod rib;
 pub mod wire;
+pub mod zedge;
 
 /// The reserved two-octet AS number that stands in for non-mappable
 /// four-octet AS numbers (RFC 6793: AS_TRANS = 23456).

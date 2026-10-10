@@ -62,6 +62,7 @@ impl Daemon {
         out_rib: Arc<dyn OutRib>,
         stop: watch::Receiver<bool>,
         refresh: watch::Receiver<u64>,
+        reach: Arc<dyn crate::zedge::PeerReachability>,
     ) -> std::io::Result<()> {
         let busy: Arc<Mutex<HashSet<IpAddr>>> = Arc::new(Mutex::new(HashSet::new()));
         let live = Arc::new(AtomicUsize::new(0));
@@ -82,8 +83,9 @@ impl Daemon {
             let mut stop = stop.clone();
             let mut refresh = refresh.clone();
             let config = self.config.clone();
+            let reach = Arc::clone(&reach);
             tokio::spawn(async move {
-                connector_loop(config, neighbor, ctx, &mut stop, &mut refresh).await;
+                connector_loop(config, neighbor, ctx, &mut stop, &mut refresh, reach).await;
             });
         }
 
@@ -215,11 +217,25 @@ async fn connector_loop<S: RouteSink + 'static>(
     ctx: SessionCtx<S>,
     stop: &mut watch::Receiver<bool>,
     refresh: &mut watch::Receiver<u64>,
+    reach: Arc<dyn crate::zedge::PeerReachability>,
 ) {
     let target = SocketAddr::new(neighbor.address, config.listen_port);
     loop {
         if *stop.borrow() {
             return;
+        }
+        // §8's Connect precondition, the zebra-client way: wait for
+        // the peer address to be usable (NHT/mirror gate; standalone
+        // mode's AlwaysReachable never waits).
+        while !reach.reachable(neighbor.address) {
+            tokio::select! {
+                _ = stop.changed() => {
+                    if *stop.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
         }
         match TcpStream::connect(target).await {
             Ok(stream) => {

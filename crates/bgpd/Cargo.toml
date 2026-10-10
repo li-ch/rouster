@@ -12,6 +12,8 @@ common = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 thiserror.workspace = true
+zapi = { workspace = true }
+tracing-subscriber.workspace = true
 
 # start_paused tokio tests + duplex sockets, dev-only (sav precedent).
 [dev-dependencies]
