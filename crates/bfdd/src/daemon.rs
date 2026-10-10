@@ -656,6 +656,26 @@ mod tests {
         DAEMON_TEST_LOCK.lock().await
     }
 
+    /// `BfddDaemon::spawn` with a bounded AddrInUse retry: a prior
+    /// test's per-session sockets can outlive its guard release by one
+    /// runtime poll (the production constraint is real — we just give
+    /// teardown a moment to finish instead of flaking ~1-in-5 under
+    /// parallel load).
+    async fn spawn_retrying(config: BfddConfig) -> io::Result<BfddDaemon> {
+        let mut last = None;
+        for _ in 0..10 {
+            match BfddDaemon::spawn(config.clone()).await {
+                Ok(d) => return Ok(d),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.expect("retry loop ran at least once"))
+    }
+
     /// The full grammar parses, with defaults and per-stanza values.
     #[test]
     fn config_full_grammar() {
@@ -839,7 +859,7 @@ peer 2001:db8::2 multihop
         let config =
             parse_bfdd_config("peer 127.0.0.1\n  transmit-interval 100\n  receive-interval 100\n")
                 .unwrap();
-        let mut daemon = BfddDaemon::spawn(config).await.unwrap();
+        let mut daemon = spawn_retrying(config).await.unwrap();
         assert_eq!(daemon.snapshots().len(), 1);
 
         let mut watch = daemon.watches[0].clone();
@@ -878,7 +898,7 @@ peer 2001:db8::2 multihop
         let config =
             parse_bfdd_config("peer 127.0.0.1\n  transmit-interval 100\n  receive-interval 100\n")
                 .unwrap();
-        let mut daemon = BfddDaemon::spawn(config).await.unwrap();
+        let mut daemon = spawn_retrying(config).await.unwrap();
         let discr_before = daemon.snapshots()[0].local_discr;
 
         // Same peer again: no bounce.
@@ -924,7 +944,7 @@ peer 2001:db8::2 multihop
             "peer 127.0.0.1\n  transmit-interval 100\n  receive-interval 100\n  echo yes\n  echo-interval 100\n",
         )
         .unwrap();
-        let daemon = BfddDaemon::spawn(config).await.unwrap();
+        let daemon = spawn_retrying(config).await.unwrap();
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         probe_sock.connect("127.0.0.1:3785").await.unwrap();
