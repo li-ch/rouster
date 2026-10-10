@@ -20,9 +20,15 @@
 # bound (arrives on vethspoof = the wrong interface).
 #
 # The route comes through the real path now: staticd config
-# `ip route 198.51.100.0/24 198.51.100.9` -> rousterd resolves the
+# `ip route 198.51.100.0/25 198.51.100.9` -> rousterd resolves the
 # gateway onto vethlegit, programs it, and savd derives its SIB from the
-# redistribute push (push form = resolved ifindex hop).
+# redistribute push (push form = resolved ifindex hop). The routed
+# prefix is a /25, NOT vethlegit's own connected /24: a protocol route
+# for the exact connected prefix is masked (CONNECT-table semantics,
+# matching zebra's per-prefix-node selection where connected distance 0
+# wins) — it would never program nor reach savd's redistribute dump. The
+# /25 is its own prefix key, still covers the spoof source .9, and real
+# FRR installs it the same way.
 #
 # The spoof counter feed is real traffic: neighbour (ARP/NDP) events on
 # savd's netlink connection are (source, ingress) observations — the
@@ -160,6 +166,14 @@ docker exec "$NAME" ip netns exec ns1 ip link set vethlegitp up
 docker exec "$NAME" ip netns exec ns1 ip link set vethspoofp up
 docker exec "$NAME" ip netns exec ns1 ip link set lo up
 
+# M3 (neighbour-liveness gate on the NEXTHOP_UPDATE answer): confirm
+# the tracked gateway's neighbour BEFORE staticd registers it, the way a
+# deployment with flowing traffic would — one ping from the container
+# side ARPs for ns1's 198.51.100.9 and holds the lladdr entry on
+# vethlegit (REACHABLE, later STALE — both confirmed for the gate).
+docker exec "$NAME" ping -c1 -W1 198.51.100.9 >/dev/null 2>&1 || true
+docker exec "$NAME" ip neigh show 198.51.100.9 dev vethlegit | grep -q lladdr
+
 SPOOF_CMD='ip netns exec ns1 ping -c3 -W1 -I 198.51.100.9 192.0.2.1'
 LEGIT_CMD='ip netns exec ns1 ping -c3 -W1 -I vethlegitp 198.51.100.1'
 
@@ -168,7 +182,7 @@ docker exec "$NAME" sh -c "printf '%s\n' \
   'zapi socket $ZAPI_SOCK' \
   > $ROUSTERD_CONF"
 docker exec "$NAME" sh -c "printf '%s\n' \
-  'ip route 198.51.100.0/24 198.51.100.9' \
+  'ip route 198.51.100.0/25 198.51.100.9' \
   > $STATICD_CONF"
 docker exec "$NAME" sh -c "printf '%s\n' \
   'interface vethlegit' \
@@ -200,7 +214,7 @@ wait_in_container "rousterd zapi server up" 30 "grep -q 'zapi: listening' $ROUST
 echo "==> starting staticd (installs the source-prefix route via ZAPI)"
 docker exec -d "$NAME" sh -c "staticd --config $STATICD_CONF --zapi-socket $ZAPI_SOCK > $STATICD_LOG 2>&1"
 wait_in_container "route programmed via vethlegit" 40 \
-    "ip route show 198.51.100.0/24 | grep -q 'via 198.51.100.9 dev vethlegit'"
+    "ip route show 198.51.100.0/25 | grep -q 'via 198.51.100.9 dev vethlegit'"
 
 echo "==> starting savd (monitor by default)"
 docker exec -d "$NAME" sh -c "savd --config $SAVD_CONF --zapi-socket $ZAPI_SOCK > $SAVD_LOG 2>&1"
@@ -218,7 +232,7 @@ wait_in_container "savd installed the monitor rule set" 30 \
     "grep -q 'rule set installed' $SAVD_LOG"
 # The strict rules from the live SIB: the allowlist prefix is the route
 # staticd installed, mirrored from the redistribute push.
-docker exec "$NAME" sh -c "grep 'savd: rule ' $SAVD_LOG" | grep "198.51.100.0/24"
+docker exec "$NAME" sh -c "grep 'savd: rule ' $SAVD_LOG" | grep "198.51.100.0/25"
 echo "    WIRED: rib synced, rules logged, monitor program installed"
 
 # ENFORCE (monitor): no kernel drop rule — sysctl stays 0 on both.
