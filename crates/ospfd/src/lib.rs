@@ -31,6 +31,7 @@
 pub mod checksum;
 pub mod error;
 pub mod lsa;
+pub mod lsdb;
 pub mod wire;
 
 /// Architectural constants (RFC 2328 Appendix B).

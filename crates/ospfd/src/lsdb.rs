@@ -1,0 +1,836 @@
+//! The link state database (RFC 2328 §12.2) and its lifecycle rules.
+//!
+//! - **Keyed store**: (LS type, Link State ID, Advertising Router) —
+//!   §12.2's lookup function; a single (most recent) instance per key.
+//! - **"Newer than"** (§13.1): the exact four-step comparison —
+//!   signed LS sequence number, then LS checksum (u16), then the
+//!   MaxAge-only rule, then the MaxAgeDiff age rule — as a total
+//!   [`std::cmp::Ordering` (plus an `Identical` outcome)] over
+//!   headers. Property-tested as a strict weak ordering.
+//! - **Install** (§13.2): replacement plus the contents-difference
+//!   detection that decides whether SPF must rerun (options / MaxAge
+//!   / length / body — explicitly *not* seq or checksum), and the
+//!   MinLSArrival guard of §13 step 5(a) (flood-installed instances
+//!   cannot be overwritten within `MIN_LS_ARRIVAL`).
+//! - **Aging** (§14): clock-injected ticks advance the age (never past
+//!   `MAX_AGE`), self-originated LSAs crossing `LS_REFRESH_TIME` are
+//!   reported for refresh (§12.4's re-origination with seq+1), and
+//!   entries reaching MaxAge are reported for the flush reflood.
+//!   A MaxAge LSA leaves the table only when it is off every
+//!   retransmission list and no adjacency is syncing (Exchange or
+//!   Loading) — §14's removal condition, polled via [`Lsdb::flush_ready`].
+//! - **Sequence rollover** (§12.1.6): originating past
+//!   `MAX_SEQUENCE_NUMBER` is refused until the instance has been
+//!   prematurely aged (§14.1) and flushed; the next origination then
+//!   restarts at `INITIAL_SEQUENCE_NUMBER`.
+//!
+//! The clock is injected throughout (`now` in seconds); nothing in
+//! here starts timers or reads wall time — the bgpd FSM convention.
+//! §12.2's "an LSA deleted from the database must also be removed
+//! from all neighbors' Link state retransmission lists" lives with
+//! the neighbor structures (M4); `remove` returns the key so callers
+//! can cascade.
+
+use std::cmp::Ordering;
+
+use crate::lsa::{Lsa, LsaBody, LsaHeader, LsaKey, INITIAL_SEQUENCE_NUMBER, MAX_SEQUENCE_NUMBER};
+use crate::{LS_REFRESH_TIME, MAX_AGE, MAX_AGE_DIFF, MIN_LS_ARRIVAL, MIN_LS_INTERVAL};
+
+/// The §13.1 comparison outcome. `Identical` is distinct from `Equal`
+/// only in naming intent (§13.1's final bullet: "the two instances
+/// are considered to be identical").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Which {
+    FirstNewer,
+    SecondNewer,
+    Identical,
+}
+
+/// §13.1: which of two instances of the same LSA is more recent.
+/// Both headers must be of the same LSA (same type/ID/adv-router);
+/// callers guarantee that (the LSDB only ever compares store hits).
+pub fn newer_than(a: &LsaHeader, b: &LsaHeader) -> Which {
+    // 1. The LSA having the newer LS sequence number is more recent
+    //    (§12.1.6: signed 32-bit space).
+    match a.seq_signed().cmp(&b.seq_signed()) {
+        Ordering::Greater => return Which::FirstNewer,
+        Ordering::Less => return Which::SecondNewer,
+        Ordering::Equal => {}
+    }
+    // 2. Same sequence: larger LS checksum (16-bit unsigned) wins.
+    match a.checksum.cmp(&b.checksum) {
+        Ordering::Greater => return Which::FirstNewer,
+        Ordering::Less => return Which::SecondNewer,
+        Ordering::Equal => {}
+    }
+    // 3. Same seq + checksum: if only one instance is MaxAge, it is
+    //    the more recent.
+    match (a.is_max_age(), b.is_max_age()) {
+        (true, false) => return Which::FirstNewer,
+        (false, true) => return Which::SecondNewer,
+        _ => {}
+    }
+    // 4. Ages differing by more than MaxAgeDiff: the younger wins.
+    let (aa, ba) = (a.effective_age(), b.effective_age());
+    if aa.abs_diff(ba) > MAX_AGE_DIFF {
+        return if aa < ba {
+            Which::FirstNewer
+        } else {
+            Which::SecondNewer
+        };
+    }
+    Which::Identical
+}
+
+/// One stored instance plus its bookkeeping.
+#[derive(Debug, Clone)]
+pub struct LsaEntry {
+    pub lsa: Lsa,
+    /// Injection-time seconds when this instance was installed.
+    pub installed_at: u64,
+    /// True when the instance arrived via flooding (subject to the
+    /// MinLSArrival overwrite guard, §13 step 5(a)).
+    pub via_flooding: bool,
+    /// True while the instance sits on some neighbor's link state
+    /// retransmission list (§14's removal condition a).
+    pub on_retransmission: bool,
+}
+
+/// What an [`Lsdb::install`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// Replaced the store copy (or created it). `changed` is §13.2's
+    /// contents-difference verdict — false means "no need to rerun
+    /// the routing calculation".
+    Installed { changed: bool },
+    /// Same instance as the store copy (§13 step 7: acknowledge /
+    /// implied-ack territory, nothing to store).
+    SameInstance,
+    /// The store copy is more recent (§13 step 8: send the database
+    /// copy back; nothing stored).
+    Stale,
+    /// Refused: the current copy was flood-installed less than
+    /// `MIN_LS_ARRIVAL` seconds ago (§13 step 5(a): discard without
+    /// acknowledging).
+    RejectedMinLsArrival,
+}
+
+/// What an aging tick observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgingReport {
+    /// Self-originated LSAs whose age crossed `LS_REFRESH_TIME`:
+    /// re-originate with seq+1 (§12.4).
+    pub refresh_due: Vec<LsaKey>,
+    /// LSAs whose age reached MaxAge: reflood them as the flush
+    /// (§14).
+    pub max_age: Vec<LsaKey>,
+}
+
+/// Sequence-number bookkeeping for a self-originated LSA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqState {
+    /// Free to originate with `next`.
+    Ready { next: u32 },
+    /// At MaxSequenceNumber: the §12.1.6 rollover path — prematurely
+    /// age, flush, then restart at InitialSequenceNumber.
+    NeedsFlush { pending: u32 },
+}
+
+/// The typed link state database for one area (plus the global
+/// AS-external scope — v1 keeps one store; areas are §Deferred).
+#[derive(Debug, Default)]
+pub struct Lsdb {
+    map: std::collections::HashMap<LsaKey, LsaEntry>,
+    self_seq: std::collections::HashMap<LsaKey, SeqState>,
+    self_originated_at: std::collections::HashMap<LsaKey, u64>,
+    last_tick: Option<u64>,
+}
+
+impl Lsdb {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn get(&self, key: &LsaKey) -> Option<&LsaEntry> {
+        self.map.get(key)
+    }
+
+    pub fn get_mut(&mut self, key: &LsaKey) -> Option<&mut LsaEntry> {
+        self.map.get_mut(key)
+    }
+
+    /// All stored instances (the database summary list of §10.3
+    /// ExStart/Exchange — MaxAge entries included; the DD layer moves
+    /// them to the retransmission list per §14).
+    pub fn all(&self) -> impl Iterator<Item = &LsaEntry> {
+        self.map.values()
+    }
+
+    pub fn contains(&self, key: &LsaKey) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// §13.2 install path. `now` is the injected clock (seconds).
+    pub fn install(&mut self, lsa: Lsa, via_flooding: bool, now: u64) -> InstallOutcome {
+        let key = lsa.key();
+        match self.map.get_mut(&key) {
+            None => {
+                self.map.insert(
+                    key,
+                    LsaEntry {
+                        lsa,
+                        installed_at: now,
+                        via_flooding,
+                        on_retransmission: false,
+                    },
+                );
+                InstallOutcome::Installed { changed: true }
+            }
+            Some(current) => {
+                match newer_than(&lsa.header, &current.lsa.header) {
+                    Which::SecondNewer => return InstallOutcome::Stale,
+                    Which::Identical => {
+                        if lsa.header.seq == current.lsa.header.seq {
+                            // §13 step 7: neither more recent — the
+                            // same instance as far as the protocol is
+                            // concerned (implied-ack territory).
+                            return InstallOutcome::SameInstance;
+                        }
+                        // Identical by the age-difference tiebreak but
+                        // a different raw instance: nothing in §13
+                        // tells us to replace the incumbent.
+                        return InstallOutcome::Stale;
+                    }
+                    Which::FirstNewer => {}
+                }
+                if via_flooding
+                    && current.via_flooding
+                    && now.saturating_sub(current.installed_at) < MIN_LS_ARRIVAL as u64
+                {
+                    return InstallOutcome::RejectedMinLsArrival;
+                }
+                let changed = contents_differ(&lsa, &current.lsa);
+                let was_retrans = current.on_retransmission;
+                let installed_at = if changed { now } else { current.installed_at };
+                *current = LsaEntry {
+                    lsa,
+                    installed_at,
+                    via_flooding,
+                    on_retransmission: was_retrans,
+                };
+                InstallOutcome::Installed { changed }
+            }
+        }
+    }
+
+    /// §13.2's contents-difference list: Options changed, one instance
+    /// MaxAge and the other not, length changed, or the body changed
+    /// (seq/checksum excluded).
+    pub fn contents_differ_with(&self, candidate: &Lsa) -> bool {
+        match self.map.get(&candidate.key()) {
+            None => true,
+            Some(entry) => contents_differ(candidate, &entry.lsa),
+        }
+    }
+
+    /// Advance every stored LSA's age by the elapsed time and report
+    /// the §14 / §12.4 events (§14: never increment past MaxAge).
+    pub fn tick_aging(&mut self, now: u64) -> AgingReport {
+        let mut report = AgingReport::default();
+        let delta = match self.last_tick {
+            None => {
+                self.last_tick = Some(now);
+                return report;
+            }
+            Some(prev) => now.saturating_sub(prev),
+        };
+        self.last_tick = Some(now);
+        if delta == 0 {
+            return report;
+        }
+        for (key, entry) in &mut self.map {
+            if entry.lsa.header.is_max_age() {
+                // Already MaxAge: awaiting the flush removal condition.
+                continue;
+            }
+            let age = entry.lsa.header.ls_age;
+            let dna = age & crate::lsa::DO_NOT_AGE;
+            let eff = (age & !crate::lsa::DO_NOT_AGE).saturating_add(delta as u16);
+            let new_eff = eff.min(MAX_AGE);
+            entry.lsa.header.ls_age = dna | new_eff;
+            if new_eff >= MAX_AGE {
+                report.max_age.push(*key);
+            }
+        }
+        // Refresh bookkeeping (§12.4): self-originated LSAs crossing
+        // LS_REFRESH_TIME are re-originated. The self-originated set
+        // is exactly the keys sequence state is tracked for.
+        for key in self.self_seq.keys() {
+            if let Some(entry) = self.map.get(key) {
+                let eff = entry.lsa.header.effective_age();
+                if eff >= LS_REFRESH_TIME && !entry.lsa.header.is_max_age() {
+                    report.refresh_due.push(*key);
+                }
+            }
+        }
+        report
+    }
+
+    /// §14's removal condition: MaxAge LSAs come out once they are on
+    /// no retransmission list and no adjacency is in Exchange/Loading
+    /// (`adjacency_syncing` carries that router-wide fact).
+    pub fn flush_ready(&self, adjacency_syncing: bool) -> Vec<LsaKey> {
+        self.map
+            .iter()
+            .filter(|(_, e)| e.lsa.header.is_max_age())
+            .filter(|(_, e)| !e.on_retransmission)
+            .filter(|_| !adjacency_syncing)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// Remove an LSA (the §14 removal, or §12.2's deletion paths).
+    /// Returns the removed instance so callers can cascade it off
+    /// neighbor retransmission lists.
+    pub fn remove(&mut self, key: &LsaKey) -> Option<Lsa> {
+        self.self_seq.remove(key);
+        self.self_originated_at.remove(key);
+        self.map.remove(key).map(|e| e.lsa)
+    }
+
+    /// Originate (or re-originate) a self-originated LSA: enforces
+    /// MinLSInterval (§Appendix B) and the §12.1.6 rollover guard,
+    /// bumps the tracked sequence, and installs it. The caller supplies
+    /// the full LSA with any sequence number — it is overwritten.
+    pub fn originate(
+        &mut self,
+        mut lsa: Lsa,
+        now: u64,
+    ) -> Result<InstallOutcome, crate::error::OspfError> {
+        let key = lsa.key();
+        if let Some(&last) = self.self_originated_at.get(&key) {
+            if now.saturating_sub(last) < MIN_LS_INTERVAL as u64 {
+                return Err(crate::error::OspfError::Config(format!(
+                    "MinLSInterval ({MIN_LS_INTERVAL}s) not elapsed for {key:?}"
+                )));
+            }
+        }
+        let next = match self.self_seq.get(&key) {
+            None => INITIAL_SEQUENCE_NUMBER,
+            Some(SeqState::Ready { next }) => *next,
+            Some(SeqState::NeedsFlush { .. }) => {
+                // §12.1.6: the MaxSequenceNumber instance must be
+                // completely flushed before a new instance is
+                // introduced.
+                if self.map.contains_key(&key) {
+                    return Err(crate::error::OspfError::Config(format!(
+                        "sequence rollover for {key:?}: flush the MaxSequenceNumber instance first"
+                    )));
+                }
+                INITIAL_SEQUENCE_NUMBER
+            }
+        };
+        let new_seq = if next == MAX_SEQUENCE_NUMBER {
+            // Originate AT MaxSequenceNumber once, then require flush.
+            self.self_seq.insert(
+                key,
+                SeqState::NeedsFlush {
+                    pending: MAX_SEQUENCE_NUMBER,
+                },
+            );
+            MAX_SEQUENCE_NUMBER
+        } else {
+            self.self_seq
+                .insert(key, SeqState::Ready { next: next + 1 });
+            next
+        };
+        lsa.header.seq = new_seq;
+        self.self_originated_at.insert(key, now);
+        Ok(self.install(lsa, false, now))
+    }
+
+    /// §14.1 premature aging: set MaxAge, keep the sequence number,
+    /// and report it for the flush reflood.
+    pub fn premature_age(&mut self, key: &LsaKey) -> Option<Lsa> {
+        let entry = self.map.get_mut(key)?;
+        entry.lsa.header.ls_age = (entry.lsa.header.ls_age & crate::lsa::DO_NOT_AGE) | MAX_AGE;
+        Some(entry.lsa.clone())
+    }
+
+    /// Mark/unmark an LSA as sitting on a retransmission list (§14
+    /// removal condition a).
+    pub fn set_on_retransmission(&mut self, key: &LsaKey, on: bool) {
+        if let Some(e) = self.map.get_mut(key) {
+            e.on_retransmission = on;
+        }
+    }
+}
+
+/// §13.2's difference list as a predicate.
+fn contents_differ(new: &Lsa, old: &Lsa) -> bool {
+    new.header.options != old.header.options
+        || new.header.is_max_age() != old.header.is_max_age()
+        || new.header.length != old.header.length
+        || body_differs(&new.body, &old.body)
+}
+
+/// The body comparison: decoded-structural for the typed bodies.
+/// (Length differences already short-circuit above; two bodies of
+/// different shapes compare unequal via the enum.)
+fn body_differs(a: &LsaBody, b: &LsaBody) -> bool {
+    a != b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsa::{
+        LinkStateId, LinkType, LsaHeader, LsaType, Options, RouterId, RouterLink, RouterLsa,
+    };
+
+    fn hdr(seq: u32, checksum: u16, age: u16) -> LsaHeader {
+        LsaHeader {
+            ls_age: age,
+            options: Options(0x02),
+            ls_type: LsaType::ROUTER,
+            link_state_id: LinkStateId::new(1),
+            adv_router: RouterId::new(2),
+            seq,
+            checksum,
+            length: 36,
+        }
+    }
+
+    fn router_lsa(seq: u32, age: u16, metric: u16) -> Lsa {
+        Lsa {
+            header: LsaHeader {
+                ls_age: age,
+                options: Options(0x02),
+                ls_type: LsaType::ROUTER,
+                link_state_id: LinkStateId::new(1),
+                adv_router: RouterId::new(2),
+                seq,
+                checksum: 0x1234,
+                length: 0,
+            },
+            body: LsaBody::Router(RouterLsa {
+                v_bit: false,
+                e_bit: false,
+                b_bit: false,
+                links: vec![RouterLink {
+                    link_id: LinkStateId::new(9),
+                    link_data: 0xffff_ff00,
+                    link_type: LinkType::Stub,
+                    metric,
+                    tos: vec![],
+                }],
+            }),
+        }
+    }
+
+    // ---- §13.1 table tests, one per bullet ----------------------
+
+    #[test]
+    fn newer_by_sequence() {
+        // Bullet 1: newer sequence wins — including across the
+        // signed wrap (0x7fffffff is the max, 0x80000001 the min).
+        assert_eq!(
+            newer_than(&hdr(5, 0x1111, 0), &hdr(4, 0xffff, 0)),
+            Which::FirstNewer
+        );
+        assert_eq!(
+            newer_than(&hdr(4, 0x1111, 0), &hdr(5, 0xffff, 0)),
+            Which::SecondNewer
+        );
+        assert_eq!(
+            newer_than(
+                &hdr(MAX_SEQUENCE_NUMBER, 1, 0),
+                &hdr(INITIAL_SEQUENCE_NUMBER, 2, 0)
+            ),
+            Which::FirstNewer
+        );
+        // seq 0 (signed 0) beats every 0x8... value.
+        assert_eq!(
+            newer_than(&hdr(0, 1, 0), &hdr(0xffff_ffff, 2, 0)),
+            Which::FirstNewer
+        );
+    }
+
+    #[test]
+    fn newer_by_checksum() {
+        // Bullet 2: same sequence, larger 16-bit checksum wins.
+        assert_eq!(
+            newer_than(&hdr(5, 0x2000, 0), &hdr(5, 0x1fff, 0)),
+            Which::FirstNewer
+        );
+        assert_eq!(
+            newer_than(&hdr(5, 0x2000, 0), &hdr(5, 0x2000, 0)),
+            Which::Identical
+        );
+    }
+
+    #[test]
+    fn newer_by_max_age_only() {
+        // Bullet 3: same seq+checksum, exactly one MaxAge — the
+        // MaxAge instance is "more recent" (it is the flush).
+        assert_eq!(
+            newer_than(&hdr(5, 7, MAX_AGE), &hdr(5, 7, 100)),
+            Which::FirstNewer
+        );
+        assert_eq!(
+            newer_than(&hdr(5, 7, 100), &hdr(5, 7, MAX_AGE)),
+            Which::SecondNewer
+        );
+    }
+
+    #[test]
+    fn newer_by_max_age_diff() {
+        // Bullet 4: ages differing by MORE than MaxAgeDiff (900):
+        // the younger instance is more recent.
+        assert_eq!(
+            newer_than(&hdr(5, 7, 100), &hdr(5, 7, 100 + 901)),
+            Which::FirstNewer
+        );
+        // Exactly MaxAgeDiff apart: identical.
+        assert_eq!(
+            newer_than(&hdr(5, 7, 100), &hdr(5, 7, 100 + MAX_AGE_DIFF)),
+            Which::Identical
+        );
+        assert_eq!(
+            newer_than(&hdr(5, 7, 100 + MAX_AGE_DIFF), &hdr(5, 7, 100)),
+            Which::Identical
+        );
+    }
+
+    // ---- install paths ------------------------------------------
+
+    #[test]
+    fn install_new_identical_stale() {
+        let mut db = Lsdb::new();
+        let a = router_lsa(10, 1, 5);
+        let key = a.key();
+        assert_eq!(
+            db.install(a.clone(), true, 100),
+            InstallOutcome::Installed { changed: true }
+        );
+        // Same instance again: §13 step 7.
+        assert_eq!(
+            db.install(a.clone(), true, 200),
+            InstallOutcome::SameInstance
+        );
+        // Older: stale.
+        let older = router_lsa(9, 1, 5);
+        assert_eq!(db.install(older, true, 300), InstallOutcome::Stale);
+        // Newer, same body: installed, contents unchanged → no SPF.
+        let newer = router_lsa(11, 1, 5);
+        assert_eq!(
+            db.install(newer, true, 400),
+            InstallOutcome::Installed { changed: false }
+        );
+        // Newer, changed body: contents changed → SPF.
+        let changed = router_lsa(12, 1, 6);
+        assert_eq!(
+            db.install(changed, true, 500),
+            InstallOutcome::Installed { changed: true }
+        );
+        assert!(db.contains(&key));
+    }
+
+    #[test]
+    fn install_min_ls_arrival_guard() {
+        // §13 step 5(a): flood-installed instances cannot be replaced
+        // within MinLSArrival (1s) — discarded WITHOUT acknowledging.
+        let mut db = Lsdb::new();
+        db.install(router_lsa(10, 1, 5), true, 1000);
+        let newer = router_lsa(11, 1, 5);
+        assert_eq!(
+            db.install(newer.clone(), true, 1000),
+            InstallOutcome::RejectedMinLsArrival
+        );
+        // At +1s (== MinLSArrival) the window has passed and it goes
+        // through; a dt strictly inside the window is the rejection.
+        let mut db2 = Lsdb::new();
+        db2.install(router_lsa(10, 1, 5), true, 1000);
+        assert_eq!(
+            db2.install(router_lsa(11, 1, 5), true, 1001 + MIN_LS_ARRIVAL as u64),
+            InstallOutcome::Installed { changed: false }
+        );
+        // A sub-second later arrival is still inside the window.
+        let mut db4 = Lsdb::new();
+        db4.install(router_lsa(10, 1, 5), true, 1000);
+        assert_eq!(
+            db4.install(router_lsa(11, 1, 5), true, 1000),
+            InstallOutcome::RejectedMinLsArrival
+        );
+        // Self-originated replacements are not guarded.
+        let mut db3 = Lsdb::new();
+        db3.install(router_lsa(10, 1, 5), false, 1000);
+        assert_eq!(
+            db3.install(router_lsa(11, 1, 5), false, 1000),
+            InstallOutcome::Installed { changed: false }
+        );
+    }
+
+    #[test]
+    fn contents_differ_list() {
+        // §13.2: options, MaxAge-vs-not, length, body. Sequence-only
+        // changes do NOT count.
+        let mut db = Lsdb::new();
+        db.install(router_lsa(10, 1, 5), true, 0);
+        assert!(!db.contents_differ_with(&router_lsa(11, 1, 5)), "seq-only");
+        assert!(
+            db.contents_differ_with(&router_lsa(11, 1, 6)),
+            "body metric"
+        );
+        let mut aged = router_lsa(11, 1, 5);
+        aged.header.ls_age = MAX_AGE;
+        assert!(db.contents_differ_with(&aged), "MaxAge vs not");
+        let mut opts = router_lsa(11, 1, 5);
+        opts.header.options = Options(0x06);
+        assert!(db.contents_differ_with(&opts), "options");
+        let mut longer = router_lsa(11, 1, 5);
+        longer.body = LsaBody::Router(RouterLsa {
+            v_bit: false,
+            e_bit: false,
+            b_bit: false,
+            links: vec![
+                RouterLink {
+                    link_id: LinkStateId::new(9),
+                    link_data: 0xffff_ff00,
+                    link_type: LinkType::Stub,
+                    metric: 5,
+                    tos: vec![],
+                },
+                RouterLink {
+                    link_id: LinkStateId::new(10),
+                    link_data: 0xffff_ff00,
+                    link_type: LinkType::Stub,
+                    metric: 5,
+                    tos: vec![],
+                },
+            ],
+        });
+        assert!(db.contents_differ_with(&longer), "length via body");
+    }
+
+    // ---- aging ---------------------------------------------------
+
+    #[test]
+    fn aging_increments_clamps_and_reports() {
+        let mut db = Lsdb::new();
+        db.install(router_lsa(10, 1, 5), true, 0);
+        let key = router_lsa(10, 1, 5).key();
+        db.tick_aging(0); // establishes the epoch
+        let report = db.tick_aging(10);
+        assert!(report.refresh_due.is_empty() && report.max_age.is_empty());
+        assert_eq!(db.get(&key).unwrap().lsa.header.ls_age, 11);
+        // A big jump clamps at MaxAge and reports the flush.
+        let report = db.tick_aging(4000);
+        assert_eq!(db.get(&key).unwrap().lsa.header.ls_age, MAX_AGE);
+        assert!(report.max_age.contains(&key));
+        assert!(db.get(&key).unwrap().lsa.header.is_max_age());
+    }
+
+    #[test]
+    fn refresh_due_at_ls_refresh_time() {
+        // §12.4: self-originated LSAs are refreshed when their age
+        // crosses LS_REFRESH_TIME (the originate() path tracks them).
+        let mut db = Lsdb::new();
+        db.originate(router_lsa(1, 0, 5), 0).unwrap();
+        let key = router_lsa(1, 0, 5).key();
+        db.tick_aging(0);
+        // Age 0 + 1799 = 1799 < LS_REFRESH_TIME: not yet due.
+        let report = db.tick_aging(LS_REFRESH_TIME as u64 - 1);
+        assert!(!report.refresh_due.contains(&key));
+        // One more second: age 1800 == LS_REFRESH_TIME: due (§12.4).
+        let report = db.tick_aging(LS_REFRESH_TIME as u64);
+        assert!(report.refresh_due.contains(&key));
+    }
+
+    #[test]
+    fn max_age_removal_condition() {
+        // §14: out of the database only when off all retransmission
+        // lists AND no adjacency is Exchange/Loading.
+        let mut db = Lsdb::new();
+        db.install(router_lsa(10, MAX_AGE, 5), true, 0);
+        let key = router_lsa(10, 1, 5).key();
+        assert_eq!(db.get(&key).unwrap().lsa.header.ls_age, MAX_AGE);
+        db.set_on_retransmission(&key, true);
+        assert!(db.flush_ready(true).is_empty());
+        assert!(
+            db.flush_ready(false).is_empty(),
+            "still on a retransmission list"
+        );
+        db.set_on_retransmission(&key, false);
+        assert!(db.flush_ready(true).is_empty(), "an adjacency is syncing");
+        assert_eq!(db.flush_ready(false), vec![key]);
+        assert!(db.remove(&key).is_some());
+        assert!(db.flush_ready(false).is_empty());
+    }
+
+    // ---- origination + rollover ----------------------------------
+
+    #[test]
+    fn originate_tracks_sequence_and_min_ls_interval() {
+        let mut db = Lsdb::new();
+        let key = router_lsa(0, 1, 5).key();
+        db.originate(router_lsa(0, 1, 5), 0).unwrap();
+        assert_eq!(
+            db.get(&key).unwrap().lsa.header.seq,
+            INITIAL_SEQUENCE_NUMBER
+        );
+        // Too soon: MinLSInterval (5s).
+        assert!(db.originate(router_lsa(0, 1, 6), 2).is_err());
+        db.originate(router_lsa(0, 1, 6), 5).unwrap();
+        assert_eq!(
+            db.get(&key).unwrap().lsa.header.seq,
+            INITIAL_SEQUENCE_NUMBER + 1
+        );
+    }
+
+    #[test]
+    fn sequence_rollover_requires_flush() {
+        // §12.1.6: at MaxSequenceNumber the instance must be flushed
+        // (premature aging, §14.1) before a fresh InitialSequenceNumber
+        // instance may be originated.
+        let mut db = Lsdb::new();
+        let key = router_lsa(0, 1, 5).key();
+        // Force the tracked sequence to the boundary.
+        db.self_seq.insert(
+            key,
+            SeqState::Ready {
+                next: MAX_SEQUENCE_NUMBER,
+            },
+        );
+        db.install(router_lsa(1, 1, 5), false, 0);
+        db.originate(router_lsa(0, 1, 5), 10).unwrap();
+        assert_eq!(db.get(&key).unwrap().lsa.header.seq, MAX_SEQUENCE_NUMBER);
+        // Further origination is refused while the instance exists.
+        assert!(db.originate(router_lsa(0, 1, 5), 100).is_err());
+        // Premature-age it (age -> MaxAge, seq kept), flush it out.
+        let aged = db.premature_age(&key).unwrap();
+        assert_eq!(aged.header.ls_age, MAX_AGE);
+        assert_eq!(
+            aged.header.seq, MAX_SEQUENCE_NUMBER,
+            "§14.1 keeps the sequence"
+        );
+        db.set_on_retransmission(&key, true);
+        assert!(db.flush_ready(false).is_empty());
+        db.set_on_retransmission(&key, false);
+        db.remove(&key);
+        // Now the restart at InitialSequenceNumber is allowed.
+        db.originate(router_lsa(0, 1, 5), 200).unwrap();
+        assert_eq!(
+            db.get(&key).unwrap().lsa.header.seq,
+            INITIAL_SEQUENCE_NUMBER
+        );
+    }
+
+    // ---- ordering property tests ---------------------------------
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn rand_header(rng: &mut XorShift) -> LsaHeader {
+        let pick = rng.next() % 4;
+        let seq = match pick {
+            0 => INITIAL_SEQUENCE_NUMBER + (rng.next() % 0xffff) as u32,
+            1 => MAX_SEQUENCE_NUMBER - (rng.next() % 0xffff) as u32,
+            2 => (rng.next() >> 40) as u32,
+            _ => 0xffff_ffff - (rng.next() % 0xffff) as u32,
+        };
+        let age = (rng.next() % (MAX_AGE as u64 + 1)) as u16;
+        hdr(
+            seq,
+            (rng.next() >> 48) as u16,
+            if rng.next().is_multiple_of(8) {
+                MAX_AGE
+            } else {
+                age
+            },
+        )
+    }
+
+    #[test]
+    fn property_ordering_is_strict_weak() {
+        // §13.1's comparison is total and antisymmetric, and — because
+        // sequence/checksum/MaxAge form a lexicographic prefix and the
+        // age-difference rule cannot cycle within the remaining class
+        // (a cycle needs ages differing by more than 3·MaxAgeDiff
+        // inside a 0..=MaxAge window) — transitive. 4096 triples.
+        let mut rng = XorShift(0x015b_0001_2026_1007);
+        for _ in 0..4096 {
+            let a = rand_header(&mut rng);
+            let b = rand_header(&mut rng);
+            let c = rand_header(&mut rng);
+            let ab = newer_than(&a, &b);
+            let ba = newer_than(&b, &a);
+            // Antisymmetry / totality.
+            match (ab, ba) {
+                // ab=FirstNewer says "a newer"; ba=SecondNewer also
+                // says "a newer" (b's view: the second arg wins).
+                (Which::FirstNewer, Which::SecondNewer)
+                | (Which::SecondNewer, Which::FirstNewer)
+                | (Which::Identical, Which::Identical) => {}
+                (Which::FirstNewer, x) => panic!("asymmetric: {ab:?} vs {x:?}"),
+                (Which::SecondNewer, x) => panic!("asymmetric: {ab:?} vs {x:?}"),
+                (Which::Identical, x) => panic!("asymmetric: {ab:?} vs {x:?}"),
+            }
+            // Transitivity of the "newer" relation.
+            let bc = newer_than(&b, &c);
+            let ac = newer_than(&a, &c);
+            if ab == Which::FirstNewer && bc == Which::FirstNewer {
+                assert_eq!(ac, Which::FirstNewer);
+            }
+            if ab == Which::SecondNewer && bc == Which::SecondNewer {
+                assert_eq!(ac, Which::SecondNewer);
+            }
+        }
+    }
+
+    #[test]
+    fn property_install_keeps_most_recent() {
+        // Whatever order instances arrive in, the store holds one of
+        // the instances not older than any it has seen.
+        let mut rng = XorShift(0x2233_4455_6677_8899);
+        for _ in 0..256 {
+            let mut db = Lsdb::new();
+            let mut best: Option<LsaHeader> = None;
+            for i in 0..16 {
+                let lsa = router_lsa(
+                    (rng.next() % 100) as u32,
+                    (rng.next() % 6) as u16,
+                    (rng.next() % 2) as u16 * 5,
+                );
+                let hdr = lsa.header;
+                let _ = i;
+                db.install(lsa, true, 1000 + 10 * i); // spacing > MinLSArrival
+                best = match best {
+                    None => Some(hdr),
+                    Some(b) => match newer_than(&hdr, &b) {
+                        Which::FirstNewer => Some(hdr),
+                        _ => Some(b),
+                    },
+                };
+            }
+            let stored = db.get(&router_lsa(0, 0, 0).key()).unwrap().lsa.header;
+            let best = best.unwrap();
+            assert_eq!(newer_than(&stored, &best), Which::Identical);
+        }
+    }
+}
