@@ -166,6 +166,20 @@ GW=$(docker exec "$R1" sh -c "ip route show default" | awk '{for(i=1;i<=NF;i++) 
 [ -n "$GW" ] || fail "no default route to test against"
 echo "==> kernel default gateway: $GW"
 
+# M3 (neighbour-liveness gate on the NEXTHOP_UPDATE answer): the /0
+# answer resolves through the default's gateway, and a gateway is only
+# ACTIVE with a confirmed neighbour entry. A quiet container never ARPs
+# the bridge gateway, so make the deployment-with-traffic shape
+# explicitly: one ping teaches eth0 the gateway's lladdr (REACHABLE,
+# later STALE — both confirmed for the gate). Without this the answer
+# is truthful-but-unresolved and ospfd correctly never originates the
+# type-7 default.
+docker exec "$R1" ping -c1 -W1 "$GW" >/dev/null 2>&1 || true
+docker exec "$R1" sh -c "ip neigh show $GW dev eth0" | grep -q lladdr \
+    || fail "gateway $GW has no lladdr neighbour after warm-up ping"
+
+echo "==> OSPF config: redistribute connected (ASBR) + NSSA default-originate (the NHT trigger)"
+
 echo "==> OSPF config: redistribute connected (ASBR) + NSSA default-originate (the NHT trigger)"
 docker exec "$R1" sh -c "printf '%s\n' \
   'frr version 10.2' \
