@@ -1,0 +1,6 @@
+savd x.y pid notanumber
+config mode bogus action monitor poll Ns interfaces 2 bindings 0
+installed rules
+rule allow if#NaN [198.51.100.0/24] strict monitor
+rule allow
+monitor source simulation invalid=x valid=0 unknown=0

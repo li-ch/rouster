@@ -1,0 +1,6 @@
+savd 0.0.0 pid 4242
+config mode strict-uRPF action monitor poll 5s interfaces 2 bindings 0
+installed 2 rules
+rule allow if#2 [198.51.100.0/24] strict monitor
+rule allow if#3 [] strict monitor
+monitor source simulation invalid=0 valid=0 unknown=0

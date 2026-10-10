@@ -1,0 +1,10 @@
+[package]
+name = "rousterctl"
+description = "Rouster operator CLI: run-dir status surfaces (show sav, status)"
+edition.workspace = true
+version.workspace = true
+
+# v1 is deliberately std-only: every answer comes from files a Rouster
+# daemon already publishes in the run dir — no IPC, no parser crates.
+# Adding a dependency here is an owner decision, not a patch detail.
+[dependencies]
