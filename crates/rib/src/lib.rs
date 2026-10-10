@@ -5,11 +5,11 @@
 //! metric; the selected route is what gets programmed into the dataplane.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use common::{
-    Dataplane, DataplaneEvent, IpPrefix, NeighbourEntry, Nexthop, NexthopGroup, RouteEntry,
-    RouteProtocol, TableId,
+    Dataplane, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix, NeighbourEntry, Nexthop,
+    NexthopGroup, RouteEntry, RouteProtocol, TableId,
 };
 use tracing::{debug, info, instrument, warn};
 
@@ -98,6 +98,14 @@ pub struct Rib {
     programmed: BTreeMap<(TableId, IpPrefix), RouteEntry>,
     /// Interface state mirrored from dataplane events, keyed by ifindex.
     interfaces: BTreeMap<u32, InterfaceState>,
+    /// The CONNECT protocol table set: connected routes derived from the
+    /// interface mirror ([`Rib::sync_connected`]), keyed like `tables`.
+    /// Kept separate from the per-protocol tables — connected state is
+    /// kernel-origin (the address lifecycle installs it), and the
+    /// redistribute/best-path surfaces consume it through the explicit
+    /// merged queries ([`Rib::best_with_connected`],
+    /// [`Rib::connected_table`], [`Rib::connected_keys`]).
+    connected: BTreeMap<TableId, Table>,
     /// Kernel neighbour (ARP/NDP) mirror, keyed by the kernel's neighbour
     /// identity (destination ip, link ifindex). Observed state only —
     /// neighbours are never programmed ([`Rib::lookup_neighbour`] is the
@@ -172,6 +180,110 @@ impl Rib {
     /// Total number of mirrored kernel routes, across tables.
     pub fn kernel_route_count(&self) -> usize {
         self.kernel_mirror.values().map(|t| t.iter().count()).sum()
+    }
+
+    /// Every (table, prefix) key holding a Connected candidate — the exact
+    /// surface a link/address event can change (the driver snapshots bests
+    /// over these keys around such events so the redistribute fan-out
+    /// covers precisely the prefixes connected-table sync can touch).
+    pub fn connected_keys(&self) -> impl Iterator<Item = (TableId, IpPrefix)> + '_ {
+        self.connected.iter().flat_map(|(&table_id, table)| {
+            table
+                .iter()
+                .filter(|(_, candidates)| {
+                    candidates
+                        .iter()
+                        .any(|e| e.protocol == RouteProtocol::Connected)
+                })
+                .map(move |(prefix, _)| (table_id, *prefix))
+        })
+    }
+
+    /// The CONNECT table of one routing table id — the connected routes
+    /// derived from the interface mirror (observation only, never a
+    /// reconcile input).
+    pub fn connected_table(&self, id: TableId) -> Option<&Table> {
+        self.connected.get(&id)
+    }
+
+    /// The best route for `prefix` with the CONNECT table participating:
+    /// a connected candidate wins at distance 0 (zebra semantics —
+    /// nothing outranks a connected prefix), otherwise the protocol
+    /// table's best answers. This merged view is the redistribute
+    /// surface; [`Rib::table`] alone stays protocol-candidates-only.
+    pub fn best_with_connected(&self, id: TableId, prefix: &IpPrefix) -> Option<RouteEntry> {
+        self.connected
+            .get(&id)
+            .and_then(|t| t.best(prefix))
+            .cloned()
+            .or_else(|| self.table(id).and_then(|t| t.best(prefix)).cloned())
+    }
+
+    /// Rebuilds the CONNECT protocol table from the interface mirror:
+    /// every address on every UP interface becomes a Connected route for
+    /// its network prefix (nexthop = the interface), placed in the main
+    /// table — or in the table of the VRF device the interface is enslaved
+    /// to, matching where the kernel itself puts the route (W4 observed
+    /// an enslaved member's connected route in the VRF's table, not 254).
+    ///
+    /// This is the zebra-faithful `ZEBRA_ROUTE_CONNECT` view:
+    /// `redistribute connected` dumps it, and its candidates win
+    /// best-path selection at distance 0 through
+    /// [`Rib::best_with_connected`]. The routes live in a DEDICATED table
+    /// set (not mixed into the per-protocol tables): connected state is
+    /// kernel-origin (`RouteProtocol::is_kernel_origin` — the kernel
+    /// installs each connected route as a product of the address
+    /// lifecycle, `proto kernel scope link src <addr>`), so reconcile
+    /// never programs it and the protocol-candidate tables stay free of
+    /// observed state. Real zebra likewise leaves the kernel's own
+    /// connected routes untouched (`ip route` on an FRR box shows them
+    /// as `proto kernel`, never `proto zebra`).
+    fn sync_connected(&mut self) {
+        // Desired state, keyed (table, prefix); the lowest ifindex wins a
+        // same-prefix tie so the rebuild is deterministic.
+        let mut desired: BTreeMap<(TableId, IpPrefix), u32> = BTreeMap::new();
+        for (&ifindex, iface) in &self.interfaces {
+            if !iface.is_up {
+                continue;
+            }
+            let table = iface
+                .master_ifindex
+                .and_then(|master| {
+                    self.interfaces
+                        .get(&master)
+                        .and_then(|master_iface| master_iface.vrf_table)
+                })
+                .unwrap_or(MAIN_TABLE);
+            for &prefix in &iface.addresses {
+                let key = (table, network_prefix(prefix));
+                desired
+                    .entry(key)
+                    .and_modify(|ix| *ix = (*ix).min(ifindex))
+                    .or_insert(ifindex);
+            }
+        }
+        // Withdraw Connected candidates that are no longer desired.
+        let stale: Vec<(TableId, IpPrefix)> = self
+            .connected_keys()
+            .filter(|key| !desired.contains_key(key))
+            .collect();
+        for (table_id, prefix) in stale {
+            if let Some(table) = self.connected.get_mut(&table_id) {
+                table.remove(&prefix, RouteProtocol::Connected);
+            }
+        }
+        // (Re)install the desired set; `Table::add` replaces a same-prefix
+        // candidate so an ifindex change lands in one step.
+        for ((table_id, prefix), ifindex) in desired {
+            let mut entry = RouteEntry::new(
+                prefix,
+                RouteProtocol::Connected,
+                NexthopGroup::single(Nexthop::IfIndex(ifindex)),
+                0,
+            );
+            entry.table = table_id;
+            self.connected.entry(table_id).or_default().add(entry);
+        }
     }
 
     /// Resolve a gateway against the connected prefixes derived from the
@@ -372,10 +484,12 @@ impl Rib {
                 iface.vrf_table = *vrf_table;
                 iface.master_ifindex = *master_ifindex;
                 self.rebuild_nht();
+                self.sync_connected();
             }
             DataplaneEvent::LinkDel { ifindex } => {
                 self.interfaces.remove(ifindex);
                 self.rebuild_nht();
+                self.sync_connected();
             }
             DataplaneEvent::AddressNew { ifindex, prefix } => {
                 let iface = self.interfaces.entry(*ifindex).or_default();
@@ -383,12 +497,14 @@ impl Rib {
                     iface.addresses.push(*prefix);
                 }
                 self.rebuild_nht();
+                self.sync_connected();
             }
             DataplaneEvent::AddressDel { ifindex, prefix } => {
                 if let Some(iface) = self.interfaces.get_mut(ifindex) {
                     iface.addresses.retain(|p| p != prefix);
                 }
                 self.rebuild_nht();
+                self.sync_connected();
             }
             DataplaneEvent::RouteNew {
                 table,
@@ -525,6 +641,20 @@ impl Rib {
         let mut desired: BTreeMap<(TableId, IpPrefix), RouteEntry> = BTreeMap::new();
         for (&table_id, table) in &self.tables {
             for (prefix, _) in table.iter() {
+                // A connected candidate MASKS the prefix (distance 0,
+                // nothing outranks it) and is itself never programmed —
+                // the kernel already holds it as `proto kernel scope
+                // link src <addr>`, a product of the address lifecycle
+                // (`Rib::sync_connected`). Replacing it would drop the
+                // prefsrc source-selection attribute; while it rules,
+                // no other candidate for the prefix programs either.
+                if self
+                    .connected
+                    .get(&table_id)
+                    .is_some_and(|t| t.best(prefix).is_some())
+                {
+                    continue;
+                }
                 let Some(best) = table.best(prefix) else {
                     continue;
                 };
@@ -605,6 +735,27 @@ fn gateway_ips(group: &NexthopGroup) -> impl Iterator<Item = IpAddr> + '_ {
         Nexthop::Ipv6(g) => Some(IpAddr::V6(g)),
         _ => None,
     })
+}
+
+/// The network form of a host prefix (`192.0.2.1/24` → `192.0.2.0/24`) —
+/// the prefix a connected route announces for a configured address.
+fn network_prefix(prefix: IpPrefix) -> IpPrefix {
+    match prefix {
+        IpPrefix::V4(p) => {
+            let addr = u32::from(p.addr());
+            let len = p.prefix_len();
+            let mask = if len == 0 { 0 } else { !0u32 << (32 - len) };
+            let network = Ipv4Addr::from(addr & mask);
+            IpPrefix::V4(Ipv4Prefix::new(network, len).expect("len preserved"))
+        }
+        IpPrefix::V6(p) => {
+            let addr = u128::from(p.addr());
+            let len = p.prefix_len();
+            let mask = if len == 0 { 0 } else { !0u128 << (128 - len) };
+            let network = Ipv6Addr::from(addr & mask);
+            IpPrefix::V6(Ipv6Prefix::new(network, len).expect("len preserved"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1868,5 +2019,178 @@ mod tests {
             &[(Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 2), 1)],
             "gateway resolved through the enslaved member interface"
         );
+    }
+
+    // --- Connected protocol routes (the CONNECT table) ---
+
+    /// Address events populate Connected routes in the main table: the
+    /// network form of each address on an UP interface, nexthop = the
+    /// interface, and the address's removal (or the link going away)
+    /// withdraws them. The kernel FIB mirror is NOT the source — these
+    /// are connected-table candidates for `redistribute connected` and
+    /// distance-0 best-path masking.
+    #[test]
+    fn connected_routes_populate_from_address_events() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.2.3/24", true));
+        rib.apply_event(&address(2, "2001:db8:1::1/64", true));
+        // Host prefix with host bits set: the connected route announces
+        // the NETWORK form.
+        rib.apply_event(&link(3, "lo", true));
+        rib.apply_event(&address(3, "127.0.0.1/8", true));
+
+        let best = rib
+            .best_with_connected(MAIN_TABLE, &"10.1.2.0/24".parse().unwrap())
+            .unwrap();
+        assert_eq!(best.protocol, RouteProtocol::Connected);
+        assert_eq!(best.metric, 0);
+        assert_eq!(
+            best.nexthops.hops(),
+            &[(Nexthop::IfIndex(2), 1)],
+            "connected routes point at the interface"
+        );
+        assert_eq!(
+            rib.best_with_connected(MAIN_TABLE, &"127.0.0.0/8".parse().unwrap())
+                .unwrap()
+                .protocol,
+            RouteProtocol::Connected
+        );
+        assert_eq!(
+            rib.best_with_connected(MAIN_TABLE, &"2001:db8:1::/64".parse().unwrap())
+                .unwrap()
+                .protocol,
+            RouteProtocol::Connected
+        );
+
+        // Duplicate notification is idempotent (same candidate replaced).
+        rib.apply_event(&address(2, "10.1.2.3/24", true));
+        assert!(rib
+            .best_with_connected(MAIN_TABLE, &"10.1.2.0/24".parse().unwrap())
+            .is_some());
+
+        // Address removal withdraws exactly that connected prefix.
+        rib.apply_event(&address(2, "10.1.2.3/24", false));
+        assert!(rib
+            .best_with_connected(MAIN_TABLE, &"10.1.2.0/24".parse().unwrap())
+            .is_none());
+
+        // Link down withdraws the interface's remaining connected routes
+        // (v6), and link gone entirely does the same.
+        rib.apply_event(&link(2, "eth0", false));
+        assert!(rib
+            .best_with_connected(MAIN_TABLE, &"2001:db8:1::/64".parse().unwrap())
+            .is_none());
+        rib.apply_event(&DataplaneEvent::LinkDel { ifindex: 3 });
+        assert!(rib
+            .best_with_connected(MAIN_TABLE, &"127.0.0.0/8".parse().unwrap())
+            .is_none());
+    }
+
+    /// Connected routes are never programmed by reconcile, and a connected
+    /// best MASKS other candidates for its prefix (nothing else programs
+    /// while it rules — the kernel's own connected route is authoritative).
+    /// When the connected candidate goes away, the next-best candidate
+    /// programs normally.
+    #[test]
+    fn connected_routes_are_never_programmed() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.2.3/24", true));
+        // A static candidate for the same prefix: connected wins at
+        // distance 0, and reconcile programs NEITHER.
+        rib.add_route(RouteEntry::new(
+            "10.1.2.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(Nexthop::Blackhole),
+            0,
+        ));
+        assert_eq!(
+            rib.best_with_connected(MAIN_TABLE, &"10.1.2.0/24".parse().unwrap())
+                .unwrap()
+                .protocol,
+            RouteProtocol::Connected,
+            "the merged best-path view is connected-masked"
+        );
+
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        assert!(
+            dp.installed_prefixes().is_empty(),
+            "connected best: nothing programs, the kernel route stays"
+        );
+
+        // Address gone → connected candidate gone → static best programs.
+        rib.apply_event(&address(2, "10.1.2.3/24", false));
+        block_on(rib.reconcile(&dp));
+        assert_eq!(
+            dp.installed_prefixes(),
+            vec!["10.1.2.0/24".parse().unwrap()]
+        );
+
+        // And back: the connected candidate returns and reconcile
+        // withdraws the static route it now masks.
+        rib.apply_event(&address(2, "10.1.2.3/24", true));
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.removed_prefixes(), vec!["10.1.2.0/24".parse().unwrap()]);
+    }
+
+    /// An interface enslaved to a VRF device gets its connected routes in
+    /// the VRF's table — where the kernel itself puts them (W4 observed
+    /// table 5001 holding the member's connected route) — never in main.
+    #[test]
+    fn connected_routes_live_in_the_enslaving_vrfs_table() {
+        let mut rib = Rib::new();
+        rib.apply_event(&vrf_link(5, "vrf-test", 5001, true));
+        rib.apply_event(&member_link(2, "dummy0", Some(5), true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        // An unenslaved interface's connected route stays in main.
+        rib.apply_event(&link(3, "eth1", true));
+        rib.apply_event(&address(3, "10.9.9.1/24", true));
+
+        assert_eq!(
+            rib.best_with_connected(5001, &"192.0.2.0/24".parse().unwrap())
+                .unwrap()
+                .protocol,
+            RouteProtocol::Connected
+        );
+        assert!(rib
+            .best_with_connected(MAIN_TABLE, &"192.0.2.0/24".parse().unwrap())
+            .is_none());
+        assert_eq!(
+            rib.best_with_connected(MAIN_TABLE, &"10.9.9.0/24".parse().unwrap())
+                .unwrap()
+                .protocol,
+            RouteProtocol::Connected
+        );
+
+        // Un-enslaving the member moves its connected routes back to main.
+        rib.apply_event(&member_link(2, "dummy0", None, true));
+        assert!(rib
+            .best_with_connected(MAIN_TABLE, &"192.0.2.0/24".parse().unwrap())
+            .is_some());
+        assert!(rib
+            .best_with_connected(5001, &"192.0.2.0/24".parse().unwrap())
+            .is_none());
+    }
+
+    /// connected_keys is the exact surface link/address events can change:
+    /// the keys are present while candidates exist and disappear with them.
+    #[test]
+    fn connected_keys_track_the_connected_surface() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.1.2.3/24", true));
+        rib.apply_event(&link(5, "vrf-test-up", true));
+        let mut keys: Vec<(TableId, IpPrefix)> = rib.connected_keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![(254, "10.1.2.0/24".parse().unwrap())],
+            "link events alone contribute nothing"
+        );
+
+        rib.apply_event(&address(2, "10.1.2.3/24", false));
+        assert_eq!(rib.connected_keys().count(), 0);
     }
 }

@@ -850,7 +850,15 @@ async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
         opaque: None,
     });
     staticd.send(&gateway_route).await;
-    staticd.send(&staticd_route_add()).await; // 203.0.113.0/24 blackhole
+    // The blackhole leg deliberately uses a /25 off the connected /24 key:
+    // the address mirror populates a CONNECTED best for 203.0.113.0/24
+    // (distance 0) that would mask a same-prefix static candidate.
+    let mut blackhole_offnet = match staticd_route_add() {
+        ZapiMessage::RouteAdd(route) => route,
+        _ => unreachable!(),
+    };
+    blackhole_offnet.prefix = "203.0.113.128/25".parse().unwrap();
+    staticd.send(&ZapiMessage::RouteAdd(blackhole_offnet)).await;
     drive_driver_n(&mut driver, &mut rx, 4).await; // attach + establish + add x2
     driver.rib.reconcile(&dp).await;
     assert_eq!(dp.installed().len(), 2);
@@ -867,7 +875,7 @@ async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
     }))
     .await;
     drive_driver_n(&mut driver, &mut rx, 3).await; // attach + establish + register
-    for prefix in ["198.51.100.0/24", "203.0.113.0/24"] {
+    for prefix in ["198.51.100.0/24", "203.0.113.128/25"] {
         let (header, body) = bgpd.read_frame().await;
         assert_eq!(header.command, 31, "registration dump ADD");
         match ZapiMessage::decode(31, &body).unwrap() {
@@ -904,7 +912,7 @@ async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
             .iter()
             .map(|r| r.prefix.to_string())
             .collect::<Vec<_>>(),
-        vec!["198.51.100.0/24", "203.0.113.0/24"],
+        vec!["198.51.100.0/24", "203.0.113.128/25"],
         "prefix-sorted dump of the adopted registration"
     );
     assert_eq!(dumped[0].flags, 0x08, "ZEBRA_FLAG_SELECTED");

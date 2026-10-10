@@ -159,6 +159,13 @@ async fn main() -> std::io::Result<()> {
         neighbours = driver.rib.neighbours().len(),
         "initial neighbour mirror"
     );
+    // The CONNECT protocol table derived from the mirrored addresses
+    // (main table only counted here — an enslaved member's connected
+    // routes live in its VRF's table, W4 placement).
+    info!(
+        connected = driver.rib.connected_keys().count(),
+        "initial connected routes"
+    );
     // VRF devices seen in the link dump (W4): each logs its bound table,
     // how many kernel-origin routes the mirror holds in that table, and
     // how many mirrored links it enslaves. Live VRF changes ride the

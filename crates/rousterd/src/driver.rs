@@ -412,7 +412,10 @@ impl RibDriver {
     /// the owning session. Route events cannot change (direct)
     /// resolution, so they skip the pass. The same link/address events
     /// can change the derived router-id (A2), so they also re-run the
-    /// router-id evaluation for ROUTER_ID_ADD-registered sessions.
+    /// router-id evaluation for ROUTER_ID_ADD-registered sessions, and
+    /// they maintain the CONNECT protocol table — connected bests that
+    /// appear or vanish fan REDISTRIBUTE pushes through
+    /// [`RibDriver::push_best_change`].
     pub fn apply_event(&mut self, ev: &DataplaneEvent) {
         let flips_resolution = matches!(
             ev,
@@ -421,10 +424,34 @@ impl RibDriver {
                 | DataplaneEvent::AddressNew { .. }
                 | DataplaneEvent::AddressDel { .. }
         );
+        // The same events can change the CONNECT protocol table (the RIB
+        // derives connected routes from the interface mirror), so the
+        // bests over the connected surface are snapshotted before and
+        // re-checked after — a connected prefix appearing or disappearing
+        // fans REDISTRIBUTE_ROUTE_ADD/DEL exactly like a route command
+        // would (the `reload_static` pattern).
+        let connected_before: Vec<(TableId, IpPrefix, Option<RouteEntry>)> = if flips_resolution {
+            self.rib
+                .connected_keys()
+                .map(|(table, prefix)| (table, prefix, self.best_of(table, prefix)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.rib.apply_event(ev);
         if flips_resolution {
             self.reevaluate_nht();
             self.reevaluate_router_id();
+            let mut keys: BTreeSet<(TableId, IpPrefix)> =
+                connected_before.iter().map(|&(t, p, _)| (t, p)).collect();
+            keys.extend(self.rib.connected_keys());
+            for (table, prefix) in keys {
+                let before = connected_before
+                    .iter()
+                    .find(|&&(t, p, _)| t == table && p == prefix)
+                    .and_then(|(_, _, before)| before.clone());
+                self.push_best_change(table, prefix, before);
+            }
         }
     }
 
@@ -485,8 +512,11 @@ impl RibDriver {
         }
     }
 
+    /// The best-of view the redistribute surfaces consume: the CONNECT
+    /// table participates at distance 0 (`Rib::best_with_connected`), so
+    /// a connected candidate masks protocol candidates for its prefix.
     fn best_of(&self, table: TableId, prefix: IpPrefix) -> Option<RouteEntry> {
-        self.rib.table(table).and_then(|t| t.best(&prefix)).cloned()
+        self.rib.best_with_connected(table, &prefix)
     }
 
     /// The router-id rousterd derives for ROUTER_ID_UPDATE (18) answers:
@@ -556,40 +586,32 @@ impl RibDriver {
     /// current best; a best route that vanished instead fans a
     /// REDISTRIBUTE_ROUTE_DEL carrying the withdrawn route to the sessions
     /// registered for ITS (afi, type) — the same zsend_redistribute_route
-    /// body as the ADD (W2, closing Z3B's disclosed cut).
+    /// body as the ADD (W2, closing Z3B's disclosed cut). A best that
+    /// moved BETWEEN (afi, type) families (connected masking lifted off a
+    /// prefix a static candidate now wins, a protocol takeover after a
+    /// withdrawal) gets both halves: the losing family's registrants are
+    /// DELed the old best before the winners get the ADD — zebra's
+    /// `redistribute_update` semantics (a route no longer selected is
+    /// withdrawn from its redistributors).
     fn push_best_change(&mut self, table: TableId, prefix: IpPrefix, before: Option<RouteEntry>) {
         let after = self.best_of(table, prefix);
         if after == before {
             return;
         }
+        // The transition DEL: the old best lost selection to a DIFFERENT
+        // (afi, type) family (the gone-entirely case is handled below).
+        if let (Some(old), Some(new)) = (&before, &after) {
+            let old_family = (afi_of(&old.prefix), route_type_from(old.protocol));
+            let new_family = (afi_of(&new.prefix), route_type_from(new.protocol));
+            if old_family != new_family {
+                self.push_withdrawn_best(old);
+            }
+        }
         let Some(best) = after else {
             let Some(withdrawn) = before else {
                 return;
             };
-            let afi = afi_of(&withdrawn.prefix);
-            let route_type = route_type_from(withdrawn.protocol);
-            let owners: Vec<u64> = self
-                .redistributes
-                .iter()
-                .filter(|(_, keys)| keys.iter().any(|k| k.0 == afi && k.1 == route_type))
-                .map(|(&owner, _)| owner)
-                .collect();
-            if owners.is_empty() {
-                return;
-            }
-            let entry = self.push_form(&withdrawn);
-            info!(
-                %prefix,
-                table,
-                route_type,
-                sessions = owners.len(),
-                "zapi: best route withdrawn; pushing REDISTRIBUTE_ROUTE_DEL"
-            );
-            for owner in owners {
-                if self.push(owner, SessionPush::RedistributeRouteDel(entry.clone())) {
-                    self.record_forgotten(owner, entry.prefix);
-                }
-            }
+            self.push_withdrawn_best(&withdrawn);
             return;
         };
         let afi = afi_of(&best.prefix);
@@ -621,6 +643,35 @@ impl RibDriver {
         }
     }
 
+    /// The DEL half of the redistribute fan-out: sessions registered for
+    /// `withdrawn`'s (afi, type) are pushed REDISTRIBUTE_ROUTE_DEL
+    /// carrying it, in push form.
+    fn push_withdrawn_best(&mut self, withdrawn: &RouteEntry) {
+        let afi = afi_of(&withdrawn.prefix);
+        let route_type = route_type_from(withdrawn.protocol);
+        let owners: Vec<u64> = self
+            .redistributes
+            .iter()
+            .filter(|(_, keys)| keys.iter().any(|k| k.0 == afi && k.1 == route_type))
+            .map(|(&owner, _)| owner)
+            .collect();
+        if owners.is_empty() {
+            return;
+        }
+        let entry = self.push_form(withdrawn);
+        info!(
+            prefix = %entry.prefix,
+            route_type,
+            sessions = owners.len(),
+            "zapi: best route withdrawn; pushing REDISTRIBUTE_ROUTE_DEL"
+        );
+        for owner in owners {
+            if self.push(owner, SessionPush::RedistributeRouteDel(entry.clone())) {
+                self.record_forgotten(owner, entry.prefix);
+            }
+        }
+    }
+
     /// The wire-facing form of a route: gateway hops rewritten to their
     /// resolved (ifindex-carrying) form where the RIB can resolve them —
     /// unresolved gateways keep their gateway form, which is exactly the
@@ -645,14 +696,31 @@ impl RibDriver {
 
     /// The best routes of one (afi, route type) in the main table — the
     /// initial-dump set, shared by the registration (W2) and reconnect
-    /// (M6) paths. Prefix-sorted (BTreeMap iteration).
+    /// (M6) paths. Prefix-sorted (BTreeMap iteration). The CONNECT table
+    /// participates: type-CONNECT registrations dump the connected routes
+    /// derived from the interface mirror, and for every other type the
+    /// merged best (`Rib::best_with_connected`) keeps a connected-masked
+    /// prefix out of the dump.
     fn dump_set(&self, afi: u8, route_type: u8) -> Vec<RouteEntry> {
+        if route_type == zapi::route_type::CONNECT {
+            return self
+                .rib
+                .connected_table(DEFAULT_TABLE)
+                .map(|table| {
+                    table
+                        .iter()
+                        .filter_map(|(prefix, _)| table.best(prefix).cloned())
+                        .filter(|best| afi_of(&best.prefix) == afi)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         self.rib
             .table(DEFAULT_TABLE)
             .map(|table| {
                 table
                     .iter()
-                    .filter_map(|(prefix, _)| table.best(prefix).cloned())
+                    .filter_map(|(prefix, _)| self.rib.best_with_connected(DEFAULT_TABLE, prefix))
                     .filter(|best| {
                         afi_of(&best.prefix) == afi && route_type_from(best.protocol) == route_type
                     })
@@ -1237,7 +1305,7 @@ mod tests {
                 Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
                 20,
             ),
-            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+            static_entry("203.0.113.128/25", Nexthop::Blackhole, 7),
         ]);
         for _ in 0..2 {
             assert!(matches!(
@@ -1254,7 +1322,7 @@ mod tests {
                 Nexthop::Ipv4("203.0.113.9".parse().unwrap()),
                 10,
             ),
-            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+            static_entry("203.0.113.128/25", Nexthop::Blackhole, 7),
             static_entry("192.0.2.0/24", Nexthop::Blackhole, 3),
         ]);
         let mut seen: BTreeMap<IpPrefix, (&'static str, u32)> = BTreeMap::new();
@@ -1284,7 +1352,7 @@ mod tests {
         // Second SIGHUP drops the gateway route entirely: a DEL carrying
         // the withdrawn best, gateway hop in resolved push form.
         driver.reload_static(&[
-            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+            static_entry("203.0.113.128/25", Nexthop::Blackhole, 7),
             static_entry("192.0.2.0/24", Nexthop::Blackhole, 3),
         ]);
         match pushes.try_recv().expect("withdrawn best pushes DEL") {
@@ -1326,7 +1394,7 @@ mod tests {
 
         let running = vec![
             static_entry("198.51.100.0/24", Nexthop::Blackhole, 20),
-            static_entry("203.0.113.0/24", Nexthop::Blackhole, 7),
+            static_entry("203.0.113.128/25", Nexthop::Blackhole, 7),
         ];
         driver.reload_static(&running);
         for _ in 0..2 {
@@ -1377,7 +1445,7 @@ mod tests {
             5,
         )));
         driver.apply(RibCommand::AddRoute(static_entry(
-            "203.0.113.0/24",
+            "203.0.113.128/25",
             Nexthop::Blackhole,
             7,
         )));
@@ -1410,7 +1478,7 @@ mod tests {
             prefixes,
             vec![
                 "198.51.100.0/24".parse::<IpPrefix>().unwrap(),
-                "203.0.113.0/24".parse::<IpPrefix>().unwrap()
+                "203.0.113.128/25".parse::<IpPrefix>().unwrap()
             ],
             "prefix-sorted dump, only the registered type/afi"
         );
@@ -1477,7 +1545,7 @@ mod tests {
             5,
         )));
         driver.apply(RibCommand::AddRoute(static_entry(
-            "203.0.113.0/24",
+            "203.0.113.128/25",
             Nexthop::Blackhole,
             7,
         )));
@@ -1489,7 +1557,7 @@ mod tests {
         });
         // The W2 registration dump: both routes, prefix order — this is
         // also the delta baseline the reconnect below diffs against.
-        for prefix in ["198.51.100.0/24", "203.0.113.0/24"] {
+        for prefix in ["198.51.100.0/24", "203.0.113.128/25"] {
             match bgpd.try_recv().expect("registration dump ADD") {
                 SessionPush::RedistributeRouteAdd(entry) => {
                     assert_eq!(entry.prefix, prefix.parse::<IpPrefix>().unwrap());
@@ -1518,7 +1586,10 @@ mod tests {
             .expect("reconnect dump ADD for the survivor")
         {
             SessionPush::RedistributeRouteAdd(entry) => {
-                assert_eq!(entry.prefix, "203.0.113.0/24".parse::<IpPrefix>().unwrap());
+                assert_eq!(
+                    entry.prefix,
+                    "203.0.113.128/25".parse::<IpPrefix>().unwrap()
+                );
             }
             other => panic!("expected RedistributeRouteAdd, got {other:?}"),
         }
@@ -1934,5 +2005,160 @@ mod tests {
             0,
         )));
         assert!(driver.sessions.is_empty());
+    }
+
+    // --- Connected redistribution (the CONNECT table at the edge) ---
+
+    /// A session registered for CONNECT redistribution sees the connected
+    /// table live: an address event that creates a connected best pushes
+    /// REDISTRIBUTE_ROUTE_ADD (push form: the IfIndex hop), removal pushes
+    /// the DEL, and a link flap does both. No registration, no push.
+    #[test]
+    fn address_events_push_connected_redistribute() {
+        let mut driver = RibDriver::new();
+        let mut ospfd = attach(&mut driver, 1);
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::CONNECT,
+            instance: 0,
+        });
+
+        driver.apply_event(&link_up(2));
+        assert!(
+            ospfd.try_recv().is_err(),
+            "a link alone contributes no connected prefix"
+        );
+        driver.apply_event(&addr_new(2, "10.1.2.3/24"));
+        match ospfd.try_recv().expect("connected ADD pushed") {
+            SessionPush::RedistributeRouteAdd(entry) => {
+                assert_eq!(entry.prefix, "10.1.2.0/24".parse().unwrap());
+                assert_eq!(entry.protocol, RouteProtocol::Connected);
+                assert_eq!(
+                    entry.nexthops.hops(),
+                    &[(Nexthop::IfIndex(2), 1)],
+                    "connected pushes carry the interface hop"
+                );
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+
+        // Removal: the DEL carries the withdrawn connected route.
+        driver.apply_event(&DataplaneEvent::AddressDel {
+            ifindex: 2,
+            prefix: "10.1.2.3/24".parse().unwrap(),
+        });
+        match ospfd.try_recv().expect("connected DEL pushed") {
+            SessionPush::RedistributeRouteDel(entry) => {
+                assert_eq!(entry.prefix, "10.1.2.0/24".parse().unwrap());
+                assert_eq!(entry.protocol, RouteProtocol::Connected);
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
+        }
+
+        // Link flap with the address still configured: DEL then ADD.
+        driver.apply_event(&addr_new(2, "10.1.2.3/24"));
+        assert!(matches!(
+            ospfd.try_recv().expect("re-added"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+        driver.apply_event(&link_down(2));
+        assert!(matches!(
+            ospfd.try_recv().expect("flap DEL"),
+            SessionPush::RedistributeRouteDel(_)
+        ));
+        driver.apply_event(&link_up(2));
+        assert!(matches!(
+            ospfd.try_recv().expect("flap ADD"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+        assert!(ospfd.try_recv().is_err(), "one push per change");
+    }
+
+    /// REDISTRIBUTE_ADD (CONNECT) dumps the connected bests that now
+    /// exist — the W1B §D3 goal, un-shrunk: the initial dump is NON-empty
+    /// (network-form prefixes, afi-filtered), and a v6 address stays out
+    /// of an afi-1 registration's dump.
+    #[test]
+    fn connected_registration_dumps_nonempty() {
+        let mut driver = RibDriver::new();
+        let mut ospfd = attach(&mut driver, 1);
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "10.1.2.3/24"));
+        driver.apply_event(&addr_new(2, "2001:db8:1::1/64"));
+
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::CONNECT,
+            instance: 0,
+        });
+        match ospfd.try_recv().expect("the dump is non-empty") {
+            SessionPush::RedistributeRouteAdd(entry) => {
+                assert_eq!(entry.prefix, "10.1.2.0/24".parse().unwrap());
+                assert_eq!(entry.protocol, RouteProtocol::Connected);
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
+        assert!(
+            ospfd.try_recv().is_err(),
+            "the v6 connected prefix is not in an afi-1 dump"
+        );
+    }
+
+    /// A connected best masks a same-prefix static candidate: when the
+    /// address goes away the best flips Connected→Static and the fan-out
+    /// delivers the transition — DEL to the CONNECT-registered session,
+    /// ADD to the STATIC-registered one.
+    #[test]
+    fn connected_best_masking_flips_both_registrations() {
+        let mut driver = RibDriver::new();
+        let mut ospfd = attach(&mut driver, 1); // wants connected
+        let mut staticd = attach(&mut driver, 2); // wants static
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 1,
+            afi: 1,
+            route_type: route_type::CONNECT,
+            instance: 0,
+        });
+        driver.apply(RibCommand::RegisterRedistribute {
+            owner: 2,
+            afi: 1,
+            route_type: route_type::STATIC,
+            instance: 0,
+        });
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "10.1.2.3/24"));
+        assert!(matches!(
+            ospfd.try_recv().expect("connected best ADD"),
+            SessionPush::RedistributeRouteAdd(_)
+        ));
+        // The static candidate arrives while connected rules: best
+        // unchanged (connected, distance 0) — no push to anyone.
+        driver.apply(RibCommand::AddRoute(static_entry(
+            "10.1.2.0/24",
+            Nexthop::Blackhole,
+            0,
+        )));
+        assert!(ospfd.try_recv().is_err(), "best unchanged by the candidate");
+        assert!(staticd.try_recv().is_err());
+
+        // The address goes away: connected withdraws, static takes over.
+        driver.apply_event(&DataplaneEvent::AddressDel {
+            ifindex: 2,
+            prefix: "10.1.2.3/24".parse().unwrap(),
+        });
+        match ospfd.try_recv().expect("connected DEL on masking end") {
+            SessionPush::RedistributeRouteDel(entry) => {
+                assert_eq!(entry.protocol, RouteProtocol::Connected);
+            }
+            other => panic!("expected RedistributeRouteDel, got {other:?}"),
+        }
+        match staticd.try_recv().expect("static ADD on takeover") {
+            SessionPush::RedistributeRouteAdd(entry) => {
+                assert_eq!(entry.protocol, RouteProtocol::Static);
+            }
+            other => panic!("expected RedistributeRouteAdd, got {other:?}"),
+        }
     }
 }
