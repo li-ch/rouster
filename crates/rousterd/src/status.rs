@@ -67,7 +67,9 @@ pub fn status_text(rib: &Rib, pid: u32) -> String {
     let mut out = format!(
         "rousterd {} pid {pid}\nrouter-id {}\n",
         env!("CARGO_PKG_VERSION"),
-        router_id(rib).map(|id| id.to_string()).unwrap_or_else(|| "none".into())
+        router_id(rib)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into())
     );
 
     // Interfaces, ifindex order (the mirror's own ordering).
@@ -95,15 +97,8 @@ pub fn status_text(rib: &Rib, pid: u32) -> String {
     let tables = table_ids(rib);
     out.push_str(&format!("tables {}\n", tables.len()));
     for id in tables {
-        let (routes, prefixes) = rib
-            .table(id)
-            .map(count_table)
-            .unwrap_or((0, 0));
-        let connected = rib
-            .connected_table(id)
-            .map(count_table)
-            .unwrap_or((0, 0))
-            .0;
+        let (routes, prefixes) = rib.table(id).map(count_table).unwrap_or((0, 0));
+        let connected = rib.connected_table(id).map(count_table).unwrap_or((0, 0)).0;
         let kernel = rib.kernel_table(id).map(count_table).unwrap_or((0, 0)).0;
         let vrf = rib
             .vrf_of_table(id)
@@ -180,7 +175,11 @@ fn router_id(rib: &Rib) -> Option<Ipv4Addr> {
             }
         }
     }
-    let pool = if loopback.is_empty() { any_up } else { loopback };
+    let pool = if loopback.is_empty() {
+        any_up
+    } else {
+        loopback
+    };
     pool.into_iter().max()
 }
 
@@ -344,13 +343,13 @@ mod tests {
         rib
     }
 
-        #[test]
+    #[test]
     fn header_carries_version_pid_and_derived_router_id() {
         let rib = populated();
         let text = status_text(&rib, 4242);
-        assert!(text.starts_with(
-            format!("rousterd {} pid 4242\n", env!("CARGO_PKG_VERSION")).as_str()
-        ));
+        assert!(
+            text.starts_with(format!("rousterd {} pid 4242\n", env!("CARGO_PKG_VERSION")).as_str())
+        );
         // The highest non-127/8 v4 on an UP interface (eth1's
         // 198.51.100.1 beats eth0's 192.0.2.1; no loopback competes).
         assert!(text.contains("\nrouter-id 198.51.100.1\n"));
@@ -359,14 +358,7 @@ mod tests {
     #[test]
     fn router_id_none_when_no_up_v4_address() {
         let mut rib = Rib::new();
-        rib.apply_event(&link(
-            1,
-            "lo",
-            true,
-            LinkFlags::up_loopback(),
-            None,
-            None,
-        ));
+        rib.apply_event(&link(1, "lo", true, LinkFlags::up_loopback(), None, None));
         rib.apply_event(&addr(1, "127.0.0.1/8")); // 127/8 excluded
         let text = status_text(&rib, 1);
         assert!(text.contains("\nrouter-id none\n"));
@@ -384,14 +376,7 @@ mod tests {
             None,
         ));
         rib.apply_event(&addr(2, "192.0.2.1/24"));
-        rib.apply_event(&link(
-            9,
-            "lo9",
-            true,
-            LinkFlags::up_loopback(),
-            None,
-            None,
-        ));
+        rib.apply_event(&link(9, "lo9", true, LinkFlags::up_loopback(), None, None));
         rib.apply_event(&addr(9, "198.51.100.7/32"));
         let text = status_text(&rib, 1);
         assert!(text.contains("\nrouter-id 198.51.100.7\n"));
@@ -402,25 +387,21 @@ mod tests {
         let rib = populated();
         let text = status_text(&rib, 4242);
         assert!(text.contains("interfaces 4\n"));
-        assert!(text
-            .contains("interface lo ifindex 1 up flags UP|LOOPBACK|RUNNING vrf -\n  address 127.0.0.1/8\n"));
+        assert!(text.contains(
+            "interface lo ifindex 1 up flags UP|LOOPBACK|RUNNING vrf -\n  address 127.0.0.1/8\n"
+        ));
         // The VRF device: no master, but its bound table.
         assert!(text.contains("interface vrf-blue ifindex 5 up flags UP|BROADCAST|RUNNING|MULTICAST vrf - vrf-table 1001\n"));
         // The enslaved member: the master's name as its vrf.
-        assert!(text.contains("interface eth1 ifindex 6 up flags UP|BROADCAST|RUNNING|MULTICAST vrf vrf-blue\n"));
+        assert!(text.contains(
+            "interface eth1 ifindex 6 up flags UP|BROADCAST|RUNNING|MULTICAST vrf vrf-blue\n"
+        ));
     }
 
     #[test]
     fn a_down_interface_renders_down() {
         let mut rib = Rib::new();
-        rib.apply_event(&link(
-            2,
-            "eth0",
-            false,
-            LinkFlags::BROADCAST,
-            None,
-            None,
-        ));
+        rib.apply_event(&link(2, "eth0", false, LinkFlags::BROADCAST, None, None));
         let text = status_text(&rib, 1);
         assert!(text.contains("interface eth0 ifindex 2 down flags BROADCAST vrf -\n"));
     }
@@ -433,8 +414,7 @@ mod tests {
         assert!(text.contains(
             "neighbour 198.51.100.9 ifindex 6 state REACHABLE lladdr 02:00:00:00:00:11\n"
         ));
-        assert!(text
-            .contains("neighbour 192.0.2.10 ifindex 2 state INCOMPLETE lladdr -\n"));
+        assert!(text.contains("neighbour 192.0.2.10 ifindex 2 state INCOMPLETE lladdr -\n"));
     }
 
     #[test]
@@ -444,13 +424,11 @@ mod tests {
         assert!(text.contains("tables 2\n"));
         // Main: 1 static candidate over 1 prefix; connected = eth0's
         // two addresses + loopback's one = 3; kernel = 1 mirror entry.
-        assert!(text
-            .contains("table 254 routes 1 prefixes 1 connected 3 kernel 1 vrf -\n"));
+        assert!(text.contains("table 254 routes 1 prefixes 1 connected 3 kernel 1 vrf -\n"));
         // VRF-blue's table: no protocol routes, eth1's connected route
         // (a member's connected route lands in the VRF's table), one
         // kernel mirror entry.
-        assert!(text
-            .contains("table 1001 routes 0 prefixes 0 connected 1 kernel 1 vrf vrf-blue\n"));
+        assert!(text.contains("table 1001 routes 0 prefixes 0 connected 1 kernel 1 vrf vrf-blue\n"));
     }
 
     #[test]
@@ -493,10 +471,8 @@ mod tests {
         let rib = Rib::new();
         // A path whose parent is a regular file: create_dir_all fails,
         // the call must return (not panic) and stay quiet about it.
-        let file = std::env::temp_dir().join(format!(
-            "rousterd-status-blocker-{}",
-            std::process::id()
-        ));
+        let file =
+            std::env::temp_dir().join(format!("rousterd-status-blocker-{}", std::process::id()));
         std::fs::write(&file, "not a dir").unwrap();
         publish_to(&file.join("rousterd.status"), &rib, 1);
         let _ = std::fs::remove_file(&file);

@@ -167,13 +167,12 @@ impl RousterdStatus {
             format!(
                 "rousterd {}  pid {}  {}",
                 self.version.as_deref().unwrap_or("?"),
-                self.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                self.pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".into()),
                 pid_state.assessment(),
             ),
-            format!(
-                "router-id {}",
-                self.router_id.as_deref().unwrap_or("none")
-            ),
+            format!("router-id {}", self.router_id.as_deref().unwrap_or("none")),
         ]
     }
 
@@ -235,7 +234,15 @@ impl RousterdStatus {
                 return format!("(no interface named {want} in the published dump)");
             }
         }
-        let headers = ["NAME", "IFINDEX", "STATE", "FLAGS", "VRF", "VRF-TABLE", "ADDRESSES"];
+        let headers = [
+            "NAME",
+            "IFINDEX",
+            "STATE",
+            "FLAGS",
+            "VRF",
+            "VRF-TABLE",
+            "ADDRESSES",
+        ];
         let rows: Vec<[String; 7]> = selected
             .iter()
             .map(|iface| {
@@ -301,7 +308,9 @@ impl RousterdStatus {
         if vrfs.is_empty() {
             return "(no VRF devices mirrored — `ip link add <name> type vrf ...`)".into();
         }
-        let headers = ["NAME", "IFINDEX", "TABLE", "MEMBERS", "STATE", "ROUTES", "KERNEL"];
+        let headers = [
+            "NAME", "IFINDEX", "TABLE", "MEMBERS", "STATE", "ROUTES", "KERNEL",
+        ];
         let rows: Vec<[String; 7]> = vrfs
             .iter()
             .map(|vrf| {
@@ -701,9 +710,7 @@ fn dash_none(value: Option<&str>) -> String {
 }
 
 fn opt_u64(value: Option<u64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".into())
+    value.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
 }
 
 /// Escapes a string for embedding in a JSON string literal.

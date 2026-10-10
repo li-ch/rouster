@@ -353,8 +353,7 @@ fn rib_dir(tag: &str, fixture: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vty-parser-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let source =
-        format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    let source = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
     std::fs::copy(source, dir.join("rousterd.status")).unwrap();
     dir
 }
@@ -462,7 +461,10 @@ fn future_dump_fields_are_tolerated() {
     let mut s = enabled_session(rib_dir("rd-future", "rousterd-status-future-fields.status"));
     let text = joined(&mut s, "show interface");
     assert!(text.contains("eth0"));
-    assert!(text.contains("1 unrecognized line"), "the disclosure renders");
+    assert!(
+        text.contains("1 unrecognized line"),
+        "the disclosure renders"
+    );
 }
 
 #[test]

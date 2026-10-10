@@ -476,8 +476,16 @@ fn rousterd_full_fixture_parses_completely() {
 fn rousterd_future_fields_are_tolerated() {
     let st = parse_rousterd("rousterd-status-future-fields.status");
     assert_eq!(st.version.as_deref(), Some("2.0.0"));
-    assert_eq!(st.pid, Some(51_234), "extra header fields don't hide the pid");
-    assert_eq!(st.router_id.as_deref(), Some("192.0.2.1"), "trailing keywords dropped");
+    assert_eq!(
+        st.pid,
+        Some(51_234),
+        "extra header fields don't hide the pid"
+    );
+    assert_eq!(
+        st.router_id.as_deref(),
+        Some("192.0.2.1"),
+        "trailing keywords dropped"
+    );
     assert_eq!(st.interfaces.len(), 2);
     let eth0 = &st.interfaces[0];
     assert_eq!(eth0.ifindex, Some(2), "mtu/type ride along harmlessly");
@@ -492,8 +500,15 @@ fn rousterd_future_fields_are_tolerated() {
         Some("REACHABLE|CONFIRMED"),
         "unknown state bits stay verbatim"
     );
-    assert_eq!(st.tables[0].kernel, Some(3), "trailing `label main` ignored");
-    assert_eq!(st.unknown_lines, 1, "`agent session ...` is not a known line");
+    assert_eq!(
+        st.tables[0].kernel,
+        Some(3),
+        "trailing `label main` ignored"
+    );
+    assert_eq!(
+        st.unknown_lines, 1,
+        "`agent session ...` is not a known line"
+    );
 }
 
 /// Malformed KNOWN lines parse defensively: bad numbers leave their
@@ -507,13 +522,23 @@ fn rousterd_malformed_lines_are_defensive() {
     let eth0 = &st.interfaces[0];
     assert_eq!(eth0.name.as_deref(), Some("eth0"));
     assert_eq!(eth0.ifindex, None, "NaN ifindex leaves the field unset");
-    assert_eq!(eth0.flags, None, "a bare `flags` word leaves the field unset");
+    assert_eq!(
+        eth0.flags, None,
+        "a bare `flags` word leaves the field unset"
+    );
     assert_eq!(eth0.up, Some(true));
-    assert_eq!(eth0.addresses, vec!["not-a-prefix"], "children stay verbatim");
+    assert_eq!(
+        eth0.addresses,
+        vec!["not-a-prefix"],
+        "children stay verbatim"
+    );
     assert_eq!(st.neighbours.len(), 0, "not-an-ip neighbours are dropped");
     assert_eq!(st.tables.len(), 1, "the id still parses");
     assert_eq!(st.tables[0].routes, None, "`many` leaves the count unset");
-    assert_eq!(st.unknown_lines, 2, "the bare `interface` and `neighbours one` lines count");
+    assert_eq!(
+        st.unknown_lines, 2,
+        "the bare `interface` and `neighbours one` lines count"
+    );
 }
 
 /// Neighbour filters: bare address, CIDR containment, either family;
@@ -613,7 +638,10 @@ fn rousterd_json_renders_have_the_agreed_shape() {
     let json = st.render_neighbours_json(PidState::Dead, Some("192.0.2.0/24"));
     assert!(json.contains("\"ip\":\"192.0.2.10\""));
     assert!(json.contains("\"pid_state\":\"dead\""));
-    assert!(!json.contains("198.51.100.9"), "the filter applies to JSON too");
+    assert!(
+        !json.contains("198.51.100.9"),
+        "the filter applies to JSON too"
+    );
 
     let json = st.render_vrfs_json(PidState::Unknown);
     assert!(json.contains("\"name\":\"vrf-blue\""));
@@ -639,7 +667,10 @@ fn args_parse_the_v2_grammar() {
     let cli = args::parse(&argv(&["show", "interface"])).unwrap();
     assert_eq!(
         cli.command,
-        Command::ShowInterface { name: None, json: false }
+        Command::ShowInterface {
+            name: None,
+            json: false
+        }
     );
     let cli = args::parse(&argv(&["show", "interface", "eth0", "--json"])).unwrap();
     assert_eq!(

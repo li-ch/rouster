@@ -49,9 +49,7 @@ pub fn dispatch(cli: &Cli) -> u8 {
             show_rousterd(&cli.run_dir, *json, &RdView::Neighbour(prefix.clone()))
         }
         Command::ShowVrf { json } => show_rousterd(&cli.run_dir, *json, &RdView::Vrf),
-        Command::ShowRibSummary { json } => {
-            show_rousterd(&cli.run_dir, *json, &RdView::RibSummary)
-        }
+        Command::ShowRibSummary { json } => show_rousterd(&cli.run_dir, *json, &RdView::RibSummary),
         Command::Status => status(&cli.run_dir),
     }
 }
@@ -70,12 +68,12 @@ impl RdView {
     /// never a miss — an empty table is a fine answer.
     fn is_miss(&self, parsed: &RousterdStatus) -> bool {
         match self {
-            RdView::Interface(name) => name.as_deref().is_some_and(|name| {
-                parsed.interfaces_matching(Some(name)).is_empty()
-            }),
-            RdView::Neighbour(prefix) => prefix.as_deref().is_some_and(|prefix| {
-                parsed.neighbours_matching(Some(prefix)).is_empty()
-            }),
+            RdView::Interface(name) => name
+                .as_deref()
+                .is_some_and(|name| parsed.interfaces_matching(Some(name)).is_empty()),
+            RdView::Neighbour(prefix) => prefix
+                .as_deref()
+                .is_some_and(|prefix| parsed.neighbours_matching(Some(prefix)).is_empty()),
             _ => false,
         }
     }

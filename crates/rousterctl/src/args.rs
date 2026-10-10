@@ -105,13 +105,23 @@ pub fn parse(argv: &[String]) -> Result<Cli, UsageError> {
                 })?;
                 match target.as_str() {
                     "sav" => command = Some(Command::ShowSav { json: false }),
-                    "interface" => command = Some(Command::ShowInterface { name: None, json: false }),
-                    "neighbour" => command = Some(Command::ShowNeighbour { prefix: None, json: false }),
+                    "interface" => {
+                        command = Some(Command::ShowInterface {
+                            name: None,
+                            json: false,
+                        })
+                    }
+                    "neighbour" => {
+                        command = Some(Command::ShowNeighbour {
+                            prefix: None,
+                            json: false,
+                        })
+                    }
                     "vrf" => command = Some(Command::ShowVrf { json: false }),
                     "rib" => {
-                        let word = argv.get(index + 2).ok_or_else(|| {
-                            "`show rib` needs `summary` in v2".to_string()
-                        })?;
+                        let word = argv
+                            .get(index + 2)
+                            .ok_or_else(|| "`show rib` needs `summary` in v2".to_string())?;
                         if word != "summary" {
                             return Err(format!(
                                 "unknown show rib form `{word}` — v2 has only `show rib summary`"

@@ -356,7 +356,10 @@ table 1001 routes 0 prefixes 0 connected 1 kernel 1 vrf vrf-blue
         assert_eq!(parsed.interfaces[2].vrf_table, Some(1001));
         assert_eq!(parsed.interfaces[3].vrf.as_deref(), Some("vrf-blue"));
         assert_eq!(parsed.neighbours.len(), 2);
-        assert_eq!(parsed.neighbours[1].lladdr.as_deref(), Some("02:00:00:00:00:11"));
+        assert_eq!(
+            parsed.neighbours[1].lladdr.as_deref(),
+            Some("02:00:00:00:00:11")
+        );
         assert_eq!(parsed.tables[0].connected, Some(3));
         assert_eq!(parsed.tables[1].vrf.as_deref(), Some("vrf-blue"));
         assert_eq!(parsed.unknown_lines, 0);
@@ -407,7 +410,10 @@ table 254 routes many prefixes 0 connected 0 kernel 0 vrf -
         assert_eq!(parsed.neighbours_matching(None).len(), 2);
         assert_eq!(parsed.neighbours_matching(Some("192.0.2.10")).len(), 1);
         assert_eq!(parsed.neighbours_matching(Some("192.0.2.0/24")).len(), 1);
-        assert_eq!(parsed.neighbours_matching(Some("198.51.100.64/26")).len(), 0);
+        assert_eq!(
+            parsed.neighbours_matching(Some("198.51.100.64/26")).len(),
+            0
+        );
         assert_eq!(parsed.neighbours_matching(Some("2001:db8::/32")).len(), 0);
     }
 

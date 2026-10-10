@@ -290,7 +290,11 @@ fn show_interface_filters_by_name_and_misses_honestly() {
     assert!(!text.contains("eth0"), "the filter selects");
 
     let miss = ctl(&["--run-dir", &dir_arg(&dir), "show", "interface", "eth9"]);
-    assert_eq!(miss.status.code(), Some(3), "a filter that names nothing exits 3");
+    assert_eq!(
+        miss.status.code(),
+        Some(3),
+        "a filter that names nothing exits 3"
+    );
     assert!(out(&miss).contains("no interface named eth9"));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -337,7 +341,14 @@ fn show_vrf_and_rib_summary_render() {
     assert!(text.contains("254"));
     assert!(text.contains("vrf-blue"), "the VRF association renders");
 
-    let json = ctl(&["--run-dir", &dir_arg(&dir), "show", "rib", "summary", "--json"]);
+    let json = ctl(&[
+        "--run-dir",
+        &dir_arg(&dir),
+        "show",
+        "rib",
+        "summary",
+        "--json",
+    ]);
     assert_eq!(json.status.code(), Some(0));
     let text = out(&json).trim().to_string();
     assert!(text.starts_with('{') && text.ends_with('}'));
@@ -407,13 +418,18 @@ fn the_empty_dump_renders_honest_empties() {
     let dir = scratch("rd-empty");
     std::fs::write(
         dir.join("rousterd.status"),
-        fixture("rousterd-status-empty.status").replace("pid 7", &format!("pid {}", std::process::id())),
+        fixture("rousterd-status-empty.status")
+            .replace("pid 7", &format!("pid {}", std::process::id())),
     )
     .unwrap();
     let vrf = ctl(&["--run-dir", &dir_arg(&dir), "show", "vrf"]);
     assert_eq!(vrf.status.code(), Some(0));
     assert!(out(&vrf).contains("no VRF devices"));
     let neigh = ctl(&["--run-dir", &dir_arg(&dir), "show", "neighbour"]);
-    assert_eq!(neigh.status.code(), Some(0), "an empty table is a fine answer");
+    assert_eq!(
+        neigh.status.code(),
+        Some(0),
+        "an empty table is a fine answer"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

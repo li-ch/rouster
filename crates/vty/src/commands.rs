@@ -102,10 +102,7 @@ pub fn enable_tree() -> WordTree {
     t.insert(Cmd {
         toks: vec![
             lit("show", "Show running system information"),
-            lit(
-                "interface",
-                "Interface status (rousterd run-dir surface)",
-            ),
+            lit("interface", "Interface status (rousterd run-dir surface)"),
         ],
         action: Action::ShowInterface,
         help: "The interface table rousterd mirrors (v4+v6)",

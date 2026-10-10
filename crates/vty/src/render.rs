@@ -498,7 +498,12 @@ pub fn show_rib_summary(run_dir: &Path) -> Vec<String> {
 
 /// The shared epilogue: the unrecognized-line disclosure and the
 /// stale-pid footer.
-fn footer(mut out: Vec<String>, parsed: &RibStatus, pid: Option<u32>, state: PidState) -> Vec<String> {
+fn footer(
+    mut out: Vec<String>,
+    parsed: &RibStatus,
+    pid: Option<u32>,
+    state: PidState,
+) -> Vec<String> {
     if parsed.unknown_lines > 0 {
         out.push(format!(
             "({} unrecognized line{} — the daemon's format is newer than this vty)",
