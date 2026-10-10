@@ -319,6 +319,77 @@ pub struct NamedPolicy {
     pub export: Option<Arc<policy::Filter>>,
 }
 
+/// The full import pipeline (W2-d): RPKI/OTC validation first (RFC
+/// 6811 §2 validity is a property of the received announcement; the
+/// typed filter sees the post-validation route), then the compiled
+/// filter.
+pub struct ImportPipeline {
+    pub validation: Arc<crate::rov::ValidationGate>,
+    pub filter: Option<Arc<policy::Filter>>,
+}
+
+impl ImportPipeline {
+    pub fn new(
+        validation: Arc<crate::rov::ValidationGate>,
+        filter: Option<Arc<policy::Filter>>,
+    ) -> Self {
+        Self { validation, filter }
+    }
+}
+
+impl ImportPolicy for ImportPipeline {
+    fn import(&self, route: Route) -> Option<Route> {
+        let route = self.validation.apply(route)?;
+        match &self.filter {
+            None => Some(route),
+            Some(filter) => run_filter(filter, route),
+        }
+    }
+}
+
+/// The full export pipeline (W2-d): §9.2.2 reflection floor, RFC 9234
+/// egress (eBGP only — roles are eBGP constructs), then the compiled
+/// filter.
+pub struct ExportPipeline {
+    pub validation: Arc<crate::rov::ValidationGate>,
+    pub filter: Option<Arc<policy::Filter>>,
+    pub local_as: u32,
+}
+
+impl ExportPipeline {
+    pub fn new(
+        validation: Arc<crate::rov::ValidationGate>,
+        filter: Option<Arc<policy::Filter>>,
+        local_as: u32,
+    ) -> Self {
+        Self {
+            validation,
+            filter,
+            local_as,
+        }
+    }
+}
+
+impl ExportPolicy for ExportPipeline {
+    fn export(&self, route: &Route, to_peer: &PeerInfo, internal: bool) -> Option<Route> {
+        // §9.2.2 loop-prevention floor.
+        if route.source.address == to_peer.address {
+            return None;
+        }
+        // RFC 9234 §5 egress (eBGP only — roles are eBGP constructs).
+        let route = if internal {
+            route.clone()
+        } else {
+            self.validation
+                .otc_egress(route, to_peer.address, self.local_as)?
+        };
+        match &self.filter {
+            None => Some(route),
+            Some(filter) => run_filter(filter, route),
+        }
+    }
+}
+
 /// Compile the config's policy stanzas and resolve the `import` /
 /// `export` names. Unknown names and grammar errors carry the line
 /// number policy's parser reported (offsets preserved by the
@@ -356,16 +427,16 @@ mod tests {
 
     fn route(prefix: &str, path: Vec<u32>) -> Route {
         let source = peer_info("192.0.2.9", 65001);
-        Route {
-            prefix: prefix.parse().unwrap(),
-            attrs: vec![
+        Route::new(
+            prefix.parse().unwrap(),
+            vec![
                 PathAttribute::Origin(Origin::Igp),
                 PathAttribute::AsPath(AsPath::sequence(path)),
                 PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
             ],
             source,
-            internal: false,
-        }
+            false,
+        )
     }
 
     fn prefix_set_filter(match_prefix: &str, actions: Vec<policy::Action>) -> policy::Filter {

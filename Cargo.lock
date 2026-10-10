@@ -26,6 +26,7 @@ version = "0.0.0"
 dependencies = [
  "common",
  "policy",
+ "rpki",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

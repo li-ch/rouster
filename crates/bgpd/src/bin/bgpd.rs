@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bgpd::peer::{ConfiguredNetworks, SharedSink};
-use bgpd::rib::{AcceptAll, LocRib, LocRibOut, RibSink};
+use bgpd::rib::{LocRib, LocRibOut, RibSink};
 use bgpd::zedge::{self, AlwaysReachable, NhtReachability, PeerReachability, ZedgeCommand};
 use bgpd::{daemon, rib};
 use tracing::{error, info, warn};
@@ -66,14 +66,55 @@ fn main() {
         .build()
         .expect("tokio runtime");
     runtime.block_on(async move {
+        // W2-d: policy + validation wiring. Named filters compile (or
+        // the daemon refuses to start — a bad policy is a config
+        // error, not a warning); the RPKI tables load or the RTR
+        // client spawns; the Loc-RIB and Adj-RIB-Out run through the
+        // pipelines. Unconfigured everything = the v1 accept-all
+        // behavior.
+        let named = match bgpd::policy_engine::compile_named_policy(&config) {
+            Ok(named) => named,
+            Err(e) => {
+                error!("bgpd: {e}");
+                std::process::exit(1);
+            }
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let tables = match bgpd::rov::tables_from_config(&config.rpki, shutdown_rx) {
+            Ok(tables) => tables,
+            Err(e) => {
+                error!("bgpd: {e}");
+                std::process::exit(1);
+            }
+        };
+        let validation = Arc::new(bgpd::rov::ValidationGate {
+            tables,
+            reject_invalid: config.rpki.reject_invalid,
+            aspa: config.aspa,
+            roles: config
+                .neighbors
+                .iter()
+                .filter_map(|(addr, n)| n.role.map(|r| (*addr, r)))
+                .collect(),
+        });
+        let import: Arc<dyn bgpd::rib::ImportPolicy> = Arc::new(
+            bgpd::policy_engine::ImportPipeline::new(Arc::clone(&validation), named.import),
+        );
+        let export: Arc<dyn bgpd::rib::ExportPolicy> =
+            Arc::new(bgpd::policy_engine::ExportPipeline::new(
+                Arc::clone(&validation),
+                named.export,
+                config.local_as,
+            ));
+
         // RIB: Loc-RIB behind the shared sink; best-path changes flow
         // to the export drainer (ZAPI) and the Adj-RIB-Out.
-        let loc_rib = Arc::new(Mutex::new(LocRib::new(config.local_as)));
+        let loc_rib = Arc::new(Mutex::new(LocRib::with_policy(config.local_as, import)));
         let sink = SharedSink(Arc::new(Mutex::new(RibSink::new(Arc::clone(&loc_rib)))));
         let out_rib = Arc::new(LocRibOut::new(
             Arc::clone(&loc_rib),
             ConfiguredNetworks::from_config(&config),
-            Arc::new(AcceptAll),
+            export,
         ));
 
         // ZAPI edge: NHT for peers + best-path export (optional —
@@ -122,6 +163,20 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // Daemon stop also stands down the RTR client (the tables
+        // handle outlives it safely either way).
+        {
+            let mut stop = channels.stop.clone();
+            let shutdown_tx = shutdown_tx;
+            tokio::spawn(async move {
+                while stop.changed().await.is_ok() {
+                    if *stop.borrow() {
+                        let _ = shutdown_tx.send(true);
+                        return;
+                    }
+                }
+            });
+        }
         let daemon = match daemon::Daemon::bind(config).await {
             Ok(daemon) => daemon,
             Err(e) => {

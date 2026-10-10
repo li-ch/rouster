@@ -35,8 +35,9 @@ use crate::attr::{attr_type, AsPath, AsSegment, Origin, PathAttribute};
 use crate::message::BgpUpdate;
 use crate::peer::{PeerInfo, RouteSink};
 
-/// One stored route: the prefix, its path attributes, and the peer it
-/// came from.
+/// One stored route: the prefix, its path attributes, the peer it
+/// came from, and the RPKI-derived validation state W2-d records at
+/// import (RFC 6811 §2 / RFC 9234 §5 visibility for show output).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     pub prefix: IpPrefix,
@@ -44,6 +45,33 @@ pub struct Route {
     pub source: PeerInfo,
     /// Learned over an internal (iBGP) session (§9.1.2.2 d).
     pub internal: bool,
+    /// RFC 6811 §2 prefix-origin validity; `None` = RPKI not in use
+    /// for this route (no tables, or an iBGP-learned path — validity
+    /// is computed at the eBGP ingress edge, v1).
+    pub rov: Option<rpki::Validity>,
+    /// ASPA verification outcome (draft-ietf-sidrops-aspa-verification
+    /// §5.5/§5.6); `None` = not computed (no tables, no neighbor
+    /// role, or iBGP).
+    pub aspa: Option<rpki::AspaValidity>,
+}
+
+impl Route {
+    /// The plain-route constructor (no RPKI state).
+    pub fn new(
+        prefix: IpPrefix,
+        attrs: Vec<PathAttribute>,
+        source: PeerInfo,
+        internal: bool,
+    ) -> Self {
+        Self {
+            prefix,
+            attrs,
+            source,
+            internal,
+            rov: None,
+            aspa: None,
+        }
+    }
 }
 
 impl Route {
@@ -96,6 +124,23 @@ impl Route {
     pub fn next_hop_v4(&self) -> Option<Ipv4Addr> {
         match self.attr(attr_type::NEXT_HOP) {
             Some(PathAttribute::NextHop(a)) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// OTC / Only To Customer (RFC 9234 §5) when the route carries it.
+    pub fn otc(&self) -> Option<u32> {
+        match self.attr(attr_type::OTC) {
+            Some(PathAttribute::Otc(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Route Origin ASN per RFC 6811 §2 (rightmost AS of a final
+    /// AS_SEQUENCE; None = that document's NONE).
+    pub fn origin_as(&self) -> Option<u32> {
+        match self.attr(attr_type::AS_PATH) {
+            Some(PathAttribute::AsPath(p)) => p.origin_as(),
             _ => None,
         }
     }
@@ -279,12 +324,7 @@ impl LocRib {
         let rib = self.adj_in.entry(peer.address).or_default();
         let internal = peer.remote_as == self.local_as;
         for prefix in update.announced() {
-            let route = Route {
-                prefix,
-                attrs: update.attrs.clone(),
-                source: *peer,
-                internal,
-            };
+            let route = Route::new(prefix, update.attrs.clone(), *peer, internal);
             match self.import.import(route) {
                 Some(route) => {
                     rib.insert(prefix, route);
@@ -478,16 +518,16 @@ impl crate::peer::OutRib for LocRibOut {
             // (never reflect to the origin peer) can never trip for it
             // (unspecified source), but the typed filter applies in
             // full.
-            let local = Route {
+            let local = Route::new(
                 prefix,
-                attrs: update.attrs.clone(),
-                source: PeerInfo {
+                update.attrs.clone(),
+                PeerInfo {
                     address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     remote_as: local_as,
                     bgp_id: None,
                 },
-                internal: false,
-            };
+                false,
+            );
             match self.policy.export(&local, &to_peer_info, internal) {
                 Some(exported) => {
                     let mut update = update;
@@ -575,12 +615,7 @@ mod tests {
         internal: bool,
         attrs: Vec<PathAttribute>,
     ) -> Route {
-        Route {
-            prefix: prefix.parse().unwrap(),
-            attrs,
-            source: *peer_info,
-            internal,
-        }
+        Route::new(prefix.parse().unwrap(), attrs, *peer_info, internal)
     }
 
     fn base_attrs(path: Vec<u32>, med: Option<u32>) -> Vec<PathAttribute> {
@@ -640,9 +675,9 @@ mod tests {
     #[test]
     fn ladder_as_set_counts_one() {
         let p = peer("192.0.2.1", 65001, 1);
-        let set = Route {
-            prefix: "203.0.113.0/24".parse().unwrap(),
-            attrs: vec![
+        let set = Route::new(
+            "203.0.113.0/24".parse().unwrap(),
+            vec![
                 PathAttribute::Origin(Origin::Igp),
                 PathAttribute::AsPath(AsPath {
                     segments: vec![
@@ -652,9 +687,9 @@ mod tests {
                 }),
                 PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
             ],
-            source: p,
-            internal: false,
-        };
+            p,
+            false,
+        );
         let longer = route("203.0.113.0/24", &p, false, base_attrs(vec![1, 2, 3], None));
         // set path = 1 + 1 = 2 beats sequence of 3.
         assert_eq!(best_path(&[set, longer]).unwrap().as_path_len(), 2);

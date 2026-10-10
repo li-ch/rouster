@@ -220,7 +220,6 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
     let mut in_rpki = false;
     let mut in_route_map = false;
     let mut policy_lines: Vec<String> = Vec::new();
-    let mut policy_any = false;
 
     for (idx, raw) in input.lines().enumerate() {
         let line_no = idx + 1;
@@ -237,7 +236,6 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
         // interpreted by the W1-a grammar at startup (never silently
         // dropped).
         let diverted = if is_policy_stanza_head(&tokens) {
-            policy_any = true;
             in_route_map = tokens[0] == "route-map";
             policy_lines.push(line.to_string());
             true

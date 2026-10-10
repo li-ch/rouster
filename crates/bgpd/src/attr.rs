@@ -141,6 +141,18 @@ impl AsPath {
         })
     }
 
+    /// The Route Origin ASN per RFC 6811 §2: "the rightmost AS in the
+    /// final AS_PATH segment ... if that segment is of type
+    /// AS_SEQUENCE" — `None` stands for that document's "NONE" (a
+    /// trailing AS_SET or an empty path can never be Matched by a
+    /// VRP). Distinct from `neighbor_as`, which skips AS_SETs.
+    pub fn origin_as(&self) -> Option<u32> {
+        match self.segments.last() {
+            Some(AsSegment::Sequence(v)) => v.last().copied(),
+            _ => None,
+        }
+    }
+
     fn encode(&self, out: &mut Vec<u8>, asn4: bool) {
         for seg in &self.segments {
             let asns = match seg {

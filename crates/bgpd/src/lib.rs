@@ -26,6 +26,7 @@ pub mod message;
 pub mod peer;
 pub mod policy_engine;
 pub mod rib;
+pub mod rov;
 pub mod wire;
 pub mod zedge;
 

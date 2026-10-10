@@ -8,6 +8,12 @@ license.workspace = true
 [dependencies]
 policy = { workspace = true }
 common = { workspace = true }
+# W2-d (M2): the VRP/ASPA tables + verify functions for ROV/OTC/ASPA
+# in the decision path. Pre-existing workspace member, path-only
+# dependency (the root workspace file is intentionally untouched —
+# same crate, no new crates, no new lock entries beyond bgpd's own
+# edge list; the zapi/tracing-subscriber W8 precedent).
+rpki = { path = "../rpki" }
 # io-util (AsyncReadExt/AsyncWriteExt) additive like zapi's; the
 # session loop's framing is read_exact/write_all based.
 tokio = { workspace = true, features = ["io-util"] }
