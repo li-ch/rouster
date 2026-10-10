@@ -658,4 +658,199 @@ mod tests {
         let err = parse_vrp_file("aspa 64501 provider\n").unwrap_err();
         assert!(err.contains("line 1"), "{err}");
     }
+
+    // ---- M3: ASPA in the decision path ----------------------------
+    // The P2-c lattice shapes (rpki/src/aspa.rs tests) driven through
+    // the bgpd gate: the verdict a rouster bgpd would record/reject
+    // with, per neighbor role and aspa mode.
+
+    fn aspa_gate(aspas: &[(u32, &[u32])], role: Role, mode: AspaMode) -> ValidationGate {
+        ValidationGate {
+            tables: Some(tables(&[], aspas)),
+            reject_invalid: true,
+            aspa: mode,
+            roles: BTreeMap::from([("192.0.2.9".parse().unwrap(), role)]),
+        }
+    }
+
+    #[test]
+    fn aspa_clean_customer_chain_is_valid_advisory_and_enforce() {
+        // 64501's provider is 64502; we receive [64502, 64501] from our
+        // customer 64502: §5.5 with a pure up-ramp ⇒ Valid, accepted
+        // under either mode with the verdict recorded.
+        for mode in [AspaMode::Advisory, AspaMode::Enforce] {
+            let gate = aspa_gate(&[(64501, &[64502])], Role::Customer, mode);
+            let out = gate
+                .apply(route_from(
+                    "203.0.113.0/24",
+                    "192.0.2.9",
+                    64502,
+                    vec![64502, 64501],
+                ))
+                .unwrap_or_else(|| panic!("{mode:?}"));
+            assert_eq!(out.aspa, Some(AspaValidity::Valid), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn aspa_unattested_hop_is_unknown_not_rejected_even_enforcing() {
+        // Same path but no attestation: Unknown — enforce rejects only
+        // Invalid (verification-28 §5: Unknown means unverifiable, not
+        // bogus).
+        let gate = aspa_gate(&[], Role::Customer, AspaMode::Enforce);
+        let out = gate
+            .apply(route_from(
+                "203.0.113.0/24",
+                "192.0.2.9",
+                64502,
+                vec![64502, 64501],
+            ))
+            .unwrap();
+        assert_eq!(out.aspa, Some(AspaValidity::Unknown));
+    }
+
+    #[test]
+    fn aspa_upstream_leak_invalid_advisory_records_enforce_rejects() {
+        // 64503 learned from a peer and leaked downstream; we (the
+        // customer) see [64503, 64502, 64501] where 64503 ∉ SPAS(64502):
+        // max_up_ramp 2 < 3 ⇒ Invalid (§5.5 step 4).
+        let path = vec![64503, 64502, 64501];
+        let aspas = [(64501, &[64502][..]), (64502, &[64500][..])];
+        let advisory = aspa_gate(&aspas, Role::Customer, AspaMode::Advisory);
+        let out = advisory
+            .apply(route_from(
+                "203.0.113.0/24",
+                "192.0.2.9",
+                64503,
+                path.clone(),
+            ))
+            .unwrap();
+        assert_eq!(out.aspa, Some(AspaValidity::Invalid), "recorded only");
+        let enforce = aspa_gate(&aspas, Role::Customer, AspaMode::Enforce);
+        assert!(
+            enforce
+                .apply(route_from("203.0.113.0/24", "192.0.2.9", 64503, path))
+                .is_none(),
+            "enforce rejects the leak"
+        );
+    }
+
+    #[test]
+    fn aspa_downstream_leak_from_provider_rejected_when_enforcing() {
+        // §5.6: provider 64504 hands us [64504, 64505, 64501] — no ramp
+        // tiling exists ⇒ Invalid; from a provider the downstream
+        // procedure applies (role → PeerRelation::Provider).
+        let aspas = [
+            (64501, &[64502][..]),
+            (64504, &[64599][..]),
+            (64505, &[64506][..]),
+        ];
+        let path = vec![64504, 64505, 64501];
+        let enforce = aspa_gate(&aspas, Role::Provider, AspaMode::Enforce);
+        assert!(enforce
+            .apply(route_from(
+                "203.0.113.0/24",
+                "192.0.2.9",
+                64504,
+                path.clone()
+            ))
+            .is_none());
+        let advisory = aspa_gate(&aspas, Role::Provider, AspaMode::Advisory);
+        assert_eq!(
+            advisory
+                .apply(route_from("203.0.113.0/24", "192.0.2.9", 64504, path))
+                .unwrap()
+                .aspa,
+            Some(AspaValidity::Invalid)
+        );
+    }
+
+    #[test]
+    fn aspa_neighbor_mismatch_from_peer_is_invalid() {
+        // §5.5 step 2: the most recently added AS must be the neighbor.
+        // The gate feeds the session's remote AS, so a forged first hop
+        // is caught even with clean attestations elsewhere.
+        let gate = aspa_gate(&[(64501, &[64502])], Role::Peer, AspaMode::Enforce);
+        assert!(
+            gate.apply(route_from(
+                "203.0.113.0/24",
+                "192.0.2.9",
+                64599,
+                vec![64502, 64501]
+            ))
+            .is_none(),
+            "neighbor 64599 != first hop 64502"
+        );
+    }
+
+    #[test]
+    fn aspa_as_set_path_is_invalid_per_rfc_9774_prerequisite() {
+        // §5.5 step 3: an AS_SET anywhere makes the path Invalid (the
+        // RFC 9774 treat-as-withdraw prerequisite; enforce drops it).
+        let gate = aspa_gate(&[(64501, &[64502])], Role::Customer, AspaMode::Enforce);
+        let mut route = route_from("203.0.113.0/24", "192.0.2.9", 64502, vec![]);
+        route.attrs[1] = PathAttribute::AsPath(AsPath {
+            segments: vec![
+                crate::attr::AsSegment::Sequence(vec![64502]),
+                crate::attr::AsSegment::Set(vec![64501]),
+            ],
+        });
+        assert!(gate.apply(route).is_none());
+    }
+
+    #[test]
+    fn aspa_dual_provider_path_resolves_valid_from_provider() {
+        // §5.6 dual-homed origin: [64503, 64502, 64501] from provider
+        // 64503 where SPAS(64501) = {64502, 64503} ⇒ Valid.
+        let gate = aspa_gate(
+            &[(64501, &[64502, 64503])],
+            Role::Provider,
+            AspaMode::Enforce,
+        );
+        let out = gate
+            .apply(route_from(
+                "203.0.113.0/24",
+                "192.0.2.9",
+                64503,
+                vec![64503, 64502, 64501],
+            ))
+            .unwrap();
+        assert_eq!(out.aspa, Some(AspaValidity::Valid));
+    }
+
+    #[test]
+    fn aspa_requires_a_role_to_run() {
+        // No role configured: no procedure selection is possible —
+        // nothing recorded, nothing rejected (honest Unknown-by-
+        // omission; verification-28 §6.3 keys off the RFC 9234 role).
+        let gate = ValidationGate {
+            tables: Some(tables(&[], &[(64501, &[64502])])),
+            reject_invalid: true,
+            aspa: AspaMode::Enforce,
+            roles: BTreeMap::new(),
+        };
+        let out = gate
+            .apply(route_from(
+                "203.0.113.0/24",
+                "192.0.2.9",
+                64503,
+                vec![64503, 64502, 64501],
+            ))
+            .unwrap();
+        assert_eq!(out.aspa, None);
+        assert_eq!(out.rov, Some(Validity::NotFound), "ROV still runs");
+    }
+
+    #[test]
+    fn aspa_advisory_is_the_v1_default_through_config() {
+        let config = crate::config::parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 64503\nneighbor 192.0.2.9 role customer\n",
+        )
+        .unwrap();
+        assert_eq!(config.aspa, AspaMode::Advisory);
+        assert!(
+            config.neighbors.values().all(|n| n.role.is_some()),
+            "roles parse independently of the rpki stanza"
+        );
+    }
 }
