@@ -18,9 +18,12 @@
 
 pub mod attr;
 pub mod capability;
+pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod fsm;
 pub mod message;
+pub mod peer;
 pub mod wire;
 
 /// The reserved two-octet AS number that stands in for non-mappable
