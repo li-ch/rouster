@@ -396,10 +396,7 @@ mod tests {
         // §5.5 with N=1: no hops, max_up_ramp = min_up_ramp = 1 = N.
         let t = table(&[]);
         let path = AsPath::sequence(vec![64501]);
-        assert_eq!(
-            verify_upstream(&t, &path, Some(64501)),
-            AspaValidity::Valid
-        );
+        assert_eq!(verify_upstream(&t, &path, Some(64501)), AspaValidity::Valid);
         assert_eq!(
             verify(&t, &path, Some(64501), PeerRelation::Customer),
             AspaValidity::Valid
@@ -411,10 +408,7 @@ mod tests {
         // 64501's provider is 64502; received from customer 64502.
         let t = table(&[(64501, &[64502])]);
         let path = AsPath::sequence(vec![64502, 64501]);
-        assert_eq!(
-            verify_upstream(&t, &path, Some(64502)),
-            AspaValidity::Valid
-        );
+        assert_eq!(verify_upstream(&t, &path, Some(64502)), AspaValidity::Valid);
     }
 
     #[test]
@@ -480,10 +474,7 @@ mod tests {
             (64504, &[64505]),
         ]);
         let path = AsPath::sequence(vec![64504, 64503, 64502, 64501]);
-        assert_eq!(
-            verify_downstream(&t, &path, 64504),
-            AspaValidity::Valid
-        );
+        assert_eq!(verify_downstream(&t, &path, 64504), AspaValidity::Valid);
     }
 
     #[test]
@@ -496,10 +487,7 @@ mod tests {
         // (§5.6 step 4) — no tiling of the path into ramps exists.
         let t = table(&[(64501, &[64502]), (64504, &[64599]), (64505, &[64506])]);
         let path = AsPath::sequence(vec![64504, 64505, 64501]);
-        assert_eq!(
-            verify_downstream(&t, &path, 64504),
-            AspaValidity::Invalid
-        );
+        assert_eq!(verify_downstream(&t, &path, 64504), AspaValidity::Invalid);
         // The same path seen upstream (from peer 64504) is also
         // Invalid — max_up_ramp 1 < 3.
         assert_eq!(
@@ -517,10 +505,7 @@ mod tests {
         // step 5).
         let t = table(&[]);
         let path = AsPath::sequence(vec![64504, 64503, 64501]);
-        assert_eq!(
-            verify_downstream(&t, &path, 64504),
-            AspaValidity::Unknown
-        );
+        assert_eq!(verify_downstream(&t, &path, 64504), AspaValidity::Unknown);
     }
 
     #[test]
@@ -534,18 +519,12 @@ mod tests {
         // = 6 ≥ 3 ⇒ Valid.
         let t = table(&[(64501, &[64502, 64503])]);
         let path = AsPath::sequence(vec![64503, 64502, 64501]);
-        assert_eq!(
-            verify_downstream(&t, &path, 64503),
-            AspaValidity::Valid
-        );
+        assert_eq!(verify_downstream(&t, &path, 64503), AspaValidity::Valid);
         // The mirrored path [64502, 64503, 64501] from the other
         // provider is Valid by the same derivation — dual-homed
         // origination is reachable through either provider.
         let path = AsPath::sequence(vec![64502, 64503, 64501]);
-        assert_eq!(
-            verify_downstream(&t, &path, 64502),
-            AspaValidity::Valid
-        );
+        assert_eq!(verify_downstream(&t, &path, 64502), AspaValidity::Valid);
     }
 
     // ---- §5.5 prerequisite steps. ----------------------------------
@@ -554,20 +533,11 @@ mod tests {
     fn empty_path_is_invalid_both_directions() {
         let t = table(&[]);
         let empty = AsPath::default();
-        assert_eq!(
-            verify_upstream(&t, &empty, Some(1)),
-            AspaValidity::Invalid
-        );
-        assert_eq!(
-            verify_downstream(&t, &empty, 1),
-            AspaValidity::Invalid
-        );
+        assert_eq!(verify_upstream(&t, &empty, Some(1)), AspaValidity::Invalid);
+        assert_eq!(verify_downstream(&t, &empty, 1), AspaValidity::Invalid);
         // An AS_SEQUENCE([]) segment is still an empty path.
         let hollow = AsPath::sequence(vec![]);
-        assert_eq!(
-            verify_upstream(&t, &hollow, Some(1)),
-            AspaValidity::Invalid
-        );
+        assert_eq!(verify_upstream(&t, &hollow, Some(1)), AspaValidity::Invalid);
     }
 
     #[test]
@@ -579,10 +549,7 @@ mod tests {
             verify_upstream(&t, &path, Some(64599)),
             AspaValidity::Invalid
         );
-        assert_eq!(
-            verify_downstream(&t, &path, 64599),
-            AspaValidity::Invalid
-        );
+        assert_eq!(verify_downstream(&t, &path, 64599), AspaValidity::Invalid);
         // RS-client exemption (§5.5 step 2's "not an RS-client"): the
         // transparent RS did not prepend, so no neighbor is checkable.
         assert_eq!(
@@ -596,16 +563,16 @@ mod tests {
         // §5.5/§5.6 step 3 (and RFC 9774's prerequisite).
         let t = table(&[(64501, &[64502])]);
         let path = AsPath {
-            segments: vec![PathSegment::AsSequence(vec![64502]), PathSegment::AsSet(vec![64501])],
+            segments: vec![
+                PathSegment::AsSequence(vec![64502]),
+                PathSegment::AsSet(vec![64501]),
+            ],
         };
         assert_eq!(
             verify_upstream(&t, &path, Some(64502)),
             AspaValidity::Invalid
         );
-        assert_eq!(
-            verify_downstream(&t, &path, 64502),
-            AspaValidity::Invalid
-        );
+        assert_eq!(verify_downstream(&t, &path, 64502), AspaValidity::Invalid);
     }
 
     #[test]
@@ -626,10 +593,7 @@ mod tests {
         );
         // With the attestation present it is Valid — N=2 either way.
         let t = table(&[(64501, &[64502]), (64502, &[64503])]);
-        assert_eq!(
-            verify_upstream(&t, &path, Some(64502)),
-            AspaValidity::Valid
-        );
+        assert_eq!(verify_upstream(&t, &path, Some(64502)), AspaValidity::Valid);
         assert_eq!(path.compressed().unwrap(), vec![64502, 64501]);
         // RFC 6811 origin extraction: rightmost AS of final segment.
         assert_eq!(path.origin(), Some(64501));
@@ -641,10 +605,7 @@ mod tests {
         // RS-client" — authorized(x, y) is Not Provider+ for every y.
         let t = table(&[(64501, &[0])]);
         let path = AsPath::sequence(vec![64502, 64501]);
-        assert_eq!(
-            authorized(&t, 64501, 64502),
-            Authorization::NotProviderPlus
-        );
+        assert_eq!(authorized(&t, 64501, 64502), Authorization::NotProviderPlus);
         assert_eq!(
             verify_upstream(&t, &path, Some(64502)),
             AspaValidity::Invalid
@@ -652,14 +613,8 @@ mod tests {
         // ...but an AS0 entry mixed into a real provider list has "no
         // influence" (§4): the real provider still attests.
         let t = table(&[(64501, &[0, 64502])]);
-        assert_eq!(
-            authorized(&t, 64501, 64502),
-            Authorization::ProviderPlus
-        );
-        assert_eq!(
-            verify_upstream(&t, &path, Some(64502)),
-            AspaValidity::Valid
-        );
+        assert_eq!(authorized(&t, 64501, 64502), Authorization::ProviderPlus);
+        assert_eq!(verify_upstream(&t, &path, Some(64502)), AspaValidity::Valid);
     }
 
     #[test]
@@ -690,12 +645,20 @@ mod tests {
         let mut t = AspaTable::new();
         t.apply(64501, PayloadFlags::ANNOUNCE, BTreeSet::from([64502]))
             .unwrap();
-        let old = t.apply(64501, PayloadFlags::ANNOUNCE, BTreeSet::from([64503, 64504]));
+        let old = t.apply(
+            64501,
+            PayloadFlags::ANNOUNCE,
+            BTreeSet::from([64503, 64504]),
+        );
         assert_eq!(old.unwrap(), Some(BTreeSet::from([64502])));
         assert_eq!(t.get(64501), Some(&BTreeSet::from([64503, 64504])));
         // Byte-identical repeat is the error-code-7 duplicate.
         assert_eq!(
-            t.apply(64501, PayloadFlags::ANNOUNCE, BTreeSet::from([64503, 64504])),
+            t.apply(
+                64501,
+                PayloadFlags::ANNOUNCE,
+                BTreeSet::from([64503, 64504])
+            ),
             Err(AspaTableError::DuplicateAnnouncement(64501))
         );
         // Withdrawal removes the record; repeating it is error 6.
@@ -719,14 +682,8 @@ mod tests {
         let mut t = AspaTable::new();
         t.apply(64501, PayloadFlags::ANNOUNCE, BTreeSet::new())
             .unwrap();
-        assert_eq!(
-            authorized(&t, 64501, 64502),
-            Authorization::NotProviderPlus
-        );
-        assert_eq!(
-            authorized(&t, 64599, 64502),
-            Authorization::NoAttestation
-        );
+        assert_eq!(authorized(&t, 64501, 64502), Authorization::NotProviderPlus);
+        assert_eq!(authorized(&t, 64599, 64502), Authorization::NoAttestation);
     }
 
     #[test]
@@ -734,7 +691,10 @@ mod tests {
         let t = table(&[(64502, &[64503]), (64501, &[64502, 64503])]);
         let cas: Vec<u32> = t.iter().map(|a| a.customer_asn).collect();
         assert_eq!(cas, vec![64501, 64502]);
-        let providers: Vec<Vec<u32>> = t.iter().map(|a| a.providers.iter().copied().collect()).collect();
+        let providers: Vec<Vec<u32>> = t
+            .iter()
+            .map(|a| a.providers.iter().copied().collect())
+            .collect();
         assert_eq!(providers, vec![vec![64502, 64503], vec![64503]]);
     }
 }

@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 
 use common::IpPrefix;
 
-use crate::pdu::{Pdu, PayloadFlags};
+use crate::pdu::{PayloadFlags, Pdu};
 
 /// One validated ROA payload: prefix, max length, origin ASN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -104,7 +104,9 @@ pub struct VrpTable {
 
 impl VrpTable {
     pub fn new() -> Self {
-        VrpTable { vrps: BTreeSet::new() }
+        VrpTable {
+            vrps: BTreeSet::new(),
+        }
     }
 
     /// Apply one payload PDU's announce/withdraw flag (RFC 8210 §5.1).

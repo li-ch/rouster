@@ -232,7 +232,10 @@ mod tests {
     #[test]
     fn same_prefix_two_asns_both_valid() {
         // Multi-homed origination: both ASNs are Valid, others Invalid.
-        let t = table(&[("198.51.100.0/24", 24, 64512), ("198.51.100.0/24", 24, 64513)]);
+        let t = table(&[
+            ("198.51.100.0/24", 24, 64512),
+            ("198.51.100.0/24", 24, 64513),
+        ]);
         assert_eq!(check(&t, "198.51.100.0/24", 64512), Validity::Valid);
         assert_eq!(check(&t, "198.51.100.0/24", 64513), Validity::Valid);
         assert_eq!(check(&t, "198.51.100.0/24", 64514), Validity::Invalid);

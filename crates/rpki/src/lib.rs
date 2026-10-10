@@ -27,14 +27,14 @@ pub mod pdu;
 pub mod rov;
 pub mod vrp;
 
-pub use pdu::{
-    ErrorCode, Pdu, PayloadFlags, Timing, MAX_PDU_LEN, RTR_PORT, VERSION_0, VERSION_1,
-    VERSION_2, HIGHEST_VERSION,
-};
 pub use aspa::{
     authorized, verify, verify_downstream, verify_upstream, AsPath, AspaTable, AspaValidity,
-    Authorization, PeerRelation, PathSegment,
+    Authorization, PathSegment, PeerRelation,
 };
 pub use client::{CacheState, ClientConfig, RtrClient, DEFAULT_CACHE_PORT};
+pub use pdu::{
+    ErrorCode, PayloadFlags, Pdu, Timing, HIGHEST_VERSION, MAX_PDU_LEN, RTR_PORT, VERSION_0,
+    VERSION_1, VERSION_2,
+};
 pub use rov::{validate, OriginAsn, Validity};
 pub use vrp::{Vrp, VrpTable};

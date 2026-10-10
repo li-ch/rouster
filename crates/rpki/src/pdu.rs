@@ -196,10 +196,7 @@ pub enum Pdu {
     /// §5.4 — router asks for the whole current database.
     ResetQuery { version: u8 },
     /// §5.5 — cache confirms a query and starts a data sequence.
-    CacheResponse {
-        version: u8,
-        session_id: u16,
-    },
+    CacheResponse { version: u8, session_id: u16 },
     /// §5.6 — IPv4 ROA payload (a VRP when announced).
     Ipv4Prefix {
         version: u8,
@@ -276,9 +273,7 @@ impl Pdu {
     /// structural decode.
     pub fn aspa_provider_list_error(&self) -> Option<ErrorCode> {
         let Pdu::Aspa {
-            flags,
-            providers,
-            ..
+            flags, providers, ..
         } = self
         else {
             return None;
@@ -643,10 +638,8 @@ impl Pdu {
                 let erroneous_pdu = body[4..4 + encap_len].to_vec();
                 let text = if text_len > 0 {
                     Some(
-                        String::from_utf8(
-                            body[8 + encap_len..8 + encap_len + text_len].to_vec(),
-                        )
-                        .map_err(|_| DecodeError::InvalidUtf8)?,
+                        String::from_utf8(body[8 + encap_len..8 + encap_len + text_len].to_vec())
+                            .map_err(|_| DecodeError::InvalidUtf8)?,
                     )
                 } else {
                     None
@@ -666,13 +659,13 @@ impl Pdu {
                         got: version,
                     });
                 }
-                if declared < 12 || (declared - 12) % 4 != 0 {
+                if declared < 12 || !(declared - 12).is_multiple_of(4) {
                     return Err(DecodeError::AspaShape { declared });
                 }
                 let customer_asn = be_u32(&body[0..4])?;
                 let mut providers = Vec::with_capacity((declared as usize - 12) / 4);
-                for chunk in body[4..].chunks_exact(4) {
-                    providers.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                for &quad in body[4..].as_chunks::<4>().0 {
+                    providers.push(u32::from_be_bytes(quad));
                 }
                 // §5.12: providers are "in increasing numeric order" and
                 // "MUST be unique" — a wire-format constraint.
@@ -696,9 +689,10 @@ impl Pdu {
 
 // All RTR integers are network byte order (RFC 8210 §5).
 fn be_u32(b: &[u8]) -> Result<u32, DecodeError> {
-    let bytes: [u8; 4] = b
-        .try_into()
-        .map_err(|_| DecodeError::Truncated { have: b.len(), need: 4 })?;
+    let bytes: [u8; 4] = b.try_into().map_err(|_| DecodeError::Truncated {
+        have: b.len(),
+        need: 4,
+    })?;
     Ok(u32::from_be_bytes(bytes))
 }
 
@@ -744,11 +738,7 @@ pub enum EncodeError {
     #[error("end-of-data timing presence ({has_timing}) wrong for version {version}")]
     VersionTiming { version: u8, has_timing: bool },
     #[error("pdu type {pdu_type} requires version >= {needs}, got {got}")]
-    TypeRequiresVersion {
-        pdu_type: u8,
-        needs: u8,
-        got: u8,
-    },
+    TypeRequiresVersion { pdu_type: u8, needs: u8, got: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -778,11 +768,7 @@ pub enum DecodeError {
         max_len: u8,
     },
     #[error("pdu type {pdu_type} requires version >= {needs}, got {got}")]
-    TypeRequiresVersion {
-        pdu_type: u8,
-        needs: u8,
-        got: u8,
-    },
+    TypeRequiresVersion { pdu_type: u8, needs: u8, got: u8 },
     #[error("protocol version {0} is not 0, 1, or 2")]
     UnsupportedVersion(u8),
     #[error("pdu type {0} is not assigned by RFC 8210 / 8210bis-27")]
@@ -1177,11 +1163,12 @@ mod tests {
     #[test]
     fn reserved_bits_and_zero_fields_ignored_on_receipt() {
         // RFC 8210 §5.1: reserved fields MUST be ignored on receipt.
-        let mut bytes = Pdu::ResetQuery { version: 1 }
-            .encode(1)
-            .unwrap();
+        let mut bytes = Pdu::ResetQuery { version: 1 }.encode(1).unwrap();
         bytes[2] = 0xff; // "zero" session field
-        assert_eq!(Pdu::decode(&bytes).unwrap().0, Pdu::ResetQuery { version: 1 });
+        assert_eq!(
+            Pdu::decode(&bytes).unwrap().0,
+            Pdu::ResetQuery { version: 1 }
+        );
 
         let mut v4 = Pdu::Ipv4Prefix {
             version: 1,
@@ -1229,7 +1216,7 @@ mod tests {
     #[test]
     fn malformed_oversized_pdu_rejected() {
         let mut bytes = Pdu::ResetQuery { version: 1 }.encode(1).unwrap();
-        bytes.extend_from_slice(&vec![0u8; 100]); // pad so declared fits in buffer
+        bytes.extend_from_slice(&[0u8; 100]); // pad so declared fits in buffer
         bytes[4..8].copy_from_slice(&(MAX_PDU_LEN + 1).to_be_bytes());
         assert!(matches!(
             Pdu::decode(&bytes),
@@ -1249,7 +1236,7 @@ mod tests {
         ] {
             let mut bytes = vec![0x01, ty, 0, 0];
             bytes.extend_from_slice(&len.to_be_bytes());
-            bytes.extend_from_slice(&vec![0u8; 40]); // buffer large enough
+            bytes.extend_from_slice(&[0u8; 40]); // buffer large enough
             assert_eq!(
                 Pdu::decode(&bytes),
                 Err(DecodeError::BadLength {
@@ -1416,25 +1403,23 @@ mod tests {
     fn malformed_unsupported_pdu_type_and_versions() {
         let mut b = vec![0x01, 0x05, 0, 0]; // type 5 reserved
         b.extend_from_slice(&8u32.to_be_bytes());
-        assert_eq!(
-            Pdu::decode(&b),
-            Err(DecodeError::UnsupportedPduType(5))
-        );
+        assert_eq!(Pdu::decode(&b), Err(DecodeError::UnsupportedPduType(5)));
         // Version 7 Serial Notify.
         let mut b = vec![0x07, 0x00, 0, 0];
         b.extend_from_slice(&12u32.to_be_bytes());
         b.extend_from_slice(&[0; 4]);
-        assert_eq!(
-            Pdu::decode(&b),
-            Err(DecodeError::UnsupportedVersion(7))
-        );
+        assert_eq!(Pdu::decode(&b), Err(DecodeError::UnsupportedVersion(7)));
         // ASPA at v1 is not a legal PDU for that version.
         let mut b = vec![0x01, 0x0b, 0x01, 0x00];
         b.extend_from_slice(&12u32.to_be_bytes());
         b.extend_from_slice(&64512u32.to_be_bytes());
         assert!(matches!(
             Pdu::decode(&b),
-            Err(DecodeError::TypeRequiresVersion { needs: 2, got: 1, .. })
+            Err(DecodeError::TypeRequiresVersion {
+                needs: 2,
+                got: 1,
+                ..
+            })
         ));
         // Router Key at v0 likewise.
         let mut b = vec![0x00, 0x09, 0x01, 0x00];
@@ -1442,7 +1427,11 @@ mod tests {
         b.extend_from_slice(&[0u8; 24]);
         assert!(matches!(
             Pdu::decode(&b),
-            Err(DecodeError::TypeRequiresVersion { needs: 1, got: 0, .. })
+            Err(DecodeError::TypeRequiresVersion {
+                needs: 1,
+                got: 0,
+                ..
+            })
         ));
     }
 
@@ -1484,7 +1473,10 @@ mod tests {
         let pdu = Pdu::ResetQuery { version: 2 };
         assert!(matches!(
             pdu.encode(1),
-            Err(EncodeError::VersionMismatch { pdu: 2, requested: 1 })
+            Err(EncodeError::VersionMismatch {
+                pdu: 2,
+                requested: 1
+            })
         ));
     }
 }

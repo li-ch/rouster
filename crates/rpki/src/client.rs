@@ -31,9 +31,7 @@ use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
 
 use crate::aspa::AspaTable;
-use crate::pdu::{
-    be_u32_len, DecodeError, ErrorCode, Pdu, Timing, HIGHEST_VERSION, VERSION_0,
-};
+use crate::pdu::{be_u32_len, DecodeError, ErrorCode, Pdu, Timing, HIGHEST_VERSION, VERSION_0};
 use crate::vrp::{Vrp, VrpTable};
 
 /// Default RTR port (RFC 8210 §9, service "rpki-rtr").
@@ -191,7 +189,10 @@ impl RtrClient {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(cache = %self.config.cache_addr, error = %e, "rpki: cache connect failed");
-                    if sleep_or_shutdown(retry_interval, &mut shutdown).await.is_err() {
+                    if sleep_or_shutdown(retry_interval, &mut shutdown)
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     continue;
@@ -216,7 +217,10 @@ impl RtrClient {
             }
             // The expire deadline survives the reconnect (the data is
             // still trusted until then, RFC 8210 §6).
-            if sleep_or_shutdown(retry_interval, &mut shutdown).await.is_err() {
+            if sleep_or_shutdown(retry_interval, &mut shutdown)
+                .await
+                .is_err()
+            {
                 if expire_at.is_some() {
                     tracing::warn!("rpki: shutdown with data still held; caller owns the tables");
                 }
@@ -226,10 +230,7 @@ impl RtrClient {
     }
 
     /// Spawn [`RtrClient::run`] on a new task.
-    pub fn spawn(
-        self,
-        shutdown: watch::Receiver<bool>,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(self, shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move { self.run(shutdown).await })
     }
 
@@ -283,7 +284,10 @@ impl RtrClient {
             (Some(_), Some(_)) => Some(QueryKind::Serial),
             _ => Some(QueryKind::Reset),
         };
-        if write_pdu(&mut tx_half, &open_query(HIGHEST_VERSION)).await.is_err() {
+        if write_pdu(&mut tx_half, &open_query(HIGHEST_VERSION))
+            .await
+            .is_err()
+        {
             end = SessionEnd::Transport("write of opening query failed".into());
             reader.abort();
             return end;
@@ -402,7 +406,9 @@ impl RtrClient {
                     }
 
                     match pdu {
-                        Pdu::SerialNotify { session_id, serial, .. } => {
+                        Pdu::SerialNotify {
+                            session_id, serial, ..
+                        } => {
                             // §8.2: a hint — query now instead of
                             // waiting out the Refresh Interval. Ignored
                             // while a response is open or version is
@@ -487,8 +493,7 @@ impl RtrClient {
                             if version.is_none() {
                                 version = Some(pdu.version());
                             }
-                            let was_reset_query =
-                                pending_query.take() == Some(QueryKind::Reset);
+                            let was_reset_query = pending_query.take() == Some(QueryKind::Reset);
                             last_reset_response = was_reset_query;
                             // §5.1: a session-id change mid-relationship
                             // is fatal, code 0, with a full flush. (A
@@ -562,10 +567,11 @@ impl RtrClient {
                             }
                             let timing = timing.unwrap_or(Timing::DEFAULT);
                             let now = Instant::now();
-                            refresh_at = Some(now + Duration::from_secs(u64::from(timing.refresh_interval)));
-                            *retry_interval =
-                                Duration::from_secs(u64::from(timing.retry_interval));
-                            *expire_at = Some(now + Duration::from_secs(u64::from(timing.expire_interval)));
+                            refresh_at =
+                                Some(now + Duration::from_secs(u64::from(timing.refresh_interval)));
+                            *retry_interval = Duration::from_secs(u64::from(timing.retry_interval));
+                            *expire_at =
+                                Some(now + Duration::from_secs(u64::from(timing.expire_interval)));
                             let mut t = self.lock();
                             t.serial = Some(serial);
                             t.session_id = Some(session_id);
@@ -598,7 +604,7 @@ impl RtrClient {
                                     // transport; negotiation is
                                     // hopeless — including at 0).
                                     let named = pdu.version();
-                                    if named <= VERSION_0 && attempted.contains(&VERSION_0) {
+                                    if named == VERSION_0 && attempted.contains(&VERSION_0) {
                                         end = SessionEnd::Reported(error_code);
                                         break;
                                     }
@@ -608,8 +614,7 @@ impl RtrClient {
                                     }
                                     attempted.push(named);
                                     version = Some(named);
-                                    if write_pdu(&mut tx_half, &open_query(named)).await.is_err()
-                                    {
+                                    if write_pdu(&mut tx_half, &open_query(named)).await.is_err() {
                                         end = SessionEnd::Transport(
                                             "downgrade query write failed".into(),
                                         );
@@ -630,7 +635,9 @@ impl RtrClient {
                                         .await
                                         .is_err()
                                     {
-                                        end = SessionEnd::Transport("no-data retry write failed".into());
+                                        end = SessionEnd::Transport(
+                                            "no-data retry write failed".into(),
+                                        );
                                         break;
                                     }
                                     pending_query = Some(QueryKind::Reset);
@@ -729,23 +736,18 @@ impl RtrClient {
     fn apply_payload(&self, pdu: &Pdu) -> Result<(), (ErrorCode, &'static str)> {
         let mut t = self.lock();
         match pdu {
-            Pdu::Ipv4Prefix {
-                flags, ..
-            }
-            | Pdu::Ipv6Prefix {
-                flags, ..
-            } => {
+            Pdu::Ipv4Prefix { flags, .. } | Pdu::Ipv6Prefix { flags, .. } => {
                 let vrp = Vrp::from_prefix_pdu(pdu).expect("prefix pdu checked by caller");
-                t.vrps
-                    .apply(vrp, *flags)
-                    .map_err(|e| match e {
-                        crate::vrp::VrpTableError::DuplicateAnnouncement(_) => {
-                            (ErrorCode::DuplicateAnnouncementReceived, "duplicate vrp announcement")
-                        }
-                        crate::vrp::VrpTableError::UnknownWithdrawal(_) => {
-                            (ErrorCode::WithdrawalOfUnknownRecord, "withdrawal of unknown vrp")
-                        }
-                    })
+                t.vrps.apply(vrp, *flags).map_err(|e| match e {
+                    crate::vrp::VrpTableError::DuplicateAnnouncement(_) => (
+                        ErrorCode::DuplicateAnnouncementReceived,
+                        "duplicate vrp announcement",
+                    ),
+                    crate::vrp::VrpTableError::UnknownWithdrawal(_) => (
+                        ErrorCode::WithdrawalOfUnknownRecord,
+                        "withdrawal of unknown vrp",
+                    ),
+                })
             }
             Pdu::RouterKey {
                 flags,
@@ -785,12 +787,14 @@ impl RtrClient {
                     .apply(*customer_asn, *flags, set)
                     .map(|_| ())
                     .map_err(|e| match e {
-                        crate::aspa::AspaTableError::DuplicateAnnouncement(_) => {
-                            (ErrorCode::DuplicateAnnouncementReceived, "duplicate aspa announcement")
-                        }
-                        crate::aspa::AspaTableError::UnknownWithdrawal(_) => {
-                            (ErrorCode::WithdrawalOfUnknownRecord, "withdrawal of unknown aspa")
-                        }
+                        crate::aspa::AspaTableError::DuplicateAnnouncement(_) => (
+                            ErrorCode::DuplicateAnnouncementReceived,
+                            "duplicate aspa announcement",
+                        ),
+                        crate::aspa::AspaTableError::UnknownWithdrawal(_) => (
+                            ErrorCode::WithdrawalOfUnknownRecord,
+                            "withdrawal of unknown aspa",
+                        ),
                     })
             }
             _ => Ok(()),
@@ -800,10 +804,7 @@ impl RtrClient {
 
 /// Read PDUs until the stream ends, forwarding them (and their raw
 /// bytes) to the session loop.
-async fn read_loop(
-    mut rx: tokio::net::tcp::OwnedReadHalf,
-    tx: mpsc::Sender<FromCache>,
-) {
+async fn read_loop(mut rx: tokio::net::tcp::OwnedReadHalf, tx: mpsc::Sender<FromCache>) {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     loop {
@@ -882,10 +883,7 @@ where
 }
 
 /// Sleep for `d` unless shutdown fires first; `Err(())` means stop.
-async fn sleep_or_shutdown(
-    d: Duration,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<(), ()> {
+async fn sleep_or_shutdown(d: Duration, shutdown: &mut watch::Receiver<bool>) -> Result<(), ()> {
     tokio::select! {
         _ = tokio::time::sleep(d) => Ok(()),
         _ = shutdown.changed() => Err(()),
@@ -900,15 +898,16 @@ mod tests {
     fn default_state_is_none_and_flush_restores_it() {
         let mut t = CacheTables::default();
         assert_eq!(t.state, CacheState::None);
-        t.vrps.apply(
-            Vrp {
-                prefix: "192.0.2.0/24".parse().unwrap(),
-                max_len: 24,
-                asn: 64512,
-            },
-            crate::pdu::PayloadFlags::ANNOUNCE,
-        )
-        .unwrap();
+        t.vrps
+            .apply(
+                Vrp {
+                    prefix: "192.0.2.0/24".parse().unwrap(),
+                    max_len: 24,
+                    asn: 64512,
+                },
+                crate::pdu::PayloadFlags::ANNOUNCE,
+            )
+            .unwrap();
         t.state = CacheState::Fresh;
         t.session_id = Some(7);
         t.serial = Some(3);

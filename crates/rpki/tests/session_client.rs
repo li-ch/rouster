@@ -42,9 +42,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use rpki::client::{CacheState, CacheTables, ClientConfig, RtrClient};
-use rpki::{
-    ErrorCode, Pdu, PayloadFlags, Timing, VERSION_1, VERSION_2,
-};
+use rpki::{ErrorCode, PayloadFlags, Pdu, Timing, VERSION_1, VERSION_2};
 
 type Tables = Arc<Mutex<CacheTables>>;
 
@@ -53,11 +51,13 @@ type Tables = Arc<Mutex<CacheTables>>;
 /// run can reorder which side parks first and let auto-advance fire
 /// client timers mid-conversation (a legitimate refresh poll landing
 /// between mock writes). Serializing the binary makes the schedule
-/// deterministic; unit and property tests stay parallel.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// deterministic; unit and property tests stay parallel. The tokio
+/// mutex's guard is held across awaits by design (one scenario at a
+/// time).
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().await
 }
 
 // ---- mock-cache plumbing ---------------------------------------------
@@ -116,7 +116,9 @@ async fn read_skipping_refresh_queries(sock: &mut TcpStream, sid: u16, serial: u
         let raw = read_one(sock).await;
         let (pdu, _) = Pdu::decode(&raw).unwrap();
         if let Pdu::SerialQuery {
-            session_id, serial: s, ..
+            session_id,
+            serial: s,
+            ..
         } = &pdu
         {
             if *session_id == sid && *s == serial {
@@ -234,7 +236,7 @@ async fn wait_until(t: &Tables, ok: impl Fn(&Snap) -> bool) -> Snap {
 
 #[tokio::test(start_paused = true)]
 async fn full_refresh_populates_tables() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
 
@@ -286,7 +288,7 @@ async fn full_refresh_populates_tables() {
 
 #[tokio::test(start_paused = true)]
 async fn serial_notify_drives_incremental_update() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -321,12 +323,19 @@ async fn serial_notify_drives_incremental_update() {
     // Deltas since serial 5: withdraw one ROA, announce a new one,
     // replace the ASPA (bis §5.12 replacement semantics).
     send(&mut cache, &cache_response(VERSION_2, sid)).await;
-    send(&mut cache, &roa4_withdraw(VERSION_2, "198.51.100.0/24", 24, 64513)).await;
+    send(
+        &mut cache,
+        &roa4_withdraw(VERSION_2, "198.51.100.0/24", 24, 64513),
+    )
+    .await;
     send(&mut cache, &roa4(VERSION_2, "203.0.113.0/24", 24, 64514)).await;
     send(&mut cache, &aspa_announce(64512, vec![64501, 64502])).await;
     send(&mut cache, &eod(VERSION_2, sid, 6, Timing::DEFAULT)).await;
 
-    let s = wait_until(&fx.tables, |s| s.state == CacheState::Serial && s.serial == Some(6)).await;
+    let s = wait_until(&fx.tables, |s| {
+        s.state == CacheState::Serial && s.serial == Some(6)
+    })
+    .await;
     assert_eq!(s.vrps, 2); // 2 - 1 + 1
     assert_eq!(s.aspas, 1); // replaced, not added
     let providers = fx
@@ -346,7 +355,7 @@ async fn serial_notify_drives_incremental_update() {
 
 #[tokio::test(start_paused = true)]
 async fn cache_reset_after_serial_mismatch_falls_back_to_reset_query() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut first = fx.accept().await;
     expect(&mut first, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -394,7 +403,7 @@ async fn cache_reset_after_serial_mismatch_falls_back_to_reset_query() {
 
 #[tokio::test(start_paused = true)]
 async fn fatal_error_report_drops_and_flushes() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -405,7 +414,11 @@ async fn fatal_error_report_drops_and_flushes() {
     wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
 
     // Code 1 Internal Error is fatal: session drops, data flushes.
-    send(&mut cache, &error_report(VERSION_2, ErrorCode::InternalError, "oom")).await;
+    send(
+        &mut cache,
+        &error_report(VERSION_2, ErrorCode::InternalError, "oom"),
+    )
+    .await;
 
     let s = wait_until(&fx.tables, |s| s.state == CacheState::None && s.vrps == 0).await;
     assert_eq!(s.serial, None);
@@ -421,7 +434,7 @@ async fn fatal_error_report_drops_and_flushes() {
 
 #[tokio::test(start_paused = true)]
 async fn unsupported_version_downgrades_to_cache_version() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
 
@@ -450,7 +463,7 @@ async fn unsupported_version_downgrades_to_cache_version() {
 
 #[tokio::test(start_paused = true)]
 async fn no_data_available_marks_state_and_retries() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
 
@@ -480,7 +493,7 @@ async fn no_data_available_marks_state_and_retries() {
 
 #[tokio::test(start_paused = true)]
 async fn duplicate_announcement_reports_code7_and_flushes() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -517,7 +530,7 @@ async fn duplicate_announcement_reports_code7_and_flushes() {
 
 #[tokio::test(start_paused = true)]
 async fn refresh_keepalive_then_expiry_flushes() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
@@ -557,7 +570,7 @@ async fn refresh_keepalive_then_expiry_flushes() {
 
 #[tokio::test(start_paused = true)]
 async fn session_id_change_terminates_with_code0_and_flushes() {
-    let _serial = serial();
+    let _serial = serial().await;
     let fx = Fixture::new().await;
     let mut cache = fx.accept().await;
     expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;

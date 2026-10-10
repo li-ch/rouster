@@ -48,7 +48,11 @@ const SEED_AS0: u64 = 0x7250_4305;
 /// A canonical (network-masked) prefix: canonical form is what real
 /// VRP ingestion carries, so containment comparisons are exact.
 fn canonical_v4(addr: u32, plen: u8) -> IpPrefix {
-    let mask = if plen == 0 { 0 } else { !0u32 << (32 - plen as u32) };
+    let mask = if plen == 0 {
+        0
+    } else {
+        !0u32 << (32 - plen as u32)
+    };
     IpPrefix::V4(Ipv4Prefix::new((addr & mask).into(), plen).unwrap())
 }
 
@@ -59,14 +63,13 @@ fn canonical_v6(addr_hi: u64, addr_lo: u64, plen: u8) -> IpPrefix {
     } else {
         !0u128 << (128 - plen as u32)
     };
-    IpPrefix::V6(Ipv6Prefix::new(((addr & mask) as u128).into(), plen).unwrap())
+    IpPrefix::V6(Ipv6Prefix::new((addr & mask).into(), plen).unwrap())
 }
 
 fn any_prefix() -> impl Strategy<Value = IpPrefix> {
     prop_oneof![
         (any::<u32>(), 0u8..=32).prop_map(|(a, p)| canonical_v4(a, p)),
-        (any::<u64>(), any::<u64>(), 0u8..=128)
-            .prop_map(|(h, l, p)| canonical_v6(h, l, p)),
+        (any::<u64>(), any::<u64>(), 0u8..=128).prop_map(|(h, l, p)| canonical_v6(h, l, p)),
     ]
 }
 
