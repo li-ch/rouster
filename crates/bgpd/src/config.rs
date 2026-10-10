@@ -190,12 +190,14 @@ fn err(line: usize, message: impl Into<String>) -> ConfigError {
 /// grammar's stanza heads). `bgp` only counts for the two policy
 /// forms — `bgp router-id` is a router directive.
 fn is_policy_stanza_head(tokens: &[&str]) -> bool {
-    match tokens {
-        ["route-map", ..] => true,
-        ["ip", "prefix-list", ..] | ["ipv6", "prefix-list", ..] => true,
-        ["bgp", "as-path", ..] | ["bgp", "community-list", ..] => true,
-        _ => false,
-    }
+    matches!(
+        tokens,
+        ["route-map", ..]
+            | ["ip", "prefix-list", ..]
+            | ["ipv6", "prefix-list", ..]
+            | ["bgp", "as-path", ..]
+            | ["bgp", "community-list", ..]
+    )
 }
 
 /// First tokens of route-map child lines (only meaningful while a

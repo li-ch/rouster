@@ -96,12 +96,21 @@ struct Incumbent {
 
 type Registry = Arc<Mutex<BTreeMap<IpAddr, Incumbent>>>;
 
+/// What registering a session hands back: the §6.8 observability
+/// handle, the eviction channel, and the registry identity (cleanup
+/// only removes its own entry).
+struct Registered {
+    shared: Arc<SessionShared>,
+    evict: watch::Receiver<bool>,
+    id: u64,
+}
+
 fn register(
     registry: &Registry,
     addr: IpAddr,
     ours: bool,
     next_id: &AtomicU64,
-) -> Option<(Arc<SessionShared>, watch::Receiver<bool>, u64)> {
+) -> Option<Registered> {
     let mut reg = registry.lock().unwrap();
     if reg.contains_key(&addr) {
         return None;
@@ -118,16 +127,16 @@ fn register(
             evict: evict_tx,
         },
     );
-    Some((shared, evict_rx, id))
+    Some(Registered {
+        shared,
+        evict: evict_rx,
+        id,
+    })
 }
 
 /// Reserve the slot for the winning challenger: overwrites whatever
 /// entry exists (the evicted incumbent's cleanup is a no-op by id).
-fn re_register(
-    registry: &Registry,
-    addr: IpAddr,
-    next_id: &AtomicU64,
-) -> (Arc<SessionShared>, watch::Receiver<bool>, u64) {
+fn re_register(registry: &Registry, addr: IpAddr, next_id: &AtomicU64) -> Registered {
     let id = next_id.fetch_add(1, Ordering::SeqCst);
     let shared = Arc::new(SessionShared::default());
     let (evict_tx, evict_rx) = watch::channel(false);
@@ -140,7 +149,11 @@ fn re_register(
             evict: evict_tx,
         },
     );
-    (shared, evict_rx, id)
+    Registered {
+        shared,
+        evict: evict_rx,
+        id,
+    }
 }
 
 fn release(registry: &Registry, addr: IpAddr, id: u64) {
@@ -211,7 +224,7 @@ impl Daemon {
         // The accept loop: match the remote address to a configured
         // neighbor; a free slot runs the session directly, an occupied
         // one goes to the §6.8 collision resolver.
-        let config = self.config;
+        let config = Arc::new(self.config);
         let sink_accept = sink;
         let out_rib = Arc::clone(&out_rib);
         let registry_accept = Arc::clone(&registry);
@@ -235,7 +248,10 @@ impl Daemon {
                                 warn!(%peer, "bgpd: connection from unconfigured address, rejected");
                                 continue;
                             };
-                            let config = config.clone();
+                            let local_addr = stream
+                                .local_addr()
+                                .map(|a| a.ip())
+                                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                             let ctx = SessionCtx {
                                 sink: sink_accept.clone(),
                                 out_rib: Arc::clone(&out_rib),
@@ -243,13 +259,17 @@ impl Daemon {
                                 next_id: Arc::clone(&next_id_accept),
                                 live: Arc::clone(&live_accept),
                             };
-                            let stop = stop_accept.clone();
-                            let refresh = refresh_accept.clone();
+                            let conn = Connection {
+                                peer_addr: peer.ip(),
+                                local_addr,
+                                config: Arc::clone(&config),
+                                neighbor,
+                                ctx,
+                                stop: stop_accept.clone(),
+                                refresh: refresh_accept.clone(),
+                            };
                             tokio::spawn(async move {
-                                accept_connection(
-                                    stream, peer.ip(), &config, &neighbor, ctx, stop, refresh,
-                                )
-                                .await;
+                                accept_connection(stream, conn).await;
                             });
                         }
                         Err(e) => {
@@ -272,67 +292,26 @@ impl Daemon {
 
 /// One accepted connection: a free registry slot runs the session
 /// (Events 4/5 shape); an occupied one resolves the §6.8 collision.
-async fn accept_connection<S: RouteSink + 'static>(
-    stream: TcpStream,
-    peer_addr: IpAddr,
-    config: &BgpdConfig,
-    neighbor: &NeighborConfig,
-    ctx: SessionCtx<S>,
-    stop: watch::Receiver<bool>,
-    refresh: watch::Receiver<u64>,
-) {
-    ctx.live.fetch_add(1, Ordering::SeqCst);
-    let local_addr = stream
-        .local_addr()
-        .map(|a| a.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    match register(&ctx.registry, peer_addr, false, &ctx.next_id) {
-        Some((shared, evict, id)) => {
-            run_session(
-                stream,
-                peer_addr,
-                local_addr,
-                config,
-                neighbor,
-                ctx.clone(),
-                stop,
-                refresh,
-                shared,
-                evict,
-                id,
-            )
-            .await;
+async fn accept_connection<S: RouteSink + 'static>(stream: TcpStream, conn: Connection<S>) {
+    let live = Arc::clone(&conn.ctx.live);
+    live.fetch_add(1, Ordering::SeqCst);
+    let registered = register(&conn.ctx.registry, conn.peer_addr, false, &conn.ctx.next_id);
+    match registered {
+        Some(registered) => {
+            run_session(stream, conn, registered).await;
         }
         None => {
-            resolve_collision(
-                stream,
-                peer_addr,
-                local_addr,
-                config,
-                neighbor,
-                ctx.clone(),
-                stop,
-                refresh,
-            )
-            .await;
+            resolve_collision(stream, conn).await;
         }
     }
-    ctx.live.fetch_sub(1, Ordering::SeqCst);
+    live.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// The §6.8 collision resolver: read the challenger's OPEN, apply the
 /// BGP-Identifier tiebreak, Cease the loser.
-async fn resolve_collision<S: RouteSink + 'static>(
-    mut stream: TcpStream,
-    peer_addr: IpAddr,
-    local_addr: IpAddr,
-    config: &BgpdConfig,
-    neighbor: &NeighborConfig,
-    ctx: SessionCtx<S>,
-    stop: watch::Receiver<bool>,
-    refresh: watch::Receiver<u64>,
-) {
-    let incumbent = ctx.registry.lock().unwrap().get(&peer_addr).cloned();
+async fn resolve_collision<S: RouteSink + 'static>(mut stream: TcpStream, conn: Connection<S>) {
+    let peer_addr = conn.peer_addr;
+    let incumbent = conn.ctx.registry.lock().unwrap().get(&peer_addr).cloned();
     let Some(incumbent) = incumbent else {
         return; // raced with teardown; nothing to collide with
     };
@@ -340,14 +319,14 @@ async fn resolve_collision<S: RouteSink + 'static>(
     let probe =
         tokio::time::timeout(COLLISION_PROBE, crate::peer::read_frame(&mut stream, true)).await;
     let open = match probe {
-        Ok(Ok(Ok(BgpMessage::Open(open)))) if open.peer_as4() == neighbor.remote_as => open,
+        Ok(Ok(Ok(BgpMessage::Open(open)))) if open.peer_as4() == conn.neighbor.remote_as => open,
         _ => {
             warn!(peer = %peer_addr, "bgpd: collision challenger sent no usable OPEN, dropped");
             let _ = stream.shutdown().await;
             return;
         }
     };
-    let our_id = config.router_id.unwrap_or(Ipv4Addr::LOCALHOST);
+    let our_id = conn.config.router_id.unwrap_or(Ipv4Addr::LOCALHOST);
     let keep_challenger = collision_verdict(
         our_id,
         open.bgp_id,
@@ -367,18 +346,19 @@ async fn resolve_collision<S: RouteSink + 'static>(
     // the challenger with its consumed OPEN frame replayed.
     info!(peer = %peer_addr, challenger_id = %open.bgp_id, our_id = %our_id,
         "bgpd: collision resolved for the challenger (peer BGP ID higher, §6.8); evicting our session");
-    let (shared, evict, id) = re_register(&ctx.registry, peer_addr, &ctx.next_id);
+    let registered = re_register(&conn.ctx.registry, peer_addr, &conn.ctx.next_id);
     let _ = incumbent.evict.send(true);
     // Bounded wait for the incumbent to vacate (its cleanup is id-safe
     // either way — this only paces our own re-admission logging).
     let deadline = tokio::time::Instant::now() + EVICT_WAIT;
     while tokio::time::Instant::now() < deadline {
-        let vacated = ctx
+        let vacated = conn
+            .ctx
             .registry
             .lock()
             .unwrap()
             .get(&peer_addr)
-            .is_none_or(|i| i.id == id);
+            .is_none_or(|i| i.id == registered.id);
         if vacated {
             break;
         }
@@ -394,10 +374,7 @@ async fn resolve_collision<S: RouteSink + 'static>(
         read: read_half,
         write: write_half,
     };
-    run_session(
-        io, peer_addr, local_addr, config, neighbor, ctx, stop, refresh, shared, evict, id,
-    )
-    .await;
+    run_session(io, conn, registered).await;
 }
 
 /// NOTIFICATION Cease / Collision Resolution Failure (RFC 4486
@@ -482,25 +459,40 @@ impl<S: RouteSink> Clone for SessionCtx<S> {
     }
 }
 
-/// One session over any stream: per-session stop = global stop OR
-/// eviction (§6.8), so the collision machinery can ManualStop exactly
-/// one session.
-async fn run_session<S, IO>(
-    io: IO,
+/// One connection's launch state: peer/session addressing, the config
+/// pair, the daemon plumbing, and the signal channels — everything a
+/// session needs beyond its IO. Bundles what would otherwise be an
+/// argument list mirroring the session's real state one field at a
+/// time.
+struct Connection<S: RouteSink> {
     peer_addr: IpAddr,
     local_addr: IpAddr,
-    config: &BgpdConfig,
-    neighbor: &NeighborConfig,
+    config: Arc<BgpdConfig>,
+    neighbor: NeighborConfig,
     ctx: SessionCtx<S>,
     stop: watch::Receiver<bool>,
     refresh: watch::Receiver<u64>,
-    shared: Arc<SessionShared>,
-    evict: watch::Receiver<bool>,
-    id: u64,
-) where
+}
+
+/// One session over any stream: per-session stop = global stop OR
+/// eviction (§6.8), so the collision machinery can ManualStop exactly
+/// one session.
+async fn run_session<S, IO>(io: IO, conn: Connection<S>, registered: Registered)
+where
     S: RouteSink,
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    let Connection {
+        peer_addr,
+        local_addr,
+        config,
+        neighbor,
+        ctx,
+        stop,
+        refresh,
+    } = conn;
+    let Registered { shared, evict, id } = registered;
+
     // Per-session stop: the daemon's global stop OR this session's
     // eviction.
     let (session_stop_tx, session_stop) = watch::channel(false);
@@ -526,7 +518,7 @@ async fn run_session<S, IO>(
         remote_as: neighbor.remote_as,
         bgp_id: None,
     };
-    let session_config = session_config_for(config, neighbor);
+    let session_config = session_config_for(&config, &neighbor);
     let mut session = PeerSession::new(
         io,
         session_config,
@@ -554,6 +546,7 @@ async fn connector_loop<S: RouteSink + 'static>(
     refresh: &mut watch::Receiver<u64>,
     reach: Arc<dyn crate::zedge::PeerReachability>,
 ) {
+    let config = Arc::new(config);
     let target = SocketAddr::new(neighbor.address, config.listen_port);
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -575,7 +568,7 @@ async fn connector_loop<S: RouteSink + 'static>(
         }
         match TcpStream::connect(target).await {
             Ok(stream) => {
-                let Some((shared, evict, id)) =
+                let Some(registered) =
                     register(&ctx.registry, neighbor.address, true, &ctx.next_id)
                 else {
                     // A passive session beat us to it (§6.8: the
@@ -589,20 +582,16 @@ async fn connector_loop<S: RouteSink + 'static>(
                     .local_addr()
                     .map(|a| a.ip())
                     .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                run_session(
-                    stream,
-                    neighbor.address,
+                let conn = Connection {
+                    peer_addr: neighbor.address,
                     local_addr,
-                    &config,
-                    &neighbor,
-                    ctx.clone(),
-                    stop.clone(),
-                    refresh.clone(),
-                    shared,
-                    evict,
-                    id,
-                )
-                .await;
+                    config: Arc::clone(&config),
+                    neighbor: neighbor.clone(),
+                    ctx: ctx.clone(),
+                    stop: stop.clone(),
+                    refresh: refresh.clone(),
+                };
+                run_session(stream, conn, registered).await;
                 ctx.live.fetch_sub(1, Ordering::SeqCst);
                 // A completed session is not a failed attempt:
                 // re-dial immediately with the backoff reset.
