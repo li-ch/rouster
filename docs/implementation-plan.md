@@ -225,3 +225,14 @@ The phase text above is unchanged; this block is status only.
   license adopted; four parallel day-streams (S1 zebra-core incl. both
   previously-fenced ZAPI edges, S2 sav polish, S3 rousterctl v1, S4
   docs/OSS prep) + S5 integration all landed; 16/16 smokes, 383/0.
+
+- 2026-10-11 — Phase 2 opens GREEN: three parallel streams landed in one
+  day — bfdd (RFC 5880-5883 codec/state machine/transports/daemon, live
+  Up-flap interop vs FRR bfdd ×2), bgpd core (RFC 4271/4760 codec, §8
+  FSM, §9.1 decision process, RIB + ZAPI client, live eBGP peering vs
+  FRR bgpd with UPDATE/refresh/soak/Cease observed ×2; two of our
+  protocol bugs fixed, four FRR-side facts pinned), rpki (RTR codec,
+  VRP/ROV per RFC 6811, ASPA lattice, mock-cache session client).
+  Integration pass: fmt/clippy sweep over stream tails, 18/18 smokes
+  (incl. the two new interop legs), workspace 640/0. Protocol docs
+  indexed. Evidence: away/2026-10-11/reports/P2-{a,b,c}.md.

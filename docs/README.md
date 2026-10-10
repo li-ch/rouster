@@ -7,6 +7,9 @@
 | [interop/zapi-10.2-pinned.md](interop/zapi-10.2-pinned.md) | **Ground truth for the ZAPI codec**: command numbers and body layouts pinned against the real FRR 10.2.2 binary (wire capture + oracle + binary extraction). The `crates/zapi` codec defers to this file, never to memory or other FRR versions. |
 | [interop/frr-10.2-interop.md](interop/frr-10.2-interop.md) | FRR 10.2.2 interop results, per smoke script, with deviations and reproduce commands. Grows as new interop scenarios land. |
 | operator-surfaces.md | The `rousterctl` v1 operator CLI: command table, exit codes, and the run-dir contract (`/run/rouster/` — who writes which file, who reads it). v1 reads only; the CLI never writes the run dir. |
+| protocols/bfd.md | The `bfdd` daemon: RFC 5880-5883 scope, the state-machine reading decisions, FRR interop facts, and the deferred ZAPI-BFD capture recipe. |
+| protocols/bgp.md | The `bgpd` core: v1 scope (codec/FSM/§9.1/RIB/ZAPI), the four pinned FRR-side interop facts, and the deferred anchors (policy engine, route-server, experimental-savnet hook). |
+| protocols/rpki.md | The `rpki` library: RTR PDU table, session diagram, RFC 6811 ROV + ASPA semantics with citations, and the real-cache interop runbook. |
 
 Repo-level entry points: [README.md](../README.md) (what runs today,
 quickstart) and [CONTRIBUTING.md](../CONTRIBUTING.md) (gates, commit and
