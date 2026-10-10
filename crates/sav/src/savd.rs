@@ -48,15 +48,25 @@
 //! "Deleting entries from the RPF lists SHOULD be delayed by a
 //! predetermined amount ... when responding to route withdrawals"; see
 //! `away/2026-10-09/quarantine/B5-urpf-notes.md` §2.6): a prefix that
-//! leaves a still-present allowlist is held installed for
-//! [`DEFERRED_DELETE_DELAY`] (a pending-deletions set the select loop's
-//! timer arm flushes), so a withdraw/re-advertise transient never
-//! flickers the dataplane — the re-advertised prefix is absorbed
-//! silently. Additions and whole-op removals (the allowlist's
-//! generator mode, interface, or action changed — operator intent, not
-//! a route flap) apply immediately. The spoof monitor judges the same
-//! effective ops the dataplane enforces, so counters and enforcement
-//! never disagree.
+//! leaves a still-present allowlist is held installed for the
+//! configured `hysteresis <secs>` window (A10's fixed 3 s is the
+//! default; a pending-deletions set the select loop's timer arm
+//! flushes), so a withdraw/re-advertise transient never flickers the
+//! dataplane — the re-advertised prefix is absorbed silently.
+//! Additions and whole-op removals (the allowlist's generator mode,
+//! interface, or action changed — operator intent, not a route flap)
+//! apply immediately. The spoof monitor judges the same effective ops
+//! the dataplane enforces, so counters and enforcement never disagree.
+//!
+//! The `collision-policy` knob selects GSC §3's resolution for mode
+//! collisions at compile time ([`CollisionPolicy`]): `ignore` (the
+//! default — colliding block-mode rules are dropped with a warning) or
+//! `subtract` (the merge-by-subtraction variant GSC §5 prefers when
+//! data-plane memory allows, landed in A6 unwired). The uRPF
+//! generators emit only IBA rules, which cannot collide — the knob is
+//! wiring for the first IBB/PBB rule source (W6 §Deferred 1's operator
+//! builder, a SAVNET agent); both policies compile today's rule sets
+//! byte-identically.
 //!
 //! The churn log renders at field granularity (A20): now that every
 //! mirror change re-evaluates, the common change is a few prefixes
@@ -98,6 +108,9 @@
 //! mode <strict|loose|fp|efp>        ! global default generator mode
 //! action <monitor|drop>             ! invalid-verdict action (default monitor)
 //! poll <secs>                       ! RIB re-evaluation cadence (default 5)
+//! hysteresis <secs>                 ! RFC 8704 §3.6.2 deletion window (default 3)
+//! collision-policy <ignore|subtract>
+//!                                   ! GSC §3 collision resolution (default ignore)
 //! i-understand-drop-mode yes        ! required friction to start in drop mode
 //! interface <name>                  ! opens a per-interface stanza
 //!   mode <strict|loose|fp|efp>      ! per-interface mode override
@@ -139,17 +152,19 @@ use crate::gen::{generate_urpf, UrpfMode};
 use crate::mode::{SavAction, SavConfig, ValidationMode};
 use crate::monitor::SpoofMonitor;
 use crate::program::program;
-use crate::table::{compile, SavOp, Verdict};
+use crate::table::{compile_with, CollisionPolicy, SavOp, Verdict};
 use crate::{Binding, BindingOrigin, InterfaceRef, Sib, MAIN_TABLE};
 
-/// Hysteresis window for allowlist deletions (RFC 8704 §3.6.2): a
-/// withdrawn prefix stays enforced this long before it finally
-/// uninstalls, so withdraw/re-advertise transients never flicker the
-/// dataplane. Short and fixed (not configurable) tonight, disclosed:
-/// long enough to absorb a redistribute flap, short enough that a real
-/// withdrawal converges promptly — and the select loop's timer arm
-/// flushes exactly at the deadline, independent of the poll cadence.
-const DEFERRED_DELETE_DELAY: Duration = Duration::from_secs(3);
+/// Default hysteresis window for allowlist deletions (RFC 8704 §3.6.2):
+/// the fixed 3 s value A10 pinned, now the default of the configurable
+/// `hysteresis <secs>` knob — long enough to absorb a redistribute
+/// flap, short enough that a real withdrawal converges promptly.
+pub const DEFAULT_HYSTERESIS_SECS: u64 = 3;
+
+/// The default window as a duration ([`DEFAULT_HYSTERESIS_SECS`]);
+/// the deferred-delete tests advance the paused clock by exactly this.
+#[cfg(test)]
+const DEFERRED_DELETE_DELAY: Duration = Duration::from_secs(DEFAULT_HYSTERESIS_SECS);
 
 /// Quiet window after the sync marker: anything the server still had
 /// queued arrives within it (the dump is produced synchronously inside
@@ -219,6 +234,16 @@ pub struct SavdConfig {
     pub action: SavAction,
     /// RIB re-evaluation cadence in seconds.
     pub poll_secs: u64,
+    /// The RFC 8704 §3.6.2 deletion-hysteresis window in seconds
+    /// (A10's fixed 3 s is the default). Parsed ≥ 1 — a zero window
+    /// would re-introduce the withdraw/re-advertise flap the hysteresis
+    /// exists to absorb, so the parser rejects it.
+    pub hysteresis_secs: u64,
+    /// GSC §3 collision resolution handed to [`crate::table::compile_with`]
+    /// (default [`CollisionPolicy::Ignore`], today's behavior; the uRPF
+    /// generators emit only IBA rules, which cannot collide — the knob
+    /// is wiring for the first IBB/PBB rule source).
+    pub collision_policy: CollisionPolicy,
     /// `i-understand-drop-mode yes` — the friction line drop mode
     /// requires.
     pub drop_ack: bool,
@@ -234,6 +259,8 @@ impl Default for SavdConfig {
             mode: UrpfMode::Strict,
             action: SavAction::Monitor,
             poll_secs: DEFAULT_POLL_SECS,
+            hysteresis_secs: DEFAULT_HYSTERESIS_SECS,
+            collision_policy: CollisionPolicy::Ignore,
             drop_ack: false,
             interfaces: Vec::new(),
             bindings: Vec::new(),
@@ -245,12 +272,14 @@ impl fmt::Display for SavdConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode {} action {} poll {}s interfaces {} bindings {}",
+            "mode {} action {} poll {}s interfaces {} bindings {} collision {} hysteresis {}s",
             self.mode,
             self.action,
             self.poll_secs,
             self.interfaces.len(),
-            self.bindings.len()
+            self.bindings.len(),
+            self.collision_policy,
+            self.hysteresis_secs
         )
     }
 }
@@ -272,6 +301,11 @@ impl SavdConfig {
     /// The re-evaluation cadence as a duration.
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_secs)
+    }
+
+    /// The deletion-hysteresis window as a duration (RFC 8704 §3.6.2).
+    pub fn hysteresis_delay(&self) -> Duration {
+        Duration::from_secs(self.hysteresis_secs)
     }
 }
 
@@ -307,6 +341,8 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
     let mut seen_global_mode = false;
     let mut seen_action = false;
     let mut seen_poll = false;
+    let mut seen_hysteresis = false;
+    let mut seen_collision_policy = false;
     let mut seen_drop_ack = false;
 
     for (idx, raw) in input.lines().enumerate() {
@@ -420,6 +456,41 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                 config.poll_secs = secs;
                 seen_poll = true;
             }
+            // RFC 8704 §3.6.2 deletion-hysteresis window (A10's fixed
+            // 3 s as the default).
+            ["hysteresis", n] => {
+                if seen_hysteresis {
+                    return Err(fail(line_no, "duplicate `hysteresis` line"));
+                }
+                let secs: u64 = n
+                    .parse()
+                    .map_err(|_| fail(line_no, format!("bad hysteresis seconds `{n}`")))?;
+                if secs == 0 {
+                    return Err(fail(
+                        line_no,
+                        "hysteresis must be at least 1 second (0 would flap withdrawals)",
+                    ));
+                }
+                config.hysteresis_secs = secs;
+                seen_hysteresis = true;
+            }
+            // GSC §3 collision resolution (A6 landed Subtract unwired).
+            ["collision-policy", p] => {
+                if seen_collision_policy {
+                    return Err(fail(line_no, "duplicate `collision-policy` line"));
+                }
+                match *p {
+                    "ignore" => config.collision_policy = CollisionPolicy::Ignore,
+                    "subtract" => config.collision_policy = CollisionPolicy::Subtract,
+                    _ => {
+                        return Err(fail(
+                            line_no,
+                            format!("bad collision-policy `{p}` (ignore|subtract)"),
+                        ))
+                    }
+                }
+                seen_collision_policy = true;
+            }
             ["i-understand-drop-mode", ack] => {
                 if seen_drop_ack {
                     return Err(fail(line_no, "duplicate `i-understand-drop-mode` line"));
@@ -441,9 +512,10 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                     line_no,
                     format!(
                         "expected `mode <strict|loose|fp|efp>`, `action <monitor|drop>`, \
-                         `poll <secs>`, `i-understand-drop-mode <yes|no>`, \
-                         `interface <name>`, or `binding <prefix> interface <name>...`, \
-                         got `{line}`"
+                         `poll <secs>`, `hysteresis <secs>`, \
+                         `collision-policy <ignore|subtract>`, \
+                         `i-understand-drop-mode <yes|no>`, `interface <name>`, or \
+                         `binding <prefix> interface <name>...`, got `{line}`"
                     ),
                 ))
             }
@@ -1228,7 +1300,7 @@ where
         let mut ops: Vec<(UrpfMode, SavOp)> = Vec::new();
         for (mode, cfg) in &partitions {
             let rules = generate_urpf(*mode, &sib, &self.rib, cfg);
-            for op in compile(&rules, cfg) {
+            for op in compile_with(&rules, cfg, self.config.collision_policy) {
                 ops.push((*mode, op));
             }
         }
@@ -1317,7 +1389,7 @@ where
                     ifindex: *ifindex,
                     action: *action,
                     prefix: *prefix,
-                    deadline: now + DEFERRED_DELETE_DELAY,
+                    deadline: now + self.config.hysteresis_delay(),
                 });
                 info!(
                     ifindex = *ifindex,
@@ -1546,6 +1618,8 @@ mod tests {
         let config = cfg("! monitor by default until acknowledged\n\
              mode strict\n\
              poll 2\n\
+             hysteresis 10\n\
+             collision-policy subtract\n\
              interface vethlegit\n\
              mode loose\n\
              interface vethspoof\n\
@@ -1556,6 +1630,15 @@ mod tests {
         assert_eq!(config.mode, UrpfMode::Strict);
         assert_eq!(config.action, SavAction::Monitor);
         assert_eq!(config.poll_secs, 2);
+        assert_eq!(
+            config.hysteresis_secs, 10,
+            "the RFC 8704 §3.6.2 window knob"
+        );
+        assert_eq!(
+            config.collision_policy,
+            CollisionPolicy::Subtract,
+            "the GSC §3 merge-by-subtraction knob (A6's unwired mode)"
+        );
         assert!(!config.drop_ack);
         assert_eq!(
             config.interfaces,
@@ -1631,6 +1714,14 @@ mod tests {
                 "duplicate ack",
             ),
             ("i-understand-drop-mode maybe", "bad ack value"),
+            ("hysteresis 0", "zero hysteresis"),
+            ("hysteresis x", "non-numeric hysteresis"),
+            ("hysteresis 1\nhysteresis 2", "duplicate hysteresis"),
+            ("collision-policy merge", "bad collision policy"),
+            (
+                "collision-policy ignore\ncollision-policy subtract",
+                "duplicate collision policy",
+            ),
             ("binding", "bare binding"),
             (
                 "binding 10.0.0.0/8 eth2",
@@ -1683,6 +1774,107 @@ mod tests {
         assert!(config.validate().is_ok());
         // A friction line without drop mode is harmless.
         assert!(cfg("i-understand-drop-mode yes\n").validate().is_ok());
+    }
+
+    /// KNOBS, default equivalence (the w8 smoke must stay green
+    /// unmodified): absent knobs, and knobs explicitly set to today's
+    /// values, parse to byte-identical configs — A10's fixed 3 s window
+    /// and A6's unwired Ignore policy are exactly the defaults.
+    #[test]
+    fn knob_defaults_preserve_todays_behavior() {
+        let absent = cfg("");
+        let explicit = cfg("hysteresis 3\ncollision-policy ignore\n");
+        assert_eq!(absent, SavdConfig::default());
+        assert_eq!(
+            explicit, absent,
+            "explicit today-values parse to the same config as no knobs at all"
+        );
+        assert_eq!(absent.hysteresis_secs, DEFAULT_HYSTERESIS_SECS);
+        assert_eq!(absent.hysteresis_delay(), DEFERRED_DELETE_DELAY);
+        assert_eq!(absent.collision_policy, CollisionPolicy::Ignore);
+        // The Display (status/config log lines) appends the knobs after
+        // the existing fields — additive, never reordered.
+        assert_eq!(
+            explicit.to_string(),
+            format!(
+                "mode strict-uRPF action monitor poll {DEFAULT_POLL_SECS}s interfaces 0 \
+                 bindings 0 collision ignore hysteresis {DEFAULT_HYSTERESIS_SECS}s"
+            )
+        );
+    }
+
+    /// KNOB WIRING, hysteresis: `hysteresis <secs>` reaches the
+    /// pending-deletion deadline — with a 60 s window a withdrawal is
+    /// still enforced well past the old fixed 3 s, and flushes only at
+    /// the configured deadline (paused clock).
+    #[tokio::test(start_paused = true)]
+    async fn hysteresis_knob_reaches_the_deletion_deadline() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        let mut config = daemon.config().clone();
+        config.hysteresis_secs = 60;
+        daemon.set_config(config);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+
+        daemon.apply_push(ZapiMessage::RedistributeRouteDel(route_del()));
+        daemon.take_dirty();
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[
+                monitor_allow(2, &["198.51.100.0/24"]),
+                monitor_allow(3, &[])
+            ],
+            "held inside the configured window"
+        );
+
+        // Past the OLD fixed 3 s window the prefix is still enforced:
+        // the knob, not the constant, owns the deadline.
+        tokio::time::advance(DEFERRED_DELETE_DELAY + Duration::from_secs(10)).await;
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(dp.installed.lock().unwrap().len(), 1, "still held");
+
+        // The configured 60 s elapse: the deletion finally applies.
+        tokio::time::advance(Duration::from_secs(47)).await;
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap().ops(),
+            &[monitor_allow(2, &[]), monitor_allow(3, &[])]
+        );
+        assert!(daemon.deletion_deadline().is_none());
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// KNOB WIRING, collision policy: `collision-policy subtract` is
+    /// handed to compile_with, but the uRPF generators emit only IBA
+    /// rules — GSC §3 collisions need IBB/PBB rules — so both policies
+    /// compile today's rule sets byte-identically (the w8 program shape
+    /// is policy-invariant until an IBB/PBB source lands).
+    #[tokio::test]
+    async fn collision_policy_knob_leaves_urpf_programs_identical() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        let ignore_program = daemon.installed().unwrap().clone();
+
+        let mut config = daemon.config().clone();
+        config.collision_policy = CollisionPolicy::Subtract;
+        daemon.set_config(config);
+        daemon.evaluate(&dp).await.unwrap();
+        assert_eq!(
+            daemon.installed().unwrap(),
+            &ignore_program,
+            "no IBB/PBB rule source exists: Subtract cannot perturb the program"
+        );
+        drop(daemon);
+        let _ = server.await;
     }
 
     // ---- program diff ----

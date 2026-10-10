@@ -225,6 +225,15 @@ pub enum CollisionPolicy {
     Subtract,
 }
 
+impl fmt::Display for CollisionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CollisionPolicy::Ignore => "ignore",
+            CollisionPolicy::Subtract => "subtract",
+        })
+    }
+}
+
 /// Compile a rule set + enforcement config into the deterministic
 /// [`SavOp`] list — the SAV Table Manager's whole local job — under
 /// the default [`CollisionPolicy::Ignore`]; [`compile_with`] selects
