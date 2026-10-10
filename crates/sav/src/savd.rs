@@ -148,7 +148,7 @@ use tokio::time::{timeout, Instant};
 use tracing::{debug, info, warn};
 use zapi::{route_type, ZapiClient, ZapiMessage};
 
-use crate::gen::{generate_urpf, UrpfMode};
+use crate::gen::{generate_urpf, RuleOrigin, UrpfMode};
 use crate::mode::{SavAction, SavConfig, ValidationMode};
 use crate::monitor::SpoofMonitor;
 use crate::program::program;
@@ -1008,11 +1008,13 @@ where
     /// Operator status snapshot (A21): the daemon's state as plain
     /// text — pid, running config, the installed program (the W8
     /// `installed` surface, one `rule` line per op in the same
-    /// rendering the rule logs use), and the last evaluate's monitor
-    /// counts with the source that fed them. The thin binary publishes
-    /// this to a run-dir status file after every evaluate (`savd
-    /// --show` prints it) — the rule set without log greps, with no
-    /// IPC and no wire changes.
+    /// rendering the rule logs use, plus the op's provenance —
+    /// " (from <origin>)" appended when the compiled op records one,
+    /// A7 riding A21), and the last evaluate's monitor counts with the
+    /// source that fed them. The thin binary publishes this to a
+    /// run-dir status file after every evaluate (`savd --show` prints
+    /// it) — the rule set without log greps, with no IPC and no wire
+    /// changes.
     pub fn status_text(&self, pid: u32) -> String {
         let mut out = format!(
             "savd {} pid {pid}\nconfig {}\n",
@@ -1024,7 +1026,12 @@ where
             Some(program) => {
                 out.push_str(&format!("installed {} rules\n", program.ops().len()));
                 for op in program.ops() {
-                    out.push_str(&format!("rule {op}\n"));
+                    match program_op_origin(&self.effective_ops, op) {
+                        Some(origin) => {
+                            out.push_str(&format!("rule {op} (from {origin})\n"));
+                        }
+                        None => out.push_str(&format!("rule {op}\n")),
+                    }
                 }
             }
         }
@@ -1593,6 +1600,22 @@ fn dp_err(err: DataplaneError) -> std::io::Error {
 /// render filter: zero rows are noise).
 fn tallies_judged(tallies: &SavMonitorCounts) -> bool {
     tallies.invalid + tallies.valid + tallies.unknown > 0
+}
+
+/// The provenance of one installed program op (A7 riding A21): the
+/// origin the effective [`SavOp`] it was compiled from carries, found
+/// by re-deriving each effective op's program form and matching it
+/// against the installed one — identity-exact (every field the
+/// program op holds, action and uRPF hint included). `None` when no
+/// effective op matches or the op recorded no origin: an origin-less
+/// or disagreeing merge never guesses a source (B5 observation 5).
+fn program_op_origin(effective: &[(UrpfMode, SavOp)], op: &SavProgramOp) -> Option<RuleOrigin> {
+    for (mode, sav_op) in effective {
+        if program(std::slice::from_ref(sav_op), *mode).ops().first() == Some(op) {
+            return sav_op.origin();
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2949,6 +2972,144 @@ mod tests {
         assert!(daemon
             .status_text(4242)
             .contains("count iba permit #3 [] monitor invalid=2 valid=0 unknown=0"));
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// A7 riding A21 (provenance in operator output): each `rule` line
+    /// appends " (from <origin>)" when the op's contributing rules
+    /// agreed on one — fib (rib-derived best route), bgp (a BGP-learned
+    /// one), static (an operator binding) — and stays bare when the op
+    /// recorded none (the seeded empty allowlist) or its rules
+    /// disagreed (a merged op never guesses a source). One origin per
+    /// interface: compile folds every IBA rule on an interface into one
+    /// allowlist op, so distinct origins need distinct interfaces.
+    #[tokio::test]
+    async fn status_rule_lines_carry_provenance() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = SavDaemon::new(ZapiClient::new(client_io));
+        daemon.apply_event(&link_up(2, "eth2"));
+        daemon.apply_event(&link_up(3, "eth3"));
+        daemon.apply_event(&link_up(4, "eth4"));
+        daemon.set_config(SavdConfig {
+            interfaces: vec![
+                InterfaceLine {
+                    name: "eth2".into(),
+                    mode: UrpfMode::Strict,
+                },
+                InterfaceLine {
+                    name: "eth3".into(),
+                    mode: UrpfMode::Strict,
+                },
+                InterfaceLine {
+                    name: "eth4".into(),
+                    mode: UrpfMode::Strict,
+                },
+            ],
+            ..SavdConfig::default()
+        });
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        let phase1 = daemon.status_text(4242);
+        assert!(
+            phase1.contains("rule allow if#2 [198.51.100.0/24] strict monitor (from fib)"),
+            "the rib-derived rule names its source: {phase1}"
+        );
+        assert!(
+            phase1.contains("rule allow if#3 [] strict monitor\n"),
+            "the seeded empty allowlist carries no origin (bare line): {phase1}"
+        );
+
+        // A BGP-learned route on eth4 and an operator binding on eth3.
+        daemon.apply_push(ZapiMessage::RedistributeRouteAdd(ZapiRoute {
+            route_type: route_type::BGP,
+            ..route_push("203.0.113.0/24", 4)
+        }));
+        let mut config = daemon.config().clone();
+        config.bindings = cfg("binding 192.0.2.0/24 interface eth3\n").bindings;
+        daemon.set_config(config);
+        daemon.take_dirty();
+        daemon.evaluate(&dp).await.unwrap();
+        let phase2 = daemon.status_text(4242);
+        assert!(
+            phase2.contains("rule allow if#3 [192.0.2.0/24] strict monitor (from static)"),
+            "the operator binding's rule: {phase2}"
+        );
+        assert!(
+            phase2.contains("rule allow if#4 [203.0.113.0/24] strict monitor (from bgp)"),
+            "the BGP-learned best route: {phase2}"
+        );
+
+        // Disagreeing origins on one interface: an extra static binding
+        // joins eth2's fib-derived allowlist — the merged op declines.
+        let mut mixed = daemon.config().clone();
+        mixed.bindings =
+            cfg("binding 192.0.2.0/24 interface eth3\nbinding 198.18.0.0/15 interface eth2\n")
+                .bindings;
+        daemon.set_config(mixed);
+        daemon.take_dirty();
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(
+            daemon
+                .status_text(4242)
+                .contains("rule allow if#2 [198.18.0.0/15, 198.51.100.0/24] strict monitor\n"),
+            "static + fib on one allowlist: no suffix, never a guess: {}",
+            daemon.status_text(4242)
+        );
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// Provenance follows the view: a config swap that lifts an
+    /// operator shadow resurfaces the rib binding, and the rule line's
+    /// origin flips with it — the suffix is derived from the CURRENT
+    /// effective ops on every status render, not cached.
+    #[tokio::test(start_paused = true)]
+    async fn provenance_follows_regeneration() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        let mut config = daemon.config().clone();
+        config.bindings = cfg("binding 198.51.100.0/24 interface eth3\n").bindings;
+        daemon.set_config(config);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(
+            daemon
+                .status_text(4242)
+                .contains("rule allow if#3 [198.51.100.0/24] strict monitor (from static)"),
+            "operator-pinned: the shadow answers as static"
+        );
+        assert!(
+            daemon
+                .status_text(4242)
+                .contains("rule allow if#2 [] strict monitor\n"),
+            "the shadowed rib egress compiled to the empty allowlist"
+        );
+
+        // SIGHUP: the binding line is gone — the rib binding resurfaces
+        // on its own egress (an addition, immediate) and the prefix on
+        // eth3 rides the hysteresis window (paused clock: still held).
+        let reloaded = daemon.config().clone();
+        daemon.set_config(SavdConfig {
+            bindings: Vec::new(),
+            ..reloaded
+        });
+        daemon.evaluate(&dp).await.unwrap();
+        let status = daemon.status_text(4242);
+        assert!(
+            status.contains("rule allow if#2 [198.51.100.0/24] strict monitor (from fib)"),
+            "the resurfaced rib binding names fib: {status}"
+        );
+        assert!(
+            status.contains("rule allow if#3 [198.51.100.0/24] strict monitor\n"),
+            "eth3 still enforces the prefix through the hysteresis window, but on \
+             the desired op's origin — the static rule that produced it is gone \
+             from the view, so the line is bare: {status}"
+        );
         drop(daemon);
         let _ = server.await;
     }
