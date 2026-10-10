@@ -26,6 +26,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "zapi",
 ]
 
 [[package]]
@@ -500,6 +502,7 @@ name = "rpki"
 version = "0.0.0"
 dependencies = [
  "common",
+ "proptest",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

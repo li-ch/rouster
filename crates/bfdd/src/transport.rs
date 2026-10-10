@@ -422,10 +422,19 @@ async fn run_session(
                                 publish(&sm, &snap, Some(&t.to_string()));
                                 // §6.8.7: transmit promptly on change.
                                 let _ = transmit_now(&tx, &mut sm).await;
+                                // §6.8.2: the interval changed with
+                                // the state — the periodic deadline
+                                // must not keep the pre-transition
+                                // (1 s-floored) schedule, or the
+                                // first Up-period gap can starve the
+                                // peer's freshly-negotiated Detection
+                                // Time.
+                                next_tx = Instant::now() + sm.transmit_interval(rng.unit());
                             }
                             if outcome.send_final {
                                 // §6.8.6 step 25: answer a Poll now.
                                 let _ = transmit_now(&tx, &mut sm).await;
+                                next_tx = Instant::now() + sm.transmit_interval(rng.unit());
                             }
                         }
                         Err(DiscardReason::AdminDownLocal) => {
@@ -449,6 +458,7 @@ async fn run_session(
                 }
                 detect_at = None;
                 let _ = transmit_now(&tx, &mut sm).await;
+                next_tx = Instant::now() + sm.transmit_interval(rng.unit());
             }
 
             _ = sleep_until(echo_detect_deadline), if echo_detect_at.is_some() => {
@@ -460,6 +470,7 @@ async fn run_session(
                 echo_detect_at = None;
                 echo_next_tx = None;
                 let _ = transmit_now(&tx, &mut sm).await;
+                next_tx = Instant::now() + sm.transmit_interval(rng.unit());
             }
 
             _ = sleep_until(echo_tx_deadline), if echo_tx.is_some() && sm.echo_transmission_allowed() => {

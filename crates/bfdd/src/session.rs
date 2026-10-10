@@ -575,9 +575,6 @@ impl SessionSm {
         if echo_ceased {
             tracing::info!(peer = %self.label, "bfdd: echo transmission ceased (zero Min Echo Rx, RFC 5880 §6.8.6 step 17)");
         }
-        if let Some(t) = &transition {
-            tracing::info!(peer = %self.label, %t, "bfdd: session transition");
-        }
 
         // Step 25: answer a Poll with a Final on the next packet.
         let send_final = pkt.poll;
