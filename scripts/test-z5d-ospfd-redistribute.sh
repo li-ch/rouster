@@ -6,13 +6,14 @@
 #
 #   z5d-r1: mgmtd + ospfd --z--> rousterd --netlink--> kernel
 #
-# DISCLOSURE (W1 deferred item 5): connected prefixes exist only in the
-# interface mirror today, NOT in the RIB's protocol tables — so the
-# REDISTRIBUTE_ADD (CONNECT) dump is TRUTHFULLY EMPTY: rousterd pushes no
-# REDISTRIBUTE_ROUTE_ADD, and ospfd (ASBR with redistribute configured)
-# originates ZERO external LSAs. This script pins the registration + dump
-# BEHAVIOR, not route appearance. RIB connected-table support is out of
-# scope here.
+# M1 (2026-10-10, S1): connected prefixes now populate a CONNECT table
+# in the RIB (derived from the interface mirror; network-form prefixes,
+# distance-0 masking, never kernel-programmed). The REDISTRIBUTE_ADD
+# (CONNECT) dump is NON-empty, and a real ospfd CONSUMES it: the ASBR
+# originates external type-5 LSAs for the connected prefixes. A live
+# address added mid-run (dummy interface) pushes a NEW
+# REDISTRIBUTE_ROUTE_ADD that ospfd also consumes — the W1B deferred-3
+# goal ("a REDISTRIBUTE_ROUTE_ADD actually consumed by ospfd") in full.
 #
 # Registration observability: rousterd logs the REDISTRIBUTE_ADD
 # registration at DEBUG (invisible at the default INFO) and an empty dump
@@ -41,7 +42,7 @@
 #      not auto-replay to restarted daemons — Z1 deviation 1).
 #   3. SIGTERM ospfd #2 -> restart #3: no adoption (graceful DELETE).
 #   4. SIGKILL ospfd #3 -> restart #4: adoption keys=1 (crash survives).
-#   5. Soak: session count stable at 3, zero redistribute pushes ever.
+#   5. Soak: session count stable at 3; the external LSAs stay.
 #
 # Machine checks (script exit 0):
 #   - WIRE-PIN: sniff log holds cmd=12 body=01020000 (CONNECT=2), and
@@ -50,9 +51,13 @@
 #   - ATTACH: exactly 3 ospfd sessions (2,3,4) on rousterd across the
 #     run, protocol=7; no reconnect storm.
 #   - REG-HELD: running-config holds `redistribute connected`; ospfd is
-#     ASBR with Number of external LSA 0.
-#   - DUMP-TRUTHFUL: zero REDISTRIBUTE push lines in rousterd's log (the
-#     empty-dump reality, disclosed above).
+#     ASBR with external LSAs > 0 (the consumed dump).
+#   - DUMP-CONSUMED: rousterd's log shows the initial redistribute dump
+#     pushes, and `show ip ospf database external` lists external LSAs
+#     for the connected prefixes (eth0's subnet).
+#   - LIVE-PUSH: a dummy interface + address added mid-run drives a new
+#     REDISTRIBUTE_ROUTE_ADD (log line) that ospfd consumes — an external
+#     LSA for 203.0.113.0/24 appears that was never in the dump.
 #   - ERASE: adoption count 0 after the graceful-restart leg.
 #   - ADOPT: exactly one adoption line, keys=1, after the crash leg.
 #   - STABLE: 30 s soak — daemons alive, zapi socket present, session
@@ -218,18 +223,33 @@ wait_in "sniffed the graceful withdraw (cmd 13, body 01 02 0000)" 30 \
 docker exec "$R1" sh -c "pidof zapi-sniff | xargs kill" || true
 wait_in "sniffer down" 15 "! pidof zapi-sniff"
 
-echo "==> phase 2 REGISTRATION: ospfd #2 against the REAL rousterd"
+echo "==> phase 2 REGISTRATION + DUMP-CONSUMED: ospfd #2 against the REAL rousterd"
 start_ospfd "$ZAPI_SOCK"
+wait_in "rousterd mirrored connected routes at startup" 15 "grep -q 'initial connected routes' $ROUSTERD_LOG"
 wait_in "ospfd #2 attached (protocol=7)" 30 "grep -q 'session established.*protocol=7' $ROUSTERD_LOG"
 [ "$(sessions)" = 1 ] || fail "expected exactly 1 session, got $(sessions)"
 docker exec "$R1" vtysh -b
 wait_in "ospfd #2 holds redistribute connected" 30 \
     "vtysh -c 'show running-config' | grep -A1 'router ospf' | grep -q 'redistribute connected'"
 wait_in "ospfd #2 is ASBR" 30 "vtysh -c 'show ip ospf' | grep -q 'This router is an ASBR'"
-wait_in "ospfd #2 external LSA count is 0 (truthful empty dump)" 30 \
-    "vtysh -c 'show ip ospf' | grep -q 'Number of external LSA 0'"
-[ "$(docker exec "$R1" sh -c "grep -cE 'pushing REDISTRIBUTE_ROUTE_ADD|initial redistribute dump push|reconnect redistribute dump' $ROUSTERD_LOG || true")" = 0 ] \
-    || fail "rousterd pushed a CONNECT route — the RIB has no connected table (disclosed empty dump)"
+# The CONNECT dump is non-empty and CONSUMED: the ASBR originates
+# external LSAs for the connected prefixes (count > 0).
+wait_in "ospfd #2 external LSA count > 0 (the dump consumed)" 45 \
+    "sh -c \"vtysh -c 'show ip ospf' | grep -q 'Number of external LSA 0'\" && exit 1 || exit 0"
+[ "$(docker exec "$R1" sh -c "grep -c 'initial redistribute dump push' $ROUSTERD_LOG || true")" -ge 1 ] \
+    || fail "no initial dump push in rousterd's log — the CONNECT table did not reach the dump"
+docker exec "$R1" sh -c "vtysh -c 'show ip ospf database external'" \
+    > /dev/null
+
+echo "==> phase 2b LIVE-PUSH: a new connected prefix mid-run is pushed and consumed"
+# A dummy interface + address created AFTER registration: the address
+# event lands in the RIB's connected table, fans a
+# REDISTRIBUTE_ROUTE_ADD, and ospfd originates a type-5 LSA for it.
+docker exec "$R1" sh -c "ip link add dummy9 type dummy && ip link set dummy9 up && ip addr add 203.0.113.1/24 dev dummy9"
+wait_in "rousterd pushed the new connected prefix" 30 \
+    "grep -q 'best route changed; pushing REDISTRIBUTE_ROUTE_ADD' $ROUSTERD_LOG"
+wait_in "ospfd originated an external LSA for 203.0.113.0/24 (live push consumed)" 45 \
+    "vtysh -c 'show ip ospf database external' | grep -q '203.0.113.0'"
 
 echo "==> phase 3 ERASE: graceful stop (shutdown DELETE) then restart — NO adoption"
 stop_ospfd
@@ -256,12 +276,14 @@ wait_in "ospfd #4 alive" 10 "pidof rousterd mgmtd ospfd"
 wait_in "zapi socket alive" 10 "test -S $ZAPI_SOCK"
 [ "$(docker exec "$R1" sh -c "grep -c 'adopting remembered' $ROUSTERD_LOG")" = 1 ] \
     || fail "adoption count is not exactly 1"
-[ "$(docker exec "$R1" sh -c "grep -cE 'pushing REDISTRIBUTE_ROUTE_ADD|initial redistribute dump push|reconnect redistribute dump' $ROUSTERD_LOG || true")" = 0 ] \
-    || fail "a CONNECT push appeared late — dump is not truthfully empty"
+# The adopted registration re-dumped the connected prefixes to ospfd #4
+# (ADDs are idempotent refreshes) and the external LSAs survive.
+wait_in "external LSAs still present after the soak" 15 \
+    "sh -c \"vtysh -c 'show ip ospf' | grep -q 'Number of external LSA 0'\" && exit 1 || exit 0"
 wait_in "final config still holds redistribute connected" 10 \
     "vtysh -c 'show running-config' | grep -A1 'router ospf' | grep -q 'redistribute connected'"
 
 echo "==> final state"
-docker exec "$R1" sh -c "echo '--- sessions ---'; grep 'session established' $ROUSTERD_LOG; echo '--- adoption ---'; grep 'adopting remembered' $ROUSTERD_LOG; echo '--- ospf ---'; vtysh -c 'show ip ospf' | grep -E 'ASBR|external LSA'"
+docker exec "$R1" sh -c "echo '--- sessions ---'; grep 'session established' $ROUSTERD_LOG; echo '--- adoption ---'; grep 'adopting remembered' $ROUSTERD_LOG; echo '--- redistribute pushes ---'; grep -cE 'initial redistribute dump push|pushing REDISTRIBUTE_ROUTE_ADD|reconnect redistribute dump' $ROUSTERD_LOG; echo '--- ospf ---'; vtysh -c 'show ip ospf' | grep -E 'ASBR|external LSA'; echo '--- external db ---'; vtysh -c 'show ip ospf database external' | grep -E 'Link State ID|203.0.113.0|external'"
 
 echo "z5d ospfd redistribute-connected interop: PASS"
