@@ -49,7 +49,7 @@ VALID_NET=198.51.100.0/24      # FRR-originated, VRP -> Valid
 INVALID_NET=203.0.113.0/24     # FRR-originated, VRP -> Invalid
 PERMIT_NET=192.0.2.0/24        # ours, export-filtered IN
 BLOCK_NET=198.18.0.0/24        # ours, export-filtered OUT
-QUARANTINE="${ROUSTER_BGP_QUARANTINE:-$(cd "$(dirname "$0")/../../.." && pwd)/away/2026-10-11/weekend/quarantine/bgp-policy}"
+QUARANTINE="${ROUSTER_BGP_QUARANTINE:-$(cd "$(dirname "$0")/../.." && pwd)/away/2026-10-11/weekend/quarantine/bgp-policy}"
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;
