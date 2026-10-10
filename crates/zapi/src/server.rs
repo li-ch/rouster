@@ -2635,11 +2635,9 @@ mod tests {
         ));
         drop(client);
         let session = task.await.unwrap().expect("connection survives");
-        assert!(
-            !session
-                .bfd_destinations
-                .contains_key(&"192.0.2.9".parse::<IpAddr>().unwrap())
-        );
+        assert!(!session
+            .bfd_destinations
+            .contains_key(&"192.0.2.9".parse::<IpAddr>().unwrap()));
         rx.close();
     }
 
