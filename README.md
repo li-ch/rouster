@@ -36,6 +36,12 @@ smoke suite (`scripts/run-smokes.sh`). What actually runs today:
   Results and known deviations: [docs/interop/frr-10.2-interop.md](docs/interop/frr-10.2-interop.md).
   The wire codec is pinned against the real 10.2.2 binary in
   [docs/interop/zapi-10.2-pinned.md](docs/interop/zapi-10.2-pinned.md).
+- **rousterctl — operator CLI**: `rousterctl show sav [--json]` reads
+  savd's published status (installed rule set, running-config summary,
+  monitor counters, pid liveness) and `rousterctl status` inventories the
+  run dir; v1 is read-only over the
+  [run-dir contract](docs/operator-surfaces.md) (`/run/rouster/`) —
+  no daemon, no IPC, the CLI never writes the run dir.
 - **savd — native source address validation**: a SAV Information Base fed
   from the RIB and config; the IBA/IBB/PBA/PBB validation-mode rule model
   (draft-ietf-savnet-general-sav-capabilities); uRPF-family rule
@@ -103,6 +109,7 @@ crates/
   netlink-dp/  Linux netlink dataplane behind the Dataplane trait
   zapi/        FRR ZAPI codec + edge server (plus sniff/probe dev tools)
   rousterd/    the daemon; also builds the staticd ZAPI client (FRR shape)
+  rousterctl/  operator CLI over the run-dir contract (show sav, status)
   sav/         SIB, SAV rule model, uRPF generation, table manager, savd
 scripts/       smoke suite (scripts/test-*.sh) + the run-smokes.sh runner
 docker/        test image definitions

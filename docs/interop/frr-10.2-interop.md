@@ -17,6 +17,18 @@ prefixes in `ip route show proto static`). Two consecutive clean runs.
 Evidence archived under `away/2026-10-08/quarantine/z5/` (rousterd.log,
 staticd.log, mgmtd.log, routes.txt, env.txt).
 
+> **Update (2026-10-10, S5 integration)**: the gateway flavor changed.
+> The dummy0 self-addressed gateway (192.0.2.1) can never satisfy the M3
+> neighbour-liveness gate on the NEXTHOP_UPDATE answer — dummy devices
+> hold no ARP — so staticd (correctly, per the gate) withdrew the
+> gateway route; the smoke now points 198.51.100.0/24 at the docker
+> bridge gateway on eth0 with its neighbour confirmed by a warm-up
+> ping. Side benefit: the flow below's step 6 no longer holds —
+> staticd now sends NEXTHOP_REGISTER for the gateway and consumes the
+> gated NEXTHOP_UPDATE answer live, closing the "future variant
+> pointing the static route at an OFF-subnet gateway" gap (the bridge
+> gateway is on-subnet but external, which is what exercises NHT).
+
 ## What passed
 
 - **Attach**: staticd connected to `/var/run/frr/zserv.api` (0666), sent
@@ -136,6 +148,18 @@ kernel through rousterd — the implementation-plan Phase-1 credibility
 milestone. Reproduce: `scripts/test-z5b-bgpd-interop.sh` (two consecutive
 clean runs). Evidence archived under `away/2026-10-09/quarantine/z5b/`
 (rousterd.log, bgpd.log, mgmtd.log, staticd.log per side + routes/bgp/env).
+
+> **Update (2026-10-10, S5 integration)**: the script now seeds both
+> peers' neighbour entries (one ping each way) after the config push.
+> bgpd will not open the BGP connection until the peer-/32
+> NEXTHOP_REGISTER is answered ACTIVE, and the M3 neighbour-liveness
+> gate needs a confirmed (lladdr) entry for the peer — two quiescent
+> containers never ARP each other, so the session cold-start deadlocked
+> without the seed. Real zebra answers ACTIVE without consulting any
+> neighbour table (nexthop_active, pinned source note in the M3
+> commit); the gate is deliberately stricter (W3 §D3), and the
+> quiescent-peer cold-start is its sharpest interop cost — recorded as
+> a design tension for the owner (S5 report §Deferred).
 
 What passed:
 
@@ -320,3 +344,37 @@ each item cites the program ledger (`away/2026-10-09/LEDGER.md`):
   smoke's own read-side defect — busybox 1.37.0 hides ECMP members
   while the product's multipath route is proven correct via iproute2
   kernel read — not an interop failure (LEDGER M4).
+
+## S5 integration pass (2026-10-10): the M3 gate's topology preconditions
+
+After the four parallel streams landed (16 commits through f16bd71),
+the full suite ran 11/16; all four interop reds traced to M3's
+neighbour-liveness gate (plus w8's CONNECT-table mask — a zebra-
+equivalent semantic the old topology happened to lean on). No product
+or codec change was needed; every fix is the smoke topology taking the
+deployment-with-traffic shape (a confirmed lladdr neighbour for the
+tracked gateway/peer before the client registers it):
+
+- **z5**: gateway flavor changed from the container's own dummy0
+  address (staticd warns "Local connected address is configured as
+  Gateway IP"; a dummy holds no ARP, so the gate answer is permanently
+  unresolved) to the docker bridge gateway with a warm-up ping — the
+  live NHT answer path is now exercised (see the z5 update note).
+- **z5b**: one ping each way seeds the peers' neighbours — without it,
+  quiescent iBGP cold-start deadlocks (bgpd waits for the peer-/32
+  ACTIVE answer; the gate waits for ARP; the ARP would only come from
+  the connection bgpd won't open). Real zebra answers ACTIVE without
+  consulting neighbours; the tension is the owner's to adjudicate
+  (S5 report §Deferred 1).
+- **z5e**: warm-up ping to the default's gateway before the ANSWER
+  phase; the differential (no-default → unresolved) phases are
+  unaffected (the /0 leaves the mirror entirely).
+- **w8**: routed prefix now a /25 past the CONNECT-table exact-prefix
+  mask (see the w8 entry in the smoke header), gateway neighbour
+  confirmed before staticd registers it.
+
+Final state: **16/16 smokes PASS in one sequential run (406 s)** —
+m4-pin, p0a/p0c/p0d/phase0, w3/w4/w4b/w7/w8, z4/z5/z5b/z5c/z5d/z5e.
+Evidence: `away/2026-10-09/quarantine/{z5,z5b,z5e,w8-savd}/` (the
+per-script quarantine captures; the orchestrator's 11:02 failing-run
+w8 captures preserved alongside as `w8-savd-orchestrator-1102/`).
