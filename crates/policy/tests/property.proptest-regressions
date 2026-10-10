@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e615f0038510009b1a588f1abe972fd49685b262cf50ad5520ece942ec2bbae0 # shrinks to gen = GenRouteMap { text: "ip prefix-list PL0 permit 0.0.0.0/0 le 32\nroute-map gen permit 10\n match ip address prefix-list PL0\n set local-preference 60\n", n_entries: 1 }, probe = "10.0.0.0/8", path = [], comms = [], lp = 5, metric = 7
