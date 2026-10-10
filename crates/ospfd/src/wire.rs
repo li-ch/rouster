@@ -55,6 +55,12 @@ impl<'a> Reader<'a> {
             .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
     }
 
+    /// The remaining bytes without advancing (a peek, for probing
+    /// nested lengths before committing a take).
+    pub fn peek_remaining(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
     /// Rest of the buffer.
     pub fn rest(&mut self) -> &'a [u8] {
         let s = &self.buf[self.pos..];

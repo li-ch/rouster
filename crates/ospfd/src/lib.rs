@@ -32,6 +32,8 @@ pub mod checksum;
 pub mod error;
 pub mod lsa;
 pub mod lsdb;
+pub mod neighbor;
+pub mod packet;
 pub mod spf;
 pub mod wire;
 
