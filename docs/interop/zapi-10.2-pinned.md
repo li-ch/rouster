@@ -733,7 +733,7 @@ DOWN @failure  : 00000002 02 c0a8d705 20 00000002 02 00000000 20 00
                 |        |  |         |  |         |  |         +-- src.plen u8 = 32
                 |        |  |         |  |         |  +-- src = 0.0.0.0 (single-hop wildcard)
                 |        |  |         |  |         +-- src.family u8 = AF_INET
-                |        |  |         |  +-- status u32 BE: 2 = BFD_STATUS_DOWN, 1 = BFD_STATUS_UP
+                |        |  |         |  +-- status u32 BE — a BITMASK (frr-10.2.2 lib/bfd.h): UNKNOWN=1<<0, DOWN=1<<1 (=2, observed), UP=1<<2 (=4, observed), ADMIN_DOWN=1<<3
                 |        |  |         +-- dst.plen u8 = 32
                 |        |  +-- dst = 192.168.215.5 (the registered destination)
                 |        +-- dst.family u8 = AF_INET

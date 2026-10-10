@@ -15,11 +15,11 @@ pub mod server;
 pub use client::{route_add_message, route_delete_message, route_type_from, ZapiClient};
 pub use header::{ZapiHeader, ZapiHeaderError, ZAPI_HEADER_LEN, ZAPI_MARKER, ZAPI_VERSION};
 pub use message::{
-    blackhole_type, message_flag, nexthop_flag, nexthop_type, route_notify_note, route_type,
-    ZapiCodecError, ZapiCommand, ZapiHello, ZapiInterface, ZapiInterfaceAddress, ZapiMessage,
-    ZapiNeighNotify, ZapiNeighRegister, ZapiNexthop, ZapiNexthopRegister, ZapiNexthopUpdate,
-    ZapiRedistribute, ZapiRoute, ZapiRouteNotifyOwner, ZapiRouterIdUpdate,
-    ZEBRA_NEIGH_STATE_FAILED,
+    bfd_status, blackhole_type, message_flag, nexthop_flag, nexthop_type, route_notify_note,
+    route_type, ZapiBfdDestStatus, ZapiBfdSessionCmd, ZapiCodecError, ZapiCommand, ZapiHello,
+    ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNeighNotify, ZapiNeighRegister,
+    ZapiNexthop, ZapiNexthopRegister, ZapiNexthopUpdate, ZapiRedistribute, ZapiRoute,
+    ZapiRouteNotifyOwner, ZapiRouterIdUpdate, ZEBRA_NEIGH_STATE_FAILED,
 };
 pub use server::{
     run_session, serve, InterfaceMirror, NhtRegistration, RibCommand, SessionPush, ZapiSession,

@@ -2,13 +2,14 @@
 //! surface).
 //!
 //! The CLIENT twin of zapi-sniff for the BFD message family: connects to a
-//! REAL zebra's zserv socket as a daemon would, sends the bgpd-shaped HELLO
-//! + ZEBRA_BFD_CLIENT_REGISTER (36, pid) + one ZEBRA_BFD_DEST_REGISTER
-//! (27) for `--peer`, and logs every frame zebra pushes back — the
-//! ZEBRA_INTERFACE_BFD_DEST_UPDATE (26) / BFD_DEST_UPDATE (29) bodies the
-//! pinned doc needs. With a real bfdd also attached to the same zebra, the
-//! registered destination becomes a live BFD session: bringing the peer up
-//! and killing it captures the Up and Down pushes.
+//! REAL zebra's zserv socket as a daemon would, sends the bgpd-shaped HELLO,
+//! then ZEBRA_BFD_CLIENT_REGISTER (36, pid), then one
+//! ZEBRA_BFD_DEST_REGISTER (27) for `--peer`, and logs every frame zebra
+//! pushes back — the ZEBRA_INTERFACE_BFD_DEST_UPDATE (26) /
+//! BFD_DEST_UPDATE (29) bodies the pinned doc needs. With a real bfdd also
+//! attached to the same zebra, the registered destination becomes a live
+//! BFD session: bringing the peer up and killing it captures the Up and
+//! Down pushes.
 //!
 //! Outgoing REGISTER bodies are built from the W1-b wire pin (a real
 //! bgpd 10.2.2 multihop frame, byte-identical golden test below) and the
@@ -78,7 +79,11 @@ impl BfdRegister {
         b.push(self.hops);
         // Single-hop carries the interface when known; multihop never does
         // (frr-10.2.2 lib/bfd.c sends ifnamelen 0 when mhop).
-        let ifname = if self.mhop { None } else { self.ifname.as_deref() };
+        let ifname = if self.mhop {
+            None
+        } else {
+            self.ifname.as_deref()
+        };
         match ifname {
             Some(name) => {
                 b.push(name.len() as u8);
@@ -222,9 +227,7 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("bad --source: {e}"))?,
                 )
             }
-            "--ifname" => {
-                ifname = Some(it.next().ok_or("--ifname needs a value")?)
-            }
+            "--ifname" => ifname = Some(it.next().ok_or("--ifname needs a value")?),
             "--vrf" => {
                 vrf_id = it
                     .next()
@@ -409,7 +412,8 @@ async fn main() -> std::process::ExitCode {
             remaining
         } else {
             let at = Duration::from_secs(args.deregister_at.unwrap());
-            at.saturating_sub(started.elapsed()).max(Duration::from_millis(50))
+            at.saturating_sub(started.elapsed())
+                .max(Duration::from_millis(50))
         };
         let header = match timeout(read_budget, stream.read_exact(&mut header_buf)).await {
             Err(_) if args.deregister_at.is_some() && !deregistered => continue,
@@ -441,7 +445,10 @@ async fn main() -> std::process::ExitCode {
         let remaining = window.saturating_sub(started.elapsed());
         match timeout(remaining, stream.read_exact(&mut body)).await {
             Err(_) => {
-                log_line(&file, &format!("ts={} event=WINDOW_END mid_body", iso8601_now()));
+                log_line(
+                    &file,
+                    &format!("ts={} event=WINDOW_END mid_body", iso8601_now()),
+                );
                 break;
             }
             Ok(Err(e)) => {
@@ -474,7 +481,10 @@ async fn main() -> std::process::ExitCode {
     let _ = stream.shutdown().await;
     log_line(
         &file,
-        &format!("ts={} event=END msgs={msgs} bfd_updates={cmd26}", iso8601_now()),
+        &format!(
+            "ts={} event=END msgs={msgs} bfd_updates={cmd26}",
+            iso8601_now()
+        ),
     );
     eprintln!(
         "zapi-bfd-probe: window done, msgs={msgs} bfd_updates={cmd26} (log: {})",
@@ -546,7 +556,10 @@ mod tests {
             unhex("000010920002c0000209000000640000006403000002000000000104657468300000")
         );
         // ...and without a known interface the body is exactly 30 bytes.
-        let reg = BfdRegister { ifname: None, ..reg };
+        let reg = BfdRegister {
+            ifname: None,
+            ..reg
+        };
         assert_eq!(reg.encode().len(), 30);
         assert_eq!(
             reg.encode(),
@@ -572,7 +585,10 @@ mod tests {
             profile: None,
         };
         let bytes = reg.encode();
-        assert_eq!(bytes.len(), 4 + 2 + 16 + 4 + 4 + 1 + 1 + 2 + 16 + 1 + 1 + 1 + 1);
+        assert_eq!(
+            bytes.len(),
+            4 + 2 + 16 + 4 + 4 + 1 + 1 + 2 + 16 + 1 + 1 + 1 + 1
+        );
         assert_eq!(&bytes[..6], &unhex("00000007000a")[..]);
         assert_eq!(&bytes[bytes.len() - 3..], &unhex("000000")[..]);
     }

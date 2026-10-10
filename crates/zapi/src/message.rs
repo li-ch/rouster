@@ -634,6 +634,10 @@ pub enum ZapiCodecError {
     TrailingBytes(usize),
     #[error("interface name is {len} bytes, max {max}")]
     NameTooLong { len: usize, max: usize },
+    #[error("BFD command carries family {first} for dst but {second} for src")]
+    FamilyMismatch { first: u16, second: u16 },
+    #[error("interface/profile name is not valid UTF-8")]
+    BadIfname,
 }
 
 // ---------------------------------------------------------------------------
@@ -2064,6 +2068,289 @@ impl ZapiRouteNotifyOwner {
 }
 
 // ---------------------------------------------------------------------------
+// The BFD message family (W1-b pins)
+// ---------------------------------------------------------------------------
+
+/// Status bits of ZEBRA_INTERFACE_BFD_DEST_UPDATE (26) — frr-10.2.2
+/// `lib/bfd.h` defines them as BITMASKS (`1 << n`), not enum values;
+/// E (W1-b Phase B): DOWN=2 observed at register and at failure, UP=4
+/// while the session was established.
+pub mod bfd_status {
+    /// BFD session status never received (`1 << 0`).
+    pub const UNKNOWN: u32 = 1;
+    /// BFD session status is down (`1 << 1`).
+    pub const DOWN: u32 = 2;
+    /// BFD session status is up (`1 << 2`).
+    pub const UP: u32 = 4;
+    /// BFD session is admin down (`1 << 3`).
+    pub const ADMIN_DOWN: u32 = 8;
+}
+
+/// The client→zebra BFD session command body, shared by
+/// ZEBRA_BFD_DEST_REGISTER (27), ZEBRA_BFD_DEST_DEREGISTER (28) and
+/// ZEBRA_BFD_DEST_UPDATE (29) — one encoder in frr-10.2.2
+/// (`zclient_bfd_command`, `lib/bfd.c`) writes all three, so the body
+/// is one shape (the command differs only in the header).
+///
+/// E (W1-b Phase A): the exact 30 bytes a real bgpd 10.2.2 sent for a
+/// multihop neighbor with `update-source`; single-hop differs only in
+/// mhop=0/src=0.0.0.0/hops=1 and a carried ifname (source-read branch;
+/// pinned by Phase B acceptance — see the pinned doc deviations).
+///
+/// `pid` u32 BE | family u16 BE | dst (family-sized) | min_rx u32 BE
+/// (MILLISECONDS) | min_tx u32 BE (ms) | detection_multiplier u8 |
+/// mhop u8 | family u16 BE (again) | src (family-sized) | hops u8 |
+/// ifnamelen u8 [+ name] | cbit u8 | profilelen u8 [+ name].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZapiBfdSessionCmd {
+    /// The sender's `getpid()`; zebra keys its per-client fan-out on it.
+    pub pid: u32,
+    pub dst: IpAddr,
+    /// Required minimum receive interval, milliseconds.
+    pub min_rx_ms: u32,
+    /// Desired minimum transmit interval, milliseconds.
+    pub min_tx_ms: u32,
+    pub detection_multiplier: u8,
+    pub mhop: bool,
+    /// 0.0.0.0/:: when the client has no local address (single-hop).
+    pub src: IpAddr,
+    /// 255 in bgpd's multihop frame (p->ttl); 1 single-hop.
+    pub hops: u8,
+    /// Carried for single-hop when the egress interface is known;
+    /// multihop always sends ifnamelen 0 (frr suppresses it).
+    pub ifname: Option<String>,
+    /// Control-plane-independent bit.
+    pub cbit: bool,
+    /// bfd profile name, when configured.
+    pub profile: Option<String>,
+}
+
+impl ZapiBfdSessionCmd {
+    pub fn decode(body: &[u8]) -> Result<Self, ZapiCodecError> {
+        let mut b = body;
+        let pid = take_be_u32(&mut b)?;
+        let family = take_be_u16(&mut b)?;
+        let blen = family_blen(family)?;
+        let dst_raw = take_n(&mut b, blen)?;
+        let min_rx_ms = take_be_u32(&mut b)?;
+        let min_tx_ms = take_be_u32(&mut b)?;
+        let detection_multiplier = take_u8(&mut b)?;
+        let mhop = take_u8(&mut b)? != 0;
+        let family2 = take_be_u16(&mut b)?;
+        if family2 != family {
+            return Err(ZapiCodecError::FamilyMismatch {
+                first: family,
+                second: family2,
+            });
+        }
+        let src_raw = take_n(&mut b, blen)?;
+        let hops = take_u8(&mut b)?;
+        let ifnamelen = take_u8(&mut b)? as usize;
+        if ifnamelen > b.len() {
+            return Err(ZapiCodecError::Truncated {
+                need: ifnamelen - b.len(),
+            });
+        }
+        let ifname = if ifnamelen > 0 {
+            Some(
+                std::str::from_utf8(&b[..ifnamelen])
+                    .map_err(|_| ZapiCodecError::BadIfname)?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        b = &b[ifnamelen..];
+        let cbit = take_u8(&mut b)? != 0;
+        let profilelen = take_u8(&mut b)? as usize;
+        if profilelen > b.len() {
+            return Err(ZapiCodecError::Truncated {
+                need: profilelen - b.len(),
+            });
+        }
+        let profile = if profilelen > 0 {
+            Some(
+                std::str::from_utf8(&b[..profilelen])
+                    .map_err(|_| ZapiCodecError::BadIfname)?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        b = &b[profilelen..];
+        if !b.is_empty() {
+            return Err(ZapiCodecError::TrailingBytes(b.len()));
+        }
+        Ok(Self {
+            pid,
+            dst: ip_from_parts(family, dst_raw)?,
+            min_rx_ms,
+            min_tx_ms,
+            detection_multiplier,
+            mhop,
+            src: ip_from_parts(family, src_raw)?,
+            hops,
+            ifname,
+            cbit,
+            profile,
+        })
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32(self.pid);
+        let (family, dst, src) = match (self.dst, self.src) {
+            (IpAddr::V4(d), IpAddr::V4(s)) => (AF_INET, d.octets().to_vec(), s.octets().to_vec()),
+            (IpAddr::V6(d), IpAddr::V6(s)) => (AF_INET6, d.octets().to_vec(), s.octets().to_vec()),
+            _ => panic!("src/dst family mismatch"),
+        };
+        buf.put_u16(family);
+        buf.put_slice(&dst);
+        buf.put_u32(self.min_rx_ms);
+        buf.put_u32(self.min_tx_ms);
+        buf.put_u8(self.detection_multiplier);
+        buf.put_u8(u8::from(self.mhop));
+        buf.put_u16(family);
+        buf.put_slice(&src);
+        buf.put_u8(self.hops);
+        // Multihop suppresses the interface (frr-10.2.2 lib/bfd.c).
+        let ifname = if self.mhop {
+            None
+        } else {
+            self.ifname.as_deref()
+        };
+        match ifname {
+            Some(name) => {
+                buf.put_u8(name.len() as u8);
+                buf.put_slice(name.as_bytes());
+            }
+            None => buf.put_u8(0),
+        }
+        buf.put_u8(u8::from(self.cbit));
+        match &self.profile {
+            Some(p) => {
+                buf.put_u8(p.len() as u8);
+                buf.put_slice(p.as_bytes());
+            }
+            None => buf.put_u8(0),
+        }
+    }
+}
+
+fn ip_from_parts(family: u16, raw: &[u8]) -> Result<IpAddr, ZapiCodecError> {
+    match family {
+        AF_INET => {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(raw);
+            Ok(IpAddr::V4(std::net::Ipv4Addr::from(a)))
+        }
+        AF_INET6 => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(raw);
+            Ok(IpAddr::V6(std::net::Ipv6Addr::from(a)))
+        }
+        other => Err(ZapiCodecError::BadFamily(other)),
+    }
+}
+
+/// ZEBRA_INTERFACE_BFD_DEST_UPDATE (26) zebra→client body — the BFD
+/// state push for a registered destination. E (W1-b Phase B): captured
+/// in three states (DOWN at register with ifindex 0, UP with the
+/// resolved egress ifindex, DOWN after failure); layout cross-verified
+/// against `bfd_get_peer_info` (frr-10.2.2 `lib/bfd.c`):
+///
+/// `ifindex` u32 BE | dst.family **u8** | dst address (family-sized) |
+/// dst.prefixlen u8 | status u32 BE ([`bfd_status`]) | src.family u8 |
+/// src address | src.prefixlen u8 | remote_cbit u8. Note the u8
+/// families (NOT the register's u16) — FRR's `struct prefix` carries a
+/// one-byte family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZapiBfdDestStatus {
+    /// 0 until zebra resolved the egress interface (E: 0 at register, 2
+    /// for eth0 once resolved).
+    pub ifindex: u32,
+    /// The registered destination as a /32 or /128 (E: plen 32).
+    pub dst: IpPrefix,
+    /// [`bfd_status`] value.
+    pub status: u32,
+    /// The session's local address as a prefix; single-hop wildcard
+    /// shows 0.0.0.0/32 (E).
+    pub src: IpPrefix,
+    /// The peer's control-plane-independent bit.
+    pub remote_cbit: bool,
+}
+
+impl ZapiBfdDestStatus {
+    pub fn decode(body: &[u8]) -> Result<Self, ZapiCodecError> {
+        let mut b = body;
+        let ifindex = take_be_u32(&mut b)?;
+        let dst_family = u16::from(take_u8(&mut b)?);
+        let dst_blen = family_blen(dst_family)?;
+        let dst_raw = take_n(&mut b, dst_blen)?;
+        let dst_len = take_u8(&mut b)?;
+        let status = take_be_u32(&mut b)?;
+        let src_family = u16::from(take_u8(&mut b)?);
+        let src_blen = family_blen(src_family)?;
+        let src_raw = take_n(&mut b, src_blen)?;
+        let src_len = take_u8(&mut b)?;
+        let remote_cbit = take_u8(&mut b)? != 0;
+        if !b.is_empty() {
+            return Err(ZapiCodecError::TrailingBytes(b.len()));
+        }
+        let dst = prefix_from_parts(dst_family, dst_raw, dst_len)?;
+        let src = prefix_from_parts(src_family, src_raw, src_len)?;
+        Ok(Self {
+            ifindex,
+            dst,
+            status,
+            src,
+            remote_cbit,
+        })
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32(self.ifindex);
+        put_u8_family_prefix(buf, &self.dst);
+        buf.put_u32(self.status);
+        put_u8_family_prefix(buf, &self.src);
+        buf.put_u8(u8::from(self.remote_cbit));
+    }
+}
+
+fn prefix_from_parts(family: u16, raw: &[u8], len: u8) -> Result<IpPrefix, ZapiCodecError> {
+    match family {
+        AF_INET => {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(raw);
+            v4_prefix(a, len)
+        }
+        AF_INET6 => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(raw);
+            v6_prefix(a, len)
+        }
+        other => Err(ZapiCodecError::BadFamily(other)),
+    }
+}
+
+/// family u8 | address bytes | prefixlen u8 — the `struct prefix`
+/// shape the BFD update carries (contrast [`put_addr_prefix`], the u16
+/// family form of NHT prefixes).
+fn put_u8_family_prefix(buf: &mut BytesMut, p: &IpPrefix) {
+    match p {
+        IpPrefix::V4(net) => {
+            buf.put_u8(AF_INET as u8);
+            buf.put_slice(&net.addr().octets());
+            buf.put_u8(net.prefix_len());
+        }
+        IpPrefix::V6(net) => {
+            buf.put_u8(AF_INET6 as u8);
+            buf.put_slice(&net.addr().octets());
+            buf.put_u8(net.prefix_len());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The message envelope
 // ---------------------------------------------------------------------------
 
@@ -2137,6 +2424,28 @@ pub enum ZapiMessage {
     BfdClientRegister {
         pid: u32,
     },
+    /// ZEBRA_BFD_DEST_REGISTER (27), client→zebra: arm a BFD session for
+    /// a destination. E (W1-b Phase A): the bgpd multihop frame; the
+    /// body layout is shared with DEREGISTER (28) and UPDATE (29) —
+    /// one encoder in frr-10.2.2 `zclient_bfd_command`.
+    BfdDestRegister(ZapiBfdSessionCmd),
+    /// ZEBRA_BFD_DEST_DEREGISTER (28): SRC body (same shape), E-absent —
+    /// no daemon observed sending one (W1-b); zebra answers nothing.
+    BfdDestDeregister(ZapiBfdSessionCmd),
+    /// ZEBRA_BFD_DEST_UPDATE (29), client→zebra: re-announce parameters
+    /// of an installed session. E (W1-b Phase A): bgpd's re-install
+    /// frame, byte-identical body to its REGISTER.
+    BfdDestUpdate(ZapiBfdSessionCmd),
+    /// ZEBRA_BFD_DEST_REPLAY (30), the BFD daemon→zebra: replay the
+    /// registered destinations to me; body = the daemon's pid u32.
+    /// E (W1-b Phase A): bfdd's connect burst.
+    BfdDestReplay {
+        pid: u32,
+    },
+    /// ZEBRA_INTERFACE_BFD_DEST_UPDATE (26), zebra→client: BFD state
+    /// push for a registered destination. E (W1-b Phase B): captured in
+    /// three states (DOWN@register / UP / DOWN@failure).
+    InterfaceBfdDestUpdate(ZapiBfdDestStatus),
     /// ZEBRA_LABEL_MANAGER_CONNECT (49): proto u8 + instance u16. E: bgpd
     /// label-manager client.
     LabelManagerConnect {
@@ -2229,6 +2538,24 @@ impl ZapiMessage {
                 }
                 Ok(Self::BfdClientRegister { pid })
             }
+            ZapiCommand::BfdDestRegister => {
+                Ok(Self::BfdDestRegister(ZapiBfdSessionCmd::decode(body)?))
+            }
+            ZapiCommand::BfdDestDeregister => {
+                Ok(Self::BfdDestDeregister(ZapiBfdSessionCmd::decode(body)?))
+            }
+            ZapiCommand::BfdDestUpdate => Ok(Self::BfdDestUpdate(ZapiBfdSessionCmd::decode(body)?)),
+            ZapiCommand::BfdDestReplay => {
+                let mut b = body;
+                let pid = take_be_u32(&mut b)?;
+                if !b.is_empty() {
+                    return Err(ZapiCodecError::TrailingBytes(b.len()));
+                }
+                Ok(Self::BfdDestReplay { pid })
+            }
+            ZapiCommand::InterfaceBfdDestUpdate => Ok(Self::InterfaceBfdDestUpdate(
+                ZapiBfdDestStatus::decode(body)?,
+            )),
             ZapiCommand::LabelManagerConnect => {
                 let mut b = body;
                 let proto = take_u8(&mut b)?;
@@ -2286,6 +2613,11 @@ impl ZapiMessage {
             Self::RedistributeRouteAdd(_) => 31,
             Self::RedistributeRouteDel(_) => 32,
             Self::BfdClientRegister { .. } => 36,
+            Self::BfdDestRegister(_) => 27,
+            Self::BfdDestDeregister(_) => 28,
+            Self::BfdDestUpdate(_) => 29,
+            Self::BfdDestReplay { .. } => 30,
+            Self::InterfaceBfdDestUpdate(_) => 26,
             Self::LabelManagerConnect { .. } => 49,
             Self::LabelManagerConnectResult { .. } => 49,
             Self::RouteNotifyRequest { .. } => 126,
@@ -2348,6 +2680,20 @@ impl ZapiMessage {
             }
             Self::BfdClientRegister { pid } => {
                 buf.put_u32(*pid);
+                Ok(())
+            }
+            Self::BfdDestRegister(cmd)
+            | Self::BfdDestDeregister(cmd)
+            | Self::BfdDestUpdate(cmd) => {
+                cmd.encode(buf);
+                Ok(())
+            }
+            Self::BfdDestReplay { pid } => {
+                buf.put_u32(*pid);
+                Ok(())
+            }
+            Self::InterfaceBfdDestUpdate(update) => {
+                update.encode(buf);
                 Ok(())
             }
             Self::LabelManagerConnect { proto, instance } => {
@@ -2583,6 +2929,229 @@ mod tests {
         assert_eq!(msg2, ZapiMessage::BfdClientRegister { pid: 535 });
         assert_eq!(roundtrip(&msg), hex("00000175"));
         assert_eq!(roundtrip(&msg2), hex("00000217"));
+    }
+
+    /// W1-b Phase A goldens: the exact bytes real FRR 10.2.2 speakers
+    /// sent — bgpd's multihop REGISTER (27) and its byte-identical
+    /// re-install UPDATE (29), and bfdd's REPLAY (30) pid body.
+    #[test]
+    fn bfd_dest_register_decodes_the_captured_bgpd_frame() {
+        let wire = hex("000000520002c63364090000012c0000012c03010002c0a8d704ff000000");
+        let msg = ZapiMessage::decode(27, &wire).unwrap();
+        let cmd = ZapiBfdSessionCmd {
+            pid: 0x52,
+            dst: "198.51.100.9".parse().unwrap(),
+            min_rx_ms: 300,
+            min_tx_ms: 300,
+            detection_multiplier: 3,
+            mhop: true,
+            src: "192.168.215.4".parse().unwrap(),
+            hops: 255,
+            ifname: None,
+            cbit: false,
+            profile: None,
+        };
+        assert_eq!(msg, ZapiMessage::BfdDestRegister(cmd.clone()));
+        assert_eq!(msg.command(), 27);
+        assert_eq!(
+            roundtrip(&msg),
+            wire,
+            "REGISTER re-encodes byte-identically"
+        );
+
+        // The re-install frame: same body, command 29.
+        let upd = ZapiMessage::decode(29, &wire).unwrap();
+        assert_eq!(upd, ZapiMessage::BfdDestUpdate(cmd));
+        assert_eq!(roundtrip(&upd), wire);
+    }
+
+    /// The DEREGISTER (28) twin shares the body (SRC — no wire frame
+    /// exists; the same-encoder source read).
+    #[test]
+    fn bfd_dest_deregister_shares_the_body() {
+        let wire = hex("000000520002c63364090000012c0000012c03010002c0a8d704ff000000");
+        let msg = ZapiMessage::decode(28, &wire).unwrap();
+        assert!(matches!(msg, ZapiMessage::BfdDestDeregister(_)));
+        assert_eq!(msg.command(), 28);
+        assert_eq!(roundtrip(&msg), wire);
+    }
+
+    /// The single-hop REGISTER the Phase B probe sent and a real zebra
+    /// accepted (30 bytes, ifnamelen 0, wildcard source).
+    #[test]
+    fn bfd_dest_register_single_hop_roundtrips() {
+        let wire = hex("0000003b0002c0a8d7050000006400000064030000020000000001000000");
+        let msg = ZapiMessage::decode(27, &wire).unwrap();
+        match &msg {
+            ZapiMessage::BfdDestRegister(cmd) => {
+                assert_eq!(cmd.dst, "192.168.215.5".parse::<IpAddr>().unwrap());
+                assert!(!cmd.mhop);
+                assert_eq!(cmd.hops, 1);
+                assert_eq!(cmd.src, "0.0.0.0".parse::<IpAddr>().unwrap());
+                assert_eq!(
+                    (cmd.min_rx_ms, cmd.min_tx_ms, cmd.detection_multiplier),
+                    (100, 100, 3)
+                );
+            }
+            other => panic!("not a register: {other:?}"),
+        }
+        assert_eq!(roundtrip(&msg), wire);
+    }
+
+    /// Single-hop with a known egress interface carries ifname (the
+    /// encoder branch frr's `zclient_bfd_command` source-read shows);
+    /// multihop suppresses it even when set (so an mhop cmd with ifname
+    /// set does NOT round-trip — encode drops it, mirroring frr).
+    #[test]
+    fn bfd_dest_register_ifname_rules() {
+        let cmd = ZapiBfdSessionCmd {
+            pid: 9,
+            dst: "192.0.2.9".parse().unwrap(),
+            min_rx_ms: 300,
+            min_tx_ms: 300,
+            detection_multiplier: 3,
+            mhop: false,
+            src: "0.0.0.0".parse().unwrap(),
+            hops: 1,
+            ifname: Some("eth0".to_string()),
+            cbit: false,
+            profile: None,
+        };
+        let msg = ZapiMessage::BfdDestRegister(cmd);
+        let wire = roundtrip(&msg);
+        assert_eq!(wire.len(), 30 + 4);
+        assert_eq!(&wire[27..29], &[4, b'e']);
+        // Multihop: the ifname byte is 0 even though one is set (encode
+        // drops it — mirroring frr — so the struct is NOT round-trip
+        // equal; assert on the wire, not via the roundtrip helper).
+        let ZapiMessage::BfdDestRegister(base) = &msg else {
+            unreachable!()
+        };
+        let mhop = ZapiMessage::BfdDestRegister(ZapiBfdSessionCmd {
+            mhop: true,
+            hops: 255,
+            src: "192.0.2.1".parse().unwrap(),
+            ..base.clone()
+        });
+        let mut buf = BytesMut::new();
+        mhop.encode_body(&mut buf).unwrap();
+        assert_eq!(buf.len(), 30, "multihop suppresses the ifname");
+        assert_eq!(buf[27], 0, "the ifnamelen byte");
+    }
+
+    /// A profile name rides profilelen + bytes (bgpd `neighbor X bfd
+    /// profile NAME`).
+    #[test]
+    fn bfd_dest_register_with_profile_roundtrips() {
+        let cmd = ZapiBfdSessionCmd {
+            pid: 5,
+            dst: "2001:db8::9".parse().unwrap(),
+            min_rx_ms: 300,
+            min_tx_ms: 300,
+            detection_multiplier: 5,
+            mhop: true,
+            src: "2001:db8::1".parse().unwrap(),
+            hops: 255,
+            ifname: None,
+            cbit: true,
+            profile: Some("slow".to_string()),
+        };
+        let msg = ZapiMessage::BfdDestUpdate(cmd);
+        let wire = roundtrip(&msg);
+        assert_eq!(
+            wire.len(),
+            4 + 2 + 16 + 4 + 4 + 1 + 1 + 2 + 16 + 1 + 1 + 1 + 1 + 4
+        );
+    }
+
+    /// bfdd's REPLAY (30) — 4-byte pid body, E.
+    #[test]
+    fn bfd_dest_replay_decodes_captured_body() {
+        let msg = ZapiMessage::decode(30, &hex("0000001e")).unwrap();
+        assert_eq!(msg, ZapiMessage::BfdDestReplay { pid: 30 });
+        assert_eq!(roundtrip(&msg), hex("0000001e"));
+        assert_eq!(
+            ZapiMessage::decode(30, &hex("0000001e00")),
+            Err(ZapiCodecError::TrailingBytes(1))
+        );
+    }
+
+    /// W1-b Phase B goldens: the three INTERFACE_BFD_DEST_UPDATE (26)
+    /// states a real zebra 10.2.2 pushed — DOWN at register (ifindex
+    /// 0), UP (ifindex 2), DOWN after the peer vanished.
+    #[test]
+    fn interface_bfd_dest_update_decodes_the_three_captured_states() {
+        let cases = [
+            (
+                "0000000002c0a8d705200000000202000000002000",
+                0,
+                bfd_status::DOWN,
+            ),
+            (
+                "0000000202c0a8d705200000000402000000002000",
+                2,
+                bfd_status::UP,
+            ),
+            (
+                "0000000202c0a8d705200000000202000000002000",
+                2,
+                bfd_status::DOWN,
+            ),
+        ];
+        for (wire, ifindex, status) in cases {
+            let wire = hex(wire);
+            let msg = ZapiMessage::decode(26, &wire).unwrap();
+            assert_eq!(
+                msg,
+                ZapiMessage::InterfaceBfdDestUpdate(ZapiBfdDestStatus {
+                    ifindex,
+                    dst: "192.168.215.5/32".parse().unwrap(),
+                    status,
+                    src: "0.0.0.0/32".parse().unwrap(),
+                    remote_cbit: false,
+                }),
+                "state ifindex={ifindex} status={status}"
+            );
+            assert_eq!(msg.command(), 26);
+            assert_eq!(roundtrip(&msg), wire, "re-encode must be byte-identical");
+        }
+    }
+
+    /// Structural errors: truncated bodies, family mismatch between the
+    /// two address slots, ifname overrun, trailing bytes, bad plen.
+    #[test]
+    fn bfd_session_cmd_rejects_malformed_bodies() {
+        // family word says AF_INET6 but only 4 address bytes follow.
+        assert!(matches!(
+            ZapiMessage::decode(27, &hex("00000001000a0001")),
+            Err(ZapiCodecError::Truncated { .. })
+        ));
+        // Second family word differs from the first (AF_INET6 vs AF_INET).
+        let wire = hex("000000010002c000020900000064000000640300000a0000000000");
+        assert!(matches!(
+            ZapiMessage::decode(27, &wire),
+            Err(ZapiCodecError::FamilyMismatch { .. })
+        ));
+        // ifnamelen overruns the body.
+        let wire = hex("000000010002c0000209000000640000006403000002000000000105");
+        assert!(matches!(
+            ZapiMessage::decode(27, &wire),
+            Err(ZapiCodecError::Truncated { .. })
+        ));
+        // trailing byte after a complete body.
+        let mut long = hex("0000003b0002c0a8d7050000006400000064030000020000000001000000");
+        long.push(0);
+        assert_eq!(
+            ZapiMessage::decode(27, &long),
+            Err(ZapiCodecError::TrailingBytes(1))
+        );
+        // Update with a prefix length beyond the family maximum.
+        let mut bad = hex("0000000002c0a8d705200000000202000000002000").to_vec();
+        bad[9] = 33; // dst.plen
+        assert_eq!(
+            ZapiMessage::decode(26, &bad),
+            Err(ZapiCodecError::BadPrefixLen { family: 2, len: 33 })
+        );
     }
 
     #[test]

@@ -47,8 +47,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 use zapi::header::ZapiHeaderError;
 use zapi::{
-    ZapiHeader, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
-    ZapiNexthopRegister, ZapiNexthopUpdate, ZAPI_HEADER_LEN,
+    ZapiHeader, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop, ZapiNexthopRegister,
+    ZapiNexthopUpdate, ZAPI_HEADER_LEN,
 };
 
 /// Max bytes buffered per connection before we declare the peer garbage and
@@ -161,9 +161,7 @@ impl FromStr for FakeIface {
             ifindex: ifindex
                 .parse()
                 .map_err(|_| format!("bad ifindex `{ifindex}`"))?,
-            addr: addr
-                .parse()
-                .map_err(|_| format!("bad address `{addr}`"))?,
+            addr: addr.parse().map_err(|_| format!("bad address `{addr}`"))?,
             plen: plen
                 .parse()
                 .map_err(|_| format!("bad prefix length `{plen}`"))?,
@@ -288,37 +286,37 @@ async fn main() -> std::process::ExitCode {
         };
         let conn = next_conn.fetch_add(1, Ordering::SeqCst);
         let sink = Arc::clone(&sink);
-        let respond_hello = args.respond_hello;
-        let hello_cmd = args.hello_cmd;
-        let respond_labelmgr = args.respond_labelmgr;
-        let respond_iface = args.respond_iface.clone();
-        let respond_nht = args.respond_nht;
+        let responders = Responders {
+            hello: args.respond_hello,
+            hello_cmd: args.hello_cmd,
+            labelmgr: args.respond_labelmgr,
+            iface: args.respond_iface.clone(),
+            nht: args.respond_nht,
+        };
         tokio::spawn(async move {
-            handle_conn(
-                stream,
-                conn,
-                sink,
-                respond_hello,
-                hello_cmd,
-                respond_labelmgr,
-                respond_iface,
-                respond_nht,
-            )
-            .await;
+            handle_conn(stream, conn, sink, responders).await;
         });
     }
 }
 
-async fn handle_conn(
-    mut stream: UnixStream,
-    conn: u64,
-    sink: LogSink,
-    respond_hello: bool,
+/// The per-connection answer policy (what the masquerade replies to).
+#[derive(Debug, Clone)]
+struct Responders {
+    hello: bool,
     hello_cmd: u16,
-    respond_labelmgr: bool,
-    respond_iface: Option<FakeIface>,
-    respond_nht: bool,
-) {
+    labelmgr: bool,
+    iface: Option<FakeIface>,
+    nht: bool,
+}
+
+async fn handle_conn(mut stream: UnixStream, conn: u64, sink: LogSink, responders: Responders) {
+    let Responders {
+        hello: respond_hello,
+        hello_cmd,
+        labelmgr: respond_labelmgr,
+        iface: respond_iface,
+        nht: respond_nht,
+    } = responders;
     log_line(
         &sink,
         &format!("ts={} conn={conn} event=CONNECT", iso8601_now()),
@@ -581,14 +579,15 @@ fn iface_reply(iface: &FakeIface) -> Result<Vec<Vec<u8>>, String> {
             if plen > 32 {
                 return Err(format!("bad v4 prefix length /{plen}"));
             }
-            let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+            let mask = if plen == 0 {
+                0
+            } else {
+                u32::MAX << (32 - plen)
+            };
             let net = u32::from_be_bytes(a.octets()) & mask;
-            format!(
-                "{}/{plen}",
-                std::net::Ipv4Addr::from(net.to_be_bytes())
-            )
-            .parse()
-            .map_err(|e: common::PrefixError| e.to_string())?
+            format!("{}/{plen}", std::net::Ipv4Addr::from(net.to_be_bytes()))
+                .parse()
+                .map_err(|e: common::PrefixError| e.to_string())?
         }
         std::net::IpAddr::V6(a) => {
             if iface.plen != 128 {
