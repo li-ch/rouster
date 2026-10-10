@@ -65,6 +65,11 @@ pub struct SessionConfig {
     pub passive: bool,
     /// Control Plane Independent bit on transmission (§4.1).
     pub control_plane_independent: bool,
+    /// Appendix A (non-normative) automatic version negotiation: when
+    /// off (the default), §6.8.6 step 1 discards any version that is
+    /// not 1; when on, a received v0 packet switches the session's
+    /// transmit version to 0 and a v1 AdminDown switches it back.
+    pub version_negotiation: bool,
     /// Simple Password authentication, when configured (§6.7.2).
     pub auth: Option<AuthConfig>,
 }
@@ -80,6 +85,7 @@ impl Default for SessionConfig {
             demand_mode: false,
             passive: false,
             control_plane_independent: false,
+            version_negotiation: false,
             auth: None,
         }
     }
@@ -199,6 +205,12 @@ impl SessionSm {
 
     pub fn local_discr(&self) -> u32 {
         self.local_discr
+    }
+
+    /// The diagnostic the next transmission carries (§6.8.1's
+    /// bfd.LocalDiag).
+    pub fn diag(&self) -> Diagnostic {
+        self.local_diag
     }
 
     pub fn remote_discr(&self) -> u32 {
@@ -407,12 +419,16 @@ impl SessionSm {
     pub fn receive(&mut self, pkt: &BfdPacket) -> Result<ReceiveOutcome, DiscardReason> {
         // Appendix A (non-normative): receiving v0 switches us to v0
         // immediately; once on v0, a v1 AdminDown switches us back.
-        if self.version == 1 && pkt.version == 0 {
-            tracing::debug!(peer = %self.label, "bfdd: appendix A: switching to version 0");
-            self.version = 0;
-        } else if self.version == 0 && pkt.version == 1 && pkt.state == BfdState::AdminDown {
-            tracing::debug!(peer = %self.label, "bfdd: appendix A: switching back to version 1");
-            self.version = 1;
+        // Off by default — §6.8.6 step 1 discards non-1 versions
+        // before this point when the decode policy was Version1Only.
+        if self.config.version_negotiation {
+            if self.version == 1 && pkt.version == 0 {
+                tracing::debug!(peer = %self.label, "bfdd: appendix A: switching to version 0");
+                self.version = 0;
+            } else if self.version == 0 && pkt.version == 1 && pkt.state == BfdState::AdminDown {
+                tracing::debug!(peer = %self.label, "bfdd: appendix A: switching back to version 1");
+                self.version = 1;
+            }
         }
 
         // Step 7: a nonzero Your Discriminator selects its session.
@@ -1082,7 +1098,14 @@ mod tests {
     /// back to 1.
     #[test]
     fn appendix_a_version_negotiation() {
-        let mut s = sm();
+        let mut s = SessionSm::new(
+            SessionConfig {
+                version_negotiation: true,
+                ..SessionConfig::default()
+            },
+            0x1000,
+            "p",
+        );
         let mut v0 = rcv(BfdState::Down);
         v0.version = 0;
         s.receive(&v0).unwrap();
@@ -1096,7 +1119,17 @@ mod tests {
 
         let mut v1_admin = rcv(BfdState::AdminDown);
         v1_admin.version = 1;
-        let _ = s.receive(&v1_admin); // discarded at step 22/21-adjacent, still switches
+        let _ = s.receive(&v1_admin); // discarded at step 21-adjacent, still switches
+        assert_eq!(s.version(), 1);
+
+        // Off (the default): no switching — the transport's
+        // Version1Only decode already discarded the v0 packet, and a
+        // v0 packet that somehow reached the state machine leaves the
+        // transmit version alone.
+        let mut s = sm();
+        let mut v0 = rcv(BfdState::Down);
+        v0.version = 0;
+        s.receive(&v0).unwrap();
         assert_eq!(s.version(), 1);
     }
 
