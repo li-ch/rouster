@@ -41,6 +41,10 @@ pub enum ParamKind {
     Ipv6Prefix,
     /// `<U32>` — a plain unsigned 32-bit number.
     U32,
+    /// `<ADDR|PREFIX>` — an address or a CIDR prefix, either family
+    /// (the neighbour filter; v4 and v6 share one node because the
+    /// tree merges parameters at the same position).
+    AddrOrPrefix,
     /// The rest of the line, verbatim (route-map display lines).
     /// Must be nonempty; no other constraint — the line is kept for
     /// display, not interpreted.
@@ -56,6 +60,7 @@ impl ParamKind {
             ParamKind::Ipv4Prefix => "<A.B.C.D/M>",
             ParamKind::Ipv6Prefix => "<X:X::X:X/M>",
             ParamKind::U32 => "<U32>",
+            ParamKind::AddrOrPrefix => "<ADDR|PREFIX>",
             ParamKind::Rest => "<LINE>",
         }
     }
@@ -73,6 +78,7 @@ impl ParamKind {
             ParamKind::Ipv4Prefix => is_prefix(token, 32),
             ParamKind::Ipv6Prefix => is_prefix(token, 128),
             ParamKind::U32 => token.parse::<u32>().is_ok(),
+            ParamKind::AddrOrPrefix => crate::ribparse::accepts_addr_or_prefix(token),
             ParamKind::Rest => !token.is_empty(),
         }
     }
@@ -138,6 +144,12 @@ pub enum Action {
     ShowSavRules,
     ShowBfd,
     ShowBfdSummary,
+    ShowInterface,
+    ShowIpInterface,
+    ShowNeighbor,
+    ShowVrf,
+    ShowRibSummary,
+    ShowIpRouteSummary,
     ShowRunningConfig,
     List,
     Enable,

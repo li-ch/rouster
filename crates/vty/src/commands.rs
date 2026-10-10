@@ -103,6 +103,98 @@ pub fn enable_tree() -> WordTree {
         toks: vec![
             lit("show", "Show running system information"),
             lit(
+                "interface",
+                "Interface status (rousterd run-dir surface)",
+            ),
+        ],
+        action: Action::ShowInterface,
+        help: "The interface table rousterd mirrors (v4+v6)",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit("interface", "Interface status (rousterd run-dir surface)"),
+            param(ParamKind::Word, "One interface's name"),
+        ],
+        action: Action::ShowInterface,
+        help: "One interface's table row",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit("ip", "IP information"),
+            lit("interface", "Interface status (rousterd run-dir surface)"),
+        ],
+        action: Action::ShowIpInterface,
+        help: "The FRR-named view of the same interface table",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit("ip", "IP information"),
+            lit("interface", "Interface status (rousterd run-dir surface)"),
+            param(ParamKind::Word, "One interface's name"),
+        ],
+        action: Action::ShowIpInterface,
+        help: "One interface's row (FRR-named view)",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit(
+                "neighbor",
+                "ARP/NDP neighbor mirror (rousterd run-dir surface)",
+            ),
+        ],
+        action: Action::ShowNeighbor,
+        help: "The neighbor table rousterd mirrors",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit(
+                "neighbor",
+                "ARP/NDP neighbor mirror (rousterd run-dir surface)",
+            ),
+            param(
+                ParamKind::AddrOrPrefix,
+                "Only neighbors inside this address or prefix",
+            ),
+        ],
+        action: Action::ShowNeighbor,
+        help: "Neighbors inside an address or prefix, either family",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit("vrf", "VRF devices (rousterd run-dir surface)"),
+        ],
+        action: Action::ShowVrf,
+        help: "VRF devices: bound table, members, route counts",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit("rib", "The Rouster RIB (rousterd run-dir surface)"),
+            lit("summary", "Counts only"),
+        ],
+        action: Action::ShowRibSummary,
+        help: "Per-table route counts with VRF associations",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit("ip", "IP information"),
+            lit("route", "IP routing table"),
+            lit("summary", "Counts only"),
+        ],
+        action: Action::ShowIpRouteSummary,
+        help: "Per-table route counts (the FRR name; summarizes every table)",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("show", "Show running system information"),
+            lit(
                 "running-config",
                 "The session's current configuration (parse-only in v1)",
             ),

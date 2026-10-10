@@ -342,3 +342,133 @@ fn enable_is_idempotent_from_enable_mode() {
     feed(&mut s, "exit");
     assert_eq!(s.prompt(), "rouster> ");
 }
+
+// ------------------------------------------------ the rousterd views
+
+// ------------------------------------------------ the rousterd views
+
+/// A scratch run dir with a rousterd dump fixture published as
+/// `rousterd.status`.
+fn rib_dir(tag: &str, fixture: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("vty-parser-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source =
+        format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::copy(source, dir.join("rousterd.status")).unwrap();
+    dir
+}
+
+/// An enabled session reading the given run dir.
+fn enabled_session(run_dir: PathBuf) -> Session {
+    let mut s = session();
+    s.info.run_dir = run_dir;
+    feed(&mut s, "enable");
+    s
+}
+
+#[test]
+fn show_interface_parses_and_renders_the_dump() {
+    let mut s = enabled_session(rib_dir("rd-iface", "rousterd-status-full.status"));
+    let text = joined(&mut s, "show interface");
+    assert!(text.contains("Interface"), "the Cisco-style header");
+    assert!(text.contains("eth0"));
+    assert!(text.contains("192.0.2.1/24"));
+    assert!(text.contains("vrf-blue"));
+    assert!(text.contains("router-id 198.51.100.1"));
+}
+
+#[test]
+fn show_ip_interface_is_the_frr_named_view() {
+    let mut s = enabled_session(rib_dir("rd-frr-name", "rousterd-status-full.status"));
+    let text = joined(&mut s, "show ip interface");
+    assert!(text.contains("eth0"), "same data under the FRR name");
+    // The abbreviated forms work like every other command.
+    assert_eq!(joined(&mut s, "sh ip int"), text);
+}
+
+#[test]
+fn show_interface_name_filter_selects_and_misses() {
+    let mut s = enabled_session(rib_dir("rd-iface-name", "rousterd-status-full.status"));
+    let text = joined(&mut s, "show interface eth1");
+    assert!(text.contains("eth1"));
+    assert!(!text.contains("eth0"), "the filter selects");
+    let miss = joined(&mut s, "show interface eth9");
+    assert!(
+        miss.contains("% Unknown interface: eth9"),
+        "the Cisco error shape"
+    );
+}
+
+#[test]
+fn show_neighbor_renders_and_filters_either_family() {
+    let mut s = enabled_session(rib_dir("rd-neigh", "rousterd-status-full.status"));
+    let text = joined(&mut s, "show neighbor");
+    assert!(text.contains("Neighbor"));
+    assert!(text.contains("02:00:00:00:00:11"));
+    let filtered = joined(&mut s, "show neighbor 192.0.2.0/24");
+    assert!(filtered.contains("192.0.2.10"));
+    assert!(!filtered.contains("198.51.100.9"));
+    let v6 = joined(&mut s, "show neighbor 2001:db8::/32");
+    assert!(v6.contains("No neighbor matches"), "the honest empty");
+    let miss = joined(&mut s, "show neighbor wat");
+    assert!(
+        miss.contains("% Invalid input"),
+        "the param kind rejects a bad token"
+    );
+}
+
+#[test]
+fn show_vrf_and_route_summary_render() {
+    let mut s = enabled_session(rib_dir("rd-vrf", "rousterd-status-full.status"));
+    let vrf = joined(&mut s, "show vrf");
+    assert!(vrf.contains("vrf-blue"));
+    assert!(vrf.contains("1001"), "the bound table renders");
+    let summary = joined(&mut s, "show ip route summary");
+    assert!(summary.contains("table"));
+    assert!(summary.contains("vrf-blue"), "the VRF association renders");
+    assert!(summary.contains("connected"));
+    // The rousterctl-parity name works too.
+    assert_eq!(joined(&mut s, "show rib summary"), summary);
+    // Abbreviated, FRR-style.
+    assert_eq!(joined(&mut s, "sh ip ro su"), summary);
+}
+
+#[test]
+fn the_rousterd_views_complain_honestly_without_a_dump() {
+    let dir = std::env::temp_dir().join(format!("vty-parser-rd-none-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = enabled_session(dir.clone());
+    for command in [
+        "show interface",
+        "show ip interface",
+        "show neighbor",
+        "show vrf",
+        "show ip route summary",
+        "show rib summary",
+    ] {
+        let text = joined(&mut s, command);
+        assert!(
+            text.contains("% No rousterd status published"),
+            "{command} complains about the missing dump"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn future_dump_fields_are_tolerated() {
+    let mut s = enabled_session(rib_dir("rd-future", "rousterd-status-future-fields.status"));
+    let text = joined(&mut s, "show interface");
+    assert!(text.contains("eth0"));
+    assert!(text.contains("1 unrecognized line"), "the disclosure renders");
+}
+
+#[test]
+fn user_mode_cannot_run_the_rousterd_views() {
+    let mut s = session();
+    s.info.run_dir = rib_dir("rd-user", "rousterd-status-full.status");
+    let text = joined(&mut s, "show interface");
+    assert!(text.contains("% Unknown command"), "enable-mode commands");
+}

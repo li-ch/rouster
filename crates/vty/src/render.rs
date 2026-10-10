@@ -13,6 +13,7 @@ use std::path::Path;
 
 use crate::bfdparse::BfdStatus;
 use crate::liveness::{pid_state, read_pidfile, PidState};
+use crate::ribparse::RibStatus;
 use crate::savparse::SavStatus;
 use crate::session::Session;
 
@@ -249,7 +250,7 @@ pub fn show_bfd(run_dir: &Path, summary_only: bool) -> Vec<String> {
 }
 
 /// Column-aligned table rendering (two-space gutters).
-fn align_table(headers: &[&str], rows: &[[String; 6]]) -> Vec<String> {
+fn align_table<const N: usize>(headers: &[&str], rows: &[[String; N]]) -> Vec<String> {
     let widths: Vec<usize> = (0..headers.len())
         .map(|column| {
             rows.iter()
@@ -275,4 +276,242 @@ fn align_table(headers: &[&str], rows: &[[String; 6]]) -> Vec<String> {
         out.push(cells.join("  "));
     }
     out
+}
+
+// ------------------------------------------------ rousterd dump views
+
+/// Reads `rousterd.status` under the run dir; the shared prologue for
+/// the four dump views: (parsed, pid, state) or the `%` complaint.
+fn load_rib_status(run_dir: &Path) -> Result<(RibStatus, Option<u32>, PidState), Vec<String>> {
+    let path = run_dir.join("rousterd.status");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Err(vec![format!(
+            "% No rousterd status published at {} (not running, or an older rousterd)",
+            path.display()
+        )]);
+    };
+    let parsed = RibStatus::parse(&text);
+    // No pidfile exists for rousterd — the dump's header pid is its
+    // live word.
+    let pid = parsed.pid;
+    let state = pid.map(pid_state).unwrap_or(PidState::Unknown);
+    Ok((parsed, pid, state))
+}
+
+/// The stale-pid footer the dump views share (the sav/bfd shape).
+fn stale_footer(pid: Option<u32>) -> Vec<String> {
+    let pid_text = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+    vec![format!(
+        "% rousterd pid {pid_text} is not running — this is the last-known record (stale run-dir files)"
+    )]
+}
+
+/// `show interface [NAME]` / `show ip interface [NAME]` (same data;
+/// the ip form is the FRR-named view of one AF-agnostic table).
+pub fn show_interfaces(run_dir: &Path, name: Option<&str>) -> Vec<String> {
+    let (parsed, pid, state) = match load_rib_status(run_dir) {
+        Ok(triple) => triple,
+        Err(complaint) => return complaint,
+    };
+    let selected = parsed.interfaces_matching(name);
+    let mut out = vec![
+        format!(
+            "rousterd {}  pid {}  {}",
+            parsed.version.as_deref().unwrap_or("?"),
+            pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            state.assessment(),
+        ),
+        format!(
+            "router-id {}",
+            parsed.router_id.as_deref().unwrap_or("none")
+        ),
+    ];
+    if let Some(want) = name {
+        if selected.is_empty() {
+            out.push(format!("% Unknown interface: {want}"));
+            return out;
+        }
+    }
+    if selected.is_empty() {
+        out.push("(no interfaces mirrored)".into());
+        return footer(out, &parsed, pid, state);
+    }
+    let headers = ["Interface", "ifindex", "state", "flags", "VRF", "addresses"];
+    let rows: Vec<[String; 6]> = selected
+        .iter()
+        .map(|iface| {
+            [
+                iface.name.clone().unwrap_or_else(|| "?".into()),
+                iface
+                    .ifindex
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                match iface.up {
+                    Some(true) => "up".into(),
+                    Some(false) => "down".into(),
+                    None => "?".into(),
+                },
+                iface.flags.clone().unwrap_or_else(|| "-".into()),
+                iface.vrf.clone().unwrap_or_else(|| "-".into()),
+                if iface.addresses.is_empty() {
+                    "-".into()
+                } else {
+                    iface.addresses.join(" ")
+                },
+            ]
+        })
+        .collect();
+    out.extend(align_table(&headers, &rows));
+    footer(out, &parsed, pid, state)
+}
+
+/// `show neighbor [ADDR|PREFIX]` (Rouster extension — FRR has no
+/// ARP-table vty command; the name matches its `neighbor` spelling).
+pub fn show_neighbors(run_dir: &Path, filter: Option<&str>) -> Vec<String> {
+    let (parsed, pid, state) = match load_rib_status(run_dir) {
+        Ok(triple) => triple,
+        Err(complaint) => return complaint,
+    };
+    let selected = parsed.neighbours_matching(filter);
+    let mut out = Vec::new();
+    if selected.is_empty() {
+        if filter.is_some() {
+            out.push("% No neighbor matches the filter.".into());
+        } else {
+            out.push("(no neighbors mirrored)".into());
+        }
+        return footer(out, &parsed, pid, state);
+    }
+    let headers = ["Neighbor", "ifindex", "state", "lladdr"];
+    let rows: Vec<[String; 4]> = selected
+        .iter()
+        .map(|neigh| {
+            [
+                neigh
+                    .ip
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                neigh
+                    .ifindex
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                neigh.state.clone().unwrap_or_else(|| "?".into()),
+                neigh.lladdr.clone().unwrap_or_else(|| "?".into()),
+            ]
+        })
+        .collect();
+    out.extend(align_table(&headers, &rows));
+    footer(out, &parsed, pid, state)
+}
+
+/// `show vrf` — VRF devices with bound table, member count, and the
+/// owning table's counts.
+pub fn show_vrf(run_dir: &Path) -> Vec<String> {
+    let (parsed, pid, state) = match load_rib_status(run_dir) {
+        Ok(triple) => triple,
+        Err(complaint) => return complaint,
+    };
+    let mut out = Vec::new();
+    let devices: Vec<&crate::ribparse::IfaceLine> = parsed
+        .interfaces
+        .iter()
+        .filter(|iface| iface.vrf_table.is_some())
+        .collect();
+    if devices.is_empty() {
+        out.push("(no VRF devices mirrored)".into());
+        return footer(out, &parsed, pid, state);
+    }
+    let headers = ["VRF", "ifindex", "table", "members", "routes", "kernel"];
+    let rows: Vec<[String; 6]> = devices
+        .iter()
+        .map(|iface| {
+            let table = iface.vrf_table.unwrap_or(0);
+            let members = parsed
+                .interfaces
+                .iter()
+                .filter(|member| member.vrf.as_deref() == iface.name.as_deref())
+                .count();
+            let counts = parsed.tables.iter().find(|t| t.id == Some(table));
+            [
+                iface.name.clone().unwrap_or_else(|| "?".into()),
+                iface
+                    .ifindex
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                table.to_string(),
+                members.to_string(),
+                counts
+                    .and_then(|t| t.routes)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                counts
+                    .and_then(|t| t.kernel)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    out.extend(align_table(&headers, &rows));
+    footer(out, &parsed, pid, state)
+}
+
+/// `show rib summary` / `show ip route summary` (the FRR name; the
+/// dump is AF-agnostic, so one summary covers every table).
+pub fn show_rib_summary(run_dir: &Path) -> Vec<String> {
+    let (parsed, pid, state) = match load_rib_status(run_dir) {
+        Ok(triple) => triple,
+        Err(complaint) => return complaint,
+    };
+    let mut out = vec![
+        format!(
+            "rousterd {}  pid {}  {}",
+            parsed.version.as_deref().unwrap_or("?"),
+            pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            state.assessment(),
+        ),
+        format!(
+            "router-id {}",
+            parsed.router_id.as_deref().unwrap_or("none")
+        ),
+    ];
+    let headers = ["table", "routes", "prefixes", "connected", "kernel", "VRF"];
+    let rows: Vec<[String; 6]> = parsed
+        .tables
+        .iter()
+        .map(|table| {
+            [
+                table
+                    .id
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                opt_count(table.routes),
+                opt_count(table.prefixes),
+                opt_count(table.connected),
+                opt_count(table.kernel),
+                table.vrf.clone().unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    out.extend(align_table(&headers, &rows));
+    footer(out, &parsed, pid, state)
+}
+
+/// The shared epilogue: the unrecognized-line disclosure and the
+/// stale-pid footer.
+fn footer(mut out: Vec<String>, parsed: &RibStatus, pid: Option<u32>, state: PidState) -> Vec<String> {
+    if parsed.unknown_lines > 0 {
+        out.push(format!(
+            "({} unrecognized line{} — the daemon's format is newer than this vty)",
+            parsed.unknown_lines,
+            if parsed.unknown_lines == 1 { "" } else { "s" },
+        ));
+    }
+    if state == PidState::Dead {
+        out.extend(stale_footer(pid));
+    }
+    out
+}
+
+fn opt_count(value: Option<u64>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
 }

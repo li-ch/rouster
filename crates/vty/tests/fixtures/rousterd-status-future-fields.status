@@ -1,0 +1,12 @@
+rousterd 2.0.0 pid 51234 uptime 3600s
+router-id 192.0.2.1 origin derived
+interfaces 2
+interface eth0 ifindex 2 up flags UP|BROADCAST|RUNNING|MULTICAST vrf - mtu 1500 type ether
+  address 192.0.2.1/24 preferred lifetime 2592000s
+interface vrf-red ifindex 5 up flags UP|RUNNING vrf - vrf-table 2002
+agent session 99 something
+neighbours 1
+neighbour 192.0.2.10 ifindex 2 state REACHABLE|CONFIRMED lladdr 02:00:00:00:00:11 used 12s
+tables 2
+table 254 routes 1 prefixes 1 connected 2 kernel 3 vrf - label main
+table 2002 routes 0 prefixes 0 connected 1 kernel 0 vrf vrf-red

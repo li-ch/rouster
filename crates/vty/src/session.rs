@@ -209,6 +209,22 @@ impl Session {
             Action::ShowSavRules => Outcome::Lines(render::show_sav(&self.info.run_dir, true)),
             Action::ShowBfd => Outcome::Lines(render::show_bfd(&self.info.run_dir, false)),
             Action::ShowBfdSummary => Outcome::Lines(render::show_bfd(&self.info.run_dir, true)),
+            Action::ShowInterface => Outcome::Lines(render::show_interfaces(
+                &self.info.run_dir,
+                params.first().map(String::as_str),
+            )),
+            Action::ShowIpInterface => Outcome::Lines(render::show_interfaces(
+                &self.info.run_dir,
+                params.first().map(String::as_str),
+            )),
+            Action::ShowNeighbor => Outcome::Lines(render::show_neighbors(
+                &self.info.run_dir,
+                params.first().map(String::as_str),
+            )),
+            Action::ShowVrf => Outcome::Lines(render::show_vrf(&self.info.run_dir)),
+            Action::ShowRibSummary | Action::ShowIpRouteSummary => {
+                Outcome::Lines(render::show_rib_summary(&self.info.run_dir))
+            }
             Action::ShowRunningConfig => {
                 let hostname = self.hostname.clone();
                 Outcome::Lines(

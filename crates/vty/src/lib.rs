@@ -7,7 +7,8 @@
 //! own pty/unix-socket plumbing, which is §Deferred until a capture
 //! pins it. Every answer comes from the run-dir contract
 //! (`docs/operator-surfaces.md`): `savd.status`, `savd.pid`,
-//! `bfdd.status`, `bfdd.pid` — file reads only, no IPC inventions.
+//! `bfdd.status`, `bfdd.pid`, `rousterd.status` — file reads only,
+//! no IPC inventions.
 //!
 //! Layout: [`tree`] is the table-driven Cisco command parser (word
 //! tree, abbreviated unambiguous commands, `?` help, ambiguity
@@ -16,11 +17,12 @@
 //! v1 command table per mode; [`config`] is the parse-only session
 //! config tree (the quarantine-B7 observed frr.conf grammar subset,
 //! echoed by `show running-config`); [`savparse`]/[`bfdparse`]/
-//! [`liveness`] re-read the run dir tolerantly (the rousterctl S3
-//! conventions, kept in-crate so the two edge crates stay
-//! decoupled); [`render`] renders the `show` outputs; [`protocol`]
-//! pins the wire framing; [`server`]/[`client`] are the TCP halves;
-//! the `vtyd` binary wires config file, flags, and signals.
+//! [`ribparse`]/[`liveness`] re-read the run dir tolerantly (the
+//! rousterctl S3 conventions, kept in-crate so the two edge crates
+//! stay decoupled); [`render`] renders the `show` outputs;
+//! [`protocol`] pins the wire framing; [`server`]/[`client`] are the
+//! TCP halves; the `vtyd` binary wires config file, flags, and
+//! signals.
 
 pub mod bfdparse;
 pub mod client;
@@ -29,6 +31,7 @@ pub mod config;
 pub mod liveness;
 pub mod protocol;
 pub mod render;
+pub mod ribparse;
 pub mod savparse;
 pub mod server;
 pub mod session;
