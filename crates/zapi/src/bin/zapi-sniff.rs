@@ -15,12 +15,30 @@
 //! without it: silent mode still captures the initial burst, and daemons
 //! reconnect, so retries are captured too.
 //!
+//! With `--respond-labelmgr` it answers EVERY ZEBRA_LABEL_MANAGER_CONNECT
+//! (49) with the pinned reply form (proto + instance + result 0) — bgpd's
+//! config apply blocks forever on that synchronous RPC when the masquerade
+//! stays silent (pinned doc, operational finding 3; W1-b hit it live pushing
+//! `router bgp` with a `neighbor ... bfd` through `vtysh -b`), so captures
+//! that need bgpd to reach its config need the answer.
+//!
+//! With `--respond-iface <NAME:IFINDEX:ADDR/PLEN>` it answers the empty-body
+//! INTERFACE_ADD (0) registration with one interface dump + one address
+//! frame for the named interface — bgpd refuses to arm SINGLE-HOP BFD
+//! (treats every NHT-unresolved neighbor as multihop-without-local,
+//! `_bfd_sess_valid` rejects; W1-b live finding) until zebra has told it
+//! about interfaces, so the single-hop BFD_DEST_REGISTER pin needs this.
+//! With `--respond-nht` it answers every ZEBRA_NEXTHOP_REGISTER (21) with a
+//! resolved NEXTHOP_UPDATE over a connected route through that interface —
+//! the same NHT-resolution trigger from the other half.
+//!
 //! Dependency-free by design: std + tokio + the crate's own header codec.
 //! Usage: zapi-sniff --socket /var/run/frr/zserv.api --log /tmp/cap.log
 //!                 [--respond-hello] [--hello-cmd N]
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +46,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use zapi::header::ZapiHeaderError;
-use zapi::{ZapiHeader, ZAPI_HEADER_LEN};
+use zapi::{
+    ZapiHeader, ZapiInterface, ZapiInterfaceAddress, ZapiMessage, ZapiNexthop,
+    ZapiNexthopRegister, ZapiNexthopUpdate, ZAPI_HEADER_LEN,
+};
 
 /// Max bytes buffered per connection before we declare the peer garbage and
 /// hang up (a stuck resync must not grow memory forever). ZAPI messages are
@@ -110,11 +131,54 @@ fn log_line(sink: &LogSink, line: &str) {
     let _ = f.flush();
 }
 
+/// The synthetic interface the `--respond-iface` mode advertises: a name,
+/// an ifindex, and one address whose connected prefix is what bgpd's
+/// `if_lookup_by_ipv4` walks to decide single-hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FakeIface {
+    name: String,
+    ifindex: u32,
+    addr: std::net::IpAddr,
+    plen: u8,
+}
+
+impl FromStr for FakeIface {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // NAME:IFINDEX:ADDR/PLEN
+        let (name, rest) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected NAME:IFINDEX:ADDR/PLEN, got `{s}`"))?;
+        let (ifindex, addr) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("expected NAME:IFINDEX:ADDR/PLEN, got `{s}`"))?;
+        let (addr, plen) = addr
+            .split_once('/')
+            .ok_or_else(|| format!("address needs a /PLEN, got `{s}`"))?;
+        Ok(Self {
+            name: name.to_string(),
+            ifindex: ifindex
+                .parse()
+                .map_err(|_| format!("bad ifindex `{ifindex}`"))?,
+            addr: addr
+                .parse()
+                .map_err(|_| format!("bad address `{addr}`"))?,
+            plen: plen
+                .parse()
+                .map_err(|_| format!("bad prefix length `{plen}`"))?,
+        })
+    }
+}
+
 struct Args {
     socket: PathBuf,
     log: PathBuf,
     respond_hello: bool,
     hello_cmd: u16,
+    respond_labelmgr: bool,
+    respond_iface: Option<FakeIface>,
+    respond_nht: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -122,6 +186,9 @@ fn parse_args() -> Result<Args, String> {
     let mut log = None;
     let mut respond_hello = false;
     let mut hello_cmd: u16 = 8;
+    let mut respond_labelmgr = false;
+    let mut respond_iface = None;
+    let mut respond_nht = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -135,6 +202,15 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("bad --hello-cmd: {e}"))?
             }
+            "--respond-labelmgr" => respond_labelmgr = true,
+            "--respond-iface" => {
+                respond_iface = Some(
+                    it.next()
+                        .ok_or("--respond-iface needs NAME:IFINDEX:ADDR/PLEN")?
+                        .parse()?,
+                )
+            }
+            "--respond-nht" => respond_nht = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -143,6 +219,9 @@ fn parse_args() -> Result<Args, String> {
         log: log.ok_or("--log is required")?,
         respond_hello,
         hello_cmd,
+        respond_labelmgr,
+        respond_iface,
+        respond_nht,
     })
 }
 
@@ -167,11 +246,14 @@ async fn main() -> std::process::ExitCode {
     log_line(
         &sink,
         &format!(
-            "ts={} event=START socket={} respond_hello={} hello_cmd={}",
+            "ts={} event=START socket={} respond_hello={} hello_cmd={} respond_labelmgr={} respond_iface={:?} respond_nht={}",
             iso8601_now(),
             args.socket.display(),
             args.respond_hello,
-            args.hello_cmd
+            args.hello_cmd,
+            args.respond_labelmgr,
+            args.respond_iface,
+            args.respond_nht,
         ),
     );
 
@@ -208,8 +290,21 @@ async fn main() -> std::process::ExitCode {
         let sink = Arc::clone(&sink);
         let respond_hello = args.respond_hello;
         let hello_cmd = args.hello_cmd;
+        let respond_labelmgr = args.respond_labelmgr;
+        let respond_iface = args.respond_iface.clone();
+        let respond_nht = args.respond_nht;
         tokio::spawn(async move {
-            handle_conn(stream, conn, sink, respond_hello, hello_cmd).await;
+            handle_conn(
+                stream,
+                conn,
+                sink,
+                respond_hello,
+                hello_cmd,
+                respond_labelmgr,
+                respond_iface,
+                respond_nht,
+            )
+            .await;
         });
     }
 }
@@ -220,6 +315,9 @@ async fn handle_conn(
     sink: LogSink,
     respond_hello: bool,
     hello_cmd: u16,
+    respond_labelmgr: bool,
+    respond_iface: Option<FakeIface>,
+    respond_nht: bool,
 ) {
     log_line(
         &sink,
@@ -277,9 +375,125 @@ async fn handle_conn(
                                 &sink,
                                 &format!(
                                     "ts={} conn={conn} event=REPLY_FAILED err={e}",
-                                    iso8601_now()
+                                    iso8601_now(),
                                 ),
                             ),
+                        }
+                    }
+                    // ZEBRA_LABEL_MANAGER_CONNECT (49): the synchronous
+                    // RPC bgpd's config apply blocks on (pinned doc,
+                    // operational finding 3). The reply form is the
+                    // client body + trailing result u8 (0 = success);
+                    // answering every occurrence, not just the first —
+                    // reconnects re-ask.
+                    if respond_labelmgr && frame.header.command == 49 && frame.body.len() == 3 {
+                        let mut reply_body = frame.body.clone();
+                        reply_body.push(0); // result: success
+                        let mut reply = vec![0u8; ZAPI_HEADER_LEN];
+                        ZapiHeader::new(
+                            frame.header.command,
+                            frame.header.vrf_id,
+                            reply_body.len(),
+                        )
+                        .encode(&mut reply);
+                        reply.extend_from_slice(&reply_body);
+                        match stream.write_all(&reply).await {
+                            Ok(()) => log_line(
+                                &sink,
+                                &format!(
+                                    "ts={} conn={conn} event=REPLY_LMC cmd=49 len={} body={}",
+                                    iso8601_now(),
+                                    reply.len(),
+                                    hex(&reply_body),
+                                ),
+                            ),
+                            Err(e) => log_line(
+                                &sink,
+                                &format!(
+                                    "ts={} conn={conn} event=REPLY_LMC_FAILED err={e}",
+                                    iso8601_now(),
+                                ),
+                            ),
+                        }
+                    }
+                    // INTERFACE_ADD registration (empty body): the
+                    // interface dump a real zebra answers with. Needed
+                    // to arm bgpd's single-hop BFD (W1-b finding).
+                    if let Some(iface) = &respond_iface {
+                        if frame.header.command == 0 && frame.body.is_empty() {
+                            match iface_reply(iface) {
+                                Ok(frames) => {
+                                    for reply in frames {
+                                        match stream.write_all(&reply).await {
+                                            Ok(()) => log_line(
+                                                &sink,
+                                                &format!(
+                                                    "ts={} conn={conn} event=REPLY_IFACE len={} body={}",
+                                                    iso8601_now(),
+                                                    reply.len(),
+                                                    hex(&reply[ZAPI_HEADER_LEN..]),
+                                                ),
+                                            ),
+                                            Err(e) => log_line(
+                                                &sink,
+                                                &format!(
+                                                    "ts={} conn={conn} event=REPLY_IFACE_FAILED err={e}",
+                                                    iso8601_now(),
+                                                ),
+                                            ),
+                                        }
+                                    }
+                                }
+                                Err(e) => log_line(
+                                    &sink,
+                                    &format!(
+                                        "ts={} conn={conn} event=REPLY_IFACE_BUILD_FAILED err={e}",
+                                        iso8601_now(),
+                                    ),
+                                ),
+                            }
+                        }
+                    }
+                    // NEXTHOP_REGISTER (21): answer with a resolved
+                    // NEXTHOP_UPDATE over the fake connected route.
+                    if respond_nht && frame.header.command == 21 {
+                        if let Some(iface) = &respond_iface {
+                            match ZapiNexthopRegister::decode(&frame.body) {
+                                Ok(register) => match nht_reply(&register, iface) {
+                                    Ok(reply) => match stream.write_all(&reply).await {
+                                        Ok(()) => log_line(
+                                            &sink,
+                                            &format!(
+                                                "ts={} conn={conn} event=REPLY_NHT len={} body={}",
+                                                iso8601_now(),
+                                                reply.len(),
+                                                hex(&reply[ZAPI_HEADER_LEN..]),
+                                            ),
+                                        ),
+                                        Err(e) => log_line(
+                                            &sink,
+                                            &format!(
+                                                "ts={} conn={conn} event=REPLY_NHT_FAILED err={e}",
+                                                iso8601_now(),
+                                            ),
+                                        ),
+                                    },
+                                    Err(e) => log_line(
+                                        &sink,
+                                        &format!(
+                                            "ts={} conn={conn} event=REPLY_NHT_BUILD_FAILED err={e}",
+                                            iso8601_now(),
+                                        ),
+                                    ),
+                                },
+                                Err(e) => log_line(
+                                    &sink,
+                                    &format!(
+                                        "ts={} conn={conn} event=REPLY_NHT_DECODE_FAILED err={e:?}",
+                                        iso8601_now(),
+                                    ),
+                                ),
+                            }
                         }
                     }
                 }
@@ -350,6 +564,86 @@ fn header_hex(header: &ZapiHeader) -> String {
     hex(&v)
 }
 
+/// ZEBRA_INTERFACE_ACTIVE (frr-10.2.2 `lib/zebra.h`): the bit zebra's
+/// interface dumps carry for an operative interface; what makes bgpd's
+/// `if_lookup_by_ipv4` candidate usable.
+const ZEBRA_INTERFACE_ACTIVE: u64 = 0x1;
+
+/// The interface-dump answer for `--respond-iface`: one INTERFACE_ADD
+/// frame plus one INTERFACE_ADDRESS_ADD for the synthetic interface.
+/// SPEC bodies (the pinned doc's source-verified zebra→client layouts).
+fn iface_reply(iface: &FakeIface) -> Result<Vec<Vec<u8>>, String> {
+    // The network address of the configured prefix (the host bits must
+    // not leak into a "connected route" advertisement).
+    let prefix: common::IpPrefix = match iface.addr {
+        std::net::IpAddr::V4(a) => {
+            let plen = u32::from(iface.plen);
+            if plen > 32 {
+                return Err(format!("bad v4 prefix length /{plen}"));
+            }
+            let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+            let net = u32::from_be_bytes(a.octets()) & mask;
+            format!(
+                "{}/{plen}",
+                std::net::Ipv4Addr::from(net.to_be_bytes())
+            )
+            .parse()
+            .map_err(|e: common::PrefixError| e.to_string())?
+        }
+        std::net::IpAddr::V6(a) => {
+            if iface.plen != 128 {
+                return Err(format!(
+                    "v6 --respond-iface needs the full /128 address, got /{}",
+                    iface.plen
+                ));
+            }
+            format!("{a}/128")
+                .parse()
+                .map_err(|e: common::PrefixError| e.to_string())?
+        }
+    };
+    let mut intf = ZapiInterface::new(&iface.name, iface.ifindex);
+    intf.flags = ZEBRA_INTERFACE_ACTIVE;
+    intf.mtu = 1500;
+    intf.mtu6 = 1500;
+    let dump = ZapiMessage::InterfaceAdd(intf)
+        .encode_frame(0)
+        .map_err(|e| e.to_string())?
+        .to_vec();
+    let addr = ZapiMessage::InterfaceAddressAdd(ZapiInterfaceAddress {
+        ifindex: iface.ifindex,
+        flags: 0,
+        address: prefix,
+        destination: None,
+    })
+    .encode_frame(0)
+    .map_err(|e| e.to_string())?
+    .to_vec();
+    Ok(vec![dump, addr])
+}
+
+/// The NHT answer for `--respond-nht`: a NEXTHOP_UPDATE resolving the
+/// registered prefix over a connected route through the `--respond-iface`
+/// interface (SPEC body, `zebra_send_rnh_update` shape).
+fn nht_reply(register: &ZapiNexthopRegister, iface: &FakeIface) -> Result<Vec<u8>, String> {
+    // Plain IFINDEX nexthop: what a connected route's rib match carries
+    // (no gateway) — the form that makes bgpd classify the peer as
+    // directly connected (shared_network) and arm SINGLE-hop BFD.
+    let hop = ZapiNexthop::new_ifindex(0, iface.ifindex);
+    let update = ZapiNexthopUpdate::resolved(
+        register.prefix,
+        register.safi,
+        2, // ZEBRA_ROUTE_CONNECT
+        0,
+        0,
+        vec![hop],
+    );
+    Ok(ZapiMessage::NexthopUpdate(update)
+        .encode_frame(0)
+        .map_err(|e| e.to_string())?
+        .to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +654,89 @@ mod tests {
         ZapiHeader::new(command, vrf_id, body.len()).encode(&mut v);
         v.extend_from_slice(body);
         v
+    }
+
+    /// The --respond-iface spec parses NAME:IFINDEX:ADDR/PLEN and rejects
+    /// malformed forms.
+    #[test]
+    fn fake_iface_spec_parses() {
+        let f: FakeIface = "eth0:2:192.168.215.2/16".parse().unwrap();
+        assert_eq!(f.name, "eth0");
+        assert_eq!(f.ifindex, 2);
+        assert_eq!(
+            f.addr,
+            std::net::IpAddr::from(std::net::Ipv4Addr::new(192, 168, 215, 2))
+        );
+        assert_eq!(f.plen, 16);
+        for bad in [
+            "eth0",
+            "eth0:2",
+            "eth0:two:192.168.215.2/16",
+            "eth0:2:192.168.215.2",
+            "eth0:2:notanip/16",
+        ] {
+            assert!(bad.parse::<FakeIface>().is_err(), "{bad} parsed");
+        }
+    }
+
+    /// The interface answer carries one INTERFACE_ADD dump (ACTIVE flag,
+    /// name, ifindex) and one INTERFACE_ADDRESS_ADD whose prefix is the
+    /// NETWORK address (host bits masked off) — both re-decodable.
+    #[test]
+    fn iface_reply_decodes_back() {
+        let f: FakeIface = "eth0:2:192.168.215.2/16".parse().unwrap();
+        let frames = iface_reply(&f).unwrap();
+        assert_eq!(frames.len(), 2);
+        match ZapiMessage::decode(0, &frames[0][ZAPI_HEADER_LEN..]).unwrap() {
+            ZapiMessage::InterfaceAdd(i) => {
+                assert_eq!(i.ifname, "eth0");
+                assert_eq!(i.ifindex, 2);
+                assert_eq!(i.flags, ZEBRA_INTERFACE_ACTIVE);
+            }
+            other => panic!("not an InterfaceAdd dump: {other:?}"),
+        }
+        match ZapiMessage::decode(2, &frames[1][ZAPI_HEADER_LEN..]).unwrap() {
+            ZapiMessage::InterfaceAddressAdd(a) => {
+                assert_eq!(a.ifindex, 2);
+                assert_eq!(
+                    a.address.to_string(),
+                    "192.168.0.0/16",
+                    "network address (host bits masked off)"
+                );
+            }
+            other => panic!("not an InterfaceAddressAdd: {other:?}"),
+        }
+    }
+
+    /// The NHT answer resolves the REGISTERED prefix (echoed back) over a
+    /// connected route with an ifindex-carrying nexthop — the shape
+    /// `bgp_nht_validate` accepts.
+    #[test]
+    fn nht_reply_resolves_registered_prefix() {
+        let f: FakeIface = "eth0:2:192.168.215.2/16".parse().unwrap();
+        let register = ZapiNexthopRegister {
+            connected: false,
+            resolve_via_default: false,
+            safi: 1,
+            prefix: "192.168.215.1/32".parse().unwrap(),
+        };
+        let frame = nht_reply(&register, &f).unwrap();
+        let header = ZapiHeader::decode(&frame[..ZAPI_HEADER_LEN]).unwrap();
+        assert_eq!(header.command, 23);
+        match ZapiMessage::decode(23, &frame[ZAPI_HEADER_LEN..]).unwrap() {
+            ZapiMessage::NexthopUpdate(u) => {
+                assert_eq!(u.registered_prefix, register.prefix);
+                assert!(u.is_resolved());
+                assert_eq!(u.nexthops.len(), 1);
+                assert_eq!(u.nexthops[0].ifindex, 2);
+                assert_eq!(
+                    u.nexthops[0].nh_type,
+                    zapi::nexthop_type::IFINDEX,
+                    "a connected route carries an ifindex-only nexthop"
+                );
+            }
+            other => panic!("not a NexthopUpdate: {other:?}"),
+        }
     }
 
     #[test]
