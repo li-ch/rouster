@@ -1,0 +1,9 @@
+rousterd x.y pid nope
+router-id not-an-ip
+interfaces 2
+interface eth0 ifindex NaN up flags vrf
+  address not-a-prefix
+interface
+neighbours one
+neighbour not-an-ip ifindex two state lladdr
+table 254 routes many prefixes connected kernel vrf

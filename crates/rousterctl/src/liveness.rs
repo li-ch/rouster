@@ -21,6 +21,26 @@ pub enum PidState {
     Unknown,
 }
 
+impl PidState {
+    /// The terminal-render phrase for the header line.
+    pub fn assessment(self) -> &'static str {
+        match self {
+            PidState::Running => "running",
+            PidState::Dead => "dead (stale files)",
+            PidState::Unknown => "liveness unknown",
+        }
+    }
+
+    /// The JSON word for the same assessment.
+    pub fn json_word(self) -> &'static str {
+        match self {
+            PidState::Running => "running",
+            PidState::Dead => "dead",
+            PidState::Unknown => "unknown",
+        }
+    }
+}
+
 /// Is there a process with this pid?
 pub fn pid_state(pid: u32) -> PidState {
     // Pid 0 is never a daemon — and `kill -0 0` would signal the whole

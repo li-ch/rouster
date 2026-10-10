@@ -414,3 +414,295 @@ fn liveness_assesses_live_and_dead_pids() {
     assert_eq!(pid_state(pid), PidState::Dead);
     assert_eq!(pid_state(0), PidState::Dead, "pid 0 is never a daemon");
 }
+
+// ------------------------------------------------------ rousterd dump
+
+use rousterctl::rousterd::RousterdStatus;
+
+fn parse_rousterd(name: &str) -> RousterdStatus {
+    RousterdStatus::parse(&fixture(name))
+}
+
+/// The full fixture (generated from the writer's real render over a
+/// populated mock rib — crates/rousterd status tests pin the same
+/// text) parses into every field.
+#[test]
+fn rousterd_full_fixture_parses_completely() {
+    let st = parse_rousterd("rousterd-status-full.status");
+    assert_eq!(st.version.as_deref(), Some("0.0.0"));
+    assert_eq!(st.pid, Some(4242));
+    assert_eq!(st.router_id.as_deref(), Some("198.51.100.1"));
+    assert_eq!(st.interfaces_claim, Some(4));
+    assert_eq!(st.interfaces.len(), 4);
+    let eth0 = &st.interfaces[1];
+    assert_eq!(eth0.name.as_deref(), Some("eth0"));
+    assert_eq!(eth0.ifindex, Some(2));
+    assert_eq!(eth0.up, Some(true));
+    assert_eq!(
+        eth0.flags.as_deref(),
+        Some("UP|BROADCAST|RUNNING|MULTICAST")
+    );
+    assert_eq!(eth0.vrf.as_deref(), Some("-"));
+    assert_eq!(eth0.vrf_table, None);
+    assert_eq!(eth0.addresses, vec!["192.0.2.1/24", "2001:db8::1/64"]);
+    // The VRF device carries its bound table; the member its master.
+    assert_eq!(st.interfaces[2].vrf_table, Some(1001));
+    assert_eq!(st.interfaces[3].vrf.as_deref(), Some("vrf-blue"));
+
+    assert_eq!(st.neighbours_claim, Some(2));
+    assert_eq!(st.neighbours.len(), 2);
+    assert_eq!(
+        st.neighbours[0].ip.map(|ip| ip.to_string()).as_deref(),
+        Some("192.0.2.10")
+    );
+    assert_eq!(st.neighbours[0].ifindex, Some(2));
+    assert_eq!(st.neighbours[0].state.as_deref(), Some("INCOMPLETE"));
+    assert_eq!(st.neighbours[0].lladdr.as_deref(), Some("-"));
+
+    assert_eq!(st.tables_claim, Some(2));
+    assert_eq!(st.tables[0].id, Some(254));
+    assert_eq!(st.tables[0].routes, Some(1));
+    assert_eq!(st.tables[0].prefixes, Some(1));
+    assert_eq!(st.tables[0].connected, Some(3));
+    assert_eq!(st.tables[0].kernel, Some(1));
+    assert_eq!(st.tables[0].vrf.as_deref(), Some("-"));
+    assert_eq!(st.tables[1].vrf.as_deref(), Some("vrf-blue"));
+    assert_eq!(st.unknown_lines, 0);
+}
+
+/// The tolerance contract: added fields ride along, unknown lines are
+/// counted, and a `state` word with an unknown bit still parses.
+#[test]
+fn rousterd_future_fields_are_tolerated() {
+    let st = parse_rousterd("rousterd-status-future-fields.status");
+    assert_eq!(st.version.as_deref(), Some("2.0.0"));
+    assert_eq!(st.pid, Some(51_234), "extra header fields don't hide the pid");
+    assert_eq!(st.router_id.as_deref(), Some("192.0.2.1"), "trailing keywords dropped");
+    assert_eq!(st.interfaces.len(), 2);
+    let eth0 = &st.interfaces[0];
+    assert_eq!(eth0.ifindex, Some(2), "mtu/type ride along harmlessly");
+    assert_eq!(eth0.vrf_table, None);
+    assert_eq!(
+        eth0.addresses,
+        vec!["192.0.2.1/24 preferred lifetime 2592000s"],
+        "the address child is kept verbatim (added fields included)"
+    );
+    assert_eq!(
+        st.neighbours[0].state.as_deref(),
+        Some("REACHABLE|CONFIRMED"),
+        "unknown state bits stay verbatim"
+    );
+    assert_eq!(st.tables[0].kernel, Some(3), "trailing `label main` ignored");
+    assert_eq!(st.unknown_lines, 1, "`agent session ...` is not a known line");
+}
+
+/// Malformed KNOWN lines parse defensively: bad numbers leave their
+/// fields unset, nothing panics.
+#[test]
+fn rousterd_malformed_lines_are_defensive() {
+    let st = parse_rousterd("rousterd-status-malformed.status");
+    assert_eq!(st.version.as_deref(), Some("x.y"));
+    assert_eq!(st.pid, None);
+    assert_eq!(st.router_id, None, "not-an-ip is dropped, not guessed");
+    let eth0 = &st.interfaces[0];
+    assert_eq!(eth0.name.as_deref(), Some("eth0"));
+    assert_eq!(eth0.ifindex, None, "NaN ifindex leaves the field unset");
+    assert_eq!(eth0.flags, None, "a bare `flags` word leaves the field unset");
+    assert_eq!(eth0.up, Some(true));
+    assert_eq!(eth0.addresses, vec!["not-a-prefix"], "children stay verbatim");
+    assert_eq!(st.neighbours.len(), 0, "not-an-ip neighbours are dropped");
+    assert_eq!(st.tables.len(), 1, "the id still parses");
+    assert_eq!(st.tables[0].routes, None, "`many` leaves the count unset");
+    assert_eq!(st.unknown_lines, 2, "the bare `interface` and `neighbours one` lines count");
+}
+
+/// Neighbour filters: bare address, CIDR containment, either family;
+/// a family mismatch selects nothing.
+#[test]
+fn rousterd_neighbour_filters_match_prefix_and_family() {
+    let st = parse_rousterd("rousterd-status-full.status");
+    let all = st.neighbours_matching(None);
+    assert_eq!(all.len(), 2);
+    let exact = st.neighbours_matching(Some("192.0.2.10"));
+    assert_eq!(exact.len(), 1, "a bare address is a /32");
+    let wide = st.neighbours_matching(Some("192.0.2.0/24"));
+    assert_eq!(wide.len(), 1);
+    let contained = st.neighbours_matching(Some("198.51.100.0/25"));
+    assert_eq!(contained.len(), 1, "198.51.100.9 falls inside the /25");
+    let miss = st.neighbours_matching(Some("198.51.100.64/26"));
+    assert!(miss.is_empty(), ".9 is outside the upper /26");
+    let wrong_family = st.neighbours_matching(Some("2001:db8::/32"));
+    assert!(wrong_family.is_empty(), "a v6 filter never matches v4 rows");
+    assert!(rousterctl::rousterd::valid_filter("2001:db8::1"));
+    assert!(rousterctl::rousterd::valid_filter("10.0.0.0/8"));
+    assert!(!rousterctl::rousterd::valid_filter("10.0.0.0/33"));
+    assert!(!rousterctl::rousterd::valid_filter("wat"));
+}
+
+/// Interface name filtering: exact name selects one row, a miss is
+/// detectable.
+#[test]
+fn rousterd_interface_name_filter_selects() {
+    let st = parse_rousterd("rousterd-status-full.status");
+    assert_eq!(st.interfaces_matching(None).len(), 4);
+    let one = st.interfaces_matching(Some("eth1"));
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].vrf.as_deref(), Some("vrf-blue"));
+    assert!(st.interfaces_matching(Some("eth9")).is_empty());
+    let miss = st.render_interfaces(Some("eth9"));
+    assert_eq!(miss, "(no interface named eth9 in the published dump)");
+}
+
+/// The VRF view: a VRF device, its member count, and the owning
+/// table's counters.
+#[test]
+fn rousterd_vrf_view_derives_members_and_counts() {
+    let st = parse_rousterd("rousterd-status-full.status");
+    let vrfs = st.vrfs();
+    assert_eq!(vrfs.len(), 1);
+    assert_eq!(vrfs[0].name, "vrf-blue");
+    assert_eq!(vrfs[0].ifindex, Some(5));
+    assert_eq!(vrfs[0].table, 1001);
+    assert_eq!(vrfs[0].members, 1, "eth1 is enslaved to vrf-blue");
+    assert_eq!(vrfs[0].up, Some(true));
+    assert_eq!(vrfs[0].counts.as_ref().and_then(|t| t.kernel), Some(1));
+    assert_eq!(vrfs[0].counts.as_ref().and_then(|t| t.routes), Some(0));
+}
+
+/// The terminal tables are genuinely aligned (the same byte-offset
+/// proof the sav table uses).
+#[test]
+fn render_aligns_the_rousterd_tables() {
+    let st = parse_rousterd("rousterd-status-full.status");
+    for (text, header_word) in [
+        (st.render_interfaces(None), "IFINDEX"),
+        (st.render_neighbours(None), "LLADDR"),
+        (st.render_rib_summary(), "PREFIXES"),
+    ] {
+        let lines: Vec<&str> = text.lines().collect();
+        let header_idx = lines
+            .iter()
+            .position(|l| l.contains(header_word))
+            .expect("a column header row");
+        let header = lines[header_idx];
+        for row in &lines[header_idx + 1..] {
+            assert_eq!(
+                column_offsets(row),
+                column_offsets(header),
+                "row `{row}` aligns with the header"
+            );
+        }
+    }
+}
+
+/// The JSON forms: one object each, the agreed field names, nulls for
+/// unset pieces.
+#[test]
+fn rousterd_json_renders_have_the_agreed_shape() {
+    let st = parse_rousterd("rousterd-status-full.status");
+    let json = st.render_interfaces_json(PidState::Running, None);
+    assert!(json.starts_with('{') && json.ends_with('}'));
+    assert!(json.contains("\"daemon\":\"rousterd\""));
+    assert!(json.contains("\"pid\":4242"));
+    assert!(json.contains("\"pid_state\":\"running\""));
+    assert!(json.contains("\"router_id\":\"198.51.100.1\""));
+    assert!(json.contains("\"name\":\"eth0\""));
+    assert!(json.contains("\"vrf\":null"), "- renders as null");
+    assert!(json.contains("\"addresses\":[\"192.0.2.1/24\",\"2001:db8::1/64\"]"));
+
+    let json = st.render_neighbours_json(PidState::Dead, Some("192.0.2.0/24"));
+    assert!(json.contains("\"ip\":\"192.0.2.10\""));
+    assert!(json.contains("\"pid_state\":\"dead\""));
+    assert!(!json.contains("198.51.100.9"), "the filter applies to JSON too");
+
+    let json = st.render_vrfs_json(PidState::Unknown);
+    assert!(json.contains("\"name\":\"vrf-blue\""));
+    assert!(json.contains("\"table\":1001"));
+    assert!(json.contains("\"members\":1"));
+    assert!(json.contains("\"pid_state\":\"unknown\""));
+
+    let json = st.render_rib_summary_json(PidState::Running);
+    assert!(json.contains("\"table\":254"));
+    assert!(json.contains("\"connected\":3"));
+    assert!(json.contains("\"vrf\":null"), "- renders as null");
+
+    let malformed = parse_rousterd("rousterd-status-malformed.status");
+    let json = malformed.render_rib_summary_json(PidState::Unknown);
+    assert!(json.contains("\"routes\":null"), "unset counts are null");
+    assert!(json.contains("\"pid\":null"));
+}
+
+// ------------------------------------------------------- args (v2)
+
+#[test]
+fn args_parse_the_v2_grammar() {
+    let cli = args::parse(&argv(&["show", "interface"])).unwrap();
+    assert_eq!(
+        cli.command,
+        Command::ShowInterface { name: None, json: false }
+    );
+    let cli = args::parse(&argv(&["show", "interface", "eth0", "--json"])).unwrap();
+    assert_eq!(
+        cli.command,
+        Command::ShowInterface {
+            name: Some("eth0".into()),
+            json: true
+        }
+    );
+    let cli = args::parse(&argv(&["show", "neighbour", "192.0.2.0/24", "--json"])).unwrap();
+    assert_eq!(
+        cli.command,
+        Command::ShowNeighbour {
+            prefix: Some("192.0.2.0/24".into()),
+            json: true
+        },
+        "the flag may sit after the positional"
+    );
+    // ...but never before the subcommand (the v1 position rule).
+    assert!(args::parse(&argv(&["--json", "show", "neighbour"])).is_err());
+    assert_eq!(
+        args::parse(&argv(&["show", "vrf"])).unwrap().command,
+        Command::ShowVrf { json: false }
+    );
+    assert_eq!(
+        args::parse(&argv(&["show", "rib", "summary", "--json"]))
+            .unwrap()
+            .command,
+        Command::ShowRibSummary { json: true }
+    );
+}
+
+#[test]
+fn args_reject_the_v2_usage_errors() {
+    let cases: [&[&str]; 7] = [
+        &["show", "ip"],
+        &["show", "rib"],
+        &["show", "rib", "detail"],
+        &["show", "interface", "eth0", "eth1"],
+        &["show", "vrf", "extra"],
+        &["--json"],
+        &["--json", "status"],
+    ];
+    for case in cases {
+        assert!(
+            args::parse(&argv(case)).is_err(),
+            "expected a usage error for {case:?}"
+        );
+    }
+}
+
+#[test]
+fn help_text_lists_the_v2_table() {
+    let help = args::help_text();
+    for needle in [
+        "show sav",
+        "show interface",
+        "show neighbour",
+        "show vrf",
+        "show rib summary",
+        "rousterd.status",
+        "filter that",
+    ] {
+        assert!(help.contains(needle), "help must mention {needle}");
+    }
+}

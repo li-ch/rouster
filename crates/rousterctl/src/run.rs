@@ -1,13 +1,15 @@
 //! Wiring: run-dir files → operator answers → exit codes.
 //!
-//! Exit codes (the v1 contract, see docs/operator-surfaces.md):
-//! `0` ok · `2` usage · `3` not found (no status published) ·
-//! `4` not running (stale files naming a dead pid).
+//! Exit codes (the v2 contract, see docs/operator-surfaces.md):
+//! `0` ok · `2` usage · `3` not found (no status published, or a
+//! filter that names nothing) · `4` not running (stale files naming
+//! a dead pid).
 
 use std::path::{Path, PathBuf};
 
 use crate::args::{self, Cli, Command};
 use crate::liveness::{pid_state, PidState};
+use crate::rousterd::RousterdStatus;
 use crate::status::SavStatus;
 
 /// Everything went fine.
@@ -32,8 +34,128 @@ pub fn dispatch(cli: &Cli) -> u8 {
             EXIT_OK
         }
         Command::ShowSav { json } => show_sav(&cli.run_dir, *json),
+        Command::ShowInterface { name, json } => {
+            show_rousterd(&cli.run_dir, *json, &RdView::Interface(name.clone()))
+        }
+        Command::ShowNeighbour { prefix, json } => {
+            if let Some(prefix) = prefix {
+                if !crate::rousterd::valid_filter(prefix) {
+                    eprintln!(
+                        "rousterctl: bad prefix filter `{prefix}` — want A.B.C.D[/M] or X:X::X:X[/M]"
+                    );
+                    return EXIT_USAGE;
+                }
+            }
+            show_rousterd(&cli.run_dir, *json, &RdView::Neighbour(prefix.clone()))
+        }
+        Command::ShowVrf { json } => show_rousterd(&cli.run_dir, *json, &RdView::Vrf),
+        Command::ShowRibSummary { json } => {
+            show_rousterd(&cli.run_dir, *json, &RdView::RibSummary)
+        }
         Command::Status => status(&cli.run_dir),
     }
+}
+
+/// Which rousterd-dump view a `show` command asked for.
+enum RdView {
+    Interface(Option<String>),
+    Neighbour(Option<String>),
+    Vrf,
+    RibSummary,
+}
+
+impl RdView {
+    /// Did the view's filter name nothing? (Exit 3: the asked-for
+    /// thing is not in the published state.) An unfiltered view is
+    /// never a miss — an empty table is a fine answer.
+    fn is_miss(&self, parsed: &RousterdStatus) -> bool {
+        match self {
+            RdView::Interface(name) => name.as_deref().is_some_and(|name| {
+                parsed.interfaces_matching(Some(name)).is_empty()
+            }),
+            RdView::Neighbour(prefix) => prefix.as_deref().is_some_and(|prefix| {
+                parsed.neighbours_matching(Some(prefix)).is_empty()
+            }),
+            _ => false,
+        }
+    }
+
+    fn render_terminal(&self, parsed: &RousterdStatus) -> String {
+        match self {
+            RdView::Interface(name) => parsed.render_interfaces(name.as_deref()),
+            RdView::Neighbour(prefix) => parsed.render_neighbours(prefix.as_deref()),
+            RdView::Vrf => parsed.render_vrfs(),
+            RdView::RibSummary => parsed.render_rib_summary(),
+        }
+    }
+
+    fn render_json(&self, parsed: &RousterdStatus, state: PidState) -> String {
+        match self {
+            RdView::Interface(name) => parsed.render_interfaces_json(state, name.as_deref()),
+            RdView::Neighbour(prefix) => parsed.render_neighbours_json(state, prefix.as_deref()),
+            RdView::Vrf => parsed.render_vrfs_json(state),
+            RdView::RibSummary => parsed.render_rib_summary_json(state),
+        }
+    }
+}
+
+/// The shared rousterd-dump leg: read the file (3 when missing),
+/// assess liveness from the pid the header records (rousterd has no
+/// pidfile — the header is its live word), render terminal or JSON,
+/// exit 3 on a filter that names nothing, and 4 on a dead pid (the
+/// file is the last-known record).
+fn show_rousterd(run_dir: &Path, json: bool, view: &RdView) -> u8 {
+    let status_path = run_dir.join("rousterd.status");
+    let text = match std::fs::read_to_string(&status_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "rousterctl: no rousterd status published at {} ({err})",
+                status_path.display()
+            );
+            return EXIT_NOT_FOUND;
+        }
+    };
+    let parsed = RousterdStatus::parse(&text);
+    let state = parsed.pid.map(pid_state).unwrap_or(PidState::Unknown);
+    if json {
+        println!("{}", view.render_json(&parsed, state));
+    } else {
+        print!(
+            "{}{}",
+            join_lines(&parsed.header_lines(state)),
+            view.render_terminal(&parsed)
+        );
+        if parsed.unknown_lines > 0 {
+            print!("{}", parsed.unknown_disclosure());
+        }
+    }
+    if state == PidState::Dead {
+        let pid = parsed
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".into());
+        eprintln!(
+            "rousterctl: rousterd pid {pid} is not running — \
+             this is the last-known record (stale run-dir files)"
+        );
+        return EXIT_NOT_RUNNING;
+    }
+    if view.is_miss(&parsed) {
+        return EXIT_NOT_FOUND;
+    }
+    EXIT_OK
+}
+
+/// Join rendered header lines (each already newline-free) into the
+/// terminal block.
+fn join_lines(lines: &[String]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// `show sav`: render the published status; assess liveness from the
@@ -125,19 +247,58 @@ fn status(run_dir: &Path) -> u8 {
         }
     }
 
-    let sockets = socket_candidates(run_dir);
-    if sockets.is_empty() {
-        println!(
-            "rousterd  no zapi socket in the run dir \
-             (not running, or no `zapi socket` line configured)"
-        );
+    // The rousterd leg: assessable since the status dump's header
+    // pid (no pidfile contract yet — the header is the live word).
+    // Without a dump, the v1 fallback stands: list socket candidates
+    // and disclose that liveness is not knowable.
+    let dump = run_dir.join("rousterd.status");
+    if dump.is_file() {
+        let parsed = std::fs::read_to_string(&dump)
+            .ok()
+            .map(|text| RousterdStatus::parse(&text));
+        match parsed.as_ref().and_then(|parsed| parsed.pid) {
+            Some(pid) => match pid_state(pid) {
+                PidState::Running => {
+                    let parsed = parsed.as_ref().expect("pid came from this parse");
+                    println!(
+                        "rousterd  pid {pid} running, dump published \
+                         ({} interfaces, {} neighbours, {} table{})",
+                        parsed.interfaces.len(),
+                        parsed.neighbours.len(),
+                        parsed.tables.len(),
+                        if parsed.tables.len() == 1 { "" } else { "s" },
+                    );
+                }
+                PidState::Dead => {
+                    println!(
+                        "rousterd  pid {pid} DEAD — stale dump \
+                         (the last-known record)"
+                    );
+                    exit = exit.max(EXIT_NOT_RUNNING);
+                }
+                PidState::Unknown => {
+                    println!("rousterd  pid {pid} present, liveness unknown (probe failed)");
+                }
+            },
+            None => {
+                println!("rousterd  dump present, no pid recorded");
+            }
+        }
     } else {
-        for socket in sockets {
+        let sockets = socket_candidates(run_dir);
+        if sockets.is_empty() {
             println!(
-                "rousterd  zapi socket {} present \
-                 (liveness not yet knowable — no rousterd pidfile contract)",
-                socket.display()
+                "rousterd  no dump and no zapi socket in the run dir \
+                 (not running, or an older rousterd without the status writer)"
             );
+        } else {
+            for socket in sockets {
+                println!(
+                    "rousterd  zapi socket {} present \
+                     (no status dump — older rousterd, liveness not knowable)",
+                    socket.display()
+                );
+            }
         }
     }
     exit

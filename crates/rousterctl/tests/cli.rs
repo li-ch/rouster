@@ -254,3 +254,166 @@ fn status_lists_run_dir_sockets() {
     drop(listener);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ------------------------------------------------ rousterd dump e2e
+
+/// The full fixture with a live header pid (the dump's pid is
+/// rousterd's live word — there is no pidfile).
+fn rousterd_with_live_pid() -> String {
+    status_with_pid("rousterd-status-full.status", std::process::id())
+}
+
+#[test]
+fn show_interface_renders_the_dump_table() {
+    let dir = scratch("rd-iface");
+    std::fs::write(dir.join("rousterd.status"), rousterd_with_live_pid()).unwrap();
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "show", "interface"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = out(&output);
+    assert!(text.contains("rousterd 0.0.0"), "the daemon header renders");
+    assert!(text.contains("router-id 198.51.100.1"));
+    assert!(text.contains("running"), "the liveness assessment renders");
+    assert!(text.contains("eth0"));
+    assert!(text.contains("192.0.2.1/24"));
+    assert!(text.contains("vrf-blue"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn show_interface_filters_by_name_and_misses_honestly() {
+    let dir = scratch("rd-iface-name");
+    std::fs::write(dir.join("rousterd.status"), rousterd_with_live_pid()).unwrap();
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "show", "interface", "eth1"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = out(&output);
+    assert!(text.contains("eth1"));
+    assert!(!text.contains("eth0"), "the filter selects");
+
+    let miss = ctl(&["--run-dir", &dir_arg(&dir), "show", "interface", "eth9"]);
+    assert_eq!(miss.status.code(), Some(3), "a filter that names nothing exits 3");
+    assert!(out(&miss).contains("no interface named eth9"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn show_neighbour_renders_and_filters() {
+    let dir = scratch("rd-neigh");
+    std::fs::write(dir.join("rousterd.status"), rousterd_with_live_pid()).unwrap();
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "show", "neighbour"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(out(&output).contains("198.51.100.9"));
+    assert!(out(&output).contains("02:00:00:00:00:11"));
+
+    let filtered = ctl(&[
+        "--run-dir",
+        &dir_arg(&dir),
+        "show",
+        "neighbour",
+        "192.0.2.0/24",
+    ]);
+    assert_eq!(filtered.status.code(), Some(0));
+    let text = out(&filtered);
+    assert!(text.contains("192.0.2.10"));
+    assert!(!text.contains("198.51.100.9"));
+
+    let bad = ctl(&["--run-dir", &dir_arg(&dir), "show", "neighbour", "wat"]);
+    assert_eq!(bad.status.code(), Some(2), "a bad filter is a usage error");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn show_vrf_and_rib_summary_render() {
+    let dir = scratch("rd-vrf");
+    std::fs::write(dir.join("rousterd.status"), rousterd_with_live_pid()).unwrap();
+    let vrf = ctl(&["--run-dir", &dir_arg(&dir), "show", "vrf"]);
+    assert_eq!(vrf.status.code(), Some(0));
+    let text = out(&vrf);
+    assert!(text.contains("vrf-blue"));
+    assert!(text.contains("1001"), "the bound table renders");
+
+    let summary = ctl(&["--run-dir", &dir_arg(&dir), "show", "rib", "summary"]);
+    assert_eq!(summary.status.code(), Some(0));
+    let text = out(&summary);
+    assert!(text.contains("254"));
+    assert!(text.contains("vrf-blue"), "the VRF association renders");
+
+    let json = ctl(&["--run-dir", &dir_arg(&dir), "show", "rib", "summary", "--json"]);
+    assert_eq!(json.status.code(), Some(0));
+    let text = out(&json).trim().to_string();
+    assert!(text.starts_with('{') && text.ends_with('}'));
+    assert!(text.contains("\"daemon\":\"rousterd\""));
+    assert!(text.contains("\"connected\":3"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn show_rousterd_without_a_dump_exits_3() {
+    let dir = scratch("rd-missing");
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "show", "interface"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        err(&output).contains("rousterd.status"),
+        "the missing file is named"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn show_rousterd_dead_header_pid_exits_4_and_still_renders() {
+    let dir = scratch("rd-dead");
+    std::fs::write(
+        dir.join("rousterd.status"),
+        status_with_pid("rousterd-status-full.status", dead_pid()),
+    )
+    .unwrap();
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "show", "vrf"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        out(&output).contains("vrf-blue"),
+        "the last-known record still renders"
+    );
+    assert!(err(&output).to_lowercase().contains("not running"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn status_inventories_a_running_rousterd_from_the_dump() {
+    let dir = scratch("rd-status");
+    std::fs::write(dir.join("rousterd.status"), rousterd_with_live_pid()).unwrap();
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "status"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = out(&output);
+    assert!(text.contains("rousterd"));
+    assert!(text.contains("dump published"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn status_names_a_stale_rousterd_dump_and_exits_4() {
+    let dir = scratch("rd-status-dead");
+    std::fs::write(
+        dir.join("rousterd.status"),
+        status_with_pid("rousterd-status-full.status", dead_pid()),
+    )
+    .unwrap();
+    let output = ctl(&["--run-dir", &dir_arg(&dir), "status"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(out(&output).to_lowercase().contains("stale"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_empty_dump_renders_honest_empties() {
+    let dir = scratch("rd-empty");
+    std::fs::write(
+        dir.join("rousterd.status"),
+        fixture("rousterd-status-empty.status").replace("pid 7", &format!("pid {}", std::process::id())),
+    )
+    .unwrap();
+    let vrf = ctl(&["--run-dir", &dir_arg(&dir), "show", "vrf"]);
+    assert_eq!(vrf.status.code(), Some(0));
+    assert!(out(&vrf).contains("no VRF devices"));
+    let neigh = ctl(&["--run-dir", &dir_arg(&dir), "show", "neighbour"]);
+    assert_eq!(neigh.status.code(), Some(0), "an empty table is a fine answer");
+    let _ = std::fs::remove_dir_all(dir);
+}

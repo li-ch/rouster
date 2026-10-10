@@ -1,0 +1,6 @@
+rousterd 0.0.0 pid 7
+router-id none
+interfaces 0
+neighbours 0
+tables 1
+table 254 routes 0 prefixes 0 connected 0 kernel 0 vrf -
