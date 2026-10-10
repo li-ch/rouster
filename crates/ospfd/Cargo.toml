@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 common = { workspace = true }
 zapi = { workspace = true }
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
