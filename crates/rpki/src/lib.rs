@@ -13,12 +13,16 @@
 //!   shapes.
 //! - [`vrp`]: the Validated ROA Payload table with RFC 6811
 //!   covering/matching semantics.
+//! - [`rov`]: RFC 6811 §2 prefix-origin validation (the pure
+//!   NotFound/Valid/Invalid function over the VRP set).
 
 pub mod pdu;
+pub mod rov;
 pub mod vrp;
 
 pub use pdu::{
     ErrorCode, Pdu, PayloadFlags, Timing, MAX_PDU_LEN, RTR_PORT, VERSION_0, VERSION_1,
     VERSION_2, HIGHEST_VERSION,
 };
+pub use rov::{validate, OriginAsn, Validity};
 pub use vrp::{Vrp, VrpTable};
