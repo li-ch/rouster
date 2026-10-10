@@ -7,7 +7,7 @@
 #        | ZAPI v6 over /var/run/frr/zserv.api (0666)
 #   rousterd (residential, config: `zapi socket /var/run/frr/zserv.api`)
 #        | netlink
-#   kernel: 203.0.113.0/24 blackhole + 198.51.100.0/24 via 192.0.2.1 (dummy0)
+#   kernel: 203.0.113.0/24 blackhole + 198.51.100.0/24 via <bridge-gw> (eth0)
 #
 # Config delivery: this FRR build has no `staticd -f` option and does not
 # auto-read /etc/frr/staticd.conf (Z1 deviation 1, pinned doc operational
@@ -18,13 +18,19 @@
 # staticd -> ZAPI -> rousterd -> kernel; the ZAPI path is the object under
 # test and is never bypassed.
 #
-# The reachable gateway 192.0.2.1 is configured on dummy0 BEFORE rousterd
-# starts, so P0B resolution succeeds from the initial mirror.
+# The reachable gateway is the docker bridge's own gateway on eth0,
+# discovered at runtime (a dummy0 self-addressed gateway — the pre-M3
+# shape — can never confirm a neighbour: dummy devices hold no ARP, so
+# the M3 neighbour-liveness gate answers it permanently unresolved and
+# staticd correctly withdraws the route; staticd itself warns "Local
+# connected address is configured as Gateway IP"). One warm-up ping
+# teaches eth0 the gateway's lladdr BEFORE staticd registers it — the
+# deployment-with-traffic shape the gate prescribes.
 #
 # Machine check (script exit 0): BOTH prefixes present in
 # `ip route show proto static` (blackhole prefix + gateway prefix via
-# 192.0.2.1). rousterd, staticd and mgmtd logs are copied to the quarantine
-# dir on success AND failure (trap).
+# the bridge gateway). rousterd, staticd and mgmtd logs are copied to
+# the quarantine dir on success AND failure (trap).
 #
 # Never pulls images. Container caps: NET_ADMIN for the `ip` commands
 # (test-phase0.sh precedent) plus NET_RAW + SYS_ADMIN, which FRR's mgmtd
@@ -60,7 +66,7 @@ capture() {
     docker cp "$NAME:$ROUSTERD_LOG" "$QUARANTINE/rousterd.log" 2>/dev/null || true
     docker cp "$NAME:$STATICD_LOG" "$QUARANTINE/staticd.log" 2>/dev/null || true
     docker cp "$NAME:$MGMTD_LOG" "$QUARANTINE/mgmtd.log" 2>/dev/null || true
-    docker exec "$NAME" sh -c 'ip route show proto static; echo ---; ip route show; echo ---; ip addr show dummy0' \
+    docker exec "$NAME" sh -c 'ip route show proto static; echo ---; ip route show; echo ---; ip neigh show dev eth0' \
         > "$QUARANTINE/routes.txt" 2>&1 || true
     docker exec "$NAME" sh -c "ls -l $ZAPI_SOCK; pidof staticd; pidof rousterd" \
         > "$QUARANTINE/env.txt" 2>&1 || true
@@ -96,19 +102,22 @@ docker run -d --name "$NAME" \
 echo "==> installing rousterd"
 docker cp "target/$MUSL_TARGET/release/rousterd" "$NAME:/usr/local/bin/rousterd"
 
+echo "==> discovering the bridge gateway + confirming its neighbour (M3 gate)"
+GW=$(docker exec "$NAME" sh -c "ip route show default" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}' | head -1)
+[ -n "$GW" ] || { echo "FAIL: no default route to use as gateway" >&2; exit 1; }
+docker exec "$NAME" ping -c1 -W1 "$GW" >/dev/null 2>&1 || true
+docker exec "$NAME" sh -c "ip neigh show $GW dev eth0" | grep -q lladdr \
+    || { echo "FAIL: gateway $GW has no lladdr neighbour after warm-up ping" >&2; exit 1; }
+
 echo "==> writing /etc/frr/frr.conf"
 docker exec "$NAME" sh -c "printf '%s\n' \
   'frr version 10.2' \
   'frr defaults traditional' \
   'hostname r1' \
   'ip route 203.0.113.0/24 blackhole' \
-  'ip route 198.51.100.0/24 192.0.2.1' \
+  'ip route 198.51.100.0/24 $GW' \
   'line vty' \
   > $FRR_CONF"
-
-echo "==> reachable gateway first: dummy0 with 192.0.2.1/24 (P0B resolution)"
-docker exec "$NAME" sh -c \
-    'ip link add dummy0 type dummy && ip link set dummy0 up && ip addr add 192.0.2.1/24 dev dummy0'
 
 echo "==> starting resident rousterd with the zapi socket"
 docker exec "$NAME" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
@@ -137,9 +146,9 @@ wait_in_container "staticd attached (HELLO in rousterd log)" 30 \
 wait_in_container "both prefixes in kernel (proto static)" 60 \
     "ip route show proto static | grep -q '203.0.113.0/24' && ip route show proto static | grep -q '198.51.100.0/24'"
 
-echo "==> verifying the gateway route goes via 192.0.2.1"
+echo "==> verifying the gateway route goes via $GW"
 docker exec "$NAME" sh -c \
-    "ip route show proto static | grep '198.51.100.0/24' | grep -q 'via 192.0.2.1'"
+    "ip route show proto static | grep '198.51.100.0/24' | grep -q 'via $GW'"
 
 echo "==> final kernel state (proto static)"
 docker exec "$NAME" ip route show proto static
