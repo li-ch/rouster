@@ -120,8 +120,10 @@ impl RibStatus {
                     }
                 }
                 "table" => {
-                    let mut table = TableLine::default();
-                    table.id = tokens.get(1).and_then(|t| t.parse().ok());
+                    let mut table = TableLine {
+                        id: tokens.get(1).and_then(|t| t.parse().ok()),
+                        ..TableLine::default()
+                    };
                     parse_table_body(&mut table, &tokens[2..]);
                     if table.id.is_some() {
                         parsed.tables.push(table);
