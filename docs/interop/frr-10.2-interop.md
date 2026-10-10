@@ -395,3 +395,41 @@ semantics).
 Evidence: `away/2026-10-09/quarantine/{z5,z5b,z5e,w8-savd}/` (the
 per-script quarantine captures; the orchestrator's 11:02 failing-run
 w8 captures preserved alongside as `w8-savd-orchestrator-1102/`).
+
+## W1-b follow-ups (2026-10-10/11): the BFD zapi family, pinned and wired
+
+Stream W1-b pinned the ZAPI BFD message family against real 10.2.2
+speakers (both directions; the pins and capture citations live in
+`docs/interop/zapi-10.2-pinned.md`'s W1-b addendum) and landed the
+whole path: codec arms, rousterd's registration relay + state
+fan-out, `bfdd --zapi` (dynamic sessions), and the
+`scripts/test-bfd-zapi.sh` smoke (exit 0 twice). Same-window
+findings worth keeping beside the z5-era notes above:
+
+- **bgpd's config apply blocks on a silent LABEL_MANAGER_CONNECT**
+  (finding 3, hit live pushing a bgp config with `neighbor ... bfd`
+  through `vtysh -b` against a masquerade): zapi-sniff gained
+  `--respond-labelmgr` (the pinned 4-byte reply form) to drive
+  captures past it.
+- **bgpd classifies NHT-unresolved neighbors' BFD as MULTIHOP** and
+  `_bfd_sess_valid` then rejects the session until a local address
+  exists — an on-link `neighbor X bfd` sent NO register in any
+  window (against the masquerade AND against rousterd with its
+  interface dump + NHT answers). The multihop + `update-source` form
+  registers reliably (that is the pinned bgpd frame, and the form
+  the bfd-zapi smoke drives).
+- **Zebra's BFD state push is command 26** (ZEBRA_INTERFACE_BFD_
+  DEST_UPDATE) with a 21-byte body; **bfdd's own transition reports
+  ride command 30** (the REPLAY command) with a 25-byte body = pid +
+  the exact 26 tuple — the same command carrying two forms,
+  distinguished by length (the INTERFACE_ADD request/dump pattern).
+- **The 26 fan-out goes to every BFD_CLIENT_REGISTER (36) sender**,
+  not just the destination's registrant (observed: one probe
+  received another probe's freshly-registered destination's DOWN).
+- **DEREGISTER (28) draws no reply** — and no FRR daemon was
+  observed SENDING one in any window.
+- The BFD status field is a BITMASK per lib/bfd.h (UNKNOWN=1, DOWN=2,
+  UP=4, ADMIN_DOWN=8) — the pre-verify "UP=1" reading was wrong; the
+  live UP frame carries 4.
+- zapi-sniff also gained `--respond-iface`/`--respond-nht` (codec-
+  built answers) as capture drivers for the above.
