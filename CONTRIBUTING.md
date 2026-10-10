@@ -1,0 +1,87 @@
+# Contributing to Rouster
+
+Thanks for looking under the hood. This file is the short version of how
+to land a change; the project's shape and rules live in
+[AGENTS.md](AGENTS.md), [docs/architecture.md](docs/architecture.md) and
+[docs/implementation-plan.md](docs/implementation-plan.md).
+
+## Build & gate
+
+Rust **stable** toolchain (no nightly features in the tree):
+
+```sh
+cargo build --release
+
+# The gate — all three must pass before a commit:
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+If your shell doesn't source your profile (CI containers, scripts,
+terminals launched oddly), cargo may not be on PATH — prefix commands with
+`PATH=$HOME/.cargo/bin:$PATH`.
+
+Protocol code carries two extra rules: **no `unsafe`** and **no new
+dependencies** without an explicit note in the commit message saying why
+the fence is being crossed (the workspace runs deliberately lean — see the
+comments in `Cargo.toml`).
+
+## Commits
+
+Imperative mood with a scope prefix — look at `git log` for the pattern:
+
+```
+rib: add best-path selection
+zapi: answer ospfd's NHT registration from the kernel mirror
+docs: add CONTRIBUTING
+```
+
+Update documentation in the same change that alters behavior:
+`docs/implementation-plan.md` Appendix C is **append-only** (status ticks
+cite their evidence), and interop results always extend
+`docs/interop/frr-10.2-interop.md` rather than rewriting it.
+
+## Wire formats: pin, never guess
+
+FRR's ZAPI drifts across versions and is not fully specified in prose, so
+every wire fact in this repo is pinned empirically against FRR **10.2.2**
+and recorded in
+[docs/interop/zapi-10.2-pinned.md](docs/interop/zapi-10.2-pinned.md) —
+that file is the codec's ground truth (see
+[docs/README.md](docs/README.md) for how the pinning was done and the
+rules). In practice:
+
+- A new ZAPI message or body field is implemented only after it has been
+  observed on the wire (capture tools: `zapi-sniff`,
+  `zapi-notify-probe` in `crates/zapi`), with the fixture committed under
+  `crates/zapi/tests/fixtures/` and the pinned doc extended in the same
+  change.
+- Numbers from other FRR versions, from the FRR dev guide, or from memory
+  are **not** authority — observations against 10.2.2 are.
+- Never paste FRR (or other GPL project) source into this repository;
+  derive wire facts from captures and observed behavior instead.
+
+Draft-dependent SAVNET wire protocols follow the same pattern behind the
+`experimental-savnet` feature flag, with the implemented draft version
+pinned in docs (implementation-plan §4).
+
+## Smoke tests
+
+Integration evidence is container-based and lives in `scripts/`:
+
+- Every `scripts/test-*.sh` is auto-discovered by `scripts/run-smokes.sh`
+  (glob filter: `scripts/run-smokes.sh 'z5*'`; logs land in
+  `target/smoke-logs/`).
+- Scripts are **self-cleaning**: whatever containers/netns/veth they
+  create get torn down in traps, including on failure.
+- Scripts **never pull images**. They build rousterd for musl on the host
+  and copy the binary into containers from cached local images (base
+  image override: `ROUSTER_TEST_BASE_IMAGE`). A new smoke script should
+  state its image prerequisites in its header comment.
+- A change that touches kernel-visible behavior ships with a smoke script
+  that proves it (or extends an existing one), not just unit tests.
+
+Anything that changes how a real FRR daemon behaves when attached belongs
+in `docs/interop/frr-10.2-interop.md` too — future readers will want to
+know what was observed, not just what was intended.
