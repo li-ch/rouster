@@ -44,7 +44,12 @@
 #   scripts/test-w8-savd.sh
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# Resolve the script dir to an ABSOLUTE path before any cd: the
+# quarantine default below anchors on it, and re-resolving a relative
+# $0 after the top-level cd silently shifts the base (the 11:02
+# orchestrator run's captures landed inside the repo that way).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
 IMAGE=rouster:w8
@@ -58,7 +63,7 @@ STATICD_CONF=/etc/staticd.conf
 SAVD_CONF=/etc/savd.conf
 ZAPI_SOCK=/run/rouster/zserv.api
 # away/<program>/quarantine sits next to the rouster repo's parent.
-QUARANTINE="${ROUSTER_W8_QUARANTINE:-$(cd "$(dirname "$0")/../.." && pwd)/away/2026-10-09/quarantine/w8-savd}"
+QUARANTINE="${ROUSTER_W8_QUARANTINE:-$SCRIPT_DIR/../../away/2026-10-09/quarantine/w8-savd}"
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;
