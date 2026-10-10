@@ -278,10 +278,13 @@ impl Packet {
                 }
             }
             PacketBody::DbDescription(d) => {
+                // §A.3.3: MTU(2) + Options(1) + I/M/MS(1) + DD
+                // sequence(4) — NO padding octets (the Day-1 pad was
+                // a wire bug FRR 10.2.2 caught: "undersized (2 B)
+                // trailing LSA header").
                 put_u16(buf, d.interface_mtu);
                 put_u8(buf, d.options.0);
                 put_u8(buf, d.flags());
-                put_u16(buf, 0); // padding to the 32-bit boundary
                 put_u32(buf, d.dd_sequence);
                 for h in &d.lsa_headers {
                     h.encode(buf);
@@ -397,7 +400,6 @@ impl Packet {
                 value: flags,
             });
         }
-        let _pad = r.u16().ok_or_else(|| need(r, 2))?;
         let dd_sequence = r.u32().ok_or_else(|| need(r, 4))?;
         let mut headers = Vec::new();
         while !r.is_empty() {
@@ -599,6 +601,43 @@ mod tests {
                 }],
             }),
         }
+    }
+
+    #[test]
+    fn dbd_empty_exstart_is_exactly_32_bytes() {
+        // §A.3.3 with no LSA headers: 24-byte common header + 8-byte
+        // DBD preamble (MTU, options, flags, sequence) — no padding.
+        // Pinned by FRR 10.2.2's own "Packet Len 32" dump and its
+        // "undersized (2 B) trailing" rejection of the padded form
+        // (the Day-1 wire bug the interop caught).
+        let dd = DbDescription {
+            interface_mtu: 1500,
+            options: Options(0x02),
+            init: true,
+            more: true,
+            master: true,
+            dd_sequence: 0x3879fa0b,
+            lsa_headers: vec![],
+        };
+        let packet = Packet {
+            header: PacketHeader {
+                version: 2,
+                packet_type: 2,
+                length: 0,
+                router_id: RouterId::from_ipv4("10.255.1.1".parse().unwrap()),
+                area_id: 0,
+                checksum: 0,
+                au_type: 0,
+                authentication: 0,
+            },
+            body: PacketBody::DbDescription(dd),
+        };
+        let bytes = packet.encode();
+        assert_eq!(bytes.len(), 32, "no pad octets in the DD preamble");
+        let back = Packet::decode(&bytes).unwrap();
+        assert_eq!(back.body, packet.body);
+        assert_eq!(back.header.router_id, packet.header.router_id);
+        assert_eq!(back.header.length, 32);
     }
 
     #[test]

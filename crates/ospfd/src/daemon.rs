@@ -124,13 +124,19 @@ impl Ospfd {
                     "interface {name}: address must be a real interface address"
                 ));
             }
+            let mut fsm = InterfaceFsm::new(icfg.network_type == NetworkType::PointToPoint);
+            // §9.3 InterfaceUp: the config's address IS the lower
+            // layer's usable-interface signal (v1: no link-state
+            // tracking) — the interface enters PointToPoint/Waiting
+            // at construction.
+            fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
             interfaces.push(Interface {
                 name: name.clone(),
                 cfg: icfg.clone(),
                 addr,
                 mask,
                 p2p: icfg.network_type == NetworkType::PointToPoint,
-                fsm: InterfaceFsm::new(icfg.network_type == NetworkType::PointToPoint),
+                fsm,
                 neighbors: HashMap::new(),
                 hello_deadline: 0,
             });
@@ -156,6 +162,30 @@ impl Ospfd {
 
     pub fn attach_zapi(&mut self, tx: mpsc::UnboundedSender<ZedgeCommand>) {
         self.zapi = Some(tx);
+    }
+
+    /// The p2p neighbor's IP address on the interface whose own
+    /// address is `interface_addr` — §16.1.1's p2p next hop ("the
+    /// neighboring router"), which no LSA carries (Link Data is the
+    /// ADVERTISER's address); the adjacency (the Hello source) does.
+    fn p2p_peer_address(&self, interface_addr: Ipv4Addr) -> Option<Ipv4Addr> {
+        self.interfaces
+            .iter()
+            .filter(|i| i.addr == interface_addr)
+            .flat_map(|i| i.neighbors.values())
+            .filter(|c| c.state() == NeighborState::Full)
+            .map(|c| c.ip)
+            .next()
+    }
+
+    /// Mark the routing calculation dirty (§16 runs on the throttle
+    /// window — FRR-parity backoff). EVERY dirtying site must go
+    /// through here: the scheduler's due deadline dies with
+    /// `mark_run`, so a bare `spf_dirty` flag without `on_change`
+    /// would never fire again.
+    fn mark_spf_dirty(&mut self, now: u64) {
+        self.spf_sched.on_change(now * 1000);
+        self.spf_dirty = true;
     }
 
     fn packet(&self, body: PacketBody) -> Packet {
@@ -197,10 +227,23 @@ impl Ospfd {
     /// neighbors (§13.3 retransmission lists armed).
     fn originate_router_lsa(&mut self, now: u64, out: &mut Vec<WireOut>) {
         let lsa = build_router_lsa(self.router_id, self.asbr, &self.interface_advs());
-        match self.lsdb.originate(lsa.clone(), now) {
+        match self.lsdb.originate(lsa, now) {
             Ok(_) => {
                 self.router_lsa_dirty = false;
-                self.flood_own(&lsa, now, out);
+                // Flood the STORED instance — Lsdb::originate stamped
+                // the sequence (§12.1.6); the builder's copy carries
+                // the raw 0.
+                let key = LsaKey {
+                    ls_type: crate::lsa::LsaType::ROUTER,
+                    link_state_id: crate::lsa::LinkStateId(self.router_id.0),
+                    adv_router: self.router_id,
+                };
+                if let Some(entry) = self.lsdb.get(&key) {
+                    let stored = entry.lsa.clone();
+                    self.flood_own(&stored, now, out);
+                    // The area graph changed: §16 runs.
+                    self.mark_spf_dirty(now);
+                }
                 info!("ospfd: router-LSA originated");
             }
             Err(e) => {
@@ -227,12 +270,17 @@ impl Ospfd {
             metric,
             true, // type-2 external (FRR's default)
         );
-        match self.lsdb.originate(lsa.clone(), now) {
+        let key = lsa.key();
+        match self.lsdb.originate(lsa, now) {
             Ok(_) => {
-                self.externals.insert(prefix.to_string(), lsa.key());
+                self.externals.insert(prefix.to_string(), key);
                 let first = !self.asbr;
                 self.asbr = true;
-                self.flood_own(&lsa, now, out);
+                if let Some(entry) = self.lsdb.get(&key) {
+                    let stored = entry.lsa.clone();
+                    self.flood_own(&stored, now, out);
+                }
+                self.mark_spf_dirty(now);
                 info!(prefix = %prefix, "ospfd: external LSA originated");
                 if first {
                     // The E-bit change re-originates the router-LSA.
@@ -441,8 +489,7 @@ impl Ospfd {
         }
         if !report.changed.is_empty() {
             // The SPF throttle (FRR-parity 0/50/5000 ms backoff).
-            self.spf_sched.on_change(now * 1000);
-            self.spf_dirty = true;
+            self.mark_spf_dirty(now);
         }
     }
 
@@ -466,7 +513,12 @@ impl Ospfd {
                 nexthops.add(
                     match nh.router {
                         Some(r) => Nexthop::Ipv4(r),
-                        None => Nexthop::Ipv4(nh.interface),
+                        // p2p first hop: the adjacency's address (the
+                        // interface-form hop is not a valid gateway).
+                        None => match self.p2p_peer_address(nh.interface) {
+                            Some(peer) => Nexthop::Ipv4(peer),
+                            None => continue,
+                        },
                     },
                     1,
                 );
@@ -521,9 +573,9 @@ impl Ospfd {
                 asbr_route
                     .next_hops
                     .iter()
-                    .map(|nh| match nh.router {
-                        Some(r) => Nexthop::Ipv4(r),
-                        None => Nexthop::Ipv4(nh.interface),
+                    .filter_map(|nh| match nh.router {
+                        Some(r) => Some(Nexthop::Ipv4(r)),
+                        None => self.p2p_peer_address(nh.interface).map(Nexthop::Ipv4),
                     })
                     .collect()
             };
@@ -630,7 +682,7 @@ impl Ospfd {
         for key in self.lsdb.flush_ready(self.any_syncing()) {
             if let Some(removed) = self.lsdb.remove(&key) {
                 debug!(key = ?key, len = removed.header.length, "ospfd: LSA flushed (MaxAge)");
-                self.spf_dirty = true;
+                self.mark_spf_dirty(now);
             }
         }
         // Deferred originations (MinLSInterval retries).

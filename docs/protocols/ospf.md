@@ -96,28 +96,69 @@ fork it. The concrete seams, documented where they bite:
   (Link Data as an interface address) and the stub-network mask
   arithmetic are v2-specific.
 
-## §Deferred (day-2 anchors)
+## Day-2 additions (2026-10-10/11, the transport + daemon + interop)
 
-- The daemon shell + real sockets: OSPF needs raw IP protocol 89 with
-  IP_ADD_MEMBERSHIP on 224.0.0.5/224.0.0.6 and TTL 1 (§A.1).
-  std::net joins the group and sets the TTL but has **no raw
-  sockets** (probed 2026-10-11); socket2 — already a workspace
-  member adopted by bfdd under owner decision A1 — is the path, but
-  the W2-e fence gates it as a STOP-and-record. Anchor:
-  `crates/ospfd/src/lib.rs` module list + the W2-e report.
-- `scripts/test-ospf-frr-interop.sh`: p2p adjacency to a real FRR
-  10.2.2 ospfd (frr-testbed, cached image), 15 s probe, LSDB
-  convergence, static→redistribute both directions.
-- Interface state machine (§9.1-§9.4) and DR/BDR election (§9.4);
-  broadcast-network origination (network-LSA by the DR, §12.4.2).
-- Multi-packet DBD walks (the §10.8 summary-list drain loop) — the
-  pure `process_dbd` handles the sequencing spine; the daemon layer
-  owns the MTU-bounded packing.
-- Retransmission lists and LSAck scheduling (§13.3/§13.5-§13.7) —
-  `flood_step` returns the decisions; the lists live with neighbors.
-- Inter-area (§16.2-§16.4), incremental SPF (§16.5/§16.6), virtual
-  links (§15), stub/NSSA areas (§3.6), authentication (Appendix D),
-  graceful restart (RFC 3623), DNA honoring, OSPFv3 bodies.
+- **socket2 adopted for ospfd** (owner decision A1, adopted
+  2026-10-11; the Day-1 STOP resolved). `transport.rs` owns the raw
+  proto-89 socket: 224.0.0.5 join, IP_MULTICAST_IF, TTL 1 on both
+  arms, AllDRouters join/leave on §9.4 role. Two disclosed fences:
+  no receive-side TTL check (socket2 0.6.5 has no recvmsg cmsg
+  parser — the bfdd wall) and no SO_BINDTODEVICE (the same crate
+  version) — the daemon demultiplexes by on-link source instead.
+  The safe-IO seam: socket2's recv wants `MaybeUninit` buffers, so
+  the armed fd is dup'ed into a tokio `UdpSocket` (same kernel
+  socket) for safe async send/recv.
+- **The wire bug the interop caught**: §A.3.3 has NO padding between
+  the I/M/MS octet and the DD sequence number — Day-1's codec wrote
+  (and read, symmetric, so its own tests passed) two spurious pad
+  bytes; FRR 10.2.2 rejected the DDs ("undersized (2 B) trailing
+  LSA header"). Golden: an empty ExStart DD is exactly 32 bytes.
+- **The daemon** (`daemon.rs` + `exchange.rs` + `bin/ospfd.rs`):
+  §10.8's MTU-bounded DD drain with the master's terminator rounds
+  and duplicate echoes, §10.9 request rounds, §13.3-§13.7
+  retransmission lists (RxmtInterval 5 s), §14 aging/flush,
+  §12.4.1/.2/.3 origination with MinLSInterval retries, the FRR-parity
+  SPF throttle, route diffing to ZEBRA_ROUTE_ADD/DELETE, and a
+  §16.4-lite external calculation (§16.4.1 steps 1-5 in the
+  single-area form: ASBR distance from the intra-area table; the
+  type-4 inter-area lookup is deferred with §16.2-§16.3).
+- **The zapi edge** (`zedge.rs`, the bgpd idioms): HELLO as OSPF
+  (7), `redistribute static` registration → the
+  REDISTRIBUTE_ROUTE_ADD/DEL pushes become §12.4.3
+  origination/withdrawal. Router ID and interface addresses come
+  from config (no ROUTER_ID_ADD/INTERFACE_ADD_REQUEST — the zapi
+  client exposes no raw send; disclosed).
+- **The p2p next-hop seam**: no LSA carries the p2p neighbor's
+  address (Link Data is the advertiser's own); the adjacency (the
+  Hello source) does — the daemon decorates the gateway at export
+  (`p2p_peer_address`), keeping SPF pure over LSAs.
+- **Interop**: `scripts/test-ospf-frr-interop.sh` — Full adjacency
+  with real FRR 10.2.2 over a p2p link, LSDB convergence both ways,
+  static→redistribute BOTH directions (ours → FRR's kernel; FRR's →
+  our §16.4 → kernel via rousterd), 30 s soak, exit 0 twice
+  back-to-back. FRR sets the type-5 forwarding address to a via-us
+  static's nexthop (§12.4.3), so the reverse direction uses a
+  blackhole static (FA 0.0.0.0) — a topology note, not a workaround.
+
+## §Deferred (updated day-2 anchors)
+
+- Broadcast networks in the DAEMON: the §9 FSM, §9.4 election and
+  §12.4.2 network-LSA origination are landed and table-tested
+  (`iface.rs`, `origination.rs`) but the daemon drives p2p only
+  (Waiting/DR/BDR wiring + the 224.0.0.6 join-on-role are the
+  remaining work).
+- §13.4 (adopting a newer self-originated LSA received back — a
+  restart with a flushed-but-not-aged peer can otherwise stick at
+  the stale instance; observed in a manual repro, benign on clean
+  startups).
+- Inter-area (§16.2-§16.3) and the type-4 lookup the external
+  calculation shortcuts; incremental SPF (§16.5/§16.6); virtual
+  links (§15); stub/NSSA areas (§3.6); authentication (Appendix D);
+  graceful restart (RFC 3623); DNA honoring; OSPFv3 bodies.
+- Receive-side TTL verification (needs the recvmsg cmsg walk — a
+  libc or socket2 upgrade); SO_BINDTODEVICE-style interface scoping.
+- Interface link-state tracking (InterfaceUp fires at construction
+  v1); the zapi interface dump as the address source.
 - The SAVNET intra-domain IGP signaling hook
   (`experimental-savnet`) — anchor `crates/ospfd/src/neighbor.rs`
   (`flood_step`'s InstallAndFlood) once the draft's wire format is
