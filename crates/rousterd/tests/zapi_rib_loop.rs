@@ -527,8 +527,8 @@ async fn nht_flip_on_address_add_pushed_over_real_socket() {
         ifindex: 2,
         prefix: "10.9.9.1/24".parse().unwrap(),
     });
-    // M3: connected is not enough — the gateway's neighbour entry must be
-    // confirmed before the answer flips (what ARP resolution does live).
+    // Live-box realism (advisory since the 2026-10-10 owner decision —
+    // the flip below comes from the covering address, not this entry).
     driver.apply_event(&DataplaneEvent::NeighbourNew {
         entry: common::NeighbourEntry::from_rtnetlink(
             "10.9.9.9".parse().unwrap(),
@@ -584,7 +584,8 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         ifindex: 3,
         prefix: "192.0.2.1/24".parse().unwrap(),
     });
-    // M3: a confirmed neighbour makes the registration answer resolved.
+    // Live-box realism (advisory since the 2026-10-10 owner decision —
+    // the resolved answer comes from the connected prefix alone).
     driver.apply_event(&DataplaneEvent::NeighbourNew {
         entry: common::NeighbourEntry::from_rtnetlink(
             "192.0.2.9".parse().unwrap(),

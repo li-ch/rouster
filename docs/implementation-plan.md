@@ -215,3 +215,13 @@ The phase text above is unchanged; this block is status only.
   against the reference model (A14, A15, W5B convention); GSC
   merge-by-subtraction policy (A6); rule provenance tracking (A7); boot-id
   stamped state for restart idempotence (A8).
+
+- 2026-10-10 (later) — Owner decision: M3's neighbour-liveness gate on
+  the NEXTHOP_UPDATE answer is REVERTED; NHT resolution is route-based,
+  zebra-faithful (`nexthop_active` consults no neighbour table). The
+  neighbour mirror stays advisory (logs, M4 session pushes, savd
+  monitor). Motivation and alternatives considered: the interop doc's
+  "Owner decision (2026-10-10)" section. Same-day follow-ups: MIT
+  license adopted; four parallel day-streams (S1 zebra-core incl. both
+  previously-fenced ZAPI edges, S2 sav polish, S3 rousterctl v1, S4
+  docs/OSS prep) + S5 integration all landed; 16/16 smokes, 383/0.

@@ -375,6 +375,23 @@ tracked gateway/peer before the client registers it):
 
 Final state: **16/16 smokes PASS in one sequential run (406 s)** —
 m4-pin, p0a/p0c/p0d/phase0, w3/w4/w4b/w7/w8, z4/z5/z5b/z5c/z5d/z5e.
+
+## Owner decision (2026-10-10, later that day): the M3 gate is REVERTED
+
+The adjudication S5 deferred: **Option 1 — zebra-faithful NHT.**
+`lookup_nexthop_routed` no longer consults the neighbour mirror at all
+(`confirm_neighbour` removed); resolution is route-based, exactly
+`nexthop_active`'s behavior. The neighbour mirror stays as advisory data
+(logs, M4 session pushes, the savd monitor feed). Rationale: perfect
+interoperability with FRR semantics, no cold-start deadlock class, and
+failure detection remains the protocols' keepalive timers' job (which is
+why those timers exist). Negative-evidence gating was considered and
+declined for now — deviations are cheap to add later and expensive to
+take back. The smoke warm-up pings stay (harmless topology realism).
+Pins honestly inverted back: rib
+`neighbour_events_leave_route_and_resolution_state_alone` and driver
+`neighbour_events_do_not_re_evaluate_nht` (their original W3 names and
+semantics).
 Evidence: `away/2026-10-09/quarantine/{z5,z5b,z5e,w8-savd}/` (the
 per-script quarantine captures; the orchestrator's 11:02 failing-run
 w8 captures preserved alongside as `w8-savd-orchestrator-1102/`).

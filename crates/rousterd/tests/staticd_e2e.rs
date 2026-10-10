@@ -138,9 +138,9 @@ async fn staticd_e2e_install_nht_filter_and_withdrawal() {
         ifindex: 2,
         prefix: "192.0.2.1/24".parse().unwrap(),
     });
-    // M3: the NHT answer is neighbour-gated — the on-subnet gateway needs
-    // a confirmed neighbour entry for its registration to answer
-    // resolved (what the kernel's ARP table would hold on a live box).
+    // Live-box realism: seed the ARP entry a running kernel would hold
+    // (advisory data since the 2026-10-10 owner decision — the NHT
+    // answer is route-based, zebra-faithful, and never gates on it).
     driver.rib.apply_event(&DataplaneEvent::NeighbourNew {
         entry: common::NeighbourEntry::from_rtnetlink(
             "192.0.2.9".parse().unwrap(),

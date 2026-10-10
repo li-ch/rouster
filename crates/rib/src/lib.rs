@@ -452,43 +452,11 @@ impl Rib {
         self.resolve_nexthop_recursive(ip)
     }
 
-    /// Neighbour-liveness confirmation for a resolved hop (the NHT
-    /// answer's liveness gate): a gateway hop is only ACTIVE when the
-    /// neighbour mirror holds a CONFIRMED entry for the gateway on the
-    /// resolved interface — `NeighbourEntry::is_up()` (lladdr held, not
-    /// INCOMPLETE/FAILED, W3's definition; STALE/DELAY/PROBE entries
-    /// still hold a valid MAC and count, so a normal REACHABLE→STALE
-    /// transition never flaps the answer). Device and blackhole hops
-    /// carry no gateway to confirm.
-    ///
-    /// Source-pin honesty: frr-10.2.2's `nexthop_active`
-    /// (`zebra/zebra_nhg.c`, fetched 2026-10-10) consults NO neighbour
-    /// table — the neighbour-confirmation gate is the mission-prescribed
-    /// semantics (W3 §D3 attributed it to FRR; no such check exists in
-    /// the 10.2.2 sources fetched), deliberately stricter than zebra.
-    /// It gates only the NEXTHOP_UPDATE answer surface — reconcile's
-    /// programming form and the redistribute push form stay
-    /// prefix-based, matching Linux route-install semantics (installing
-    /// `via <gw>` never requires a resolved ARP entry).
-    fn confirm_neighbour(&self, hop: Nexthop) -> Option<Nexthop> {
-        match hop {
-            Nexthop::Ipv4If(gate, ifindex) => self
-                .neighbours
-                .get(&(IpAddr::V4(gate), ifindex))
-                .is_some_and(NeighbourEntry::is_up)
-                .then_some(hop),
-            Nexthop::Ipv6If(gate, ifindex) => self
-                .neighbours
-                .get(&(IpAddr::V6(gate), ifindex))
-                .is_some_and(NeighbourEntry::is_up)
-                .then_some(hop),
-            // No gateway to confirm.
-            Nexthop::IfIndex(_) | Nexthop::Blackhole => Some(hop),
-            // Never produced by the resolver arms above; a bare gateway
-            // form cannot be confirmed and is not a resolution answer.
-            Nexthop::Ipv4(_) | Nexthop::Ipv6(_) => None,
-        }
-    }
+    // (Historic: `confirm_neighbour` — the M3 neighbour-liveness gate —
+    // was removed by the 2026-10-10 owner decision. Zebra-faithful NHT:
+    // `nexthop_active` consults no neighbour table; the gate deadlocked
+    // quiescent iBGP cold-start. Rationale: the interop doc's dated
+    // amendment.)
 
     /// NHT query with the routing-table fallback zebra's RNH resolution
     /// has (`zebra_rnh_resolve_nexthop_entry` matches the RIB tables, not
@@ -505,14 +473,14 @@ impl Rib {
     /// route. A matched default answers with its own observed hop; a
     /// bare-gateway hop recurses through the full resolver.
     ///
-    /// Every answer passes the neighbour-liveness gate
-    /// ([`Rib::confirm_neighbour`]): a gateway is only reported ACTIVE
-    /// when connected AND its neighbour entry confirmed.
+    /// Deliberately zebra-faithful (owner decision 2026-10-10): frr-10.2.2's
+    /// `nexthop_active` (`zebra/zebra_nhg.c`) consults NO neighbour table,
+    /// and neither do we — neighbour state is advisory only (mirror, logs,
+    /// savd monitor). The M3 neighbour-confirmation gate was reverted for
+    /// exactly this equivalence; the historic rationale lives in the
+    /// interop doc's dated amendment.
     pub fn lookup_nexthop_routed(&self, ip: IpAddr, resolve_via_default: bool) -> Option<Nexthop> {
-        if let Some(hop) = self
-            .resolve_nexthop_recursive(ip)
-            .and_then(|hop| self.confirm_neighbour(hop))
-        {
+        if let Some(hop) = self.resolve_nexthop_recursive(ip) {
             return Some(hop);
         }
         if !resolve_via_default {
@@ -536,27 +504,14 @@ impl Rib {
         }
         best.and_then(|(_, entry)| entry.nexthops.hops().first().map(|&(hop, _)| hop))
             .and_then(|hop| match hop {
-                // A device-route adoption puts the queried IP on-link on
-                // that device: its own neighbour entry is the liveness
-                // evidence (same rule the on-link arm's answer passes).
-                Nexthop::IfIndex(ifindex) => self
-                    .neighbours
-                    .get(&(ip, ifindex))
-                    .is_some_and(NeighbourEntry::is_up)
-                    .then_some(hop),
-                // Blackholes carry no liveness to confirm.
-                Nexthop::Blackhole => Some(hop),
-                // A gateway hop recurses through the full resolver — and
-                // must survive the neighbour gate like any other answer.
-                Nexthop::Ipv4If(g, ix) => self.confirm_neighbour(Nexthop::Ipv4If(g, ix)),
-                Nexthop::Ipv6If(g, ix) => self.confirm_neighbour(Nexthop::Ipv6If(g, ix)),
+                // A device-route adoption answers as-is; a gateway hop
+                // answers as-is (zebra-faithful: no neighbour consult).
+                Nexthop::IfIndex(_) | Nexthop::Blackhole => Some(hop),
+                // A gateway hop recurses through the full resolver.
+                Nexthop::Ipv4If(_, _) | Nexthop::Ipv6If(_, _) => Some(hop),
                 // Bare gateway: full recursion through the resolver.
-                Nexthop::Ipv4(g) => self
-                    .resolve_nexthop_recursive(IpAddr::V4(g))
-                    .and_then(|hop| self.confirm_neighbour(hop)),
-                Nexthop::Ipv6(g) => self
-                    .resolve_nexthop_recursive(IpAddr::V6(g))
-                    .and_then(|hop| self.confirm_neighbour(hop)),
+                Nexthop::Ipv4(g) => self.resolve_nexthop_recursive(IpAddr::V4(g)),
+                Nexthop::Ipv6(g) => self.resolve_nexthop_recursive(IpAddr::V6(g)),
             })
     }
 
@@ -1381,14 +1336,15 @@ mod tests {
             ifindex: 2,
             prefix: "192.168.215.4/24".parse().unwrap(),
         });
-        // M3: the answer is neighbour-gated — the default's gateway needs
-        // a CONFIRMED neighbour entry on the resolved interface.
+        // Zebra-faithful (owner decision 2026-10-10): the default answers
+        // from the mirror with NO neighbour confirmation.
         assert_eq!(
             rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true),
-            None,
-            "connected but neighbour unconfirmed: the answer stays unresolved"
+            Some(Nexthop::Ipv4If(Ipv4Addr::new(192, 168, 215, 1), 2))
         );
-        rib.apply_event(&neighbour_new("192.168.215.1", 2, Some(0x01), 0x80));
+        // Neighbour state is advisory only — even an INCOMPLETE entry
+        // (no lladdr) never flips the answer.
+        rib.apply_event(&neighbour_new("192.168.215.1", 2, None, 0x01));
         assert_eq!(
             rib.lookup_nexthop_routed(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true),
             Some(Nexthop::Ipv4If(Ipv4Addr::new(192, 168, 215, 1), 2))
@@ -1400,19 +1356,16 @@ mod tests {
             None
         );
         // On-link still wins over the mirror for flag-set registrations —
-        // including through the neighbour gate (confirmed entry present).
+        // with or without neighbour state.
+        assert_eq!(
+            rib.lookup_nexthop_routed("192.168.215.9".parse().unwrap(), true),
+            Some(Nexthop::Ipv4If("192.168.215.9".parse().unwrap(), 2))
+        );
         rib.apply_event(&neighbour_new("192.168.215.9", 2, Some(0x09), 0x80));
         assert_eq!(
             rib.lookup_nexthop_routed("192.168.215.9".parse().unwrap(), true),
             Some(Nexthop::Ipv4If("192.168.215.9".parse().unwrap(), 2))
         );
-        // An INCOMPLETE entry (no lladdr yet) does not confirm.
-        rib.apply_event(&neighbour_new("192.168.215.9", 2, None, 0x01));
-        assert_eq!(
-            rib.lookup_nexthop_routed("192.168.215.9".parse().unwrap(), true),
-            None
-        );
-        rib.apply_event(&neighbour_new("192.168.215.9", 2, Some(0x09), 0x80));
         // Fresh lookups only (event-driven re-eval is Z3B): deleting the
         // default drops the mirror answer; the connected /24 does not
         // cover 0.0.0.0.
@@ -1636,7 +1589,7 @@ mod tests {
     /// this keeps verbatim; the answer half changed with M3's liveness
     /// gate, honestly.)
     #[test]
-    fn neighbour_events_move_only_the_nht_answer() {
+    fn neighbour_events_leave_route_and_resolution_state_alone() {
         let mut rib = Rib::new();
         rib.apply_event(&link(2, "eth0", true));
         rib.apply_event(&address(2, "192.0.2.1/24", true));
@@ -1651,15 +1604,16 @@ mod tests {
         let resolved = rib.resolve_nexthop(ip("192.0.2.7"));
         assert!(resolved.is_some());
         assert_eq!(rib.kernel_route_count(), 1);
-
-        // A neighbour for the gateway IP appearing and disappearing
-        // changes neither the programming resolution nor the route
-        // mirror — but it DOES gate the NHT answer surface (M3).
+        // Zebra-faithful NHT (owner decision 2026-10-10): connected is
+        // enough — no neighbour confirmation required.
         assert_eq!(
             rib.lookup_nexthop_routed(ip("192.0.2.7"), false),
-            None,
-            "connected but unconfirmed: the NHT answer is unresolved"
+            Some(Nexthop::Ipv4If("192.0.2.7".parse().unwrap(), 2))
         );
+
+        // A neighbour for the gateway IP appearing and disappearing
+        // changes neither the programming resolution, the route mirror,
+        // NOR the NHT answer (advisory data only).
         rib.apply_event(&neighbour_new("192.0.2.7", 2, Some(0x07), 0x80));
         assert_eq!(rib.resolve_nexthop(ip("192.0.2.7")), resolved);
         assert_eq!(rib.resolve_nexthop_recursive(ip("192.0.2.7")), resolved);
@@ -1668,12 +1622,9 @@ mod tests {
             rib.lookup_nexthop_routed(ip("192.0.2.7"), false),
             Some(Nexthop::Ipv4If("192.0.2.7".parse().unwrap(), 2))
         );
-        // A STALE-but-lladdr-holding replacement still confirms (no flap
-        // on REACHABLE→STALE), an INCOMPLETE one does not.
-        rib.apply_event(&neighbour_new("192.0.2.7", 2, Some(0x07), 0x04));
-        assert!(rib.lookup_nexthop_routed(ip("192.0.2.7"), false).is_some());
+        // Even an INCOMPLETE entry (lladdr absent) never flips the answer.
         rib.apply_event(&neighbour_new("192.0.2.7", 2, None, 0x01));
-        assert_eq!(rib.lookup_nexthop_routed(ip("192.0.2.7"), false), None);
+        assert!(rib.lookup_nexthop_routed(ip("192.0.2.7"), false).is_some());
         rib.apply_event(&neighbour_new("192.0.2.7", 2, Some(0x07), 0x80));
         rib.apply_event(&DataplaneEvent::NeighbourDel {
             ip: ip("192.0.2.7"),
@@ -1682,7 +1633,10 @@ mod tests {
         assert_eq!(rib.resolve_nexthop(ip("192.0.2.7")), resolved);
         assert_eq!(rib.resolve_nexthop_recursive(ip("192.0.2.7")), resolved);
         assert_eq!(rib.kernel_route_count(), 1);
-        assert_eq!(rib.lookup_nexthop_routed(ip("192.0.2.7"), false), None);
+        assert_eq!(
+            rib.lookup_nexthop_routed(ip("192.0.2.7"), false),
+            Some(Nexthop::Ipv4If("192.0.2.7".parse().unwrap(), 2))
+        );
     }
 
     // --- Nexthop resolution & tracking (P0B) ---
@@ -2180,16 +2134,17 @@ mod tests {
         rib.apply_event(&address(2, "10.1.1.1/24", true));
         rib.apply_event(&mirror_route("0.0.0.0/0", "10.1.1.9", 2));
 
-        // 100.64.0.1 is covered only by the default route — and the
-        // answer rides the neighbour gate like every NHT answer.
+        // 100.64.0.1 is covered only by the default route — the flag-set
+        // NHT surface (`lookup_nexthop_routed`) is the one path where it
+        // may answer, with no neighbour confirmation (zebra-faithful).
         assert_eq!(rib.resolve_nexthop_recursive(ip("100.64.0.1")), None);
         assert_eq!(rib.lookup_nexthop_routed(ip("100.64.0.1"), false), None);
         assert_eq!(
             rib.lookup_nexthop_routed(ip("100.64.0.1"), true),
-            None,
-            "default found but its gateway's neighbour is unconfirmed"
+            Some(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2))
         );
-        rib.apply_event(&neighbour_new("10.1.1.9", 2, Some(0x09), 0x80));
+        // Neighbour state never flips the answer (advisory only).
+        rib.apply_event(&neighbour_new("10.1.1.9", 2, None, 0x01));
         assert_eq!(
             rib.lookup_nexthop_routed(ip("100.64.0.1"), true),
             Some(Nexthop::Ipv4If("10.1.1.9".parse().unwrap(), 2))
