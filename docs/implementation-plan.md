@@ -236,3 +236,16 @@ The phase text above is unchanged; this block is status only.
   Integration pass: fmt/clippy sweep over stream tails, 18/18 smokes
   (incl. the two new interop legs), workspace 640/0. Protocol docs
   indexed. Evidence: away/2026-10-11/reports/P2-{a,b,c}.md.
+
+- 2026-10-11 (later) — Owner decisions A-K adopted (sheet:
+  away/2026-10-11/weekend/DECISIONS.md): socket2 in (A1, wired for
+  bfdd's BFD TTL/hop-limit/auth); gortr:local + rouster-nft:local
+  images built while the owner was present (B1/E1 — the real-cache RTR
+  runbook and the W7B nftables backend are unblocked); SIB fold-in
+  deferred with the DIRECTION RATIFIED — the SIB will consume the
+  explicit rib surfaces (C2); netns stays per-process, no unsafe (F2);
+  mirrored test helpers stay (G2); tokio test-util ratified (H1);
+  sync-RPC hazard documented-only (I2); registration restart hole
+  accepted (J2); vtyd apply direction = config-manager target,
+  file+SIGHUP interim (K3); CI = private GitHub + Linux Actions (D1 —
+  workflow staged, repo creation is the owner's).
