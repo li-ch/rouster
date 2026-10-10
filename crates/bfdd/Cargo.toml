@@ -1,12 +1,15 @@
 [package]
 name = "bfdd"
-description = "Rouster bfdd — see docs/architecture.md and the Phase-2 plan"
+description = "Rouster bfdd — BFD daemon: RFC 5880/5881/5882/5883 wire codec, state machine, UDP transports, daemon"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-common = { workspace = true }
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+# Thin binary wiring (log output), the savd shape: a pre-existing
+# workspace member — no new crates, no new lock entries beyond the
+# bfdd package's own dependency edges.
+tracing-subscriber.workspace = true
