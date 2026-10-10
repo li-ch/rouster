@@ -24,6 +24,7 @@ pub mod error;
 pub mod fsm;
 pub mod message;
 pub mod peer;
+pub mod policy_engine;
 pub mod rib;
 pub mod wire;
 pub mod zedge;

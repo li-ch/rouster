@@ -362,6 +362,7 @@ mod tests {
             passive: false,
             timers: Some((10, 30)),
             mrai: 0,
+            role: None,
         };
         assert_eq!(session_config_for(&config, &neighbor).hold_time, 30);
         neighbor.timers = None;

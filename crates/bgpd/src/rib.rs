@@ -20,11 +20,13 @@
 //! 6. f) lowest BGP Identifier;
 //! 7. g) lowest peer address from which the route was received.
 //!
-//! Import/export are trait seams with accept-all defaults — the
-//! BIRD-inspired typed policy engine is a later milestone by scope.
+//! Import/export are trait seams (W2-d: the BIRD-inspired typed policy
+//! engine plus RPKI/OTC validation implement them; the defaults stay
+//! accept-all, so an unconfigured daemon is behavior-identical).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use common::{IpPrefix, Nexthop, NexthopGroup, RouteEntry, RouteProtocol};
 use tracing::info;
@@ -99,29 +101,44 @@ impl Route {
     }
 }
 
-/// Import policy seam (Phase 1 accept/reject; the typed engine comes
-/// later — v1 ships accept-all).
+/// Import policy seam: Phase 1 of §9.1.1 / §9.2.1 — everything an
+/// Adj-RIB-In route passes through before it becomes a decision-process
+/// candidate. Returns the (possibly mutated) route, or `None` to
+/// reject. W2-d widened this from a bool: a set-action filter mutates
+/// attributes before best-path (§9.1.1: local policy may raise the
+/// degree of preference).
 pub trait ImportPolicy: Send + Sync {
-    fn accept(&self, route: &Route) -> bool {
-        let _ = route;
-        true
-    }
+    fn import(&self, route: Route) -> Option<Route>;
 }
 
-/// Export policy seam (Phase 3 dissemination filter).
+/// Export policy seam: the §9.2.1 Phase 3 dissemination filter (plus
+/// W2-d's RFC 9234 OTC synthesis on eBGP export). Returns the
+/// advertisement-shaped route, or `None` to suppress. `internal` is
+/// whether the target session is iBGP (RFC 9234 applies to eBGP only).
 pub trait ExportPolicy: Send + Sync {
-    fn advertise(&self, route: &Route, to_peer: &PeerInfo) -> bool {
-        // §9.2.2's loop-prevention floor: never send a route back to
-        // the peer it was learned from.
-        route.source.address != to_peer.address
-    }
+    fn export(&self, route: &Route, to_peer: &PeerInfo, internal: bool) -> Option<Route>;
 }
 
-/// The accept-all pair (v1).
+/// The accept-all pair (the unconfigured default — behavior-identical
+/// to the v1 seams: import passes routes through unchanged; export
+/// keeps §9.2.2's loop-prevention floor of never reflecting a route to
+/// the peer it was learned from).
 #[derive(Default)]
 pub struct AcceptAll;
-impl ImportPolicy for AcceptAll {}
-impl ExportPolicy for AcceptAll {}
+impl ImportPolicy for AcceptAll {
+    fn import(&self, route: Route) -> Option<Route> {
+        Some(route)
+    }
+}
+impl ExportPolicy for AcceptAll {
+    fn export(&self, route: &Route, to_peer: &PeerInfo, _internal: bool) -> Option<Route> {
+        if route.source.address == to_peer.address {
+            None
+        } else {
+            Some(route.clone())
+        }
+    }
+}
 
 /// The §9.1 decision process: pick the best route among candidates.
 /// Pure — callers feed Adj-RIB-In candidates for one prefix.
@@ -230,14 +247,22 @@ pub struct LocRib {
     /// peer address → (prefix → route)
     adj_in: BTreeMap<IpAddr, BTreeMap<IpPrefix, Route>>,
     best: BTreeMap<IpPrefix, Route>,
+    /// The Phase 1 import policy (§9.2.1): typed filter + RPKI/OTC
+    /// validation in W2-d; accept-all by default.
+    import: Arc<dyn ImportPolicy>,
 }
 
 impl LocRib {
     pub fn new(local_as: u32) -> Self {
+        Self::with_policy(local_as, Arc::new(AcceptAll))
+    }
+
+    pub fn with_policy(local_as: u32, import: Arc<dyn ImportPolicy>) -> Self {
         Self {
             local_as,
             adj_in: BTreeMap::new(),
             best: BTreeMap::new(),
+            import,
         }
     }
 
@@ -245,20 +270,29 @@ impl LocRib {
         self.local_as
     }
 
-    /// Adj-RIB-In update from one peer's UPDATE (announce side).
+    /// Adj-RIB-In update from one peer's UPDATE (announce side). Each
+    /// carried prefix runs the import policy (§9.2.1 Phase 1) before
+    /// entering the Adj-RIB-In: rejected prefixes never become
+    /// decision candidates; accepted ones may carry mutated
+    /// attributes.
     pub fn announce(&mut self, peer: &PeerInfo, update: &BgpUpdate) {
         let rib = self.adj_in.entry(peer.address).or_default();
         let internal = peer.remote_as == self.local_as;
         for prefix in update.announced() {
-            rib.insert(
+            let route = Route {
                 prefix,
-                Route {
-                    prefix,
-                    attrs: update.attrs.clone(),
-                    source: *peer,
-                    internal,
-                },
-            );
+                attrs: update.attrs.clone(),
+                source: *peer,
+                internal,
+            };
+            match self.import.import(route) {
+                Some(route) => {
+                    rib.insert(prefix, route);
+                }
+                None => {
+                    info!(peer = %peer.address, %prefix, "bgpd: route rejected by import policy");
+                }
+            }
         }
     }
 
@@ -422,9 +456,60 @@ impl crate::peer::OutRib for LocRibOut {
         to_peer: IpAddr,
         internal: bool,
     ) -> Vec<BgpUpdate> {
-        let mut updates = self
+        // Locally-originated networks, gated by the export policy like
+        // every other advertisement (FRR's neighbor route-map OUT
+        // applies to `network` announcements too).
+        let to_peer_info = PeerInfo {
+            address: to_peer,
+            remote_as: 0,
+            bgp_id: None,
+        };
+        let local_as = self.rib.lock().unwrap().local_as();
+        let mut updates = Vec::new();
+        for update in self
             .networks
-            .advertisements(afi, safi, next_hop, to_peer, internal);
+            .advertisements(afi, safi, next_hop, to_peer, internal)
+        {
+            let Some(prefix) = update.announced().first().copied() else {
+                updates.push(update);
+                continue;
+            };
+            // A synthetic local route: the export gate's §9.2.2 floor
+            // (never reflect to the origin peer) can never trip for it
+            // (unspecified source), but the typed filter applies in
+            // full.
+            let local = Route {
+                prefix,
+                attrs: update.attrs.clone(),
+                source: PeerInfo {
+                    address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    remote_as: local_as,
+                    bgp_id: None,
+                },
+                internal: false,
+            };
+            match self.policy.export(&local, &to_peer_info, internal) {
+                Some(exported) => {
+                    let mut update = update;
+                    // Splice the policy's edits in, keeping the
+                    // NEXT_HOP/MP_REACH encoding the session layer
+                    // produced (the typed model has no next-hop
+                    // representation to edit).
+                    let mut attrs = exported.attrs;
+                    for attr in &update.attrs {
+                        if matches!(attr, PathAttribute::NextHop(_) | PathAttribute::MpReach(_)) {
+                            attrs.retain(|a| a.attr_type() != attr.attr_type());
+                            attrs.push(attr.clone());
+                        }
+                    }
+                    update.attrs = attrs;
+                    updates.push(update);
+                }
+                None => {
+                    info!(%prefix, %to_peer, "bgpd: network not advertised (export policy)")
+                }
+            }
+        }
         // Learned best paths: advertise to OTHER peers per policy.
         // v1 single-family guard: only v4-unicast re-advertisement is
         // wired (the smoke's shape); v6 learned paths ride their
@@ -434,20 +519,13 @@ impl crate::peer::OutRib for LocRibOut {
             for route in rib.best_routes() {
                 // The export-policy seam (Phase 3); the default blocks
                 // reflection to the origin peer.
-                if !self.policy.advertise(
-                    route,
-                    &PeerInfo {
-                        address: to_peer,
-                        remote_as: 0,
-                        bgp_id: None,
-                    },
-                ) {
-                    continue;
-                }
-                let Some(&PathAttribute::NextHop(_)) = route.attr(attr_type::NEXT_HOP) else {
+                let Some(exported) = self.policy.export(route, &to_peer_info, internal) else {
                     continue;
                 };
-                let mut attrs = route.attrs.clone();
+                let Some(&PathAttribute::NextHop(_)) = exported.attr(attr_type::NEXT_HOP) else {
+                    continue;
+                };
+                let mut attrs = exported.attrs;
                 // Phase 3 (§5.1.2): prepend the local AS on eBGP
                 // re-advertisement; keep AS_PATH on iBGP.
                 if !internal {
@@ -471,7 +549,7 @@ impl crate::peer::OutRib for LocRibOut {
                 updates.push(BgpUpdate {
                     withdrawn: vec![],
                     attrs,
-                    nlri: vec![route.prefix],
+                    nlri: vec![exported.prefix],
                 });
             }
         }
@@ -784,8 +862,11 @@ mod tests {
     fn export_policy_default_blocks_reflection() {
         let p = peer("192.0.2.1", 65001, 1);
         let r = route("203.0.113.0/24", &p, false, base_attrs(vec![65001], None));
-        assert!(!AcceptAll.advertise(&r, &p), "never reflect to origin");
+        assert!(
+            AcceptAll.export(&r, &p, false).is_none(),
+            "never reflect to origin"
+        );
         let other = peer("192.0.2.2", 65002, 2);
-        assert!(AcceptAll.advertise(&r, &other));
+        assert!(AcceptAll.export(&r, &other, false).is_some());
     }
 }

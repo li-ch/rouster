@@ -36,6 +36,9 @@ pub mod attr_type {
     pub const MP_UNREACH_NLRI: u8 = 15;
     pub const AS4_PATH: u8 = 17;
     pub const AS4_AGGREGATOR: u8 = 18;
+    /// OTC / Only To Customer (RFC 9234 §5): optional transitive,
+    /// 4-octet AS number.
+    pub const OTC: u8 = 35;
 }
 
 /// Attribute flag bits (RFC 4271 §4.3).
@@ -296,6 +299,10 @@ pub enum PathAttribute {
         asn: u32,
         addr: Ipv4Addr,
     },
+    /// OTC / Only To Customer (RFC 9234 §5): the AS number that marked
+    /// the route. "Once the OTC Attribute has been set, it MUST be
+    /// preserved unchanged."
+    Otc(u32),
     /// Unrecognized optional attribute, bytes verbatim; re-advertised
     /// with the partial bit forced (§5).
     Unknown {
@@ -320,6 +327,7 @@ impl PathAttribute {
             Self::MpUnreach(_) => attr_type::MP_UNREACH_NLRI,
             Self::As4Path(_) => attr_type::AS4_PATH,
             Self::As4Aggregator { .. } => attr_type::AS4_AGGREGATOR,
+            Self::Otc(_) => attr_type::OTC,
             Self::Unknown { attr_type, .. } => *attr_type,
         }
     }
@@ -336,7 +344,8 @@ impl PathAttribute {
             Self::Aggregator { .. }
             | Self::Communities(_)
             | Self::As4Path(_)
-            | Self::As4Aggregator { .. } => Some(OPTIONAL_TRANSITIVE),
+            | Self::As4Aggregator { .. }
+            | Self::Otc(_) => Some(OPTIONAL_TRANSITIVE),
             Self::Unknown { .. } => None,
         }
     }
@@ -365,6 +374,7 @@ impl PathAttribute {
                     put_u32(out, *c);
                 }
             }
+            Self::Otc(v) => put_u32(out, *v),
             Self::MpReach(mp) => {
                 put_u16(out, mp.afi);
                 out.push(mp.safi);
@@ -730,6 +740,16 @@ fn decode_one(attr_type: u8, flags: u8, value: &[u8], asn4: bool) -> BgpResult<P
             // session encoding (RFC 6793 §4.2 note: NEW speakers encode
             // AS4_PATH with 4-octet).
             Ok(PathAttribute::As4Path(AsPath::decode(value, true)?))
+        }
+        attr_type::OTC => {
+            // RFC 9234 §5: optional transitive, exactly 4 octets. A
+            // malformed length is RFC 7606 treat-as-withdraw territory;
+            // bgpd's v1 error model notifies (the RFC 7606 framework
+            // is §Deferred for every attribute — disclosed).
+            if flags & !attr_flag::EXTENDED_LENGTH != OPTIONAL_TRANSITIVE {
+                return Err(flags_error(attr_type, flags));
+            }
+            u32_from(value, attr_type).map(PathAttribute::Otc)
         }
         _ => Ok(PathAttribute::Unknown {
             attr_type,
