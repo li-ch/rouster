@@ -333,10 +333,22 @@ impl WordTree {
     pub fn find(&self, tokens: &[&str]) -> Result<Match, MatchErr> {
         let mut node = &self.root;
         let mut params = Vec::new();
-        for token in tokens {
+        for (index, token) in tokens.iter().enumerate() {
             let (tok, next) = step(node, token)?;
-            if matches!(tok, Tok::Param { .. }) {
-                params.push((*token).to_string());
+            match tok {
+                // The rest-of-line parameter swallows everything
+                // that remains (canonical single-space join — a
+                // display canonicalization, disclosed).
+                Tok::Param {
+                    kind: ParamKind::Rest,
+                    ..
+                } => {
+                    params.push(tokens[index..].join(" "));
+                    node = next;
+                    break;
+                }
+                Tok::Param { .. } => params.push((*token).to_string()),
+                Tok::Lit { .. } => {}
             }
             node = next;
         }

@@ -1,0 +1,5 @@
+bfdd x.y pid notanumber
+peers NaN
+session nonsense entirely
+session peer 192.0.2.2 state Up diag X local-discr -1 remote-discr z detection-time 900ms tx-interval 300ms
+  last-transition
