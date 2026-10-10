@@ -6,6 +6,13 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio.workspace = true
+# io-util ( AsyncReadExt/AsyncWriteExt for the line discipline) is
+# added here on top of the workspace's feature set — same crate,
+# same lock entry, no workspace-file change.
+tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 thiserror.workspace = true
+# Thin binary wiring (log output), the savd/bfdd shape: a
+# pre-existing workspace member — no new crates, no new lock
+# entries beyond the vty package's own dependency edges.
+tracing-subscriber.workspace = true
