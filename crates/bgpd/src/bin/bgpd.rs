@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bgpd::peer::{ConfiguredNetworks, SharedSink};
 use bgpd::rib::{LocRib, LocRibOut, RibSink};
-use bgpd::zedge::{self, AlwaysReachable, NhtReachability, PeerReachability, ZedgeCommand};
+use bgpd::zedge::{self, AlwaysReachable, NhtReachability, PeerReachability};
 use bgpd::{daemon, rib};
 use tracing::{error, info, warn};
 
@@ -108,8 +108,21 @@ fn main() {
             ));
 
         // RIB: Loc-RIB behind the shared sink; best-path changes flow
-        // to the export drainer (ZAPI) and the Adj-RIB-Out.
+        // to the export drainer (ZAPI) and the Adj-RIB-Out. Route
+        // server mode (N5): the RS-client set rides the Loc-RIB —
+        // their routes reflect transparently between clients and
+        // never reach the kernel.
         let loc_rib = Arc::new(Mutex::new(LocRib::with_policy(config.local_as, import)));
+        {
+            let mut rib = loc_rib.lock().unwrap();
+            rib.set_route_server_clients(
+                config
+                    .neighbors
+                    .values()
+                    .filter(|n| n.route_server)
+                    .map(|n| n.address),
+            );
+        }
         let sink = SharedSink(Arc::new(Mutex::new(RibSink::new(Arc::clone(&loc_rib)))));
         let out_rib = Arc::new(LocRibOut::new(
             Arc::clone(&loc_rib),
@@ -124,7 +137,9 @@ fn main() {
                 let peers = config.neighbors.keys().copied().collect();
                 match zedge::spawn(socket, peers).await {
                     Ok((nht, tx)) => {
-                        // Export drainer: RibSink changes → ZAPI.
+                        // Export drainer: RibSink changes → ZAPI
+                        // (route-server bests never install — the RS
+                        // RIB stays out of the kernel).
                         let drain_sink = sink.clone();
                         tokio::spawn(async move {
                             loop {
@@ -133,14 +148,9 @@ fn main() {
                                     sink.take_changes()
                                 };
                                 for change in changes {
-                                    let command =
-                                        match change.best.as_ref().and_then(rib::route_entry) {
-                                            Some(entry) => ZedgeCommand::RouteAdd(entry),
-                                            None => ZedgeCommand::RouteDel(
-                                                rib::route_delete_entry(change.prefix),
-                                            ),
-                                        };
-                                    let _ = tx.send(command);
+                                    for command in rib::zebra_commands(&change) {
+                                        let _ = tx.send(command);
+                                    }
                                 }
                                 tokio::time::sleep(Duration::from_millis(250)).await;
                             }

@@ -45,7 +45,9 @@ use crate::config::{BgpdConfig, NeighborConfig};
 use crate::error::{cease_subcode, error_code};
 use crate::fsm::SessionConfig;
 use crate::message::{BgpMessage, BgpNotification};
-use crate::peer::{OutRib, PeerInfo, PeerSession, RouteSink, SessionShared, SharedSink};
+use crate::peer::{
+    OutRib, PeerInfo, PeerSession, RouteSink, SessionEnd, SessionShared, SharedSink,
+};
 
 /// ConnectRetry, §10-shaped: 120 s is the RFC's suggested *initial*
 /// value; v1 backs off exponentially from 1 s to that cap (disclosed
@@ -479,7 +481,7 @@ struct Connection<S: RouteSink> {
 /// one session.
 async fn run_session<S, IO>(io: IO, conn: Connection<S>, registered: Registered)
 where
-    S: RouteSink,
+    S: RouteSink + 'static,
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     let Connection {
@@ -492,6 +494,8 @@ where
         refresh,
     } = conn;
     let Registered { shared, evict, id } = registered;
+    let shared_for_gr = Arc::clone(&shared);
+    let flush_sink_for = ctx.sink.clone();
 
     // Per-session stop: the daemon's global stop OR this session's
     // eviction.
@@ -533,12 +537,38 @@ where
     )
     .with_shared(shared)
     .with_update_handling(neighbor.update_handling.handling(internal));
+    // RFC 4724 §4.2 (sending side, N5 scope): advertise the
+    // capability when configured. (The receiving side is
+    // unconditional for peers that offer it.)
+    if let Some(restart_time) = neighbor.graceful_restart {
+        session = session.with_graceful_restart(restart_time);
+    }
     let mut sink = ctx.sink;
     let end = session
         .run_with_signals(&mut sink, session_stop, refresh)
         .await;
     info!(peer = %peer_addr, ?end, "bgpd: session ended");
     release(&ctx.registry, peer_addr, id);
+    // RFC 4724 §4.1: the restart timer — if the session had the GR
+    // capability and the loss retained stale routes, whatever is
+    // still stale is deleted once the advertised Restart Time
+    // passes without a re-establishment. (Earlier EOR or
+    // re-establishment flushes are idempotent with this.)
+    let peer_gr = *shared_for_gr.peer_gr.lock().unwrap();
+    if let Some(gr) = peer_gr {
+        if !matches!(end, SessionEnd::ManualStop) {
+            let mut flush_sink = flush_sink_for;
+            let flush_peer = PeerInfo {
+                address: peer_addr,
+                remote_as: neighbor.remote_as,
+                bgp_id: None,
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(gr.restart_time.max(1) as u64)).await;
+                flush_sink.flush_stale(&flush_peer);
+            });
+        }
+    }
 }
 
 /// The active side: dial the neighbor, run the session, back off
@@ -683,6 +713,8 @@ mod tests {
             mrai: 0,
             role: None,
             update_handling: Default::default(),
+            route_server: false,
+            graceful_restart: None,
         };
         assert_eq!(session_config_for(&config, &neighbor).hold_time, 30);
         neighbor.timers = None;

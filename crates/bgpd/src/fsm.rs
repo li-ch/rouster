@@ -158,6 +158,20 @@ pub struct Negotiated {
     /// "Internal" = peer AS equals local AS (§8.2.2.3 note).
     pub internal: bool,
     pub route_refresh: bool,
+    /// The peer's Graceful Restart capability (RFC 4724 §3) when
+    /// advertised: the Restart State (R) bit and the 12-bit Restart
+    /// Time. Presence alone switches the receiving-side retention
+    /// rules on (§4.1).
+    pub graceful_restart: Option<GracefulRestartInfo>,
+}
+
+/// The RFC 4724 §3 facts a receiving speaker needs from the peer's
+/// capability: whether the peer restarted (R) and how long its routes
+/// may be retained (Restart Time, seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GracefulRestartInfo {
+    pub restart_state: bool,
+    pub restart_time: u16,
 }
 
 /// A pure BGP FSM instance for one peer.
@@ -375,6 +389,7 @@ impl Fsm {
                     asn4: self.config.local_four_octet && open.four_octet_capable(),
                     internal: open.peer_as4() == self.config.local_as,
                     route_refresh: open.supports_route_refresh(),
+                    graceful_restart: open.graceful_restart(),
                 };
                 let zero_hold = negotiated.hold_time == 0;
                 self.negotiated = Some(negotiated);
@@ -837,6 +852,40 @@ mod tests {
                 Action::CloseTcp
             ]
         );
+    }
+
+    /// RFC 4724 §3: the GR capability lands in Negotiated — the
+    /// receiving-side retention switch.
+    #[test]
+    fn negotiation_records_graceful_restart() {
+        let mut f = Fsm::new(SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90));
+        let open = BgpOpen::new(
+            65001,
+            90,
+            "10.9.9.9".parse().unwrap(),
+            vec![crate::capability::Capability::GracefulRestart {
+                restart_state: true,
+                restart_time: 150,
+                families: vec![(1, 1, true)],
+            }],
+        );
+        f.fire(Event::Start { passive: false });
+        f.fire(Event::TcpConnectionConfirmed);
+        f.fire(Event::BgpOpen(open));
+        assert_eq!(
+            f.negotiated().unwrap().graceful_restart,
+            Some(crate::fsm::GracefulRestartInfo {
+                restart_state: true,
+                restart_time: 150
+            })
+        );
+        // Without the capability: None (RFC 4271 teardown rules).
+        let mut f = Fsm::new(SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90));
+        let open = BgpOpen::new(65001, 90, "10.9.9.9".parse().unwrap(), vec![]);
+        f.fire(Event::Start { passive: false });
+        f.fire(Event::TcpConnectionConfirmed);
+        f.fire(Event::BgpOpen(open));
+        assert_eq!(f.negotiated().unwrap().graceful_restart, None);
     }
 
     /// Session-identity facts: iBGP detection and AS_TRANS peers.

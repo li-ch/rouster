@@ -50,6 +50,24 @@ pub trait RouteSink: Send {
     /// "Deletes all routes associated with this connection" (the
     /// Established teardown rows).
     fn clear_peer(&mut self, peer: &PeerInfo);
+    /// RFC 4724 §4.1 (receiving speaker, GR negotiated): the session
+    /// went down — retain the peer's routes, marked stale, instead of
+    /// deleting them. Default: the non-GR behavior (delete).
+    fn retain_stale(&mut self, peer: &PeerInfo) {
+        self.clear_peer(peer);
+    }
+    /// Delete the peer's routes still marked stale (restart-timer
+    /// expiry, or re-establishment without the R bit). Default:
+    /// nothing (nothing was retained).
+    fn flush_stale(&mut self, peer: &PeerInfo) {
+        let _ = peer;
+    }
+    /// The End-of-RIB marker for one family arrived (RFC 4724 §3):
+    /// routes of that family still stale from the peer are removed.
+    /// Default: nothing.
+    fn eor_received(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
+        let _ = (peer, afi, safi);
+    }
     /// A ROUTE-REFRESH arrived (RFC 2918 §4): the session answers from
     /// [`OutRib`] itself; the hook exists for observability.
     fn refresh_requested(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
@@ -93,6 +111,15 @@ impl<T: RouteSink> RouteSink for SharedSink<T> {
     fn clear_peer(&mut self, peer: &PeerInfo) {
         self.0.lock().unwrap().clear_peer(peer);
     }
+    fn retain_stale(&mut self, peer: &PeerInfo) {
+        self.0.lock().unwrap().retain_stale(peer);
+    }
+    fn flush_stale(&mut self, peer: &PeerInfo) {
+        self.0.lock().unwrap().flush_stale(peer);
+    }
+    fn eor_received(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
+        self.0.lock().unwrap().eor_received(peer, afi, safi);
+    }
     fn refresh_requested(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
         self.0.lock().unwrap().refresh_requested(peer, afi, safi);
     }
@@ -127,6 +154,11 @@ pub struct RecordingSink {
     pub announced: BTreeMap<IpPrefix, BgpUpdate>,
     pub withdrawn: Vec<IpPrefix>,
     pub cleared: usize,
+    /// RFC 4724 hooks: retain-stale calls, flush-stale calls, and the
+    /// End-of-RIB (afi, safi) pairs.
+    pub retained: usize,
+    pub flushed: usize,
+    pub eors: Vec<(u16, u8)>,
 }
 
 impl RouteSink for RecordingSink {
@@ -140,6 +172,15 @@ impl RouteSink for RecordingSink {
     }
     fn clear_peer(&mut self, _peer: &PeerInfo) {
         self.cleared += 1;
+    }
+    fn retain_stale(&mut self, _peer: &PeerInfo) {
+        self.retained += 1;
+    }
+    fn flush_stale(&mut self, _peer: &PeerInfo) {
+        self.flushed += 1;
+    }
+    fn eor_received(&mut self, _peer: &PeerInfo, afi: u16, safi: u8) {
+        self.eors.push((afi, safi));
     }
 }
 
@@ -170,11 +211,19 @@ const FAR: Duration = Duration::from_secs(86_400 * 365);
 pub struct SessionShared {
     pub peer_bgp_id: std::sync::Mutex<Option<Ipv4Addr>>,
     pub established: std::sync::atomic::AtomicBool,
+    /// The peer's Graceful Restart capability (RFC 4724 §3), read by
+    /// the daemon after the session ends to arm the restart-timer
+    /// flush of retained stale routes.
+    pub peer_gr: std::sync::Mutex<Option<crate::fsm::GracefulRestartInfo>>,
 }
 
 impl SessionShared {
     fn note_open(&self, bgp_id: Ipv4Addr) {
         *self.peer_bgp_id.lock().unwrap() = Some(bgp_id);
+    }
+
+    fn note_gr(&self, gr: Option<crate::fsm::GracefulRestartInfo>) {
+        *self.peer_gr.lock().unwrap() = gr;
     }
 
     fn note_established(&self) {
@@ -210,6 +259,21 @@ pub struct PeerSession<IO> {
     /// UPDATE error handling for this session (RFC 7606 by default;
     /// strict-RFC-4271 is the per-neighbor compatibility knob).
     update_handling: UpdateHandling,
+    /// Sending-side graceful restart (RFC 4724 §4.2, N5 scope): the
+    /// restart time to advertise in the OPEN capability. EOR markers
+    /// are emitted regardless (RFC 4724 §3 recommends them generally).
+    gr_advertise: Option<u16>,
+    /// RFC 4724 §4.1: the teardown retained this peer's routes as
+    /// stale (suppresses the FSM's clear_peer action; the daemon arms
+    /// the restart-timer flush).
+    gr_retained: bool,
+    /// A deliberate close (ManualStop, received NOTIFICATION): no
+    /// GR retention, the teardown clears as in RFC 4271.
+    gr_hard_clear: bool,
+    /// The GR capability the peer negotiated (captured when the OPEN
+    /// lands — the FSM clears `negotiated` during teardown rows,
+    /// before the actions perform).
+    gr_negotiated: Option<crate::fsm::GracefulRestartInfo>,
     end: Option<SessionEnd>,
     /// Daemon-side observability (None in tests).
     shared: Option<Arc<SessionShared>>,
@@ -265,6 +329,10 @@ where
             next_advertisement: None,
             now: Instant::now,
             update_handling: UpdateHandling::default(),
+            gr_advertise: None,
+            gr_retained: false,
+            gr_hard_clear: false,
+            gr_negotiated: None,
             end: None,
             shared: None,
             #[cfg(feature = "experimental-savnet")]
@@ -323,6 +391,21 @@ where
     /// behavior).
     pub fn with_update_handling(mut self, handling: UpdateHandling) -> Self {
         self.update_handling = handling;
+        self
+    }
+
+    /// Advertise the Graceful Restart capability (RFC 4724 §3, the
+    /// sending side): the given Restart Time, no restart state, both
+    /// unicast families with the Forwarding bit clear (v1 does not
+    /// preserve forwarding state across a restart — the full
+    /// restart-preserving-local-RIB machinery is §Deferred).
+    pub fn with_graceful_restart(mut self, restart_time: u16) -> Self {
+        self.gr_advertise = Some(restart_time);
+        self.advertise.push(Capability::GracefulRestart {
+            restart_state: false,
+            restart_time,
+            families: vec![(1, 1, false), (2, 1, false)],
+        });
         self
     }
 
@@ -483,7 +566,15 @@ where
     /// is over.
     async fn step<S: RouteSink>(&mut self, event: Event, sink: &mut S) -> Option<SessionEnd> {
         let was = self.fsm.state();
+        if matches!(event, Event::ManualStop) {
+            self.gr_hard_clear = true;
+        }
         let actions = self.fsm.fire(event.clone());
+        // Capture the peer's GR capability while the negotiation
+        // record still exists (teardown rows clear it).
+        if let Some(n) = self.fsm.negotiated() {
+            self.gr_negotiated = n.graceful_restart;
+        }
         if let Err(e) = self.perform_all(actions, sink).await {
             self.end = Some(SessionEnd::Transport(e.to_string()));
             return self.end.clone();
@@ -511,6 +602,23 @@ where
             }
             if let Some(shared) = &self.shared {
                 shared.note_established();
+            }
+            // RFC 4724 §4.1 (receiving speaker): the peer's OPEN said
+            // whether it restarted. With the R bit set, stale routes
+            // stay until the per-family End-of-RIB; without it, they
+            // are deleted immediately — before the new exchange.
+            match self.fsm.negotiated().and_then(|n| n.graceful_restart) {
+                Some(gr) if gr.restart_state => {
+                    info!(peer = %self.peer.address,
+                        restart_time = gr.restart_time,
+                        "bgpd: peer restarted (R bit), stale routes retained until EOR (RFC 4724 §4.1)");
+                }
+                Some(_) => {
+                    info!(peer = %self.peer.address,
+                        "bgpd: session re-established without restart state, flushing stale routes");
+                    sink.flush_stale(&self.peer);
+                }
+                None => {}
             }
             if let Err(e) = self.on_established().await {
                 self.end = Some(SessionEnd::Transport(e.to_string()));
@@ -554,11 +662,24 @@ where
                 self.peer.bgp_id = Some(open.bgp_id);
                 if let Some(shared) = &self.shared {
                     shared.note_open(open.bgp_id);
+                    shared.note_gr(open.graceful_restart());
                 }
                 self.step(Event::BgpOpen(open), sink).await
             }
             BgpMessage::Keepalive => self.step(Event::KeepAliveMsg, sink).await,
             BgpMessage::Update(update) => {
+                // RFC 4724 §3: an UPDATE with no reachable and no
+                // withdrawn NLRI is the End-of-RIB marker — the
+                // stale-flush trigger for the family (v4-unicast's is
+                // the bare minimum UPDATE; MP families carry an empty
+                // MP_UNREACH naming theirs).
+                if let Some(family) = update.end_of_rib() {
+                    let (afi, safi) = family.unwrap_or((1, 1));
+                    info!(peer = %self.peer.address, afi, safi,
+                        "bgpd: End-of-RIB received (RFC 4724)");
+                    sink.eor_received(&self.peer, afi, safi);
+                    return self.step(Event::UpdateMsg, sink).await;
+                }
                 if let Err(err) = update.validate_well_known() {
                     let (code, sub) = err.notification.unwrap_or((3, 1));
                     // RFC 7606 §7: a missing well-known mandatory
@@ -662,6 +783,10 @@ where
                     "bgpd: NOTIFICATION received"
                 );
                 let actions = self.fsm.fire(Event::NotifMsg);
+                // A received NOTIFICATION is a deliberate close — no
+                // graceful-restart retention (RFC 4724 §4.1 deletes
+                // on a peer-chosen close).
+                self.gr_hard_clear = true;
                 let _ = self.perform_all(actions, sink).await;
                 #[cfg(feature = "experimental-savnet")]
                 self.sav_adjacency_down();
@@ -708,18 +833,27 @@ where
     }
 
     /// The Established transition: initial advertisement of the
-    /// Adj-RIB-Out for every family.
+    /// Adj-RIB-Out for every family, each dump closed by its
+    /// End-of-RIB marker (RFC 4724 §3 — recommended generally; an
+    /// empty UPDATE is a no-op for a non-GR receiver).
     async fn on_established(&mut self) -> io::Result<()> {
-        let Some(rib) = self.out_rib.clone() else {
-            return Ok(());
+        let families = match self.out_rib.as_ref() {
+            Some(rib) => rib.families(),
+            // No Adj-RIB-Out source: still close the default
+            // families' (empty) dumps with their markers.
+            None => vec![(1, 1), (2, 1)],
         };
         let next_hop = self.local_addr;
         let to_peer = self.peer.address;
         let internal = self.fsm.negotiated().is_some_and(|n| n.internal);
-        for (afi, safi) in rib.families() {
-            for update in rib.advertisements(afi, safi, next_hop, to_peer, internal) {
-                self.send_update(&update).await?;
+        for (afi, safi) in families {
+            if let Some(rib) = self.out_rib.clone() {
+                for update in rib.advertisements(afi, safi, next_hop, to_peer, internal) {
+                    self.send_update(&update).await?;
+                }
             }
+            self.send_update(&BgpUpdate::end_of_rib_marker(afi, safi))
+                .await?;
         }
         Ok(())
     }
@@ -809,7 +943,19 @@ where
                 }
             }
             Action::ReleaseResources | Action::WithdrawRoutes => {
-                sink.clear_peer(&self.peer);
+                // RFC 4724 §4.1: with the GR capability negotiated,
+                // a lost session retains the peer's routes marked
+                // stale (our own ManualStop and a received
+                // NOTIFICATION are deliberate closes — hard clear).
+                let gr = self.gr_negotiated.is_some();
+                if gr && !self.gr_hard_clear {
+                    self.gr_retained = true;
+                    sink.retain_stale(&self.peer);
+                    info!(peer = %self.peer.address,
+                        "bgpd: session lost, routes retained stale (RFC 4724 §4.1)");
+                } else {
+                    sink.clear_peer(&self.peer);
+                }
                 self.disarm();
             }
         }
@@ -1338,7 +1484,13 @@ mod tests {
         write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
 
         // Our keepalive timer (1 s) fires before the hold (3 s).
-        let frame = read_bytes(&mut theirs).await;
+        // (End-of-RIB markers are UPDATE frames — skip past them.)
+        let frame = loop {
+            let frame = read_bytes(&mut theirs).await;
+            if frame[18] == message_type::KEEPALIVE {
+                break frame;
+            }
+        };
         assert_eq!(frame[18], message_type::KEEPALIVE, "keepalive sent");
 
         driver.abort();
@@ -1520,8 +1672,13 @@ mod tests {
         ]
         .to_vec();
         peer.raw(&body).await;
-        let frame = read_bytes(&mut peer.io).await;
-        assert_eq!(frame[18], message_type::NOTIFICATION);
+        // (Skip past the session's End-of-RIB markers — UPDATEs.)
+        let frame = loop {
+            let frame = read_bytes(&mut peer.io).await;
+            if frame[18] == message_type::NOTIFICATION {
+                break frame;
+            }
+        };
         let notification = match BgpMessage::decode(&frame, true).unwrap() {
             BgpMessage::Notification(n) => n,
             other => panic!("{other:?}"),
@@ -1587,6 +1744,245 @@ mod tests {
             "missing NEXT_HOP treats the NLRI as withdrawn (RFC 7606 §7)"
         );
         assert_eq!(sink.cleared, 0);
+        driver.abort();
+    }
+
+    // ---- RFC 4724 graceful restart at the session (N5 M3) -------
+
+    /// A speaking partner that advertises the GR capability.
+    fn gr_open(asn: u32, restart_state: bool, restart_time: u16) -> BgpOpen {
+        BgpOpen::new(
+            asn,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![Capability::GracefulRestart {
+                restart_state,
+                restart_time,
+                families: vec![(1, 1, true)],
+            }],
+        )
+    }
+
+    /// The receiving-side lifecycle (RFC 4724 §4.1): a session with
+    /// a GR peer loses the transport — routes are RETAINED (marked
+    /// stale by the RIB sink), not cleared. The peer returns with
+    /// the R bit set: stale stays until the End-of-RIB marker for the
+    /// family arrives.
+    #[tokio::test]
+    async fn gr_session_loss_retains_and_eor_flushes() {
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let observed = sink.clone();
+
+        // First life: establish, learn a route, lose the transport.
+        {
+            let (ours, mut theirs) = duplex(8192);
+            let mut sess = session(ours, 65001, None);
+            let mut driver_sink = sink.clone();
+            let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+            let frame = read_bytes(&mut theirs).await;
+            let _ = BgpMessage::decode(&frame, true).unwrap();
+            write_bytes(
+                &mut theirs,
+                &BgpMessage::Open(gr_open(65001, false, 30))
+                    .encode(true)
+                    .unwrap(),
+            )
+            .await;
+            let frame = read_bytes(&mut theirs).await;
+            assert_eq!(frame[18], message_type::KEEPALIVE);
+            write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+            let update = BgpMessage::Update(BgpUpdate {
+                withdrawn: vec![],
+                attrs: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::sequence([65001])),
+                    PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+                ],
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+            });
+            write_bytes(&mut theirs, &update.encode(true).unwrap()).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            theirs.shutdown().await.unwrap();
+            let end = driver.await.unwrap();
+            assert!(matches!(end, SessionEnd::Transport(_)));
+        }
+        let flushed_before;
+        {
+            let sink = observed.0.lock().unwrap();
+            assert_eq!(sink.retained, 1, "routes retained stale (RFC 4724 §4.1)");
+            assert_eq!(sink.cleared, 0, "no delete on a GR session loss");
+            // (The first life's own Established ran an R-clear flush
+            // over an empty stale table — a no-op.)
+            flushed_before = sink.flushed;
+        }
+
+        // Second life: the peer restarts (R bit set) — stale retained
+        // through re-establishment, then the v4 End-of-RIB flushes.
+        {
+            let (ours, mut theirs) = duplex(8192);
+            let mut sess = session(ours, 65001, None);
+            let mut driver_sink = sink.clone();
+            let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+            let frame = read_bytes(&mut theirs).await;
+            let _ = BgpMessage::decode(&frame, true).unwrap();
+            write_bytes(
+                &mut theirs,
+                &BgpMessage::Open(gr_open(65001, true, 30))
+                    .encode(true)
+                    .unwrap(),
+            )
+            .await;
+            let frame = read_bytes(&mut theirs).await;
+            assert_eq!(frame[18], message_type::KEEPALIVE);
+            write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            {
+                let sink = observed.0.lock().unwrap();
+                assert_eq!(
+                    sink.flushed, flushed_before,
+                    "R bit set: no new flush before EOR"
+                );
+            }
+            // The bare minimum UPDATE = the v4-unicast End-of-RIB.
+            write_bytes(
+                &mut theirs,
+                &BgpUpdate::default().encode_frame(true).unwrap(),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            {
+                let sink = observed.0.lock().unwrap();
+                assert_eq!(sink.eors, vec![(1, 1)], "v4 EOR observed");
+            }
+            theirs.shutdown().await.unwrap();
+            let _ = driver.await.unwrap();
+        }
+    }
+
+    /// Re-establishment WITHOUT the R bit: stale routes are flushed
+    /// immediately at Established (before the new exchange).
+    #[tokio::test]
+    async fn gr_re_establishment_without_r_bit_flushes() {
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let observed = sink.clone();
+        {
+            let (ours, mut theirs) = duplex(8192);
+            let mut sess = session(ours, 65001, None);
+            let mut driver_sink = sink.clone();
+            let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+            let frame = read_bytes(&mut theirs).await;
+            let _ = BgpMessage::decode(&frame, true).unwrap();
+            write_bytes(
+                &mut theirs,
+                &BgpMessage::Open(gr_open(65001, false, 30))
+                    .encode(true)
+                    .unwrap(),
+            )
+            .await;
+            let _ = read_bytes(&mut theirs).await;
+            write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            theirs.shutdown().await.unwrap();
+            let _ = driver.await.unwrap();
+        }
+        assert_eq!(observed.0.lock().unwrap().retained, 1);
+        let flushed_before = observed.0.lock().unwrap().flushed;
+        {
+            let (ours, mut theirs) = duplex(8192);
+            let mut sess = session(ours, 65001, None);
+            let mut driver_sink = sink.clone();
+            let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+            let frame = read_bytes(&mut theirs).await;
+            let _ = BgpMessage::decode(&frame, true).unwrap();
+            write_bytes(
+                &mut theirs,
+                &BgpMessage::Open(gr_open(65001, false, 30))
+                    .encode(true)
+                    .unwrap(),
+            )
+            .await;
+            let _ = read_bytes(&mut theirs).await;
+            write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            {
+                let sink = observed.0.lock().unwrap();
+                assert_eq!(
+                    sink.flushed,
+                    flushed_before + 1,
+                    "no R bit: stale deleted at Established"
+                );
+            }
+            theirs.shutdown().await.unwrap();
+            let _ = driver.await.unwrap();
+        }
+    }
+
+    /// A session loss WITHOUT the GR capability deletes as before
+    /// (clear_peer, no retention).
+    #[tokio::test]
+    async fn non_gr_session_loss_still_clears() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+        partner.io.shutdown().await.unwrap();
+        let _ = driver.await.unwrap();
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.cleared, 1, "RFC 4271 delete (no capability)");
+        assert_eq!(sink.retained, 0);
+    }
+
+    /// The sending side (N5 scope): `with_graceful_restart(120)` puts
+    /// the capability in our OPEN, and Established ends the initial
+    /// dump with the per-family End-of-RIB markers (v4 bare + v6
+    /// empty MP_UNREACH).
+    #[tokio::test]
+    async fn gr_sending_side_advertises_and_emits_eor() {
+        let (ours, mut theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None).with_graceful_restart(120);
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+
+        // Our OPEN carries capability 64 with time 120, R clear.
+        let frame = read_bytes(&mut theirs).await;
+        let open = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Open(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            open.capabilities.contains(&Capability::GracefulRestart {
+                restart_state: false,
+                restart_time: 120,
+                families: vec![(1, 1, false), (2, 1, false)],
+            }),
+            "the GR capability rides our OPEN: {:?}",
+            open.capabilities
+        );
+        let mine = BgpOpen::new(65001, 30, "10.9.9.9".parse().unwrap(), vec![]);
+        write_bytes(&mut theirs, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let _ = read_bytes(&mut theirs).await; // our KEEPALIVE
+        write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        // Established (no out_rib -> no routes): the two EOR markers
+        // still close their families' (empty) dumps.
+        let frame = read_bytes(&mut theirs).await;
+        let eor4 = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected the v4 EOR, got {other:?}"),
+        };
+        assert_eq!(eor4.end_of_rib(), Some(None), "bare minimum UPDATE");
+        let frame = read_bytes(&mut theirs).await;
+        let eor6 = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected the v6 EOR, got {other:?}"),
+        };
+        assert_eq!(eor6.end_of_rib(), Some(Some((2, 1))), "empty MP_UNREACH");
         driver.abort();
     }
 

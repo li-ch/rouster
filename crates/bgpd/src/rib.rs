@@ -24,7 +24,7 @@
 //! engine plus RPKI/OTC validation implement them; the defaults stay
 //! accept-all, so an unconfigured daemon is behavior-identical).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -38,7 +38,11 @@ use crate::peer::{PeerInfo, RouteSink};
 /// One stored route: the prefix, its path attributes, the peer it
 /// came from, and the RPKI-derived validation state W2-d records at
 /// import (RFC 6811 §2 / RFC 9234 §5 visibility for show output).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// [`PartialEq`] deliberately ignores [`Route::stale`]: marking a
+/// route stale (RFC 4724 §4.1 retention) is bookkeeping, not a route
+/// change — `recompute` must not report a best-path flip for it.
+#[derive(Debug, Clone, Eq)]
 pub struct Route {
     pub prefix: IpPrefix,
     pub attrs: Vec<PathAttribute>,
@@ -53,6 +57,16 @@ pub struct Route {
     /// §5.5/§5.6); `None` = not computed (no tables, no neighbor
     /// role, or iBGP).
     pub aspa: Option<rpki::AspaValidity>,
+    /// Learned over a route-server-client session (N5): the route
+    /// reflects to other clients transparently (no local-AS prepend,
+    /// NEXT_HOP/MED preserved) and never installs into the kernel —
+    /// the RS RIB stays separate from the kernel RIB.
+    pub rs_client: bool,
+    /// RFC 4724 §4.1: retained across a GR peer's session loss. Stale
+    /// routes keep feeding forwarding/best-path until flushed (EOR,
+    /// re-establishment without the R bit, or the restart timer); a
+    /// re-advertised prefix simply replaces its stale entry.
+    pub stale: bool,
 }
 
 impl Route {
@@ -70,7 +84,22 @@ impl Route {
             internal,
             rov: None,
             aspa: None,
+            rs_client: false,
+            stale: false,
         }
+    }
+}
+
+impl PartialEq for Route {
+    fn eq(&self, other: &Self) -> bool {
+        // Every field except `stale` (see the type doc).
+        self.prefix == other.prefix
+            && self.attrs == other.attrs
+            && self.source == other.source
+            && self.internal == other.internal
+            && self.rov == other.rov
+            && self.aspa == other.aspa
+            && self.rs_client == other.rs_client
     }
 }
 
@@ -295,6 +324,9 @@ pub struct LocRib {
     /// The Phase 1 import policy (§9.2.1): typed filter + RPKI/OTC
     /// validation in W2-d; accept-all by default.
     import: Arc<dyn ImportPolicy>,
+    /// Route-server client addresses (N5): their routes carry the
+    /// transparent-reflection and never-install semantics.
+    rs_clients: BTreeSet<IpAddr>,
 }
 
 impl LocRib {
@@ -308,7 +340,17 @@ impl LocRib {
             adj_in: BTreeMap::new(),
             best: BTreeMap::new(),
             import,
+            rs_clients: BTreeSet::new(),
         }
+    }
+
+    /// Configure the route-server client set (N5).
+    pub fn set_route_server_clients(&mut self, clients: impl IntoIterator<Item = IpAddr>) {
+        self.rs_clients = clients.into_iter().collect();
+    }
+
+    pub fn is_route_server_client(&self, addr: &IpAddr) -> bool {
+        self.rs_clients.contains(addr)
     }
 
     pub fn local_as(&self) -> u32 {
@@ -323,8 +365,10 @@ impl LocRib {
     pub fn announce(&mut self, peer: &PeerInfo, update: &BgpUpdate) {
         let rib = self.adj_in.entry(peer.address).or_default();
         let internal = peer.remote_as == self.local_as;
+        let rs_client = self.rs_clients.contains(&peer.address);
         for prefix in update.announced() {
-            let route = Route::new(prefix, update.attrs.clone(), *peer, internal);
+            let mut route = Route::new(prefix, update.attrs.clone(), *peer, internal);
+            route.rs_client = rs_client;
             match self.import.import(route) {
                 Some(route) => {
                     rib.insert(prefix, route);
@@ -343,6 +387,60 @@ impl LocRib {
                 rib.remove(prefix);
             }
         }
+    }
+
+    /// RFC 4724 §4.1: mark every route of a lost GR session stale —
+    /// retained (still a best-path candidate) until flushed.
+    pub fn mark_peer_stale(&mut self, peer: &PeerInfo) {
+        if let Some(rib) = self.adj_in.get_mut(&peer.address) {
+            for route in rib.values_mut() {
+                route.stale = true;
+            }
+            if !rib.is_empty() {
+                info!(peer = %peer.address, routes = rib.len(),
+                    "bgpd: routes marked stale (RFC 4724)");
+            }
+        }
+    }
+
+    /// Delete the peer's routes still marked stale (re-advertised
+    /// prefixes replaced theirs). Returns how many left.
+    pub fn flush_stale(&mut self, peer: &PeerInfo) -> usize {
+        self.flush_stale_family(peer, None)
+    }
+
+    /// [`Self::flush_stale`] for one family (`Some(true)` = v6,
+    /// `Some(false)` = v4, `None` = both) — the per-family EOR
+    /// trigger (RFC 4724 §3/§4.1).
+    pub fn flush_stale_family(&mut self, peer: &PeerInfo, v6: Option<bool>) -> usize {
+        let Some(rib) = self.adj_in.get_mut(&peer.address) else {
+            return 0;
+        };
+        let before = rib.len();
+        rib.retain(|_, route| {
+            let in_family = v6.is_none_or(|want| {
+                matches!(
+                    (want, route.prefix),
+                    (true, IpPrefix::V6(_)) | (false, IpPrefix::V4(_))
+                )
+            });
+            !(route.stale && in_family)
+        });
+        let gone = before - rib.len();
+        if gone > 0 {
+            info!(peer = %peer.address, routes = gone,
+                "bgpd: stale routes flushed (RFC 4724)");
+        }
+        gone
+    }
+
+    /// How many of the peer's routes are currently stale (tests,
+    /// show surface).
+    pub fn stale_count(&self, peer: &PeerInfo) -> usize {
+        self.adj_in
+            .get(&peer.address)
+            .map(|rib| rib.values().filter(|r| r.stale).count())
+            .unwrap_or(0)
     }
 
     /// "Deletes all routes associated with this connection".
@@ -454,6 +552,26 @@ impl RouteSink for RibSink {
     fn clear_peer(&mut self, peer: &PeerInfo) {
         let mut rib = self.rib.lock().unwrap();
         rib.clear_peer(peer);
+        self.changes.extend(rib.recompute());
+    }
+
+    fn retain_stale(&mut self, peer: &PeerInfo) {
+        let mut rib = self.rib.lock().unwrap();
+        rib.mark_peer_stale(peer);
+        // No recompute: stale routes stay best-path candidates until
+        // flushed (RFC 4724 §4.1 retention).
+    }
+
+    fn flush_stale(&mut self, peer: &PeerInfo) {
+        let mut rib = self.rib.lock().unwrap();
+        rib.flush_stale(peer);
+        self.changes.extend(rib.recompute());
+    }
+
+    fn eor_received(&mut self, peer: &PeerInfo, afi: u16, safi: u8) {
+        let _ = safi;
+        let mut rib = self.rib.lock().unwrap();
+        rib.flush_stale_family(peer, Some(afi == 2));
         self.changes.extend(rib.recompute());
     }
 
@@ -573,7 +691,19 @@ impl crate::peer::OutRib for LocRibOut {
         // MP_REACH attributes through unchanged.
         if afi == 1 && safi == 1 {
             let rib = self.rib.lock().unwrap();
+            // N5 route-server mode: an RS-client target receives only
+            // other clients' routes, transparently — no local-AS
+            // prepend, NEXT_HOP and MED exactly as received (FRR
+            // doc/user/routeserver.rst: `route-server-client`
+            // "enables the transparent mode ... some BGP attributes
+            // (as-path, next-hop and MED) of the routes announced to
+            // that peer are not modified"; bgp_route.c's transparency
+            // check requires BOTH ends to be RS clients).
+            let to_is_client = rib.is_route_server_client(&to_peer);
             for route in rib.best_routes() {
+                if to_is_client && !route.rs_client {
+                    continue; // "RS-clients do not receive any announce from the Main Loc-RIB"
+                }
                 // The export-policy seam (Phase 3); the default blocks
                 // reflection to the origin peer.
                 let Some(exported) = self.policy.export(route, &to_peer_info, internal) else {
@@ -584,8 +714,10 @@ impl crate::peer::OutRib for LocRibOut {
                 };
                 let mut attrs = exported.attrs;
                 // Phase 3 (§5.1.2): prepend the local AS on eBGP
-                // re-advertisement; keep AS_PATH on iBGP.
-                if !internal {
+                // re-advertisement; keep AS_PATH on iBGP. RS-client
+                // targets are the exception: the reflection is
+                // transparent (the client's own AS_PATH, unchanged).
+                if !internal && !to_is_client {
                     if let Some(PathAttribute::AsPath(p)) = attrs
                         .iter_mut()
                         .find(|a| a.attr_type() == attr_type::AS_PATH)
@@ -614,9 +746,44 @@ impl crate::peer::OutRib for LocRibOut {
     }
 }
 
+/// The ZAPI egress decision for one best-path change, honoring the
+/// route-server RIB separation (N5): a best path learned from an
+/// RS-client never installs into the kernel — FRR's route-server
+/// flavor of a view ("Routes selected by the view are not installed
+/// into the kernel routing table", doc/user/bgp.rst) — while a
+/// transition that replaces an installed route with an RS-only one
+/// still withdraws it.
+pub fn zebra_commands(change: &BestChange) -> Vec<crate::zedge::ZedgeCommand> {
+    match change.best.as_ref() {
+        Some(route) if route.rs_client => {
+            if change.old.as_ref().is_some_and(|old| !old.rs_client) {
+                vec![crate::zedge::ZedgeCommand::RouteDel(route_delete_entry(
+                    change.prefix,
+                ))]
+            } else {
+                Vec::new()
+            }
+        }
+        Some(route) => match route_entry(route) {
+            Some(entry) => vec![crate::zedge::ZedgeCommand::RouteAdd(entry)],
+            None => Vec::new(),
+        },
+        None => {
+            if change.old.as_ref().is_some_and(|old| old.rs_client) {
+                Vec::new()
+            } else {
+                vec![crate::zedge::ZedgeCommand::RouteDel(route_delete_entry(
+                    change.prefix,
+                ))]
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn peer(addr: &str, as_: u32, id: u8) -> PeerInfo {
         PeerInfo {
@@ -957,5 +1124,309 @@ mod tests {
         );
         let other = peer("192.0.2.2", 65002, 2);
         assert!(AcceptAll.export(&r, &other, false).is_some());
+    }
+
+    // ---- N5: route-server mode --------------------------------------
+
+    /// An RS-client's routes carry the rs_client flag; the reflection
+    /// toward another client is transparent — the client's own
+    /// AS_PATH and NEXT_HOP unchanged, no local-AS prepend, MED
+    /// preserved.
+    #[test]
+    fn route_server_reflection_is_transparent() {
+        let mut rib = LocRib::new(65000);
+        let client_a = peer("192.0.2.101", 65001, 1);
+        let client_b_addr: IpAddr = "192.0.2.102".parse().unwrap();
+        rib.set_route_server_clients(vec![client_a.address, client_b_addr]);
+        rib.announce(
+            &client_a,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], Some(42)), // MED rides along
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        assert!(rib.recompute()[0].best.as_ref().unwrap().rs_client);
+
+        let out = LocRibOut::new(
+            Arc::new(Mutex::new(rib)),
+            crate::peer::ConfiguredNetworks::new(65000, vec![]),
+            Arc::new(AcceptAll),
+        );
+        let updates = crate::peer::OutRib::advertisements(
+            &out,
+            1,
+            1,
+            "10.0.0.1".parse().unwrap(), // the RS's own address — must NOT be used
+            client_b_addr,
+            false, // eBGP session
+        );
+        assert_eq!(updates.len(), 1);
+        let update = &updates[0];
+        let path = update.as_path().unwrap();
+        assert_eq!(path.path_length(), 1, "no RS AS prepended");
+        assert!(
+            !path
+                .segments
+                .iter()
+                .any(|s| matches!(s, AsSegment::Sequence(v) if v.contains(&65000))),
+            "the RS's own AS never enters the reflected path"
+        );
+        assert_eq!(
+            update.attr(attr_type::NEXT_HOP),
+            Some(&PathAttribute::NextHop("192.0.2.1".parse().unwrap())),
+            "the origin client's next hop preserved"
+        );
+        assert_eq!(
+            update.attr(attr_type::MULTI_EXIT_DISC),
+            Some(&PathAttribute::Med(42))
+        );
+    }
+
+    /// The origin-peer floor survives RS mode (no reflect back), an
+    /// RS-client target does not receive non-client routes (v1: no
+    /// per-client RIBs — FRR's route-server-maps stay §Deferred), and
+    /// a normal peer still gets the client's route with the local AS
+    /// prepended (the Main Loc-RIB path).
+    #[test]
+    fn route_server_scoping_floors_and_normal_peers() {
+        let mut rib = LocRib::new(65000);
+        let client_a = peer("192.0.2.101", 65001, 1);
+        let client_b_addr: IpAddr = "192.0.2.102".parse().unwrap();
+        let third_addr: IpAddr = "192.0.2.10".parse().unwrap();
+        rib.set_route_server_clients(vec![client_a.address, client_b_addr]);
+        rib.announce(
+            &client_a,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        // A normal-peer route in the table too.
+        let normal_peer = peer("192.0.2.9", 65009, 9);
+        rib.announce(
+            &normal_peer,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65009], None),
+                nlri: vec!["198.51.100.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        rib.recompute();
+
+        let out = LocRibOut::new(
+            Arc::new(Mutex::new(rib)),
+            crate::peer::ConfiguredNetworks::new(65000, vec![]),
+            Arc::new(AcceptAll),
+        );
+        // Back to the origin client: nothing.
+        assert!(
+            crate::peer::OutRib::advertisements(
+                &out,
+                1,
+                1,
+                "10.0.0.1".parse().unwrap(),
+                client_a.address,
+                false
+            )
+            .is_empty(),
+            "never reflect to the origin peer"
+        );
+        // To the other client: only the client route, not the normal
+        // peer's.
+        let to_client = crate::peer::OutRib::advertisements(
+            &out,
+            1,
+            1,
+            "10.0.0.1".parse().unwrap(),
+            client_b_addr,
+            false,
+        );
+        assert_eq!(to_client.len(), 1);
+        assert_eq!(to_client[0].nlri, vec!["203.0.113.0/24".parse().unwrap()]);
+        // To a third (normal, non-client) peer: both routes, the
+        // client's path prepended with the RS AS (the Main Loc-RIB
+        // path — the normal peer's own route is reflected there too).
+        let to_normal = crate::peer::OutRib::advertisements(
+            &out,
+            1,
+            1,
+            "10.0.0.1".parse().unwrap(),
+            third_addr,
+            false,
+        );
+        assert_eq!(to_normal.len(), 2);
+        let reflected = to_normal
+            .iter()
+            .find(|u| u.nlri == vec!["203.0.113.0/24".parse().unwrap()])
+            .unwrap();
+        assert_eq!(reflected.as_path().unwrap().path_length(), 2);
+        assert!(reflected
+            .as_path()
+            .unwrap()
+            .neighbor_as()
+            .is_some_and(|a| a == 65001));
+    }
+
+    /// RFC 4724 §4.1 stale lifecycle: a lost GR session retains the
+    /// routes marked stale (still best-path candidates); a
+    /// re-advertised prefix replaces its stale entry; the per-family
+    /// EOR flush removes only that family's leftovers; a full flush
+    /// removes the rest.
+    #[test]
+    fn graceful_restart_stale_lifecycle() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        let u4 = |pfx: &str| BgpUpdate {
+            attrs: base_attrs(vec![65001], None),
+            nlri: vec![pfx.parse().unwrap()],
+            ..Default::default()
+        };
+        let u6 = |pfx: &str| BgpUpdate {
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::MpReach(crate::attr::MpReach {
+                    afi: 2,
+                    safi: 1,
+                    next_hop: crate::attr::MpNextHop::V6 {
+                        global: "2001:db8::1".parse().unwrap(),
+                        link_local: None,
+                    },
+                    nlri: vec![pfx.parse().unwrap()],
+                }),
+            ],
+            ..Default::default()
+        };
+        rib.announce(&p, &u4("203.0.113.0/24"));
+        rib.announce(&p, &u4("198.51.100.0/24"));
+        rib.announce(&p, &u6("2001:db8:1::/48"));
+        rib.recompute();
+
+        // Session lost: everything goes stale, nothing deleted.
+        rib.mark_peer_stale(&p);
+        assert_eq!(rib.stale_count(&p), 3);
+        assert_eq!(rib.route_count(), 3, "retained, not deleted");
+        assert!(rib.recompute().is_empty(), "best paths unchanged");
+
+        // The peer returns: one prefix re-advertised (its stale entry
+        // is replaced wholesale), then the v4 EOR flushes the rest of
+        // v4 — the v6 route stays until its own EOR.
+        rib.announce(&p, &u4("203.0.113.0/24"));
+        assert_eq!(rib.stale_count(&p), 2, "re-advertised prefix is fresh");
+        rib.flush_stale_family(&p, Some(false));
+        assert_eq!(rib.route_count(), 2, "stale v4 flushed, v6 retained");
+        assert_eq!(rib.stale_count(&p), 1);
+
+        // The v6 EOR (or the restart timer) takes the rest.
+        let changes = {
+            rib.flush_stale_family(&p, Some(true));
+            rib.recompute()
+        };
+        assert_eq!(rib.route_count(), 1, "only the re-advertised route left");
+        assert_eq!(
+            changes.iter().filter(|c| c.best.is_none()).count(),
+            2,
+            "the flushed stale bests withdrew"
+        );
+
+        // Re-establishment without the R bit: flush_stale sweeps all.
+        rib.mark_peer_stale(&p);
+        assert_eq!(rib.stale_count(&p), 1);
+        rib.flush_stale(&p);
+        assert_eq!(rib.route_count(), 0);
+    }
+
+    /// RibSink drives the same lifecycle through the RouteSink hooks
+    /// the session calls.
+    #[test]
+    fn rib_sink_graceful_restart_hooks() {
+        let rib = Arc::new(std::sync::Mutex::new(LocRib::new(65000)));
+        let mut sink = RibSink::new(Arc::clone(&rib));
+        let p = peer("192.0.2.1", 65001, 1);
+        sink.announce(
+            &p,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        // Session lost with GR: retained stale, not cleared.
+        sink.retain_stale(&p);
+        assert_eq!(rib.lock().unwrap().route_count(), 1);
+        assert_eq!(rib.lock().unwrap().stale_count(&p), 1);
+        // Re-established without the R bit: flushed, best withdrawn.
+        sink.flush_stale(&p);
+        assert_eq!(rib.lock().unwrap().route_count(), 0);
+        assert!(!sink.take_changes().is_empty());
+        // The EOR hook routes per-family flushes.
+        sink.announce(
+            &p,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], None),
+                nlri: vec!["198.51.100.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        sink.retain_stale(&p);
+        sink.eor_received(&p, 1, 1);
+        assert_eq!(rib.lock().unwrap().route_count(), 0, "v4 EOR flushed it");
+    }
+
+    /// The RS RIB stays out of the kernel (FRR's view semantics): an
+    /// RS-client best never produces a ZAPI add; replacing an
+    /// installed route with an RS-client one withdraws it.
+    #[test]
+    fn route_server_bests_never_install_to_zebra() {
+        let client = peer("192.0.2.101", 65001, 1);
+        let mut rs_route = route(
+            "203.0.113.0/24",
+            &client,
+            false,
+            base_attrs(vec![65001], None),
+        );
+        rs_route.rs_client = true;
+        // RS best with no installed predecessor: nothing to say.
+        assert!(zebra_commands(&BestChange {
+            prefix: rs_route.prefix,
+            best: Some(rs_route.clone()),
+            old: None,
+        })
+        .is_empty());
+        // Normal best installs; transition to an RS best withdraws.
+        let normal = route(
+            "203.0.113.0/24",
+            &peer("192.0.2.9", 65009, 9),
+            false,
+            base_attrs(vec![65009], None),
+        );
+        assert!(matches!(
+            zebra_commands(&BestChange {
+                prefix: normal.prefix,
+                best: Some(normal.clone()),
+                old: None,
+            })
+            .as_slice(),
+            [crate::zedge::ZedgeCommand::RouteAdd(_)]
+        ));
+        assert!(matches!(
+            zebra_commands(&BestChange {
+                prefix: normal.prefix,
+                best: Some(rs_route.clone()),
+                old: Some(normal),
+            })
+            .as_slice(),
+            [crate::zedge::ZedgeCommand::RouteDel(_)]
+        ));
+        // Losing the last RS best: nothing was installed, nothing to
+        // delete.
+        assert!(zebra_commands(&BestChange {
+            prefix: rs_route.prefix,
+            best: None,
+            old: Some(rs_route),
+        })
+        .is_empty());
     }
 }

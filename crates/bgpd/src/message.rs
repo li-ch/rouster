@@ -226,6 +226,23 @@ impl BgpOpen {
             .any(|c| matches!(c, Capability::RouteRefresh))
     }
 
+    /// The peer's Graceful Restart capability (RFC 4724 §3),
+    /// flattened to the receiving-speaker facts: the Restart State
+    /// (R) bit and the 12-bit Restart Time.
+    pub fn graceful_restart(&self) -> Option<crate::fsm::GracefulRestartInfo> {
+        self.capabilities.iter().find_map(|c| match c {
+            Capability::GracefulRestart {
+                restart_state,
+                restart_time,
+                ..
+            } => Some(crate::fsm::GracefulRestartInfo {
+                restart_state: *restart_state,
+                restart_time: *restart_time,
+            }),
+            _ => None,
+        })
+    }
+
     /// True when the peer offered the given (AFI, SAFI) multiprotocol
     /// capability.
     pub fn supports_af(&self, afi: u16, safi: u8) -> bool {
@@ -572,7 +589,7 @@ impl BgpUpdate {
     /// UPDATE for IPv4 unicast, or an MP_UNREACH carrying no routes
     /// for a multiprotocol family (returns that family).
     pub fn end_of_rib(&self) -> Option<Option<(u16, u8)>> {
-        if !self.withdrawn.is_empty() || !self.nlri.is_empty() || self.announced().is_empty() {
+        if !self.withdrawn.is_empty() || !self.announced().is_empty() {
             return None;
         }
         match self.attrs.as_slice() {
@@ -1031,6 +1048,44 @@ mod tests {
         );
         assert_eq!(update.announced().len(), 2);
         assert_eq!(update.withdrawn_all().len(), 2);
+    }
+
+    /// RFC 4724 §3 End-of-RIB markers: the v4-unicast one is the bare
+    /// minimum UPDATE; a multiprotocol family's is an empty
+    /// MP_UNREACH. Neither an ordinary UPDATE nor a withdrawn-only
+    /// UPDATE counts.
+    #[test]
+    fn end_of_rib_marker_shapes() {
+        let v4 = BgpUpdate::end_of_rib_marker(1, 1);
+        assert_eq!(v4.end_of_rib(), Some(None));
+        let frame = v4.encode_frame(false).unwrap();
+        assert_eq!(frame.len(), 23, "the minimum UPDATE length");
+        match BgpMessage::decode(&frame, false).unwrap() {
+            BgpMessage::Update(back) => assert_eq!(back, v4),
+            other => panic!("{other:?}"),
+        }
+
+        let v6 = BgpUpdate::end_of_rib_marker(2, 1);
+        assert_eq!(v6.end_of_rib(), Some(Some((2, 1))));
+        let frame = v6.encode_frame(true).unwrap();
+        match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Update(back) => assert_eq!(back, v6),
+            other => panic!("{other:?}"),
+        }
+
+        // A route-bearing UPDATE is not an EOR; neither is a
+        // withdrawal.
+        let announce = BgpUpdate {
+            attrs: vec![PathAttribute::Origin(Origin::Igp)],
+            nlri: vec!["203.0.113.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        assert_eq!(announce.end_of_rib(), None);
+        let withdraw = BgpUpdate {
+            withdrawn: vec!["203.0.113.0/24".parse().unwrap()],
+            ..Default::default()
+        };
+        assert_eq!(withdraw.end_of_rib(), None);
     }
 
     #[test]

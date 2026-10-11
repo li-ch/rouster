@@ -152,3 +152,162 @@ async fn two_speakers_over_tcp_reach_established_and_exchange_a_prefix() {
         .unwrap()
         .unwrap();
 }
+
+// ---- N5: route-server mode, two real sessions into one wiring ---
+//
+// Two RS clients (AS 65001 at 192.0.2.101, AS 65002 at
+// 192.0.2.102) against the binary's own wiring (Loc-RIB with the
+// RS-client set, RibSink, LocRibOut): client A's route must reach
+// client B with A's own AS_PATH (no RS prepend), A's next hop
+// preserved, MED intact — FRR `route-server-client` transparent mode
+// (doc/user/routeserver.rst). The sessions are real PeerSessions
+// over duplex pairs (the daemon's own session type); B establishes
+// after A announced, matching the v1 Adj-RIB-Out shape (initial
+// advertisement at Established).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_server_reflects_between_clients_transparently() {
+    use bgpd::attr::{AsPath, Origin, PathAttribute};
+    use bgpd::fsm::SessionConfig;
+    use bgpd::message::{BgpMessage, BgpOpen, BgpUpdate};
+    use bgpd::peer::{OutRib, PeerInfo, PeerSession, SharedSink};
+    use bgpd::rib::{LocRib, LocRibOut, RibSink};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    async fn read_frame(io: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut header = vec![0u8; 19];
+        io.read_exact(&mut header).await.unwrap();
+        let len = u16::from_be_bytes([header[16], header[17]]) as usize;
+        let mut body = vec![0u8; len - 19];
+        io.read_exact(&mut body).await.unwrap();
+        header.extend_from_slice(&body);
+        header
+    }
+
+    async fn write_frame(io: &mut tokio::io::DuplexStream, frame: &[u8]) {
+        io.write_all(frame).await.unwrap();
+        io.flush().await.unwrap();
+    }
+
+    async fn until(io: &mut tokio::io::DuplexStream, want: u8) -> bgpd::message::BgpMessage {
+        loop {
+            let frame = read_frame(io).await;
+            let message = bgpd::message::BgpMessage::decode(&frame, true).unwrap();
+            if message.message_type() == want {
+                return message;
+            }
+        }
+    }
+
+    // The binary's route-server wiring.
+    let loc_rib = Arc::new(Mutex::new(LocRib::new(65000)));
+    loc_rib.lock().unwrap().set_route_server_clients(vec![
+        "192.0.2.101".parse::<IpAddr>().unwrap(),
+        "192.0.2.102".parse::<IpAddr>().unwrap(),
+    ]);
+    let sink = SharedSink(Arc::new(Mutex::new(RibSink::new(Arc::clone(&loc_rib)))));
+    let out_rib: Arc<dyn OutRib> = Arc::new(LocRibOut::new(
+        Arc::clone(&loc_rib),
+        bgpd::peer::ConfiguredNetworks::new(65000, vec![]),
+        Arc::new(bgpd::rib::AcceptAll),
+    ));
+
+    fn session(
+        io: tokio::io::DuplexStream,
+        addr: &str,
+        remote_as: u32,
+        out_rib: Arc<dyn OutRib>,
+    ) -> PeerSession<tokio::io::DuplexStream> {
+        PeerSession::new(
+            io,
+            SessionConfig::new(65000, Ipv4Addr::new(10, 0, 0, 1), 90),
+            PeerInfo {
+                address: addr.parse().unwrap(),
+                remote_as,
+                bgp_id: None,
+            },
+            "192.0.2.100".parse().unwrap(),
+            Some(out_rib),
+            std::time::Duration::ZERO,
+        )
+    }
+
+    // Client A: handshake + announce 203.0.113.0/24 with MED 77 and
+    // next hop 192.0.2.101.
+    let (a_ours, mut a_io) = tokio::io::duplex(8192);
+    let mut a_sess = session(a_ours, "192.0.2.101", 65001, Arc::clone(&out_rib));
+    let mut a_sink = sink.clone();
+    let a_driver = tokio::spawn(async move { a_sess.run(&mut a_sink).await });
+    let _ = until(&mut a_io, 1).await;
+    write_frame(
+        &mut a_io,
+        &BgpMessage::Open(BgpOpen::new(65001, 30, "10.1.1.1".parse().unwrap(), vec![]))
+            .encode(true)
+            .unwrap(),
+    )
+    .await;
+    let _ = until(&mut a_io, 4).await;
+    write_frame(&mut a_io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+    write_frame(
+        &mut a_io,
+        &BgpMessage::Update(BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::NextHop("192.0.2.101".parse().unwrap()),
+                PathAttribute::Med(77),
+            ],
+            nlri: vec!["203.0.113.0/24".parse().unwrap()],
+        })
+        .encode(true)
+        .unwrap(),
+    )
+    .await;
+
+    // Client B establishes AFTER A announced: its initial dump must
+    // carry A's route, transparently.
+    let (b_ours, mut b_io) = tokio::io::duplex(8192);
+    let mut b_sess = session(b_ours, "192.0.2.102", 65002, Arc::clone(&out_rib));
+    let mut b_sink = sink.clone();
+    let b_driver = tokio::spawn(async move { b_sess.run(&mut b_sink).await });
+    let _ = until(&mut b_io, 1).await;
+    write_frame(
+        &mut b_io,
+        &BgpMessage::Open(BgpOpen::new(65002, 30, "10.2.2.2".parse().unwrap(), vec![]))
+            .encode(true)
+            .unwrap(),
+    )
+    .await;
+    let _ = until(&mut b_io, 4).await;
+    write_frame(&mut b_io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+    let update = until(&mut b_io, 2).await;
+    let update = match update {
+        BgpMessage::Update(u) => u,
+        other => panic!("expected UPDATE, got {other:?}"),
+    };
+    assert_eq!(update.nlri, vec!["203.0.113.0/24".parse().unwrap()]);
+    let path = update.as_path().unwrap();
+    assert_eq!(path.path_length(), 1, "only client A's AS");
+    assert!(
+        !path
+            .segments
+            .iter()
+            .any(|s| matches!(s, bgpd::attr::AsSegment::Sequence(v) if v.contains(&65000))),
+        "the route server's AS is never prepended (transparent mode)"
+    );
+    assert_eq!(
+        update.attr(3),
+        Some(&PathAttribute::NextHop("192.0.2.101".parse().unwrap())),
+        "client A's next hop preserved"
+    );
+    assert_eq!(
+        update.attr(4),
+        Some(&PathAttribute::Med(77)),
+        "MED (IGP metric) preserved"
+    );
+
+    a_driver.abort();
+    b_driver.abort();
+}

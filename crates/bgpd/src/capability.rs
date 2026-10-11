@@ -15,6 +15,8 @@ pub mod capability_code {
     pub const MULTIPROTOCOL_EXTENSIONS: u8 = 1;
     pub const ROUTE_REFRESH: u8 = 2;
     pub const FOUR_OCTET_AS_NUMBER: u8 = 65;
+    /// Graceful Restart (RFC 4724 §3).
+    pub const GRACEFUL_RESTART: u8 = 64;
 }
 
 /// One advertised capability.
@@ -26,6 +28,16 @@ pub enum Capability {
     RouteRefresh,
     /// Code 65: the 4-octet AS number (RFC 6793 §2).
     FourOctetAsNumber { asn: u32 },
+    /// Code 64 (RFC 4724 §3): 2 restart octets — the Restart State
+    /// (R) bit in the top bit, a 12-bit Restart Time in seconds —
+    /// followed by up to 63 `<AFI(2), SAFI(1), Flags(1)>` triples
+    /// whose top flag bit is the per-family Forwarding State (F)
+    /// bit. An empty family list = receiving-side support only.
+    GracefulRestart {
+        restart_state: bool,
+        restart_time: u16,
+        families: Vec<(u16, u8, bool)>,
+    },
     /// Unrecognized code: value kept verbatim for logging.
     Unknown { code: u8, value: Vec<u8> },
 }
@@ -36,6 +48,7 @@ impl Capability {
             Self::Multiprotocol { .. } => capability_code::MULTIPROTOCOL_EXTENSIONS,
             Self::RouteRefresh => capability_code::ROUTE_REFRESH,
             Self::FourOctetAsNumber { .. } => capability_code::FOUR_OCTET_AS_NUMBER,
+            Self::GracefulRestart { .. } => capability_code::GRACEFUL_RESTART,
             Self::Unknown { code, .. } => *code,
         }
     }
@@ -49,6 +62,19 @@ impl Capability {
             }
             Self::RouteRefresh => {}
             Self::FourOctetAsNumber { asn } => out.extend_from_slice(&asn.to_be_bytes()),
+            Self::GracefulRestart {
+                restart_state,
+                restart_time,
+                families,
+            } => {
+                let restart = (*restart_state as u16) << 15 | (restart_time & 0x0fff);
+                out.extend_from_slice(&restart.to_be_bytes());
+                for (afi, safi, forwarding) in families {
+                    out.extend_from_slice(&afi.to_be_bytes());
+                    out.push(*safi);
+                    out.push((*forwarding as u8) << 7);
+                }
+            }
             Self::Unknown { value, .. } => out.extend_from_slice(value),
         }
     }
@@ -98,6 +124,29 @@ pub fn decode_capabilities(buf: &[u8]) -> BgpResult<Vec<Capability>> {
                     }
                 } else {
                     return Err(BgpError::local("four-octet AS capability not 4 bytes"));
+                }
+            }
+            capability_code::GRACEFUL_RESTART => {
+                // 2 restart octets + 4-octet family triples (RFC 4724
+                // §3; at most 63 triples, so the value caps at 254).
+                if value.len() < 2 || (value.len() - 2) % 4 != 0 || value.len() > 2 + 63 * 4 {
+                    return Err(BgpError::local(
+                        "graceful restart capability length not 2+4n",
+                    ));
+                }
+                let restart = u16::from_be_bytes([value[0], value[1]]);
+                let mut families = Vec::new();
+                for chunk in value[2..].as_chunks::<4>().0 {
+                    families.push((
+                        u16::from_be_bytes([chunk[0], chunk[1]]),
+                        chunk[2],
+                        chunk[3] & 0x80 != 0,
+                    ));
+                }
+                Capability::GracefulRestart {
+                    restart_state: restart & 0x8000 != 0,
+                    restart_time: restart & 0x0fff,
+                    families,
                 }
             }
             code => Capability::Unknown {
@@ -196,5 +245,51 @@ mod tests {
     #[test]
     fn bad_multiprotropic_length_rejected() {
         assert!(decode_capabilities(&[1, 3, 0x00, 0x01, 0x01]).is_err());
+    }
+
+    // ---- RFC 4724 Graceful Restart (N5 M3) -------------------------
+
+    /// The capability's wire shape (RFC 4724 §3): the R bit in the
+    /// top bit of the 2-octet field, the 12-bit Restart Time below
+    /// it, then 4-octet family triples with the F bit on top of the
+    /// flags octet.
+    #[test]
+    fn graceful_restart_capability_wire_format() {
+        let cap = Capability::GracefulRestart {
+            restart_state: true,
+            restart_time: 120,
+            families: vec![(1, 1, true), (2, 1, false)],
+        };
+        let mut buf = Vec::new();
+        encode_capabilities(std::slice::from_ref(&cap), &mut buf);
+        // code 64, len 10, restart 0x8000|120 = 0x8078, then
+        // 0001 01 80, 0002 01 00.
+        assert_eq!(
+            buf,
+            vec![64, 10, 0x80, 0x78, 0x00, 0x01, 0x01, 0x80, 0x00, 0x02, 0x01, 0x00]
+        );
+        assert_eq!(decode_capabilities(&buf).unwrap(), vec![cap]);
+
+        // No restart bit, no families (receive-only speaker).
+        let bare = Capability::GracefulRestart {
+            restart_state: false,
+            restart_time: 90,
+            families: vec![],
+        };
+        let mut buf = Vec::new();
+        encode_capabilities(std::slice::from_ref(&bare), &mut buf);
+        assert_eq!(buf, vec![64, 2, 0x00, 0x5a]);
+        assert_eq!(decode_capabilities(&buf).unwrap(), vec![bare]);
+    }
+
+    #[test]
+    fn graceful_restart_bad_lengths_rejected() {
+        // value not 2+4n.
+        assert!(decode_capabilities(&[64, 3, 0x00, 0x78, 0x01]).is_err());
+        assert!(decode_capabilities(&[64, 0]).is_err());
+        // 64 triples would exceed the capability's length octet.
+        let mut buf = vec![64, 255];
+        buf.extend(std::iter::repeat_n(0u8, 255));
+        assert!(decode_capabilities(&buf).is_err());
     }
 }

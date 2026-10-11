@@ -15,6 +15,8 @@
 //!  neighbor 192.0.2.9 mrai 0
 //!  neighbor 192.0.2.9 role peer
 //!  neighbor 192.0.2.9 update-error-handling rfc7606
+//!  neighbor 192.0.2.9 route-server
+//!  neighbor 192.0.2.9 graceful-restart 120
 //!  network 203.0.113.0/24
 //!  network 2001:db8:1::/48
 //!  import IN
@@ -172,6 +174,16 @@ pub struct NeighborConfig {
     /// UPDATE error handling: `rfc7606` (default) or
     /// `strict-rfc4271` (N5, RFC 7606).
     pub update_handling: UpdateErrorHandling,
+    /// Route-server client (N5): routes from this neighbor are
+    /// reflected to other clients transparently — no local-AS
+    /// prepend, NEXT_HOP/MED preserved (FRR `neighbor PEER
+    /// route-server-client`, doc/user/routeserver.rst).
+    pub route_server: bool,
+    /// Graceful Restart sending side (RFC 4724 §4.2, N5): the
+    /// Restart Time advertised in the capability (seconds, 1..=4095
+    /// — the 12-bit wire field). The receiving side is always on for
+    /// peers that advertise the capability.
+    pub graceful_restart: Option<u16>,
 }
 
 /// The whole daemon config.
@@ -433,6 +445,8 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                             mrai: 0,
                             role: None,
                             update_handling: UpdateErrorHandling::default(),
+                            route_server: false,
+                            graceful_restart: None,
                         });
                         if neighbor.remote_as != asn {
                             return Err(err(
@@ -487,6 +501,26 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                         })?;
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
                         neighbor.role = Some(role);
+                    }
+                    ["route-server"] => {
+                        let neighbor = require_neighbor(&mut config, addr, line_no)?;
+                        neighbor.route_server = true;
+                    }
+                    ["graceful-restart", secs] => {
+                        let secs: u16 = secs.parse().map_err(|_| {
+                            err(
+                                line_no,
+                                format!("graceful-restart expects seconds 1..=4095, got `{secs}`"),
+                            )
+                        })?;
+                        if !(1..=4095).contains(&secs) {
+                            return Err(err(
+                                line_no,
+                                format!("graceful-restart expects seconds 1..=4095, got `{secs}` (the RFC 4724 §3 12-bit field)"),
+                            ));
+                        }
+                        let neighbor = require_neighbor(&mut config, addr, line_no)?;
+                        neighbor.graceful_restart = Some(secs);
                     }
                     ["update-error-handling", mode] => {
                         let handling = UpdateErrorHandling::parse(mode).ok_or_else(|| {
@@ -826,5 +860,52 @@ ip prefix-list CUST seq 5 permit 203.0.113.0/24
             UpdateErrorHandling::StrictRfc4271.handling(true),
             crate::attr::UpdateHandling::StrictRfc4271
         ));
+    }
+
+    #[test]
+    fn graceful_restart_knob_parses_with_bounds() {
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 graceful-restart 120\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].graceful_restart,
+            Some(120)
+        );
+        for bad in ["0", "4096", "junk"] {
+            let e = parse_config(&format!(
+                "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 graceful-restart {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(e.to_string().contains("1..=4095"), "{bad}: {e}");
+        }
+        // Unconfigured neighbors default to None (receiving side only).
+        let bare = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\n",
+        )
+        .unwrap();
+        assert_eq!(
+            bare.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].graceful_restart,
+            None
+        );
+    }
+
+    #[test]
+    fn route_server_client_knob_parses() {
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.101 remote-as 65001\nneighbor 192.0.2.101 route-server\n",
+        )
+        .unwrap();
+        assert!(config.neighbors[&"192.0.2.101".parse::<IpAddr>().unwrap()].route_server);
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.101 remote-as 65001\n",
+        )
+        .unwrap();
+        assert!(!config.neighbors[&"192.0.2.101".parse::<IpAddr>().unwrap()].route_server);
+        let e = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.101 route-server\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no remote-as yet"), "{e}");
     }
 }
