@@ -55,12 +55,15 @@ trust rc):
 | `show neighbor [ADDR\|PREFIX]` | `rousterd.status` | Rouster extension (FRR has no ARP-table vty command); filter is either family, bare or CIDR |
 | `show vrf` | `rousterd.status` | FRR name |
 | `show ip route summary`, `show rib summary` | `rousterd.status` | the FRR name and the rousterctl-parity name render the same summary (every table, both AFs — the dump is AF-agnostic) |
-| `show running-config`, config mode | session-local | parse-only (W1-c; apply is Phase 4) |
+| `show running-config`, config mode | session-local | parse-only (W1-c; the apply design is recorded in [protocols/vty.md](protocols/vty.md) — file+SIGHUP interim, config-manager target — the build is Phase 4) |
 
 ## 2. The run-dir contract (who writes what)
 
 `/run/rouster/` is the workspace's sanctioned run dir. v1 reads only —
-`rousterctl` never writes it.
+`rousterctl` never writes it. (The recorded vtyd apply design
+([protocols/vty.md](protocols/vty.md), K3) will amend this when it
+lands: vtyd becomes the one sanctioned writer of *candidate* config
+files there; `rousterctl` stays read-only.)
 
 **Reader note (N8)**: all three status files are parsed by ONE
 implementation — `common::rundir` (std-only), one parser table per
