@@ -62,6 +62,18 @@ trust rc):
 `/run/rouster/` is the workspace's sanctioned run dir. v1 reads only —
 `rousterctl` never writes it.
 
+**Reader note (N8)**: all three status files are parsed by ONE
+implementation — `common::rundir` (std-only), one parser table per
+format (§2.1 savd, §2.3 rousterd, plus bfdd's session file per
+`docs/protocols/bfd.md`), one tolerance engine underneath them all.
+The edge consumers (rousterctl, vty) map from the reader's typed
+structs into their own render shapes; they no longer carry parser
+copies. The canonical fixture corpus lives in
+`crates/common/tests/fixtures/` (the union of the per-consumer
+corpora); the per-consumer mirrors stay in place pinning their own
+suites (test-side mirroring is the adopted G2 deviation — unifying
+the mirrors is a separate owner call).
+
 | File | Writer | Lifecycle | v1 consumer |
 |---|---|---|---|
 | `savd.pid` | savd (`--pidfile`, default `/run/rouster/savd.pid`) | written at start; removed on every clean exit; only SIGKILL leaves it behind, naming a dead pid | `show sav` (liveness, preferred), `status` |
@@ -105,7 +117,9 @@ added fields ride along harmlessly; a `rule` line matching no known
 shape is kept verbatim (rendered in the table, carried as
 `{"kind":"raw"}` in JSON) so no operator data is lost; a malformed
 number leaves its field unset rather than failing the parse. Parsing
-never fails. The fixture corpus pinning this lives in
+never fails. The canonical fixture corpus pinning this lives in
+`crates/common/tests/fixtures/` (the reader's own suite); the
+rousterctl mirror that pins this CLI's rendering stays in
 `crates/rousterctl/tests/fixtures/`.
 
 ### 2.2 Liveness method (disclosed)
@@ -170,21 +184,24 @@ fails. `router-id` is only rendered when it parses as an address.
   the header pid is the liveness word, and a stale file is the
   last-known record.
 
-The fixture corpus pinning this lives in
-`crates/rousterctl/tests/fixtures/` (`rousterd-status-*.status`;
+The canonical fixture corpus pinning this lives in
+`crates/common/tests/fixtures/` (`rousterd-status-*.status`;
 `full`/`empty` are generated from the writer's real renders, which
-the writer's own tests byte-pin) and is copied into
-`crates/vty/tests/fixtures/` for the vty-side parser (the W1-c
-in-crate-parser deviation: consolidation is an owner decision
-recorded in docs/protocols/vty.md).
+the writer's own tests byte-pin). The per-consumer mirrors stay in
+`crates/rousterctl/tests/fixtures/` and `crates/vty/tests/fixtures/`
+for their own suites (the former W1-c in-crate-parser deviation is
+resolved — N8 consolidated the parsing itself into
+`common::rundir`; only the mirrored fixtures remain, per the adopted
+G2 keep-mirrors decision).
 
 ## 3. vtysh-shim mapping (edge adapter)
 
 The vtysh shim is a translator at the compatibility edge
 (architecture invariant 1); `rousterctl`'s run-dir reads are the
 native surface underneath it, and the `vty` crate (W1-c) is that
-translator today — `vtyd` re-parses the same run-dir files with the
-same tolerance rules and renders them under Cisco grammar (§1.2).
+translator today — `vtyd` reads the same run-dir files through the
+same shared reader (`common::rundir`, the N8 consolidation) and
+renders them under Cisco grammar (§1.2).
 Mapping, informed by the observed FRR grammar subset (quarantine B7):
 
 | vtysh command | Native source | Status |
@@ -199,8 +216,9 @@ Mapping, informed by the observed FRR grammar subset (quarantine B7):
 
 When a PENDING source lands, the pattern to repeat is today's:
 daemon publishes a run-dir file (or a dump command with a pinned
-format) → rousterctl parses tolerantly with a fixture corpus → the
-shim maps vtysh grammar onto it. The shim must verify state, never
+format) → a format table joins the ONE reader (`common::rundir`)
+with fixture-corpus coverage there → the edge surfaces map their
+views onto it → the shim maps vtysh grammar over the same parse. The shim must verify state, never
 trust exit codes (B7 §4.2: `vtysh -b` exits 0 even when apply fails
 — the same discipline applies in reverse). The end-to-end proof of
 the whole chain (writer → files → both consumers, content-asserted)
@@ -211,9 +229,11 @@ is `scripts/test-vty-smoke.sh`, auto-discovered by
 
 No writes to the run dir, no daemon management (start/stop stay with
 the operator's process supervisor), no config editing (YANG-native
-northbound is Phase 4), no new dependencies — the crate is std-only
-by design; pulling in a parser or JSON crate is an owner decision to
-record, not a patch detail. Per-route `show ip route` rows (not just
+northbound is Phase 4), no external crates — the crate stays free of
+outside dependencies by design; its single dependency is the
+workspace member `common` (the N8-consolidated run-dir reader;
+pulling in a parser or JSON crate remains an owner decision to
+record, not a patch detail). Per-route `show ip route` rows (not just
 the summary) need a dump format decision (route lines in
 `rousterd.status`, or a separate dump file) — an owner decision to
 record when the demand lands.

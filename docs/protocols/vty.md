@@ -189,11 +189,14 @@ writes it).
    no per-user AAA, no enable password.
 4. **Rest-of-line params are canonicalized** to single-space joins
    (`route-map` display lines).
-5. **Liveness/parse duplication with rousterctl**: the S3
-   conventions and liveness method are re-implemented in-crate so
-   the two edge adapters stay decoupled (both are W2-f's to
-   consolidate if the owner wants a shared reader crate — a
-   dependency-edge decision, recorded here).
+5. **Parse consolidation, done (N8)**: the run-dir status parsing
+   previously lived in-crate (the W1-c deviation, so the two edge
+   adapters stayed decoupled); since the N8 consolidation both edges
+   read through the ONE shared reader, `common::rundir` —
+   `savparse`/`bfdparse` are re-exports of its types, `ribparse` is
+   the claim-less vty projection. The liveness method is still
+   in-crate (rousterctl's `liveness` and vty's `liveness` remain
+   separate thin modules; pooling them was never asked for).
 6. **tokio `io-util` feature** added crate-locally on the
    workspace dependency (line discipline needs AsyncRead/WriteExt);
    no workspace-file change, no new lock entries. `tracing`
