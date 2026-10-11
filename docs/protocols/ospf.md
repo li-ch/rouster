@@ -12,6 +12,8 @@ is the day-2 pickup.
 |---|---|
 | `checksum` | The two OSPF checksums, never to be confused: the LSA Fletcher-16 (§12.1.7, ISO 8473 via RFC 1008, FRR-pinned placement math) and the packet IP one's-complement (§A.3.1, auth-field-excluded) |
 | `lsa` | The 20-byte header (§A.4.1) and the v2 bodies: router §A.4.2, network §A.4.3, summary §A.4.4, AS-external §A.4.5; signed sequence space §12.1.6; strict length/count validation |
+| `lsa_v3` | The OSPFv3 LSA codecs (RFC 5340 §A.4): the 16-bit LS type, the A.4.1 prefix triple, the seven v3 bodies + the U-bit `Unknown`, 24-bit Options |
+| `packet_v3` | The OSPFv3 packet codecs (RFC 5340 §A.3): the 16-byte header with Instance ID, Hello/DBD/LSR/LSU/LSAck, the IPv6 pseudo-header checksum |
 | `lsdb` | The typed store keyed (LS type, LS ID, adv router) (§12.2); the §13.1 "which instance is newer" ordering; §13.2 install with contents-difference SPF gating and the MinLSArrival guard; §14 aging/MaxAge/refresh bookkeeping; §12.1.6 rollover guard |
 | `spf` | The §16.1 two-stage Dijkstra (stub networks in stage two), §16.1.1 per-path next hops, §16.1 step-3 network-before-router tiebreak, equal-cost accumulation, TransitCapability; the pure throttle scheduler |
 | `packet` | §A.3 codecs: header, Hello, DBD, LSR, LSU, LSAck with packet checksum verification |
@@ -95,6 +97,56 @@ fork it. The concrete seams, documented where they bite:
   never on addresses; only the §16.1.1 next-hop *interpretation*
   (Link Data as an interface address) and the stub-network mask
   arithmetic are v2-specific.
+
+**The v3 codec slice landed (N2B, 2026-10-11): the seams held.**
+`lsa_v3.rs` + `packet_v3.rs` are *parallel* v3 modules (the Holo
+placement — separate per-version bodies over the shared core), and
+the v2 codecs are untouched: nothing the LSDB, aging, flooding
+decisions or checksums need had to move. What the v3 family
+confirmed concretely:
+
+- The Fletcher-16 placement (offset 14 from byte 2, field at 16-17)
+  and the signed sequence space port **verbatim** — the v3 tests
+  re-verify both.
+- The LSU count + per-LSA length probe, the LSR 12-byte-entry
+  arithmetic and the bare-header DBD/LSAck shapes port with only the
+  header codec swapped.
+- The two real design moves were exactly the two the priming notes
+  predicted: the **U-bit unknown-type tolerance** (v3's `Unknown`
+  body with raw bytes for byte-faithful flooding — the opposite of
+  v2's reject; the reserved S2/S1 scope `0b11` is still rejected)
+  and the **pseudo-header checksum inputs** (encode/decode take
+  `(src: Ipv6Addr, dst: Ipv6Addr)`; the transport supplies the real
+  socket addresses when a v6 runtime exists).
+- Curated strictness for v3 (recorded, RFC-cited in the tests):
+  unknown **Options**/PrefixOptions bits are carried and ignored
+  (A.2's "ignore the unrecognized bits" — the deliberate exception
+  to the reserved-bit house rule), the deprecated x-bits (router
+  flags 0x08, options 0x04, prefix-options 0x04) are set-0/ignored,
+  and structural reserved fields (the prefix triple's 16-bit zero,
+  the router-link reserved octet, the five bits above E/F/T, the
+  DBD preamble's reserved octets, the LSR entry's reserved halfword)
+  reject non-zero as in v2.
+- v3-only facts pinned: the DBD preamble is 12 bytes (the
+  MTU + reserved-octet + flags row keeps the no-padding lesson —
+  an empty ExStart DBD is exactly 28 bytes); Hello's dead interval
+  is 16-bit; DR/BDR are Router IDs; the LSR entry's LS type is the
+  16-bit v3 type under a 16-bit reserved halfword; NSSA 0x2007
+  shares the AS-external body decode (A.4.8) with the FA-must-be-
+  global rule (A.4.7: never `::`, never `fe80::/10`).
+
+Decisions behind the slice (the notes' stop-and-record items):
+5340 fixed layouts first — RFC 8362's E-LSAs are deferred (the live
+oracle FRR 10.2.2 ospf6d speaks legacy shapes); parallel
+`LsaBodyV3` enum rather than widening the v2 enum (keeps
+`Lsa::decode` single-entry per family; a shared trait can come with
+the first code that processes both); Instance ID decode-and-carry
+only (equality is interface-layer); the Nt bit decode-carry only
+(RFC 3101 v3 translation semantics ride with future type-7 work);
+no test-oracle corpus existed, so goldens are hand-derived from the
+RFC diagrams and byte-pinned in comments — the wire-truth leg (a
+live FRR ospf6d interop, v6 sockets and all) is the recorded
+follow-up below.
 
 ## Day-2 additions (2026-10-10/11, the transport + daemon + interop)
 
@@ -459,8 +511,19 @@ fork it. The concrete seams, documented where they bite:
 
 - §16.3 (transit areas' summary-LSAs — the V-bit now lands with the
   virtual links, the summary rules themselves remain); graceful
-  restart (RFC 3623); DNA honoring; OSPFv3 bodies (the ladder's
-  codecs-only scope).
+  restart (RFC 3623); DNA honoring.
+- **OSPFv3 runtime** (the N2B codecs landed; what remains): v6
+  transport (ff02::5/6 memberships, IPv6 sockopts), the live FRR
+  ospf6d interop leg to give the v3 codecs wire truth (the goldens
+  are RFC-diagram-derived, no real corpus yet), SPF v3 (link-LSA
+  next hops, IAPR prefix attachment, transit networks keyed by
+  (DR Interface ID, DR Router ID)), link-local-scope LSDB placement
+  in the interface structure (RFC 5340 §3.2), instance-ID dispatch,
+  multiple-router-LSA concatenation with lowest-LS-ID precedence
+  (A.4.3 — any LSDB helper assuming one router-LSA per (router,
+  area) must not survive into that slice), RFC 5838 address-family
+  instances, RFC 8362 extended LSAs, v3 auth (IPsec/RFC 4552,
+  trailer/RFC 7166 — the auth.rs MAC skeleton is already v3-ready).
 - Virtual-link remainder: multi-hop transit endpoint refinement,
   ifIndex Link Data, vlink auth (v1 rides the transit interface's
   auth), and the live FRR virtual-link interop leg.

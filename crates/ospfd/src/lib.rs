@@ -24,6 +24,13 @@
 //! seam, and every v6 divergence point is documented where it will
 //! bite (see `docs/protocols/ospf.md`).
 //!
+//! The OSPFv3 codec family (`lsa_v3` + `packet_v3`, RFC 5340
+//! Appendices A.3/A.4) proves the seam claim: parallel modules
+//! sharing `LsaType`/`RouterId`/`LinkStateId`, the Fletcher
+//! placement and the packet spines, with no v2 code moved. Codecs
+//! only — the v6 runtime (transport, SPF, LSDB placement) is
+//! §Deferred.
+//!
 //! Incremental SPF (§16.5/§16.6) and inter-area/external route
 //! calculation (§16.2-§16.4) are §Deferred (anchors in the stream
 //! report).
