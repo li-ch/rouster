@@ -83,7 +83,7 @@ impl Options24 {
         self.0 & Self::DC != 0
     }
 
-    fn read(r: &mut Reader<'_>, field: &'static str) -> Result<Self, OspfError> {
+    pub(crate) fn read(r: &mut Reader<'_>, field: &'static str) -> Result<Self, OspfError> {
         let raw = r.u24().ok_or(OspfError::Truncated {
             field,
             need: 3,
@@ -92,7 +92,7 @@ impl Options24 {
         Ok(Self(raw))
     }
 
-    fn put(&self, buf: &mut Vec<u8>) {
+    pub(crate) fn put(&self, buf: &mut Vec<u8>) {
         put_u24(buf, self.0);
     }
 }

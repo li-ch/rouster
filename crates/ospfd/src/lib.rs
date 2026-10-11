@@ -41,6 +41,7 @@ pub mod lsdb;
 pub mod neighbor;
 pub mod origination;
 pub mod packet;
+pub mod packet_v3;
 pub mod spf;
 pub mod transport;
 pub mod wire;
