@@ -1,8 +1,10 @@
 # rpki — RTR client and ROV/ASPA library
 
-Status: **Phase 2, stream P2-c** (2026-10-10/11). `crates/rpki` is a
-library for the edge — bgpd's import policy is the consumer; no daemon
-this round. Everything below cites the exact section that pins it.
+Status: **Phase 2, stream P2-c** (2026-10-10/11); **real-cache
+interop executed** against gortr v0.14.7 on 2026-10-11 (N7 — see
+"Real-cache interop" below). `crates/rpki` is a library for the edge —
+bgpd's import policy is the consumer; no daemon this round. Everything
+below cites the exact section that pins it.
 
 Sources (fetched 2026-10-10):
 
@@ -130,6 +132,20 @@ Client implementation notes (`crates/rpki/src/client.rs`):
 - Cache state exposed to the consumer: `None / Negotiating /
   Receiving / Fresh / Serial / NoData`, with `session_id`, `serial`,
   `timing`, `protocol_version` — one `Arc<Mutex<CacheTables>>`.
+- `ClientConfig::max_version` caps the negotiation offer (bis §7
+  starts at the router's highest version); the default is
+  `HIGHEST_VERSION`. Negotiation outcomes (agreed version, versions
+  already offered) persist across reconnects, and a session that ends
+  before its first End of Data reconnects after a short fixed delay
+  (1 s), not the §6 default Retry Interval — the §8.4 No-Data retry
+  follows the same rule pre-sync (see "Real-cache interop" for the
+  gortr behaviors that forced each).
+- The §6 expire deadline is raced everywhere data is held: inside the
+  session, during the between-connection waits (a cache that died
+  with its port refusing connections parks the client where no
+  session timer is armed), and the §8.4 No-Data sleep. It stays
+  disarmed while a Cache Response sequence is open, and a session
+  that dies inside one flushes the partial table.
 
 ## ROV (RFC 6811 §2, exactly)
 
@@ -222,22 +238,90 @@ is bgpd's call; Unknown ranks with Valid.
    timer starts upon receipt of the containing End Of Data PDU"), so
    an unanswered poll is bounded by the expire deadline rather than a
    send-time re-arm.
+5. A session that ends between a Cache Response and its End of Data
+   flushes everything (§5.5's reset response already cleared the old
+   table; a half-applied delta set is not data either). The RFC is
+   silent on incomplete sequences; discarding is the conservative
+   reading of §6's successful-poll premise (test-pinned, scenario
+   15). The connect attempt itself is not raced against the expire
+   deadline — the OS bounds it (SYN retries) far below any sane
+   Expire Interval.
+
+## Real-cache interop (gortr, executed 2026-10-11)
+
+`scripts/test-rpki-gortr.sh` proves the client against a REAL cache —
+`gortr:local` (Cloudflare GoRTR v0.14.7, linux/amd64 under emulation)
+— fully offline. **Trust posture: this is a protocol interop test,
+not a web-of-trust validation** — the cache serves an unsigned local
+JSON file with `-verify=false -checktime=false`; no TAL, no RRDP, no
+repository fetch. The invocation that works offline (there is no
+baked VRP data in the image — mount your own):
+
+```sh
+docker run -d --name rouster-rpki-gortr -p 127.0.0.1:8282:8282 \
+  -v "$DATA":/data:ro gortr:local \
+  -cache /data/rpki.json -verify=false -checktime=false \
+  -rtr.sessionid 42 -rtr.refresh 10 -rtr.retry 5 -rtr.expire 30 \
+  -refresh 5 -loglevel debug
+```
+
+(`-cache` takes a plain file path — only `http(s)://` prefixes go to
+HTTP; `-rtr.*` set the End-of-Data timing; `-refresh` is the file
+re-fetch period, also reactive to SIGHUP.) Input shape:
+`{"metadata": {...}, "roas": [{"prefix": "192.0.2.0/24",
+"maxLength": 24, "asn": "AS64512", "ta": "n7"}]}` — `asn` is the
+string `"AS…"`.
+
+What the run pinned (gortr v0.14.7 behavior, all live-captured):
+
+- **RTR v0/v1 only.** A v2 Reset Query is answered by a **silent
+  close — zero bytes, no Error Report** (the code-4 branch exists in
+  its sources but `EnforceVersion` is never set). The §7 downgrade
+  arm is therefore unreachable against it; `ClientConfig::max_version`
+  (default [`HIGHEST_VERSION`]) is the operator's pin — the smoke and
+  `rtr-check` pass `--max-version 1`.
+- **Serial starts at 0** and advances only when the file content hash
+  changes; an identical re-fetch bumps nothing.
+- **Serial Notify** (same session ID, new serial) rides the OPEN
+  connection on a data change; the delta is exact-tuple (withdraw of
+  the changed tuple + announces) — matching `vrp.rs` semantics 1:1.
+- **Serial Query for a serial it cannot serve** (fresh instance, any
+  serial ≠ current) → **Cache Reset**, exercising the §8.3
+  Reset-Query fallback live.
+- A **fresh gortr whose initial file read failed** (a swap racing the
+  entrypoint) answers the first Reset Query with **Error Code 2** —
+  not an empty CacheResponse — and its `-refresh` timer recovers the
+  data seconds later.
+- **No Router Key or ASPA PDUs, ever** (v1 only): those tables stay
+  empty against gortr; `router_keys.is_empty()` is asserted, not
+  assumed away.
+
+Fixes the run surfaced (each with a failing-first mock test in
+`tests/session_client.rs`, scenarios 10–15): the `max_version` pin;
+negotiation memory across reconnects (bis §7); fast reconnect before
+the first End of Data (also the §8.4 No-Data retry — the 600 s §6
+default must not gate a pre-sync cache); the §6 expire deadline raced
+in the between-session waits (a dead cache whose port refuses
+connections used to park the client where no timer watched expiry);
+and mid-load semantics (expire disarmed while a Cache Response
+sequence is open + a flush of the partial table when the session dies
+inside one — a half-streamed load is not data).
+
+`crates/rpki/src/bin/rtr-check.rs` is the live probe: it prints every
+cache-state transition (a driver script can watch the session live)
+and exits 0 only when its `--expect-*` assertions and `--rov
+PREFIX,ASN,Verdict` samples all hold. Terminal-state assertions arm
+only after the first observed transition, so `--expect-state None`
+(the expire-flush leg) matches the flush, not the virgin snapshot.
 
 ## §Deferred (owner-authorized follow-ups)
 
-1. **Real-cache interop.** No routinator/gortr image is available in
-   the cached set and no pulls are authorized this round. When an
-   owner authorizes it, run:
-   ```
-   docker run -d --name routinator -p 3323:3323 nlnetlabs/routinator
-   # then, in an owner session:
-   cargo test -p rpki --test live_cache -- --ignored   # (test to be added)
-   ```
-   and point a `ClientConfig` at `127.0.0.1:3323` (routinator's RTR
-   port; the IANA default is 323). Assert: negotiation at v2
-   (routinator ≥ 0.14 speaks v1/v2), a full refresh reaching `Fresh`,
-   and serial updates on notifies. gortr equivalent:
-   `docker run -p 8282:8282 cloudflare/gortr -r ...` (port 8282).
+1. **A second, version-2 cache.** gortr v0.14.7 cannot exercise the
+   v2 surface (ASPA PDUs, Router Keys, error codes 9–12); routinator
+   (or StayRTR with v2 support, if any) remains the deferred second
+   cache — no such image is cached and no pulls are authorized. When
+   one lands, the assertions to add: negotiation at v2, an ASPA
+   table actually filling, and Router Key storage over the wire.
 2. **Fuzzing** the PDU codec with cargo-fuzz (AGENTS.md invariant 7
    applies once a fuzz harness exists for the other wire codecs).
 3. **bgpd wiring**: policy conditions `rpki valid|invalid|notfound`
