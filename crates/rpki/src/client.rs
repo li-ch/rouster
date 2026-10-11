@@ -105,17 +105,60 @@ pub type SharedTables = Arc<Mutex<CacheTables>>;
 
 /// Client configuration. Everything timing-related comes from the
 /// cache's End-of-Data PDUs (RFC 8210 §6); before the first
-/// successful poll the client retries on the §6 default Retry
-/// Interval.
+/// successful poll the client reconnects on a short fixed delay (see
+/// [`FAST_RECONNECT`]) and retries a No-Data cache on the §6 default
+/// Retry Interval.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub cache_addr: SocketAddr,
+    /// Highest RTR version this client will offer; negotiation starts
+    /// here and downgrades on Error Code 4 (bis §7). Defaults to
+    /// [`HIGHEST_VERSION`]. Pin it lower for caches that close the
+    /// transport silently on an unknown version instead of answering
+    /// code 4 — gortr v0.14.x does exactly that (see
+    /// docs/protocols/rpki.md, "Real-cache interop"); there is no
+    /// signal to downgrade on, so the pin is the operator's.
+    pub max_version: u8,
 }
 
 impl ClientConfig {
     pub fn new(cache_addr: SocketAddr) -> Self {
-        ClientConfig { cache_addr }
+        ClientConfig {
+            cache_addr,
+            max_version: HIGHEST_VERSION,
+        }
     }
+}
+
+/// Delay between connection attempts before the first successful
+/// synchronization. RFC 8210 §6's default Retry Interval (600 s) is
+/// meant for "a router [that] has never issued a successful query
+/// against a particular cache" in the data sense; a cache dropping
+/// the transport before any End of Data (gortr v0.14.x on a version
+/// it does not speak) would otherwise cost the full 600 s per
+/// attempt. Once a session has reached End of Data, the cache's own
+/// Retry Interval governs.
+const FAST_RECONNECT: Duration = Duration::from_secs(1);
+
+/// The reconnect delay for the next attempt: the negotiated Retry
+/// Interval once the cache has ever served data, [`FAST_RECONNECT`]
+/// before that.
+fn reconnect_delay(ever_synced: bool, retry_interval: Duration) -> Duration {
+    if ever_synced {
+        retry_interval
+    } else {
+        FAST_RECONNECT
+    }
+}
+
+/// Version negotiation state that outlives any one connection
+/// (8210bis-27 §7): the version agreed so far and every version
+/// offered, so a reconnecting client re-opens at the version the
+/// cache accepted instead of re-offering one it already rejected.
+#[derive(Debug)]
+struct Negotiation {
+    version: Option<u8>,
+    attempted: Vec<u8>,
 }
 
 /// Messages from the per-connection reader task.
@@ -180,7 +223,20 @@ impl RtrClient {
         // periodically using the default Retry Interval."
         let mut retry_interval = Duration::from_secs(u64::from(Timing::DEFAULT.retry_interval));
         let mut expire_at: Option<Instant> = None;
+        // Negotiation state spans connections (bis §7): a version the
+        // cache named or accepted on an earlier connection sticks.
+        let mut negotiation = Negotiation {
+            version: None,
+            attempted: vec![self.config.max_version],
+        };
+        let mut ever_synced = false;
         loop {
+            // Note: the connect attempt itself is not raced against
+            // the expire deadline — the OS bounds it (SYN retries)
+            // far below any sane §6 Expire Interval, and the sleeps
+            // below carry the between-sessions deadline (a cache that
+            // died with its port refusing connections parks the
+            // client in THIS loop; the live gortr lesson).
             let connect = tokio::select! {
                 _ = shutdown.changed() => return,
                 stream = TcpStream::connect(self.config.cache_addr) => stream,
@@ -189,17 +245,29 @@ impl RtrClient {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(cache = %self.config.cache_addr, error = %e, "rpki: cache connect failed");
-                    if sleep_or_shutdown(retry_interval, &mut shutdown)
-                        .await
-                        .is_err()
+                    match wait_or_expire(
+                        reconnect_delay(ever_synced, retry_interval),
+                        &mut shutdown,
+                        &expire_at,
+                    )
+                    .await
                     {
-                        return;
+                        WaitOutcome::Shutdown => return,
+                        WaitOutcome::Expired => self.expire_flush(&mut expire_at),
+                        WaitOutcome::Done => {}
                     }
                     continue;
                 }
             };
             match self
-                .run_session(stream, &mut shutdown, &mut expire_at, &mut retry_interval)
+                .run_session(
+                    stream,
+                    &mut shutdown,
+                    &mut expire_at,
+                    &mut retry_interval,
+                    &mut negotiation,
+                    &mut ever_synced,
+                )
                 .await
             {
                 SessionEnd::Stopped => return,
@@ -216,17 +284,35 @@ impl RtrClient {
                 }
             }
             // The expire deadline survives the reconnect (the data is
-            // still trusted until then, RFC 8210 §6).
-            if sleep_or_shutdown(retry_interval, &mut shutdown)
-                .await
-                .is_err()
+            // still trusted until then, RFC 8210 §6) — and races this
+            // sleep the same way.
+            match wait_or_expire(
+                reconnect_delay(ever_synced, retry_interval),
+                &mut shutdown,
+                &expire_at,
+            )
+            .await
             {
-                if expire_at.is_some() {
-                    tracing::warn!("rpki: shutdown with data still held; caller owns the tables");
+                WaitOutcome::Shutdown => {
+                    if expire_at.is_some() {
+                        tracing::warn!(
+                            "rpki: shutdown with data still held; caller owns the tables"
+                        );
+                    }
+                    return;
                 }
-                return;
+                WaitOutcome::Expired => self.expire_flush(&mut expire_at),
+                WaitOutcome::Done => {}
             }
         }
+    }
+
+    /// The §6 expire action: data learned from the cache is dropped
+    /// once the Expire Interval passes without a successful poll.
+    fn expire_flush(&self, expire_at: &mut Option<Instant>) {
+        tracing::warn!(cache = %self.config.cache_addr, "rpki: expire interval passed, flushing cache data");
+        self.lock().flush();
+        *expire_at = None;
     }
 
     /// Spawn [`RtrClient::run`] on a new task.
@@ -240,21 +326,26 @@ impl RtrClient {
         self.tables.lock().unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_session(
         &self,
         stream: Stream,
         shutdown: &mut watch::Receiver<bool>,
         expire_at: &mut Option<Instant>,
         retry_interval: &mut Duration,
+        negotiation: &mut Negotiation,
+        ever_synced: &mut bool,
     ) -> SessionEnd {
         let _ = stream.set_nodelay(true);
         let (rx_half, mut tx_half) = stream.into_split();
         let (from_cache_tx, mut from_cache_rx) = mpsc::channel::<FromCache>(16);
         let reader = tokio::spawn(read_loop(rx_half, from_cache_tx));
 
-        // Negotiation state (RFC 8210 §7 / bis §7).
-        let mut version: Option<u8> = None;
-        let mut attempted: Vec<u8> = vec![HIGHEST_VERSION];
+        // Negotiation state (RFC 8210 §7 / bis §7), shared across the
+        // connection's life and remembered by the caller's reconnect
+        // loop: `version` is the agreed session version (None until
+        // fixed), `attempted` every version offered so far.
+        let Negotiation { version, attempted } = negotiation;
 
         // Current session bookkeeping.
         let (have_sid, have_serial) = {
@@ -284,7 +375,11 @@ impl RtrClient {
             (Some(_), Some(_)) => Some(QueryKind::Serial),
             _ => Some(QueryKind::Reset),
         };
-        if write_pdu(&mut tx_half, &open_query(HIGHEST_VERSION))
+        // Open at the version the cache last accepted when there is
+        // one (bis §7 negotiation memory across reconnects), else the
+        // configured ceiling.
+        let open_version = (*version).unwrap_or(self.config.max_version);
+        if write_pdu(&mut tx_half, &open_query(open_version))
             .await
             .is_err()
         {
@@ -300,7 +395,17 @@ impl RtrClient {
                 Timer(Instant),
                 Shutdown,
             }
-            let next_timer = [refresh_at, *expire_at].into_iter().flatten().min();
+            // While a Cache Response sequence is open the §5.5 full
+            // load is REPLACING the table (already cleared at the
+            // response); the §6 expire deadline protects data HELD
+            // from the last successful poll, so it stays disarmed
+            // until the End of Data re-arms it. (The live gortr run
+            // showed why: a mid-reload flush loses payload PDUs and
+            // leaves a partial table behind.)
+            let next_timer = [refresh_at, if receiving { None } else { *expire_at }]
+                .into_iter()
+                .flatten()
+                .min();
             let timer = async {
                 match next_timer {
                     Some(at) => sleep_until(at).await,
@@ -324,9 +429,7 @@ impl RtrClient {
                     if Some(at) == *expire_at {
                         // RFC 8210 §6: data "MUST NOT" be retained past
                         // the Expire Interval without a successful poll.
-                        tracing::warn!(cache = %self.config.cache_addr, "rpki: expire interval passed, flushing cache data");
-                        self.lock().flush();
-                        *expire_at = None;
+                        self.expire_flush(expire_at);
                         refresh_at = None;
                     } else if Some(at) == refresh_at {
                         // §6 refresh poll; doubles as the §8.1
@@ -341,7 +444,7 @@ impl RtrClient {
                             .unwrap_or_else(|| {
                                 Duration::from_secs(u64::from(Timing::DEFAULT.refresh_interval))
                             });
-                        if let (Some(sid), Some(serial), Some(v)) = (sid, serial, version) {
+                        if let (Some(sid), Some(serial), Some(v)) = (sid, serial, *version) {
                             let q = Pdu::SerialQuery {
                                 version: v,
                                 session_id: sid,
@@ -375,7 +478,7 @@ impl RtrClient {
                             tracing::warn!(%err, "rpki: undecodable PDU from cache");
                             let _ = send_error(
                                 &mut tx_half,
-                                version.unwrap_or(HIGHEST_VERSION),
+                                version.unwrap_or(self.config.max_version),
                                 ErrorCode::CorruptData,
                                 &raw,
                                 Some(&format!("undecodable PDU: {err}")),
@@ -389,7 +492,7 @@ impl RtrClient {
                     // Version stability (RFC 8210 §7): once negotiated,
                     // any other version is fatal — except an Error
                     // Report, which never gets answered (§5.11).
-                    match (&version, pdu.version()) {
+                    match (&*version, pdu.version()) {
                         (Some(v), pv) if pv != *v && !matches!(pdu, Pdu::ErrorReport { .. }) => {
                             let _ = send_error(
                                 &mut tx_half,
@@ -418,7 +521,7 @@ impl RtrClient {
                             if version.is_some() && !receiving {
                                 let (sid, held_serial, v) = {
                                     let t = self.lock();
-                                    (t.session_id, t.serial, version)
+                                    (t.session_id, t.serial, *version)
                                 };
                                 if let (Some(sid), Some(s), Some(v)) = (sid, held_serial, v) {
                                     if session_id != sid {
@@ -464,9 +567,9 @@ impl RtrClient {
                             if version.is_none() {
                                 // Any well-formed response fixes the
                                 // session version (§7).
-                                version = Some(pdu.version());
+                                *version = Some(pdu.version());
                             }
-                            let v = version.unwrap_or(HIGHEST_VERSION);
+                            let v = version.unwrap_or(self.config.max_version);
                             if write_pdu(&mut tx_half, &Pdu::ResetQuery { version: v })
                                 .await
                                 .is_err()
@@ -481,7 +584,7 @@ impl RtrClient {
                             if receiving {
                                 let _ = send_error(
                                     &mut tx_half,
-                                    version.unwrap_or(HIGHEST_VERSION),
+                                    version.unwrap_or(self.config.max_version),
                                     ErrorCode::CorruptData,
                                     &raw,
                                     Some("cache response inside an open sequence"),
@@ -491,7 +594,7 @@ impl RtrClient {
                                 break;
                             }
                             if version.is_none() {
-                                version = Some(pdu.version());
+                                *version = Some(pdu.version());
                             }
                             let was_reset_query = pending_query.take() == Some(QueryKind::Reset);
                             last_reset_response = was_reset_query;
@@ -505,7 +608,7 @@ impl RtrClient {
                                     if known != session_id {
                                         let _ = send_error(
                                             &mut tx_half,
-                                            version.unwrap_or(HIGHEST_VERSION),
+                                            version.unwrap_or(self.config.max_version),
                                             ErrorCode::CorruptData,
                                             &raw,
                                             Some("session id changed"),
@@ -539,7 +642,7 @@ impl RtrClient {
                             if !receiving {
                                 let _ = send_error(
                                     &mut tx_half,
-                                    version.unwrap_or(HIGHEST_VERSION),
+                                    version.unwrap_or(self.config.max_version),
                                     ErrorCode::CorruptData,
                                     &raw,
                                     Some("end of data without a cache response"),
@@ -556,7 +659,7 @@ impl RtrClient {
                             if session_id != rx_sid {
                                 let _ = send_error(
                                     &mut tx_half,
-                                    version.unwrap_or(HIGHEST_VERSION),
+                                    version.unwrap_or(self.config.max_version),
                                     ErrorCode::CorruptData,
                                     &raw,
                                     Some("end of data session id mismatch"),
@@ -572,6 +675,10 @@ impl RtrClient {
                             *retry_interval = Duration::from_secs(u64::from(timing.retry_interval));
                             *expire_at =
                                 Some(now + Duration::from_secs(u64::from(timing.expire_interval)));
+                            // The cache has now served data at least
+                            // once: reconnects fall back to the Retry
+                            // Interval it named (RFC 8210 §6).
+                            *ever_synced = true;
                             let mut t = self.lock();
                             t.serial = Some(serial);
                             t.session_id = Some(session_id);
@@ -608,12 +715,15 @@ impl RtrClient {
                                         end = SessionEnd::Reported(error_code);
                                         break;
                                     }
-                                    if attempted.contains(&named) || named > HIGHEST_VERSION {
+                                    if attempted.contains(&named)
+                                        || named > self.config.max_version
+                                        || named > HIGHEST_VERSION
+                                    {
                                         end = SessionEnd::Reported(error_code);
                                         break;
                                     }
                                     attempted.push(named);
-                                    version = Some(named);
+                                    *version = Some(named);
                                     if write_pdu(&mut tx_half, &open_query(named)).await.is_err() {
                                         end = SessionEnd::Transport(
                                             "downgrade query write failed".into(),
@@ -624,13 +734,30 @@ impl RtrClient {
                                 ErrorCode::NoDataAvailable => {
                                     // §8.4: retry periodically with Reset
                                     // Queries until a usable load arrives.
+                                    // §8.4 names no interval of its own; the
+                                    // cache's Retry Interval governs once
+                                    // one is known, and the pre-sync fast
+                                    // delay does before that (a fresh
+                                    // gortr whose initial file read failed
+                                    // answers the FIRST query with code 2 —
+                                    // the N7 live capture — and must not
+                                    // cost the 600 s §6 default).
                                     self.lock().state = CacheState::NoData;
-                                    let wait = *retry_interval;
-                                    if sleep_or_shutdown(wait, shutdown).await.is_err() {
-                                        end = SessionEnd::Stopped;
-                                        break;
+                                    let wait = reconnect_delay(*ever_synced, *retry_interval);
+                                    match wait_or_expire(wait, shutdown, expire_at).await {
+                                        WaitOutcome::Shutdown => {
+                                            end = SessionEnd::Stopped;
+                                            break;
+                                        }
+                                        // Held data (if any) cannot outlive
+                                        // the Expire Interval while we wait
+                                        // out a No-Data cache (§6).
+                                        WaitOutcome::Expired => {
+                                            self.expire_flush(expire_at);
+                                        }
+                                        WaitOutcome::Done => {}
                                     }
-                                    let v = version.unwrap_or(HIGHEST_VERSION);
+                                    let v = version.unwrap_or(self.config.max_version);
                                     if write_pdu(&mut tx_half, &Pdu::ResetQuery { version: v })
                                         .await
                                         .is_err()
@@ -673,7 +800,7 @@ impl RtrClient {
                             if !receiving {
                                 let _ = send_error(
                                     &mut tx_half,
-                                    version.unwrap_or(HIGHEST_VERSION),
+                                    version.unwrap_or(self.config.max_version),
                                     ErrorCode::InvalidRequest,
                                     &raw,
                                     Some("payload PDU outside a cache response"),
@@ -685,7 +812,7 @@ impl RtrClient {
                             if let Some(code) = payload.aspa_provider_list_error() {
                                 let _ = send_error(
                                     &mut tx_half,
-                                    version.unwrap_or(HIGHEST_VERSION),
+                                    version.unwrap_or(self.config.max_version),
                                     code,
                                     &raw,
                                     Some("aspa provider list error"),
@@ -698,7 +825,7 @@ impl RtrClient {
                             if let Err((code, why)) = verdict {
                                 let _ = send_error(
                                     &mut tx_half,
-                                    version.unwrap_or(HIGHEST_VERSION),
+                                    version.unwrap_or(self.config.max_version),
                                     code,
                                     &raw,
                                     Some(why),
@@ -713,7 +840,7 @@ impl RtrClient {
                             // from the cache.
                             let _ = send_error(
                                 &mut tx_half,
-                                version.unwrap_or(HIGHEST_VERSION),
+                                version.unwrap_or(self.config.max_version),
                                 ErrorCode::InvalidRequest,
                                 &raw,
                                 Some("query PDU from cache"),
@@ -728,6 +855,20 @@ impl RtrClient {
         }
         reader.abort();
         let _ = tx_half.shutdown().await;
+        // A Cache Response sequence that never reached its End of
+        // Data leaves a PARTIAL table (a reset response already
+        // cleared §5.5's "whole current database"; a delta response
+        // is half-applied). Retaining either would betray §6's
+        // successful-poll premise: flush, and the next connection
+        // re-opens with a Reset Query.
+        if receiving {
+            tracing::warn!(
+                cache = %self.config.cache_addr,
+                "rpki: session ended mid cache response, flushing partial data"
+            );
+            self.lock().flush();
+            *expire_at = None;
+        }
         end
     }
 
@@ -882,11 +1023,38 @@ where
     write_pdu(w, &report).await
 }
 
-/// Sleep for `d` unless shutdown fires first; `Err(())` means stop.
-async fn sleep_or_shutdown(d: Duration, shutdown: &mut watch::Receiver<bool>) -> Result<(), ()> {
+/// Resolve when the expire deadline passes; never resolves while no
+/// deadline is armed (RFC 8210 §6 racing between sessions).
+async fn expire_timer(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Outcome of a bounded wait that also races the expire deadline.
+enum WaitOutcome {
+    /// The duration elapsed.
+    Done,
+    /// Shutdown was requested.
+    Shutdown,
+    /// The expire deadline fired first (§6).
+    Expired,
+}
+
+/// Sleep for `d`, unless shutdown fires or the §6 expire deadline
+/// passes first — held data must never outlive the Expire Interval,
+/// including while parked in the reconnect loop with no session
+/// timers armed (the live gortr lesson: cache dead, port refusing).
+async fn wait_or_expire(
+    d: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    expire_at: &Option<Instant>,
+) -> WaitOutcome {
     tokio::select! {
-        _ = tokio::time::sleep(d) => Ok(()),
-        _ = shutdown.changed() => Err(()),
+        _ = tokio::time::sleep(d) => WaitOutcome::Done,
+        _ = shutdown.changed() => WaitOutcome::Shutdown,
+        _ = expire_timer(*expire_at) => WaitOutcome::Expired,
     }
 }
 
@@ -921,5 +1089,29 @@ mod tests {
     fn default_port_matches_rfc() {
         // RFC 8210 §9: the rpki-rtr port.
         assert_eq!(DEFAULT_CACHE_PORT, 323);
+    }
+
+    #[test]
+    fn default_config_offers_the_highest_version() {
+        // bis §7: negotiation starts at the router's highest version
+        // unless the operator pinned lower (the gortr knob).
+        let cfg = ClientConfig::new("127.0.0.1:8282".parse().unwrap());
+        assert_eq!(cfg.max_version, HIGHEST_VERSION);
+    }
+
+    #[test]
+    fn reconnect_is_fast_until_the_cache_has_served_data() {
+        // Pre-sync failures (a cache closing on an unknown version,
+        // connection refused) cost FAST_RECONNECT, not the §6 default
+        // 600 s retry — the gortr silent-close lesson.
+        let retry = Duration::from_secs(600);
+        assert_eq!(reconnect_delay(false, retry), FAST_RECONNECT);
+        // Once a session reached End of Data, the cache's own Retry
+        // Interval governs (RFC 8210 §6).
+        assert_eq!(reconnect_delay(true, retry), retry);
+        assert_eq!(
+            reconnect_delay(true, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 }

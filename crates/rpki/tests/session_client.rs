@@ -29,6 +29,27 @@
 //!    the paused clock each mock read-park lets auto-advance fire one
 //!    client timer, and a chain of two such parks reaches the Expire
 //!    Interval, which would legitimately flush mid-conversation.)
+//! 10. pinned max version — the gortr fix (docs/protocols/rpki.md
+//!     "Real cache"): a `ClientConfig` capped at v1 opens with a v1
+//!     Reset Query and completes the whole session at v1;
+//! 11. silent-close fall-through — the live gortr v0.14.x wire shape
+//!     (v2 opening answered by a close with ZERO bytes, no Error
+//!     Report): the client must reconnect and still complete when the
+//!     next connection behaves conformantly (code 4 → downgrade);
+//! 12. negotiation memory — bis §7's downgrade outcome survives a
+//!     transport drop: after code 4 named v1 on connection one, the
+//!     reconnect opens at v1 directly instead of re-offering v2.
+//! 13. no-data pacing — the live gortr lesson: a cache that answers
+//!     the FIRST Reset Query with Error Code 2 (a fresh gortr whose
+//!     initial file read failed serves exactly that) must not cost the
+//!     §6 default Retry Interval (600 s) before the retry — nothing
+//!     has ever synced, so the retry is fast (RFC 8210 §8.4 says
+//!     "periodically", and names no interval of its own).
+//! 14. expiry between sessions — the other live gortr lesson: when the
+//!     cache dies and its port starts REFUSING connections, the client
+//!     loops in the reconnect path, where no session timer is armed;
+//!     the Expire Interval deadline must still be honored there or the
+//!     held data outlives RFC 8210 §6's "MUST NOT be retained" bound.
 //!
 //! Clock: every test runs tokio's paused clock (`start_paused`), so
 //! the RFC's default intervals (retry 600 s, expire 7200 s) elapse
@@ -71,9 +92,19 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Fixture {
+        // The cache_addr is replaced with the listener's below; only
+        // the version policy of the default config matters here.
+        let any = "127.0.0.1:1".parse().unwrap();
+        Fixture::with_config(ClientConfig::new(any)).await
+    }
+
+    async fn with_config(config: ClientConfig) -> Fixture {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (client, tables) = RtrClient::new(ClientConfig::new(addr));
+        let (client, tables) = RtrClient::new(ClientConfig {
+            cache_addr: addr,
+            ..config
+        });
         let (shutdown, rx) = watch::channel(false);
         let handle = client.spawn(rx);
         Fixture {
@@ -92,6 +123,14 @@ impl Fixture {
     async fn stop(self) {
         self.shutdown.send(true).unwrap();
         self.handle.await.unwrap();
+    }
+
+    /// Close the mock cache's LISTENING socket (the `docker stop`
+    /// shape: connections become refused instead of accepted) and
+    /// hand back the still-live client pieces.
+    fn close_listener(self) -> (Tables, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        drop(self.listener);
+        (self.tables, self.shutdown, self.handle)
     }
 }
 
@@ -360,9 +399,21 @@ async fn cache_reset_after_serial_mismatch_falls_back_to_reset_query() {
     let mut first = fx.accept().await;
     expect(&mut first, Pdu::ResetQuery { version: VERSION_2 }).await;
     let sid = 0x1234;
+    // A deliberately wide Expire Interval (§6's ceiling): under the
+    // paused clock, mock read-parks let auto-advance jump whole client
+    // timers at a time, and the client now HONORS the expire deadline
+    // between sessions — with §6's default 7200 s the reconnect could
+    // legitimately land past it (the data flushed, the §8.3 Serial
+    // Query premise gone). 172800 s keeps "data unexpired" true for
+    // every schedule this conversation can take.
+    let wide = Timing {
+        refresh_interval: 3600,
+        retry_interval: 600,
+        expire_interval: 172_800,
+    };
     send(&mut first, &cache_response(VERSION_2, sid)).await;
     send(&mut first, &roa4(VERSION_2, "192.0.2.0/24", 24, 64512)).await;
-    send(&mut first, &eod(VERSION_2, sid, 5, Timing::DEFAULT)).await;
+    send(&mut first, &eod(VERSION_2, sid, 5, wide)).await;
     wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
 
     // Transport drops; the client holds the data (§8.1: Serial Query
@@ -601,6 +652,214 @@ async fn session_id_change_terminates_with_code0_and_flushes() {
 
     let s = wait_until(&fx.tables, |s| s.state == CacheState::None && s.vrps == 0).await;
     assert_eq!(s.session_id, None);
+
+    fx.stop().await;
+}
+
+// ---- 10. pinned max version (the gortr fix) -----------------------------
+
+#[tokio::test(start_paused = true)]
+async fn client_pinned_to_v1_opens_and_syncs_at_v1() {
+    let _serial = serial().await;
+    let any = "127.0.0.1:1".parse().unwrap();
+    let fx = Fixture::with_config(ClientConfig {
+        max_version: VERSION_1,
+        ..ClientConfig::new(any)
+    })
+    .await;
+    let mut cache = fx.accept().await;
+
+    // The opening query is v1 — no v2 offer for the cache to trip on.
+    expect(&mut cache, Pdu::ResetQuery { version: VERSION_1 }).await;
+    let sid = 0x0042;
+    send(&mut cache, &cache_response(VERSION_1, sid)).await;
+    send(&mut cache, &roa4(VERSION_1, "192.0.2.0/24", 24, 64512)).await;
+    send(&mut cache, &eod(VERSION_1, sid, 0, Timing::DEFAULT)).await;
+
+    let s = wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
+    assert_eq!(s.version, Some(VERSION_1));
+    assert_eq!(s.vrps, 1);
+    assert_eq!(s.serial, Some(0));
+
+    fx.stop().await;
+}
+
+// ---- 11. silent close → reconnect → conformant downgrade -----------------
+
+#[tokio::test(start_paused = true)]
+async fn gortr_silent_close_falls_through_to_conformant_downgrade() {
+    let _serial = serial().await;
+    let fx = Fixture::new().await;
+
+    // Connection 1 — the live gortr v0.14.x shape: it reads the v2
+    // Reset Query and closes WITHOUT sending a single byte (no Error
+    // Report; captured against the real cache in the N7 runbook).
+    let mut first = fx.accept().await;
+    expect(&mut first, Pdu::ResetQuery { version: VERSION_2 }).await;
+    drop(first);
+
+    // Connection 2 — the client reconnects (fast: nothing was ever
+    // synced) and offers its highest version again, having learned
+    // nothing (correct: a silent close carries no version signal).
+    // This connection behaves conformantly: code 4 names v1.
+    let mut second = fx.accept().await;
+    expect(&mut second, Pdu::ResetQuery { version: VERSION_2 }).await;
+    send(
+        &mut second,
+        &error_report(VERSION_1, ErrorCode::UnsupportedProtocolVersion, "v1 only"),
+    )
+    .await;
+    expect(&mut second, Pdu::ResetQuery { version: VERSION_1 }).await;
+    let sid = 0x0042;
+    send(&mut second, &cache_response(VERSION_1, sid)).await;
+    send(&mut second, &roa4(VERSION_1, "192.0.2.0/24", 24, 64512)).await;
+    send(&mut second, &eod(VERSION_1, sid, 0, Timing::DEFAULT)).await;
+
+    let s = wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
+    assert_eq!(s.version, Some(VERSION_1));
+    assert_eq!(s.vrps, 1);
+
+    fx.stop().await;
+}
+
+// ---- 12. negotiation memory survives a reconnect (bis §7) ----------------
+
+#[tokio::test(start_paused = true)]
+async fn downgrade_negotiation_survives_reconnect() {
+    let _serial = serial().await;
+    let fx = Fixture::new().await;
+
+    // Connection 1: the cache downgrades us to v1 (code 4), the
+    // client re-queries at v1 on the same transport — and then the
+    // transport dies before any data arrives.
+    let mut first = fx.accept().await;
+    expect(&mut first, Pdu::ResetQuery { version: VERSION_2 }).await;
+    send(
+        &mut first,
+        &error_report(VERSION_1, ErrorCode::UnsupportedProtocolVersion, "v1 only"),
+    )
+    .await;
+    expect(&mut first, Pdu::ResetQuery { version: VERSION_1 }).await;
+    drop(first);
+
+    // Connection 2: the agreed version is remembered — the opening
+    // query is v1, not a fresh v2 offer.
+    let mut second = fx.accept().await;
+    expect(&mut second, Pdu::ResetQuery { version: VERSION_1 }).await;
+    let sid = 0x0042;
+    send(&mut second, &cache_response(VERSION_1, sid)).await;
+    send(&mut second, &roa4(VERSION_1, "192.0.2.0/24", 24, 64512)).await;
+    send(&mut second, &eod(VERSION_1, sid, 0, Timing::DEFAULT)).await;
+
+    let s = wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
+    assert_eq!(s.version, Some(VERSION_1));
+    assert_eq!(s.vrps, 1);
+
+    fx.stop().await;
+}
+
+// ---- 13. no-data retry pacing (§8.4, the gortr reality) ------------------
+
+#[tokio::test(start_paused = true)]
+async fn no_data_retry_is_fast_before_first_sync() {
+    let _serial = serial().await;
+    let fx = Fixture::new().await;
+    let mut cache = fx.accept().await;
+
+    expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
+    // The live shape: a freshly started gortr whose initial file read
+    // raced the data swap answers the first Reset Query with Error
+    // Code 2 (captured in the N7 runbook) — not an empty Cache
+    // Response.
+    send(
+        &mut cache,
+        &error_report(VERSION_2, ErrorCode::NoDataAvailable, "no data yet"),
+    )
+    .await;
+    wait_until(&fx.tables, |s| s.state == CacheState::NoData).await;
+
+    // The §8.4 retry must come quickly: no End of Data has ever named
+    // a Retry Interval, so the pre-sync fast reconnect delay governs,
+    // not the 600 s default (asserted on tokio's paused-clock virtual
+    // time, which counts everything auto-advance skipped).
+    let t0 = tokio::time::Instant::now();
+    expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
+    let elapsed = tokio::time::Instant::now() - t0;
+    assert!(
+        elapsed <= Duration::from_secs(10),
+        "no-data retry took {elapsed:?} of virtual time pre-sync; want the fast delay"
+    );
+
+    // And the retry completes normally once data exists.
+    let sid = 0x1234;
+    send(&mut cache, &cache_response(VERSION_2, sid)).await;
+    send(&mut cache, &roa4(VERSION_2, "192.0.2.0/24", 24, 64512)).await;
+    send(&mut cache, &eod(VERSION_2, sid, 1, Timing::DEFAULT)).await;
+    let s = wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
+    assert_eq!(s.vrps, 1);
+
+    fx.stop().await;
+}
+
+// ---- 14. expiry honored between sessions (§6, the gortr reality) ---------
+
+#[tokio::test(start_paused = true)]
+async fn expire_fires_while_reconnects_are_refused() {
+    let _serial = serial().await;
+    let fx = Fixture::new().await;
+    let mut cache = fx.accept().await;
+
+    expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
+    let sid = 0x1234;
+    // Expire far inside the Retry Interval, so an unwatched deadline
+    // would be skipped by the reconnect sleeps (the live shape: gortr
+    // stopped, its mapped port refusing, expire 30 s, retry 5 s).
+    let timing = Timing {
+        refresh_interval: 3600,
+        retry_interval: 5,
+        expire_interval: 2,
+    };
+    send(&mut cache, &cache_response(VERSION_2, sid)).await;
+    send(&mut cache, &roa4(VERSION_2, "192.0.2.0/24", 24, 64512)).await;
+    send(&mut cache, &eod(VERSION_2, sid, 5, timing)).await;
+    wait_until(&fx.tables, |s| s.state == CacheState::Fresh).await;
+
+    // The cache dies and its port disappears: the listening socket
+    // closes, so every reconnect is REFUSED — the client parks in the
+    // reconnect loop where no session timer is armed.
+    drop(cache);
+    let (tables, shutdown, handle) = fx.close_listener();
+
+    // §6: the data "MUST NOT" be retained past the Expire Interval
+    // without a successful poll — refused reconnects are not polls.
+    let s = wait_until(&tables, |s| s.state == CacheState::None && s.vrps == 0).await;
+    assert_eq!(s.serial, None);
+
+    shutdown.send(true).unwrap();
+    handle.await.unwrap();
+}
+
+// ---- 15. mid-load session death (§5.5 atomicity) --------------------------
+
+#[tokio::test(start_paused = true)]
+async fn transport_death_mid_reload_flushes_partial() {
+    let _serial = serial().await;
+    let fx = Fixture::new().await;
+    let mut cache = fx.accept().await;
+
+    expect(&mut cache, Pdu::ResetQuery { version: VERSION_2 }).await;
+    let sid = 0x1234;
+    send(&mut cache, &cache_response(VERSION_2, sid)).await;
+    // Half the load lands, then the cache dies mid-sequence — no
+    // End of Data ever arrives.
+    send(&mut cache, &roa4(VERSION_2, "192.0.2.0/24", 24, 64512)).await;
+    drop(cache);
+
+    // Nothing of the partial load survives: state None, tables empty,
+    // no session id/serial to resume from.
+    let s = wait_until(&fx.tables, |s| s.state == CacheState::None && s.vrps == 0).await;
+    assert_eq!(s.session_id, None);
+    assert_eq!(s.serial, None);
 
     fx.stop().await;
 }

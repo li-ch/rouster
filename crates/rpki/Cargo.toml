@@ -12,6 +12,10 @@ common = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 thiserror.workspace = true
+# rtr-check's log init (the daemon-bin pattern: bfdd/ospfd/savd); the
+# crate is already in the workspace table — no new crates, no new lock
+# entries beyond rpki's own dependency edges.
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # ROV property tests (P2-c milestone 3) — dev-only, pinned in the
