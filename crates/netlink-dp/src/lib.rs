@@ -24,6 +24,11 @@ pub use stub::NetlinkDataplane;
 /// its unit tests run on dev machines; the Linux impl executes it).
 pub mod sav;
 
+/// SAV program → nftables ruleset translation + backend selection
+/// (pure, cross-platform for host-side tests; the Linux impl executes
+/// `nft` against it).
+pub mod sav_nft;
+
 /// Applied-SAV state persistence (what the backend wrote, and the
 /// pre-SAV values to restore) — pure encode/decode, cross-platform for
 /// host-side tests.
