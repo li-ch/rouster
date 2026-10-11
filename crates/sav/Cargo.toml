@@ -5,6 +5,15 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# SAVNET agent interface (repo AGENTS.md SAVNET rules): in-process
+# hooks only — no wire protocols, no serialization, no sockets. Every
+# draft the interface anticipates is expired or unstable, so the
+# surface compiles only on explicit request and defaults OFF (see
+# docs/protocols/savnet.md). Default-off also means the default
+# workspace gate exercises none of it.
+experimental-savnet = []
+
 [dependencies]
 common.workspace = true
 rib.workspace = true

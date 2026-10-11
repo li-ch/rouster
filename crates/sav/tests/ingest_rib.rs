@@ -155,10 +155,14 @@ fn fixture() -> (Rib, MockDp) {
         0,
     ));
 
-    // Kernel-mirror route (observed state): must NOT feed the SIB.
+    // Kernel-mirror route (observed state): must NOT feed the SIB —
+    // 198.19.0.0/16 is neither connected nor a protocol candidate, so
+    // its source space must fall through to the default marker below.
+    // (Pre-fold-in this probe rode on 192.0.2.0/24, which the CONNECT
+    // fold-in now legitimately binds — the C2-ratified change.)
     rib.apply_event(&DataplaneEvent::RouteNew {
         table: 254,
-        prefix: "192.0.2.0/24".parse().unwrap(),
+        prefix: "198.19.0.0/16".parse().unwrap(),
         protocol: RouteProtocol::Kernel,
         metric: 0,
         gateway: None,
@@ -191,9 +195,12 @@ fn resolved_egress_feeds_the_sib() {
     );
 
     let sib = Sib::from_rib(&rib);
-    // Held route, blackhole route, and the kernel mirror produce no
-    // bindings: five rib-origin bindings for the five resolvable routes.
-    assert_eq!(sib.bindings().count(), 5);
+    // Held route (off-subnet gateway nothing covers), blackhole route,
+    // and the kernel mirror produce no bindings: five route-derived
+    // bindings for the five resolvable routes, plus the three CONNECT
+    // fold-in bindings (one per interface address network — the
+    // C2-ratified explicit-surface consumption).
+    assert_eq!(sib.bindings().count(), 8);
 
     assert_eq!(sib.interfaces_for(ip("10.0.5.7")), vec![iface(3, "eth1")]);
     assert_eq!(sib.interfaces_for(ip("10.0.9.9")), vec![iface(2, "eth0")]);
@@ -204,6 +211,19 @@ fn resolved_egress_feeds_the_sib() {
     );
     assert_eq!(
         sib.interfaces_for(ip("2001:db8:2::77")),
+        vec![iface(4, "eth2")]
+    );
+
+    // The CONNECT fold-in: each interface's address network binds to
+    // that interface (sources connected there legitimately arrive
+    // there).
+    assert_eq!(sib.interfaces_for(ip("192.0.2.55")), vec![iface(2, "eth0")]);
+    assert_eq!(
+        sib.interfaces_for(ip("198.51.100.55")),
+        vec![iface(3, "eth1")]
+    );
+    assert_eq!(
+        sib.interfaces_for(ip("2001:db8:1::55")),
         vec![iface(4, "eth2")]
     );
 }
@@ -230,9 +250,11 @@ fn default_route_falls_back_to_the_any_interface_marker() {
     );
 
     // The kernel mirror's route must not have become a binding: if it
-    // had, 192.0.2.55 would answer eth0 instead of the default fallback.
+    // had, 198.19.0.9 would answer an interface instead of the default
+    // fallback (the pre-fold-in probe prefix 192.0.2.0/24 is now a
+    // CONNECT binding — see resolved_egress_feeds_the_sib).
     assert_eq!(
-        sib.interfaces_for(ip("192.0.2.55")),
+        sib.interfaces_for(ip("198.19.0.9")),
         vec![InterfaceRef::Any]
     );
 
@@ -247,4 +269,51 @@ fn default_route_falls_back_to_the_any_interface_marker() {
         .unwrap();
     assert_eq!(default.interfaces, vec![iface(2, "eth0")]);
     assert_eq!(default.origin, BindingOrigin::Rib);
+}
+
+/// The fold-in's recursive half (C2): an off-subnet gateway that a
+/// covering route reaches resolves through the walk and derives a
+/// binding at the chain's landing interface; the same gateway with the
+/// covering route withdrawn goes back to no-binding (the query falls
+/// through to the default marker — unknown ≠ invalid).
+#[test]
+fn off_link_gateways_resolve_through_the_recursive_walk() {
+    let (rib, _dp) = fixture();
+    // In the base fixture 203.0.113.0/24 via 100.64.0.1 is held: no
+    // on-link prefix covers 100.64.0.1 and no route covers it either.
+    assert_eq!(
+        Sib::from_rib(&rib).interfaces_for(ip("203.0.113.7")),
+        vec![InterfaceRef::Any]
+    );
+
+    // Adding the covering route 100.64.0.0/10 via the on-link
+    // 192.0.2.9 completes the chain: the walk lands on eth0.
+    let mut rib = rib;
+    rib.add_route(gw_route("100.64.0.0/10", "192.0.2.9"));
+    let sib = Sib::from_rib(&rib);
+    assert_eq!(
+        sib.interfaces_for(ip("203.0.113.7")),
+        vec![iface(2, "eth0")],
+        "the off-link gateway resolved through the covering route's on-link hop"
+    );
+
+    // A covering route whose own gateway is a blackhole terminates the
+    // chain unresolved (the S1 no-fall-through deviation): no binding,
+    // the default marker answers again.
+    let mut rib2 = Rib::new();
+    rib2.apply_event(&link(2, "eth0"));
+    rib2.apply_event(&address(2, "192.0.2.1/24"));
+    rib2.add_route(gw_route("203.0.113.0/24", "100.64.0.1"));
+    rib2.add_route(RouteEntry::new(
+        "100.64.0.0/10".parse().unwrap(),
+        RouteProtocol::Static,
+        NexthopGroup::single(Nexthop::Blackhole),
+        0,
+    ));
+    rib2.add_route(gw_route("0.0.0.0/0", "192.0.2.9"));
+    assert_eq!(
+        Sib::from_rib(&rib2).interfaces_for(ip("203.0.113.7")),
+        vec![InterfaceRef::Any],
+        "blackhole covering candidate: chain terminates unresolved, no fall-through"
+    );
 }

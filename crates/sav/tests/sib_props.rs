@@ -39,6 +39,29 @@
 //!    slot, the default-route `Any` marker, or nothing; a repeat sweep
 //!    retires nothing (idempotence).
 //!
+//! C2 fold-in extensions (2026-10-11; the SIB now consumes the S1
+//! explicit rib surfaces — the CONNECT table and the recursive
+//! resolver). The reference model gained both sources and every
+//! property above re-pinned against it; three new properties pin the
+//! fold-in itself:
+//!
+//! 9. **connected fold-in** — over a RIB with an interface mirror
+//!    (link/address events) plus protocol routes, the derivation equals
+//!    the model's merged view: connected candidates (network form of
+//!    every UP-interface address, lowest ifindex winning same-prefix
+//!    ties) mask protocol bests and become bindings on their interface;
+//!    queries follow the model over the union.
+//! 10. **recursive walk** — over bare RIBs whose bare-gateway hops are
+//!     deliberately drawn INSIDE other routes' prefixes, the derivation
+//!     equals the model's walk (on-link first — empty on a bare Rib —
+//!     then one best covering candidate, /0 excluded, cycles via the
+//!     visited set, blackhole/held terminating without fall-through).
+//! 11. **empty-surface equivalence** — with no CONNECT candidates and
+//!     no ifindex-free hops left to resolve (only IfIndex/explicit-if/
+//!     blackhole hops over a bare Rib), the fold-in derivation is
+//!     byte-identical to the legacy one (the pre-fold-in model):
+//!     the new surfaces change nothing when they carry nothing.
+//!
 //! Determinism (frozen bar "seeds fixed"): every runner is constructed
 //! with an explicit [`proptest::test_runner::RngSeed::Fixed`], so plain
 //! `cargo test` replays identical case sequences every run. The
@@ -51,10 +74,11 @@
 //! invariant holds — two distinct prefixes of one family and length
 //! cannot both contain the same address. Routes use `IfIndex`/explicit-if
 //! hops (always resolvable), bare gateway hops (unresolvable against a
-//! bare `Rib::new()` with no interface mirror) and blackholes, so the
-//! "no resolvable egress ⇒ no binding" rule (unknown ≠ invalid) is
-//! exercised per hop. Interface names are cosmetic to the SIB and mixed
-//! `None`/`Some` on purpose.
+//! bare `Rib::new()` with no interface mirror ON-LINK, but resolvable
+//! through the walk when another route covers them — the model computes
+//! exactly which) and blackholes, so the "no resolvable egress ⇒ no
+//! binding" rule (unknown ≠ invalid) is exercised per hop. Interface
+//! names are cosmetic to the SIB and mixed `None`/`Some` on purpose.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -77,6 +101,10 @@ const SEED_ROUND_TRIP: u64 = 0x5735_4205;
 const SEED_BATCH_ATOMICITY: u64 = 0x5735_4206;
 const SEED_REMOVE_FALLBACK: u64 = 0x5735_4207;
 const SEED_SWEEP_FALLBACK: u64 = 0x5735_4208;
+// C2 fold-in properties (2026-10-11): distinct streams, same scheme.
+const SEED_CONNECTED_FOLD_IN: u64 = 0x5735_4209;
+const SEED_RECURSIVE_WALK: u64 = 0x5735_420a;
+const SEED_EMPTY_SURFACE_EQUIV: u64 = 0x5735_420b;
 
 fn seeded(seed: u64) -> ProptestConfig {
     ProptestConfig {
@@ -168,8 +196,10 @@ fn config_binding_strategy() -> impl Strategy<Value = Binding> {
 }
 
 /// Route hops: ifindex-carrying forms (always resolvable), bare gateways
-/// (never resolvable against a bare Rib), and blackholes — the full hop
-/// taxonomy `rib_egress` branches on.
+/// (resolvable on a bare Rib only through the covering-route walk —
+/// another generated route may or may not cover them, exactly what the
+/// model computes), and blackholes — the full hop taxonomy `rib_egress`
+/// branches on.
 fn hop_strategy() -> impl Strategy<Value = Nexthop> {
     prop_oneof![
         ifindex_strategy().prop_map(Nexthop::IfIndex),
@@ -246,13 +276,320 @@ fn build_rib(routes: &[RouteEntry]) -> Rib {
     rib
 }
 
-/// The bindings `Sib::from_rib` must derive from `routes`: replay the
-/// main table's per-protocol candidate replacement, pick each prefix's
-/// best route exactly like `Table::best` (`min (admin distance, metric)`,
-/// first candidate wins ties), then resolve egress against a bare Rib —
-/// ifindex-carrying hops contribute, bare gateways stay unresolved,
-/// blackholes contribute nothing; an empty result yields no binding.
+/// One interface-mirror spec for the connected-fold-in property: the
+/// link state (ifindex, name, admin up) and the raw address prefixes
+/// (host bits preserved — `sync_connected` network-masks them for the
+/// CONNECT table, on-link resolution matches through them raw).
+#[derive(Clone, Debug)]
+struct IfaceSpec {
+    ifindex: u32,
+    name: String,
+    is_up: bool,
+    addresses: Vec<IpPrefix>,
+}
+
+/// Raw (not network-masked) address prefixes — host bits land wherever
+/// the entropy puts them, exercising `network_prefix` on the connected
+/// path and raw-`contains` matching on the on-link path.
+fn host_prefix_strategy() -> impl Strategy<Value = IpPrefix> {
+    prop_oneof![
+        (any::<[u8; 4]>(), 8u8..=32).prop_map(|(octets, len)| {
+            IpPrefix::V4(Ipv4Prefix::new(Ipv4Addr::from(octets), len).unwrap())
+        }),
+        (any::<[u16; 8]>(), 16u8..=72).prop_map(|(words, len)| {
+            IpPrefix::V6(Ipv6Prefix::new(Ipv6Addr::from(words), len).unwrap())
+        }),
+    ]
+}
+
+fn iface_spec_strategy() -> impl Strategy<Value = IfaceSpec> {
+    (
+        ifindex_strategy(),
+        any::<u8>().prop_map(|n| format!("eth{n}")),
+        any::<bool>(),
+        proptest::collection::vec(host_prefix_strategy(), 0..=3),
+    )
+        .prop_map(|(ifindex, name, is_up, addresses)| IfaceSpec {
+            ifindex,
+            name,
+            is_up,
+            addresses,
+        })
+}
+
+fn iface_specs_strategy() -> impl Strategy<Value = Vec<IfaceSpec>> {
+    proptest::collection::vec(iface_spec_strategy(), 0..=6)
+}
+
+/// A Rib with an interface mirror: link/address events exactly as the
+/// daemon's dataplane feed drives them (duplicate ifindexes replace
+/// link state, addresses accumulate per ifindex — the model replays
+/// the same rules).
+fn build_mirror_rib(specs: &[IfaceSpec]) -> Rib {
+    let mut rib = Rib::new();
+    for spec in specs {
+        rib.apply_event(&common::DataplaneEvent::LinkNew {
+            ifindex: spec.ifindex,
+            name: spec.name.clone(),
+            is_up: spec.is_up,
+            flags: if spec.is_up {
+                common::LinkFlags::up_broadcast()
+            } else {
+                common::LinkFlags::default()
+            },
+            vrf_table: None,
+            master_ifindex: None,
+        });
+        for &prefix in &spec.addresses {
+            rib.apply_event(&common::DataplaneEvent::AddressNew {
+                ifindex: spec.ifindex,
+                prefix,
+            });
+        }
+    }
+    rib
+}
+
+/// The interface mirror as the events build it (the model's replay of
+/// `Rib::apply_event`): last link state wins per ifindex, addresses
+/// accumulate without duplicates, keyed by ascending ifindex — the
+/// iteration order `resolve_on_link` sees.
+fn mirror_of(specs: &[IfaceSpec]) -> BTreeMap<u32, (String, bool, Vec<IpPrefix>)> {
+    let mut mirror: BTreeMap<u32, (String, bool, Vec<IpPrefix>)> = BTreeMap::new();
+    for spec in specs {
+        let entry = mirror.entry(spec.ifindex).or_default();
+        entry.0 = spec.name.clone();
+        entry.1 = spec.is_up;
+        for &prefix in &spec.addresses {
+            if !entry.2.contains(&prefix) {
+                entry.2.push(prefix);
+            }
+        }
+    }
+    mirror
+}
+
+/// The network form of an address prefix (`sync_connected`'s connected
+/// route announces the NETWORK form) — the rib crate's `network_prefix`
+/// replayed.
+fn network_prefix_of(prefix: IpPrefix) -> IpPrefix {
+    match prefix {
+        IpPrefix::V4(p) => {
+            let len = p.prefix_len();
+            let bits = u32::from(p.addr());
+            let mask = if len == 0 {
+                0
+            } else {
+                !0u32 << (32 - u32::from(len))
+            };
+            IpPrefix::V4(Ipv4Prefix::new(Ipv4Addr::from(bits & mask), len).expect("len preserved"))
+        }
+        IpPrefix::V6(p) => {
+            let len = p.prefix_len();
+            let bits = u128::from(p.addr());
+            let mask = if len == 0 {
+                0
+            } else {
+                !0u128 << (128 - u32::from(len))
+            };
+            IpPrefix::V6(Ipv6Prefix::new(Ipv6Addr::from(bits & mask), len).expect("len preserved"))
+        }
+    }
+}
+
+/// The model's walk (the C2 fold-in reference): on-link first (the
+/// longest address prefix on an UP interface containing the gateway,
+/// lowest ifindex winning length ties), then ONE best covering
+/// candidate across the protocol bests and the CONNECT set — the /0
+/// default never answers, cycles die on the visited set, blackholes
+/// and empty-hop candidates terminate unresolved with NO fall-through.
+fn model_resolve(
+    gw: IpAddr,
+    candidates: &BTreeMap<IpPrefix, Vec<&RouteEntry>>,
+    connected: &BTreeMap<IpPrefix, u32>,
+    mirror: &BTreeMap<u32, (String, bool, Vec<IpPrefix>)>,
+    visited: &mut std::collections::BTreeSet<IpAddr>,
+) -> Option<u32> {
+    // On-link arm (resolve_on_link): ascending ifindex, strict `>` —
+    // the first interface at the max length wins ties.
+    let mut best: Option<(u8, u32)> = None;
+    for (&ifindex, (_, is_up, addresses)) in mirror {
+        if !*is_up {
+            continue;
+        }
+        for &prefix in addresses {
+            let len = match (prefix, gw) {
+                (IpPrefix::V4(p), IpAddr::V4(a)) if p.contains(a) => p.prefix_len(),
+                (IpPrefix::V6(p), IpAddr::V6(a)) if p.contains(a) => p.prefix_len(),
+                _ => continue,
+            };
+            if best.is_none_or(|(best_len, _)| len > best_len) {
+                best = Some((len, ifindex));
+            }
+        }
+    }
+    if let Some((_, ifindex)) = best {
+        return Some(ifindex);
+    }
+    if !visited.insert(gw) {
+        return None; // cycle guard
+    }
+    // The covering candidate: longest non-default containing prefix
+    // (distinct canonical prefixes ⇒ one per length ⇒ deterministic);
+    // at the same prefix the CONNECT candidate (distance 0) masks any
+    // protocol best — exactly `covering_route`'s (len, dist, metric)
+    // maximum over the two sources.
+    let covering = candidates
+        .keys()
+        .chain(connected.keys())
+        .copied()
+        .filter(|p| contains(*p, gw) && prefix_len(*p) > 0)
+        .max_by_key(|p| prefix_len(*p))?;
+    let (hop, _weight) = match connected.get(&covering) {
+        Some(&ifindex) => (Nexthop::IfIndex(ifindex), 1u8),
+        None => candidates[&covering]
+            .iter()
+            .min_by_key(|e| (e.protocol.admin_distance(), e.metric))
+            .expect("candidate list is non-empty")
+            .nexthops
+            .hops()
+            .first()
+            .copied()?,
+    };
+    match hop {
+        // A device/ifindex-carrying hop adopts its ifindex for the
+        // gateway; a blackhole or an unusable candidate terminates
+        // unresolved — no fall-through to shorter prefixes.
+        Nexthop::IfIndex(ifindex) => Some(ifindex),
+        Nexthop::Ipv4If(_, ifindex) | Nexthop::Ipv6If(_, ifindex) => Some(ifindex),
+        Nexthop::Blackhole => None,
+        Nexthop::Ipv4(next) => {
+            model_resolve(IpAddr::V4(next), candidates, connected, mirror, visited)
+        }
+        Nexthop::Ipv6(next) => {
+            model_resolve(IpAddr::V6(next), candidates, connected, mirror, visited)
+        }
+    }
+}
+
+/// The model egress of one hop list: ifindex-carrying hops contribute
+/// their (mirror-named) interface, bare gateways go through
+/// [`model_resolve`], blackholes contribute nothing.
+fn model_egress(
+    hops: &[(Nexthop, u8)],
+    candidates: &BTreeMap<IpPrefix, Vec<&RouteEntry>>,
+    connected: &BTreeMap<IpPrefix, u32>,
+    mirror: &BTreeMap<u32, (String, bool, Vec<IpPrefix>)>,
+) -> Vec<InterfaceRef> {
+    let name_of = |ifindex: u32| mirror.get(&ifindex).map(|(name, _, _)| name.clone());
+    let mut interfaces: Vec<InterfaceRef> = Vec::new();
+    for &(hop, _weight) in hops {
+        let ifindex = match hop {
+            Nexthop::IfIndex(ifindex) => Some(ifindex),
+            Nexthop::Ipv4If(_, ifindex) | Nexthop::Ipv6If(_, ifindex) => Some(ifindex),
+            Nexthop::Blackhole => None,
+            Nexthop::Ipv4(gw) => model_resolve(
+                IpAddr::V4(gw),
+                candidates,
+                connected,
+                mirror,
+                &mut std::collections::BTreeSet::new(),
+            ),
+            Nexthop::Ipv6(gw) => model_resolve(
+                IpAddr::V6(gw),
+                candidates,
+                connected,
+                mirror,
+                &mut std::collections::BTreeSet::new(),
+            ),
+        };
+        if let Some(ifindex) = ifindex {
+            let reference = InterfaceRef::If {
+                ifindex,
+                name: name_of(ifindex),
+            };
+            if !interfaces.contains(&reference) {
+                interfaces.push(reference);
+            }
+        }
+    }
+    interfaces.sort();
+    interfaces
+}
+
+/// The bindings `Sib::from_rib` must derive from `routes` over a bare
+/// Rib (no interface mirror): replay the main table's per-protocol
+/// candidate replacement, pick each prefix's best route exactly like
+/// `Table::best`, then resolve egress through the walk-aware model
+/// (which on a bare Rib reduces to the covering-route walk — bare
+/// gateways resolve only when another route covers them).
 fn derive_expected(routes: &[RouteEntry]) -> Vec<Binding> {
+    derive_expected_with_mirror(routes, &[])
+}
+
+/// The full fold-in derivation (C2): protocol candidates over an
+/// interface mirror. The CONNECT set (network form of every
+/// UP-interface address, lowest ifindex winning same-network ties,
+/// main table — no VRFs generated) participates twice: its candidates
+/// MASK protocol bests at distance 0 (the merged
+/// `best_with_connected` view), and they are covering candidates for
+/// the recursive walk.
+fn derive_expected_with_mirror(routes: &[RouteEntry], specs: &[IfaceSpec]) -> Vec<Binding> {
+    let mut candidates: BTreeMap<IpPrefix, Vec<&RouteEntry>> = BTreeMap::new();
+    for route in routes {
+        let list = candidates.entry(route.prefix).or_default();
+        list.retain(|e| e.protocol != route.protocol);
+        list.push(route);
+    }
+    let mirror = mirror_of(specs);
+    let mut connected: BTreeMap<IpPrefix, u32> = BTreeMap::new();
+    for (&ifindex, (_, is_up, addresses)) in &mirror {
+        if !*is_up {
+            continue;
+        }
+        for &addr in addresses {
+            let net = network_prefix_of(addr);
+            connected
+                .entry(net)
+                .and_modify(|ix| *ix = (*ix).min(ifindex))
+                .or_insert(ifindex);
+        }
+    }
+    let mut keys: std::collections::BTreeSet<IpPrefix> = candidates.keys().copied().collect();
+    keys.extend(connected.keys().copied());
+    let mut expected = Vec::new();
+    for prefix in keys {
+        // The merged best: a connected candidate masks the protocol
+        // best; otherwise `Table::best` over the prefix's candidates.
+        let hops: Vec<(Nexthop, u8)> = match connected.get(&prefix) {
+            Some(&ifindex) => vec![(Nexthop::IfIndex(ifindex), 1u8)],
+            None => candidates[&prefix]
+                .iter()
+                .min_by_key(|e| (e.protocol.admin_distance(), e.metric))
+                .expect("candidate list is non-empty")
+                .nexthops
+                .hops()
+                .to_vec(),
+        };
+        let interfaces = model_egress(&hops, &candidates, &connected, &mirror);
+        if !interfaces.is_empty() {
+            expected.push(Binding {
+                prefix,
+                interfaces,
+                origin: BindingOrigin::Rib,
+                expires_at: None,
+            });
+        }
+    }
+    expected
+}
+
+/// The PRE-fold-in derivation (the W5B legacy model), kept verbatim for
+/// the empty-surface equivalence property: protocol bests over a bare
+/// Rib, ifindex-carrying hops contributing directly, bare gateways
+/// NEVER resolving (the old on-link-only resolver against an empty
+/// mirror), blackholes contributing nothing.
+fn legacy_derive(routes: &[RouteEntry]) -> Vec<Binding> {
     let mut candidates: BTreeMap<IpPrefix, Vec<&RouteEntry>> = BTreeMap::new();
     for route in routes {
         let list = candidates.entry(route.prefix).or_default();
@@ -896,5 +1233,179 @@ proptest! {
 
         // Idempotent: the swept keys are gone, a repeat retires nothing.
         prop_assert!(sib.sweep(sweep_at).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 9 — the connected fold-in (C2): over an interface mirror, the
+// derivation equals the model's merged (CONNECT-masking) view
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(seeded(SEED_CONNECTED_FOLD_IN))]
+    #[test]
+    fn connected_fold_in_matches_the_merged_model(
+        specs in iface_specs_strategy(),
+        routes in routes_strategy(),
+        probes in probes_strategy(),
+    ) {
+        let mut rib = build_mirror_rib(&specs);
+        for route in &routes {
+            rib.add_route(route.clone());
+        }
+        let sib = Sib::from_rib(&rib);
+
+        // The derivation equals the model's merged view: connected
+        // candidates (network form, lowest ifindex ties) become
+        // bindings on their interface and mask protocol bests; every
+        // egress (connected IfIndex hops, protocol hops, walk-resolved
+        // gateways) resolves identically.
+        prop_assert_eq!(
+            snapshot(&sib),
+            derive_expected_with_mirror(&routes, &specs),
+            "the fold-in derivation equals the merged model"
+        );
+
+        // Queries follow the model over the union of the two origins
+        // (the Rib slot just derived): random probes plus an address
+        // inside every derived prefix and every mirror address network.
+        let stored: Stored = sib
+            .bindings()
+            .map(|b| ((b.prefix, b.origin), b.clone()))
+            .collect();
+        let mut all_probes = probes;
+        for binding in sib.bindings() {
+            // deterministic inside-probe: first 16 bytes of the network.
+            let mut entropy_bytes = [0u8; 16];
+            let probe_addr = match binding.prefix {
+                IpPrefix::V4(p) => {
+                    entropy_bytes[..4].copy_from_slice(&p.addr().octets());
+                    addr_inside(binding.prefix, entropy_bytes)
+                }
+                IpPrefix::V6(p) => {
+                    entropy_bytes.copy_from_slice(&p.addr().octets()[..16]);
+                    addr_inside(binding.prefix, entropy_bytes)
+                }
+            };
+            all_probes.push(probe_addr);
+        }
+        for probe in all_probes {
+            prop_assert_eq!(
+                sib.interfaces_for(probe),
+                model_interfaces_for(&stored, probe),
+                "for probe {}",
+                probe
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 10 — the recursive walk (C2): bare-gateway hops deliberately
+// drawn inside other routes' prefixes resolve exactly as the model's
+// walk computes (chains, cycles, blackhole/held termination)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(seeded(SEED_RECURSIVE_WALK))]
+    #[test]
+    fn recursive_walk_derivation_matches_the_model(
+        pool in proptest::collection::vec(prefix_strategy(), 1..=8),
+        hops in proptest::collection::vec(
+            proptest::option::of(ifindex_strategy()), 0..=12),
+        coins in proptest::collection::vec(any::<bool>(), 0..=48),
+        entropy in entropy_strategy(),
+    ) {
+        // One route per generated hop slot: the prefix comes from the
+        // pool (round-robin — same-prefix routes replay the per-protocol
+        // replacement the model expects), and the hop is an ifindex
+        // route, a blackhole, or — the walk-heavy arm — a bare gateway
+        // drawn INSIDE another pool prefix of the same family, so the
+        // covering-route chain (and its cycles) is actually exercised.
+        let mut routes: Vec<RouteEntry> = Vec::new();
+        for (i, ifindex) in hops.iter().enumerate() {
+            let prefix = pool[i % pool.len()];
+            let protocols = [RouteProtocol::Static, RouteProtocol::Ospf, RouteProtocol::Bgp];
+            let protocol = protocols[i % protocols.len()];
+            let coin = coins.get(i).copied().unwrap_or(false);
+            let hop = match (ifindex, coin) {
+                (Some(ifindex), _) => Nexthop::IfIndex(*ifindex),
+                (None, true) => Nexthop::Blackhole,
+                (None, false) => {
+                    // A bare gateway inside a same-family pool prefix
+                    // (self included: the self-covering cycle shape).
+                    let target = pool[(i + 1) % pool.len()];
+                    match (target, entropy.get(i).copied().unwrap_or([0u8; 16])) {
+                        (IpPrefix::V4(_), e) => match addr_inside(target, e) {
+                            IpAddr::V4(a) => Nexthop::Ipv4(a),
+                            IpAddr::V6(_) => unreachable!("family preserved"),
+                        },
+                        (IpPrefix::V6(_), e) => match addr_inside(target, e) {
+                            IpAddr::V6(a) => Nexthop::Ipv6(a),
+                            IpAddr::V4(_) => unreachable!("family preserved"),
+                        },
+                    }
+                }
+            };
+            routes.push(RouteEntry::new(
+                prefix,
+                protocol,
+                NexthopGroup::single(hop),
+                0,
+            ));
+        }
+        let rib = build_rib(&routes);
+        let sib = Sib::from_rib(&rib);
+        prop_assert_eq!(
+            snapshot(&sib),
+            derive_expected(&routes),
+            "walk-resolved derivation equals the model over the same candidate set"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 11 — empty-surface equivalence (C2): with no CONNECT
+// candidates and no ifindex-free hop left to resolve, the fold-in
+// derivation is byte-identical to the legacy (pre-fold-in) one
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(seeded(SEED_EMPTY_SURFACE_EQUIV))]
+    #[test]
+    fn empty_new_surfaces_derive_the_legacy_bindings_byte_identically(
+        pool in proptest::collection::vec(prefix_strategy(), 0..=8),
+        ifindexes in proptest::collection::vec(
+            proptest::option::of(ifindex_strategy()), 0..=12),
+        coins in proptest::collection::vec(any::<bool>(), 0..=12),
+    ) {
+        // Only ifindex-carrying and blackhole hops over a bare Rib: no
+        // interface mirror (so no CONNECT set), no bare gateways (so
+        // the walk is never consulted) — both new surfaces empty.
+        let mut routes: Vec<RouteEntry> = Vec::new();
+        for (i, ifindex) in ifindexes.iter().enumerate() {
+            let prefix = pool.get(i).copied().unwrap_or_else(|| {
+                "203.0.113.0/24".parse::<IpPrefix>().unwrap()
+            });
+            let hop = match ifindex {
+                Some(ix) => Nexthop::IfIndex(*ix),
+                None if coins.get(i).copied().unwrap_or(false) => Nexthop::Blackhole,
+                None => Nexthop::Ipv4If("198.51.100.1".parse().unwrap(), 7),
+            };
+            routes.push(RouteEntry::new(
+                prefix,
+                RouteProtocol::Static,
+                NexthopGroup::single(hop),
+                0,
+            ));
+        }
+        let rib = build_rib(&routes);
+        let sib = Sib::from_rib(&rib);
+        prop_assert_eq!(
+            snapshot(&sib),
+            legacy_derive(&routes),
+            "empty connected surface + no gateway to walk: the derivation is \
+             byte-identical to the pre-fold-in model"
+        );
     }
 }

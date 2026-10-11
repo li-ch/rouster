@@ -10,14 +10,17 @@
 //! before drop, and **unknown ≠ invalid** (an "empty" or "any interface"
 //! answer is *no conclusion*, never a spoof verdict).
 //!
-//! Bindings derive from the RIB tonight ([`Sib::from_rib`]: best
-//! main-table routes with their egress interfaces resolved the same way
-//! reconcile programs them) and from operator config (the `binding`
-//! lines [`savd`] parses, fed through [`Sib::replace_origin`] as the
-//! Config origin). Everything here is in-process, synchronous, and
-//! side-effect-free on the dataplane: no IPC, no wire formats, and no
-//! draft-dependent signaling (nothing tonight is draft-dependent, so no
-//! `experimental-savnet` feature flag is needed).
+//! Bindings derive from the RIB tonight ([`Sib::from_rib`]: the merged
+//! best of the main table's protocol candidates and its CONNECT set —
+//! the C2-ratified fold-in onto the S1 explicit rib surfaces, 2026-10-11
+//! — with egress interfaces resolved through the recursive resolver)
+//! and from operator config (the `binding` lines [`savd`] parses, fed
+//! through [`Sib::replace_origin`] as the Config origin). Everything
+//! here is in-process, synchronous, and side-effect-free on the
+//! dataplane: no IPC, no wire formats. The one draft-dependent surface
+//! — the SAVNET agent interface — lives behind the crate's
+//! `experimental-savnet` feature (default OFF; see [`agent`] when
+//! compiled in).
 //!
 //! Bindings may carry an optional expiry ([`Binding::expires_at`], aged
 //! out by [`Sib::sweep`]) so stale *dynamically-learned* state cannot
@@ -53,7 +56,7 @@ pub mod program;
 pub mod savd;
 pub mod table;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::time::Instant;
@@ -242,55 +245,83 @@ impl Sib {
         sib
     }
 
-    /// Replace the RIB-origin bindings from `rib`'s current best
-    /// main-table routes, leaving Config-origin bindings alone (replace
+    /// Replace the RIB-origin bindings from `rib`'s current view of the
+    /// main table, leaving Config-origin bindings alone (replace
     /// semantics are per origin). Wholesale by design tonight; the daemon
     /// (W8) re-ingests on a timer/event — incremental diffing on rib
     /// events is §Deferred.
     ///
-    /// Derivation per best route: egress interfaces are resolved the same
-    /// way reconcile's programming form is — `IfIndex` and
-    /// explicit-ifindex hops map to their ifindex, gateway hops go
-    /// through [`Rib::resolve_nexthop`]. A best route with no resolvable
-    /// egress (an unresolved gateway, or a blackhole) yields **no
-    /// binding**: the SIB never asserts an empty interface set (unknown ≠
-    /// invalid), so the query falls through to less specific bindings.
-    /// Kernel-mirror routes are observed state and are never ingested —
-    /// the same rule the RIB applies to best-path selection.
+    /// Derivation per prefix over the merged view (the C2-ratified
+    /// fold-in onto the S1 explicit rib surfaces, 2026-10-11):
+    ///
+    /// - The key set is the union of the main table's per-protocol
+    ///   candidates and its CONNECT set ([`Rib::connected_table`] —
+    ///   every address on every UP interface as its network prefix).
+    ///   Per prefix the binding follows [`Rib::best_with_connected`]:
+    ///   a connected candidate masks a protocol best at distance 0
+    ///   (zebra semantics — nothing outranks a connected prefix), so a
+    ///   configured address on an interface *is* the SAV truth for its
+    ///   network: sources there legitimately arrive on that interface.
+    /// - Egress interfaces are resolved through the recursive resolver
+    ///   ([`Rib::resolve_nexthop_recursive`]): `IfIndex` and
+    ///   explicit-ifindex hops map to their ifindex, gateway hops walk
+    ///   on-link first then the covering-route chain (the S1-disclosed
+    ///   deviations — no fall-through, the /0 default never answers —
+    ///   carry over unchanged; the kernel mirror participates in the
+    ///   *walk* as a resolution source but never as a binding source).
+    ///
+    /// A merged best with no resolvable egress (an unresolved gateway
+    /// chain, or a blackhole) yields **no binding**: the SIB never
+    /// asserts an empty interface set (unknown ≠ invalid), so the query
+    /// falls through to less specific bindings. Kernel-mirror routes
+    /// are observed state and are never ingested as bindings — the same
+    /// rule the RIB applies to best-path selection.
+    ///
+    /// Equivalence: when the two new surfaces are empty (no CONNECT
+    /// candidates, and no walk candidate covers any gateway — e.g. a
+    /// bare `Rib::new()` fed `IfIndex`-hop routes), the derivation is
+    /// byte-identical to the pre-fold-in one (property-pinned).
     pub fn ingest_rib(&mut self, rib: &Rib) -> &mut Self {
         let mut made = Vec::new();
         let mut skipped = 0usize;
+        // The merged key set: protocol candidates ∪ CONNECT candidates
+        // of the main table (BTreeSet for deterministic prefix order).
+        let mut prefixes: BTreeSet<IpPrefix> = BTreeSet::new();
         if let Some(table) = rib.table(MAIN_TABLE) {
-            for (prefix, _) in table.iter() {
-                let Some(best) = table.best(prefix) else {
-                    continue;
-                };
-                let interfaces = rib_egress(rib, &best.nexthops);
-                if interfaces.is_empty() {
-                    skipped += 1;
-                    debug!(
-                        prefix = %best.prefix,
-                        protocol = ?best.protocol,
-                        "no resolved egress interface; no SIB binding (unknown != invalid)"
-                    );
-                    continue;
-                }
-                made.push(Binding {
-                    prefix: *prefix,
-                    interfaces,
-                    origin: BindingOrigin::Rib,
-                    // No TTL on rib-derived bindings: the wholesale
-                    // re-ingest that rebuilds this slot on every
-                    // evaluate already refreshes it, so a deadline here
-                    // would only misexpire bindings whose route is still
-                    // present. The field waits for a dynamic origin.
-                    expires_at: None,
-                });
+            prefixes.extend(table.iter().map(|(prefix, _)| *prefix));
+        }
+        if let Some(table) = rib.connected_table(MAIN_TABLE) {
+            prefixes.extend(table.iter().map(|(prefix, _)| *prefix));
+        }
+        for prefix in prefixes {
+            let Some(best) = rib.best_with_connected(MAIN_TABLE, &prefix) else {
+                continue;
+            };
+            let interfaces = rib_egress(rib, &best.nexthops);
+            if interfaces.is_empty() {
+                skipped += 1;
+                debug!(
+                    prefix = %best.prefix,
+                    protocol = ?best.protocol,
+                    "no resolved egress interface; no SIB binding (unknown != invalid)"
+                );
+                continue;
             }
+            made.push(Binding {
+                prefix,
+                interfaces,
+                origin: BindingOrigin::Rib,
+                // No TTL on rib-derived bindings: the wholesale
+                // re-ingest that rebuilds this slot on every
+                // evaluate already refreshes it, so a deadline here
+                // would only misexpire bindings whose route is still
+                // present. The field waits for a dynamic origin.
+                expires_at: None,
+            });
         }
         info!(
             bindings = made.len(),
-            skipped, "sib ingested rib best routes (main table)"
+            skipped, "sib ingested rib best routes (main table, merged with connected)"
         );
         self.replace_slot(BindingOrigin::Rib, made);
         self
@@ -497,11 +528,17 @@ fn normalize(interfaces: &mut Vec<InterfaceRef>) {
     interfaces.dedup();
 }
 
-/// The egress interfaces of a best route's nexthop group, resolved the
-/// way the RIB's programming form resolves: `IfIndex` and explicit-if
-/// hops carry their ifindex directly, gateway hops go through
-/// [`Rib::resolve_nexthop`], blackholes contribute nothing. Empty result
-/// = no binding (see [`Sib::ingest_rib`]).
+/// The egress interfaces of a merged-best nexthop group, resolved
+/// through the recursive resolver (the C2-ratified fold-in):
+/// `IfIndex` and explicit-if hops carry their ifindex directly, bare
+/// gateway hops walk on-link first then the covering-route chain
+/// ([`Rib::resolve_nexthop_recursive`] — the S1 deviations apply: no
+/// fall-through on an unusable candidate, the /0 default never
+/// answers), blackholes contribute nothing. Empty result = no binding
+/// (see [`Sib::ingest_rib`]). Both call sites (the SIB ingest and the
+/// FP-mode alternate expansion in [`gen`]) ride the same resolver, so
+/// a gateway resolves identically for a binding and for an alternate
+/// feasible path.
 pub(crate) fn rib_egress(rib: &Rib, group: &NexthopGroup) -> Vec<InterfaceRef> {
     let mut out: Vec<InterfaceRef> = Vec::new();
     for &(hop, _weight) in group.hops() {
@@ -509,10 +546,10 @@ pub(crate) fn rib_egress(rib: &Rib, group: &NexthopGroup) -> Vec<InterfaceRef> {
             Nexthop::IfIndex(ifindex) => Some(ifindex),
             Nexthop::Ipv4If(_, ifindex) | Nexthop::Ipv6If(_, ifindex) => Some(ifindex),
             Nexthop::Ipv4(gateway) => rib
-                .resolve_nexthop(IpAddr::V4(gateway))
+                .resolve_nexthop_recursive(IpAddr::V4(gateway))
                 .and_then(nexthop_ifindex),
             Nexthop::Ipv6(gateway) => rib
-                .resolve_nexthop(IpAddr::V6(gateway))
+                .resolve_nexthop_recursive(IpAddr::V6(gateway))
                 .and_then(nexthop_ifindex),
             Nexthop::Blackhole => None,
         };
@@ -943,6 +980,152 @@ mod tests {
         assert!(
             keys.windows(2).all(|w| w[0] < w[1]),
             "deterministic (prefix, origin) order"
+        );
+    }
+
+    // --- C2 fold-in: connected prefixes + the recursive walk ---
+
+    fn link_event(ifindex: u32, name: &str, is_up: bool) -> common::DataplaneEvent {
+        common::DataplaneEvent::LinkNew {
+            ifindex,
+            name: name.into(),
+            is_up,
+            flags: if is_up {
+                common::LinkFlags::up_broadcast()
+            } else {
+                common::LinkFlags::default()
+            },
+            vrf_table: None,
+            master_ifindex: None,
+        }
+    }
+
+    fn address_event(ifindex: u32, prefix: &str, add: bool) -> common::DataplaneEvent {
+        let prefix = prefix.parse().unwrap();
+        if add {
+            common::DataplaneEvent::AddressNew { ifindex, prefix }
+        } else {
+            common::DataplaneEvent::AddressDel { ifindex, prefix }
+        }
+    }
+
+    /// The C2 fold-in's first half: a connected prefix (an address on
+    /// an UP interface) becomes a Rib-origin binding on exactly that
+    /// interface, masks a protocol best for the same prefix (zebra
+    /// distance-0 semantics — `best_with_connected`), and withdraws
+    /// with the address.
+    #[test]
+    fn connected_prefixes_fold_into_the_sib_and_mask_protocol_bests() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link_event(2, "eth0", true));
+        rib.apply_event(&address_event(2, "192.0.2.1/24", true));
+        // A protocol candidate for the SAME prefix: connected masks it
+        // (a blackhole here would otherwise be a binding-free prefix —
+        // the connected candidate must win the merged best instead).
+        rib.add_route(RouteEntry::new(
+            "192.0.2.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(Nexthop::Blackhole),
+            0,
+        ));
+        let sib = Sib::from_rib(&rib);
+        assert_eq!(
+            sib.binding(&"192.0.2.0/24".parse().unwrap(), BindingOrigin::Rib)
+                .unwrap()
+                .interfaces,
+            vec![if_ref(2, Some("eth0"))],
+            "the connected candidate (not the static blackhole) derives the binding"
+        );
+        assert_eq!(
+            sib.interfaces_for(ip("192.0.2.55")),
+            vec![if_ref(2, Some("eth0"))]
+        );
+
+        // The address leaving withdraws the connected binding; the
+        // blackhole becomes the merged best and yields none.
+        rib.apply_event(&address_event(2, "192.0.2.1/24", false));
+        let sib = Sib::from_rib(&rib);
+        assert!(
+            sib.binding(&"192.0.2.0/24".parse().unwrap(), BindingOrigin::Rib)
+                .is_none(),
+            "no address, no connected candidate; the blackhole best yields no binding"
+        );
+    }
+
+    /// The fold-in's second half: a gateway no on-link prefix covers
+    /// resolves through the recursive walk (the covering route's own
+    /// hop), while a cyclic chain still yields no binding (unknown ≠
+    /// invalid).
+    #[test]
+    fn recursive_walk_resolves_off_link_gateways_into_bindings() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link_event(2, "eth0", true));
+        rib.apply_event(&address_event(2, "10.1.1.1/24", true));
+        // 203.0.113.0/24 via 100.64.0.1 (off-link), covered by
+        // 100.64.0.0/10 via the on-link 10.1.1.9: two chained hops.
+        let gw = |p: &str, g: &str| {
+            RouteEntry::new(
+                p.parse().unwrap(),
+                RouteProtocol::Static,
+                NexthopGroup::single(Nexthop::Ipv4(g.parse().unwrap())),
+                0,
+            )
+        };
+        rib.add_route(gw("203.0.113.0/24", "100.64.0.1"));
+        rib.add_route(gw("100.64.0.0/10", "10.1.1.9"));
+        let sib = Sib::from_rib(&rib);
+        assert_eq!(
+            sib.interfaces_for(ip("203.0.113.7")),
+            vec![if_ref(2, Some("eth0"))],
+            "the off-link gateway resolved through the walk to eth0"
+        );
+
+        // A two-gateway cycle terminates unresolved: no binding, the
+        // query falls through to whatever else covers (nothing here).
+        let mut rib2 = Rib::new();
+        rib2.apply_event(&link_event(2, "eth0", true));
+        rib2.apply_event(&address_event(2, "10.1.1.1/24", true));
+        rib2.add_route(gw("10.2.0.0/16", "10.3.0.1"));
+        rib2.add_route(gw("10.3.0.0/16", "10.2.0.1"));
+        let sib2 = Sib::from_rib(&rib2);
+        assert!(
+            sib2.binding(&"10.2.0.0/16".parse().unwrap(), BindingOrigin::Rib)
+                .is_none(),
+            "a cyclic chain yields no binding (unknown != invalid)"
+        );
+    }
+
+    /// The byte-identical-when-empty bar: with no CONNECT candidates
+    /// and no walk-reachable gateway (a bare rib whose gateway hops
+    /// nothing covers), the fold-in derivation equals the legacy one
+    /// (protocol best + direct ifindex extraction) exactly.
+    #[test]
+    fn empty_new_surfaces_derive_the_legacy_bindings_byte_identically() {
+        let mut rib = Rib::new();
+        rib.add_route(static_if_route("10.0.0.0/16", 2));
+        rib.add_route(static_if_route("2001:db8:5::/64", 4));
+        // Gateway routes whose gateways are covered by nothing (no
+        // interface mirror, no covering candidate): still no binding.
+        let gw = |p: &str, g: &str| {
+            RouteEntry::new(
+                p.parse().unwrap(),
+                RouteProtocol::Static,
+                NexthopGroup::single(Nexthop::Ipv4(g.parse().unwrap())),
+                0,
+            )
+        };
+        rib.add_route(gw("198.51.100.0/24", "203.0.113.9"));
+        let sib = Sib::from_rib(&rib);
+        // The legacy derivation, inline: protocol bests with ifindex
+        // hops only — exactly what the pre-fold-in ingest produced.
+        let legacy: Vec<Binding> = vec![
+            rib_binding("10.0.0.0/16", &[2]),
+            rib_binding("2001:db8:5::/64", &[4]),
+        ];
+        assert_eq!(
+            sib.bindings().cloned().collect::<Vec<_>>(),
+            legacy,
+            "empty connected + unreachable walk: byte-identical derivation"
         );
     }
 }
