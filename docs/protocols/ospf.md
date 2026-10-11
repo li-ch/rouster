@@ -191,9 +191,13 @@ follow-up below.
 - **The zapi edge** (`zedge.rs`, the bgpd idioms): HELLO as OSPF
   (7), `redistribute static` registration → the
   REDISTRIBUTE_ROUTE_ADD/DEL pushes become §12.4.4
-  origination/withdrawal. Router ID and interface addresses come
-  from config (no ROUTER_ID_ADD/INTERFACE_ADD_REQUEST — the zapi
-  client exposes no raw send; disclosed).
+  origination/withdrawal. Router ID comes from config (no
+  ROUTER_ID_ADD — the zapi client exposes no raw send; disclosed).
+  Interface addresses: DYNAMIC as of ADD-C2 — ospfd requests the
+  INTERFACE_ADD dump at startup (`ifdump`: the empty-body request,
+  the savd causality-marker bounding the no-end-of-dump burst) and
+  merges it with the config, static `address` lines the fallback;
+  see the ADD-C2 section below.
 - **The p2p next-hop seam**: no LSA carries the p2p neighbor's
   address (Link Data is the advertiser's own); the adjacency (the
   Hello source) does — the daemon decorates the gateway at export
@@ -521,6 +525,57 @@ follow-up below.
   halves route each other's stub networks. §16.3's
   transit-summary refinement rides §Deferred below.
 
+## The zapi interface dump as the address source (2026-10-11, ADD-C2)
+
+- **ospfd is a zapi interface-dump consumer now** (`ifdump.rs`): at
+  startup, before the core constructs, the daemon's zapi session
+  HELLOs as OSPF, sends the empty-body INTERFACE_ADD (the
+  registration request every FRR daemon sends), then a transient
+  dummy NEXTHOP_REGISTER as the savd causality marker — the marker's
+  NEXTHOP_UPDATE can only follow the server's processing of the dump
+  request on the same session, so it is the deterministic dump-end
+  delimiter (ZAPI has no end-of-dump marker). All pre-modeled
+  message types; no new pins were needed (the W-series had already
+  modeled INTERFACE_ADD/DELETE/ADDRESS_ADD/DELETE both directions).
+- **Merge semantics — dump wins, config falls back**: a configured
+  interface picks up its first non-secondary IPv4 address (mask from
+  the prefix length; v6 skipped for this v2 daemon; secondary-only
+  or v6-only keeps the static `address` line), its live link state,
+  and nothing else. Interfaces the dump does not know keep their
+  static config verbatim (standalone mode — no zapi socket — is
+  exactly the v1 behavior, `link_state` absent).
+- **Live link state at construction**: `IFF_UP|IFF_RUNNING` and not
+  `IFF_LOOPBACK` (the flags word INTERFACE_ADD relays verbatim from
+  the kernel). An interface the dump reports down — or a loopback,
+  hello-less stub with no `passive` knob yet — does NOT fire §9.3's
+  InterfaceUp: it sits in Down, sends no Hellos (the new tick gate:
+  §9.3/§C.3's "Down sends none" — previously unreachable, every
+  interface fired InterfaceUp at construction), and contributes no
+  router-LSA links (§12.4.1's state filter already excluded Down).
+  ONGOING tracking (INTERFACE_UP/DOWN pushes flipping a running
+  interface) remains §Deferred — this is the startup snapshot.
+- **MTU deliberately NOT overlaid** (disclosed): the wire body
+  carries it, but rousterd's interface mirror does not — the dump
+  frames stamp the codec default 1500 on every interface, which
+  would stomp an operator's `mtu 9000` with a fabricated value.
+  Rides §Deferred until the mirror carries the kernel's MTU.
+- **One session, one HELLO**: the dump runs on the connection that
+  becomes the resident zedge (`zedge::connect` + `spawn_with_client`)
+  — the old connect-retry-spawn path is unchanged for callers that
+  skip the dump.
+- **Tests**: 11 unit tests over the collector/merge (primary
+  selection skipping v6+secondary, the pending-address ordering
+  bag, delete handling, loopback-not-usable, mask edges), 2
+  daemon-level tests (a merged-down interface: Down, silent on the
+  tick, linkless in the router-LSA; Some(true)/None exactly the v1
+  construction), 2 integration tests over a real `zapi::serve`
+  socket (the z5-family convention) driving a canned interface
+  mirror through the server's actual dump encode → client decode →
+  merge → `Ospfd::new`. The interop smoke grew
+  `ROUSTER_OSPF_DYNAMIC_ADDRESS=1`: r2's ospfd.conf carries no
+  `address` line — the dump feeds eth0 — with the dump log line
+  machine-checked before the adjacency legs.
+
 ## §Deferred (updated day-3 anchors)
 
 - §16.3 (transit areas' summary-LSAs — the V-bit now lands with the
@@ -555,8 +610,12 @@ follow-up below.
   (6) rides with it.
 - Receive-side TTL verification (needs the recvmsg cmsg walk — a
   libc or socket2 upgrade); SO_BINDTODEVICE-style interface scoping.
-- Interface link-state tracking (InterfaceUp fires at construction
-  v1); the zapi interface dump as the address source.
+- Interface link-state tracking ONGOING (the dump's startup snapshot
+  landed with ADD-C2 above: a down/loopback interface stays Down at
+  construction and sends no Hellos; what remains is reacting to
+  INTERFACE_UP/DOWN/ADDRESS changes on a RUNNING daemon); the MTU
+  overlay once the interface mirror carries the kernel's MTU;
+  `passive-interface` (loopbacks as stub-only members).
 - The SAVNET intra-domain IGP signaling wire protocol
   (`experimental-savnet`) once the draft's format is pinned. The
   in-process half LANDED (2026-10-11) behind the flag: the

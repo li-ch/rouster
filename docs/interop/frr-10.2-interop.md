@@ -479,3 +479,27 @@ kept for reuse:
   static's nexthop (§12.4.4) — the reverse (REDIST-IN) direction
   uses a blackhole static (FA 0.0.0.0) so the two routers don't
   loop through each other.
+
+## ADD-C2 interop (2026-10-11/12 night): ospfd fed by the ZAPI dump
+
+`ROUSTER_OSPF_DYNAMIC_ADDRESS=1 scripts/test-ospf-frr-interop.sh`
+(exit 0; captures under `away/2026-10-11/night/quarantine/ospf-dynamic/`,
+static-mode control run under `.../ospf-static/`): the same two-router
+p2p topology, but r2's `ospfd.conf` carries NO `address` line — our
+ospfd takes eth0's address from rousterd's ZAPI interface dump (the
+netlink mirror's truth, encode through the real `zapi::serve` path).
+The merge report logged `dynamic=1 fallback=0 down=0` BEFORE the
+adjacency legs, then the same Full adjacency / LSDB both ways /
+both-direction redistribute / 30 s soak checks passed unchanged —
+the dynamic address source is a drop-in for the static one on the
+live wire. Facts kept for reuse:
+
+- rousterd's startup `dump_state()` (netlink RTM_GETLINK/DUMP) means
+  the mirror already holds pre-existing container interfaces when a
+  client connects later — no event-only gap; the dump answers from
+  the mirror directly.
+- The dump's flags word carries the kernel's `ifi_flags` verbatim, so
+  `IFF_UP|IFF_RUNNING` (FRR `if_is_operative`) is directly consumable
+  link state — docker bridge eth0 relays UP|RUNNING|BROADCAST|
+  MULTICAST and the merge brought the interface up (Waiting →
+  election path exercised by the broadcast smoke family).

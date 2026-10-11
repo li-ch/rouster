@@ -396,7 +396,12 @@ fetched by Z2 — and are implemented + synthetic-round-trip-tested in
   x1, Connected x4, Intf Addr x2, then INTERFACE_LINK_PARAMS (41) last.
 - **ZEBRA_INTERFACE_ADDRESS_ADD/DELETE (2/3)**: ifindex u32 | flags u8 |
   family u8 | address bytes (4/16) | prefixlen u8 (AFTER the address) |
-  destination bytes (all-zero = none).
+  destination bytes (all-zero = none). The flags u8 carries
+  `ZEBRA_IFA_*` (10.2.2 `lib/zclient.h`): SECONDARY = 0x01, PEER =
+  0x02 — SPEC values (source-read; our zebra answers every dump
+  address with flags 0, so the bits only distinguish primaries
+  against a real FRR zebra dump — ospfd's interface merge is the
+  consumer).
 - **ZEBRA_NEXTHOP_UPDATE (23)** (`zebra_send_rnh_update`): message u32 |
   safi u16 | registered prefix {family u16, plen u8, addr} | resolved
   prefix {same} | [srte_color u32 if SRTE bit] | route type u8 | instance

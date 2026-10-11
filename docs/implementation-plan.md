@@ -330,3 +330,26 @@ The phase text above is unchanged; this block is status only.
   ospf.md, the interop doc, and the mirrored ospfd code comments).
   Gate re-run at close by M5: fmt + clippy -D warnings clean,
   workspace 1262/0 (night baseline 1052/0).
+
+- 2026-10-11/12 (night program, ADD-C2) — ospfd takes interface
+  addresses from the ZAPI interface dump (`crates/ospfd/src/ifdump.rs`):
+  the startup session HELLOs as OSPF, requests the dump (the
+  empty-body INTERFACE_ADD), and bounds the burst with the savd
+  causality marker (a dummy NEXTHOP_REGISTER's UPDATE is the
+  deterministic dump-end — ZAPI has no end-of-dump marker); all
+  pre-modeled message types, no new pins. The merge is dump-wins /
+  static-falls-back: first non-secondary IPv4 address (mask from the
+  prefix len; v6 skipped for the v2 daemon), live link state from the
+  relayed ifi_flags (a dump-reported down/loopback interface stays in
+  Down — no InterfaceUp at construction, no Hellos under the new §9.3
+  tick gate, no router-LSA links); MTU deliberately not overlaid (the
+  interface mirror carries none — a fabricated 1500 would stomp
+  operator config; disclosed). The dump's session becomes the
+  resident zedge (one socket, one HELLO; `zedge::connect` +
+  `spawn_with_client`). Tests: 13 unit/daemon-level + 2 real-socket
+  integration tests through `zapi::serve`'s actual dump encode; the
+  interop smoke gained `ROUSTER_OSPF_DYNAMIC_ADDRESS=1` (no static
+  `address` line, dump log line machine-checked) — BOTH modes PASS
+  against the cached FRR 10.2.2 testbed (dynamic: Full adjacency,
+  redistribute both directions, 30 s soak, exit 0). Gate: fmt +
+  clippy -D warnings clean, workspace tests 0 failures.
