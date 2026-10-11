@@ -32,7 +32,7 @@ CB1=w1b-cap-b1
 CB2=w1b-cap-b2
 IMAGE=frr-testbed:10.2.2
 FRR_CONF=/etc/frr/frr.conf
-QUARANTINE="${ROUSTER_W1B_QUARANTINE:-/Users/li/Documents/kimi/Workspaces/frrr/away/2026-10-11/weekend/quarantine/bfd-zapi}"
+QUARANTINE="${ROUSTER_W1B_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/../away" && pwd)/2026-10-11/weekend/quarantine/bfd-zapi}"
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;
