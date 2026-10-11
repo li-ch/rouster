@@ -55,6 +55,16 @@ pub struct Interface {
     pub mask: Ipv4Addr,
     pub p2p: bool,
     pub fsm: InterfaceFsm,
+    /// The elected DR/BDR addresses on a broadcast network (§9.4's
+    /// result; also our Hello's DR/BDR claim fields, §A.3.2 —
+    /// 0.0.0.0 while Waiting).
+    pub dr: Ipv4Addr,
+    pub bdr: Ipv4Addr,
+    /// §9.3's WaitTimer deadline (monotonic seconds), broadcast only.
+    pub wait_deadline: Option<u64>,
+    /// Per-neighbor Hello claims on a broadcast network (§9.2/§9.4's
+    /// election inputs: priority + the DR/BDR each neighbor claims).
+    pub claims: HashMap<RouterId, crate::iface::ElectionNeighbor>,
     /// Neighbors keyed by Router ID.
     pub neighbors: HashMap<RouterId, Conversation>,
     /// Next hello deadline (monotonic seconds).
@@ -68,6 +78,19 @@ impl Interface {
             mtu: self.cfg.mtu,
             options: Options(Options::E),
         }
+    }
+
+    /// §10.4's adjacency decision on a broadcast network: only the
+    /// DR and BDR pairs — "all routers become adjacent to both the
+    /// Designated Router and the Backup Designated Router". The
+    /// neighbor is identified by its interface address matching the
+    /// elected DR/BDR (§A.3.2: the claim fields name addresses).
+    fn adjacency_ok(&self, nbr_addr: Ipv4Addr) -> bool {
+        matches!(
+            self.fsm.state,
+            crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+        ) || nbr_addr == self.dr
+            || nbr_addr == self.bdr
     }
 }
 
@@ -85,6 +108,11 @@ pub struct Ospfd {
     externals: BTreeMap<String, LsaKey>,
     /// Router-LSA re-origination pending (adjacency change or refresh).
     router_lsa_dirty: bool,
+    /// Self-originated network-LSAs per interface (§12.4.2) — the
+    /// flush handles on losing DR.
+    network_lsas: HashMap<usize, LsaKey>,
+    /// Network-LSA re-origination pending per interface.
+    network_lsa_dirty: Vec<usize>,
     /// Whether any external LSA exists (the router-LSA E-bit, §12.4.3).
     asbr: bool,
     /// SPF pending (an LSA changed contents; §16 runs on the
@@ -95,15 +123,21 @@ pub struct Ospfd {
 }
 
 /// What the core wants put on the wire after one input.
+#[derive(Clone)]
 pub struct WireOut {
     pub iface: usize,
     pub to: WireTo,
     pub packet: Packet,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WireTo {
+    /// AllSPFRouters, 224.0.0.5 (§A.1) — Hellos and the DR/BDR
+    /// floods on broadcast networks.
     Multicast,
+    /// AllDRouters, 224.0.0.6 (§A.1) — a DR Other's flood on a
+    /// broadcast network (§13.3: only the DR/BDR process it).
+    AllDRouters,
     Unicast(Ipv4Addr),
 }
 
@@ -124,19 +158,32 @@ impl Ospfd {
                     "interface {name}: address must be a real interface address"
                 ));
             }
-            let mut fsm = InterfaceFsm::new(icfg.network_type == NetworkType::PointToPoint);
+            let p2p = icfg.network_type == NetworkType::PointToPoint;
+            let mut fsm = InterfaceFsm::new_with_priority(p2p, icfg.priority);
             // §9.3 InterfaceUp: the config's address IS the lower
             // layer's usable-interface signal (v1: no link-state
             // tracking) — the interface enters PointToPoint/Waiting
-            // at construction.
-            fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
+            // (or DR Other at priority 0) at construction.
+            let (_, actions) = fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
+            let wait_deadline = if actions.contains(&crate::iface::InterfaceAction::StartWaitTimer)
+            {
+                // The WaitTimer is the RouterDeadInterval (§9.5.1's
+                // startup form), clocked from the daemon's t=0.
+                Some(icfg.dead_interval as u64)
+            } else {
+                None
+            };
             interfaces.push(Interface {
                 name: name.clone(),
                 cfg: icfg.clone(),
                 addr,
                 mask,
-                p2p: icfg.network_type == NetworkType::PointToPoint,
+                p2p,
                 fsm,
+                dr: Ipv4Addr::UNSPECIFIED,
+                bdr: Ipv4Addr::UNSPECIFIED,
+                wait_deadline,
+                claims: HashMap::new(),
                 neighbors: HashMap::new(),
                 hello_deadline: 0,
             });
@@ -153,6 +200,8 @@ impl Ospfd {
             routes: BTreeMap::new(),
             externals: BTreeMap::new(),
             router_lsa_dirty: true,
+            network_lsas: HashMap::new(),
+            network_lsa_dirty: Vec::new(),
             asbr: false,
             spf_dirty: false,
             zapi: None,
@@ -200,27 +249,218 @@ impl Ospfd {
     fn interface_advs(&self) -> Vec<InterfaceAdv> {
         self.interfaces
             .iter()
-            .map(|i| InterfaceAdv {
-                state: i.fsm.state,
-                p2p: i.p2p,
-                address: i.addr,
-                mask: i.mask,
-                cost: i.cfg.cost,
-                p2p_neighbors_full: i
+            .map(|i| {
+                let full: Vec<RouterId> = i
                     .neighbors
                     .values()
                     .filter(|c| c.state() == NeighborState::Full)
                     .filter_map(|c| c.peer_router_id)
-                    .collect(),
-                attached_routers: i
-                    .neighbors
-                    .values()
-                    .filter(|c| c.state() == NeighborState::Full)
-                    .filter_map(|c| c.peer_router_id)
-                    .collect(),
-                dr_address: None,
+                    .collect();
+                let elected = !i.p2p
+                    && i.fsm.state != crate::iface::InterfaceState::Waiting
+                    && i.dr != Ipv4Addr::UNSPECIFIED;
+                // §12.4.1.2's adjacency gate: fully adjacent to the
+                // DR (its conversation sits at Full), or we ARE the
+                // DR with at least one Full other router.
+                let transit_adjacent = if !i.p2p {
+                    if i.fsm.state == crate::iface::InterfaceState::Dr {
+                        !full.is_empty()
+                    } else {
+                        i.neighbors
+                            .values()
+                            .any(|c| c.ip == i.dr && c.state() == NeighborState::Full)
+                    }
+                } else {
+                    false
+                };
+                InterfaceAdv {
+                    state: i.fsm.state,
+                    p2p: i.p2p,
+                    address: i.addr,
+                    mask: i.mask,
+                    cost: i.cfg.cost,
+                    p2p_neighbors_full: full.clone(),
+                    attached_routers: full,
+                    dr_address: if elected { Some(i.dr) } else { None },
+                    transit_adjacent,
+                }
             })
             .collect()
+    }
+
+    /// Run the §9.4 election on one interface (the ElectDr action of
+    /// the §9.3 rows: WaitTimer, BackupSeen, NeighborChange) and
+    /// apply the outcome: the interface's DR/BDR and state (§9.4
+    /// steps 5), the AdjOK? re-evaluation on identity changes (step
+    /// 7), and the §12.4.2 network-LSA duties on role changes.
+    fn run_election(&mut self, idx: usize, now: u64, out: &mut Vec<WireOut>) {
+        let (neighbors, own_addr, own_pri, prev) = {
+            let iface = &self.interfaces[idx];
+            // §9.4's inputs: the bidirectional neighbors' claims
+            // (state ≥ 2-Way).
+            let neighbors: Vec<crate::iface::ElectionNeighbor> = iface
+                .neighbors
+                .iter()
+                .filter(|(_, c)| c.state().at_least(NeighborState::TwoWay))
+                .filter_map(|(rid, _)| iface.claims.get(rid).copied())
+                .collect();
+            (
+                neighbors,
+                iface.addr,
+                iface.cfg.priority,
+                (iface.dr, iface.bdr),
+            )
+        };
+        let own = crate::iface::ElectionNeighbor {
+            router_id: self.router_id,
+            address: own_addr,
+            priority: own_pri,
+            // Our claims = what our Hellos carry: the interface's
+            // current DR/BDR (§9.4's repeat reads them back).
+            dr: prev.0,
+            bdr: prev.1,
+        };
+        let outcome = crate::iface::elect_dr(own, &neighbors, prev);
+        let was_role = self.interfaces[idx].fsm.state;
+        {
+            let iface = &mut self.interfaces[idx];
+            iface.dr = outcome.dr;
+            iface.bdr = outcome.bdr;
+            // §9.3's "New state: Depends upon action routine" — the
+            // election IS the action routine for the Waiting rows.
+            iface.fsm.state = outcome.role;
+            if outcome.role != crate::iface::InterfaceState::Waiting {
+                iface.wait_deadline = None;
+            }
+        }
+        if was_role != outcome.role || outcome.dr_changed || outcome.bdr_changed {
+            info!(
+                iface = %self.interfaces[idx].name,
+                dr = %outcome.dr,
+                bdr = %outcome.bdr,
+                role = outcome.role.name(),
+                "ospfd: DR election (§9.4)"
+            );
+        }
+        if was_role != outcome.role {
+            // The transit-link description changed with the role.
+            self.router_lsa_dirty = true;
+            // §12.4.2: a former DR flushes its network-LSA.
+            if was_role == crate::iface::InterfaceState::Dr
+                && outcome.role != crate::iface::InterfaceState::Dr
+            {
+                if let Some(key) = self.network_lsas.remove(&idx) {
+                    if let Some(maxage) = self.lsdb.premature_age(&key) {
+                        self.flood_own(&maxage, now, out);
+                        info!(iface = %self.interfaces[idx].name, "ospfd: network-LSA flushed (no longer DR)");
+                    }
+                }
+            }
+            if outcome.role == crate::iface::InterfaceState::Dr {
+                self.network_lsa_dirty.push(idx);
+            }
+        }
+        if outcome.dr_changed || outcome.bdr_changed {
+            // §9.4 step (7): AdjOK? on every neighbor ≥ 2-Way.
+            let keys: Vec<RouterId> = self.interfaces[idx]
+                .neighbors
+                .iter()
+                .filter(|(_, c)| c.state().at_least(NeighborState::TwoWay))
+                .map(|(rid, _)| *rid)
+                .collect();
+            for key in keys {
+                self.reevaluate_adjacency(idx, key, now, out);
+            }
+        }
+    }
+
+    /// Fire AdjOK? with §10.4's answer for one neighbor on a
+    /// broadcast interface (also the TwoWayReceived decision point).
+    fn reevaluate_adjacency(
+        &mut self,
+        idx: usize,
+        peer: RouterId,
+        now: u64,
+        out: &mut Vec<WireOut>,
+    ) {
+        let answer = {
+            let iface = &self.interfaces[idx];
+            match iface.neighbors.get(&peer) {
+                Some(c) => iface.adjacency_ok(c.ip),
+                None => return,
+            }
+        };
+        let iface = &mut self.interfaces[idx];
+        if let Some(conv) = iface.neighbors.get_mut(&peer) {
+            let (sends, report) = conv.fire_and_map(NeighborEvent::AdjOk(answer), &self.lsdb, now);
+            out.extend(sends_into(idx, sends));
+            if report.adjacency_up || report.adjacency_down {
+                let _ = iface;
+                self.router_lsa_dirty = true;
+                if self.interfaces[idx].fsm.state == crate::iface::InterfaceState::Dr {
+                    self.network_lsa_dirty.push(idx);
+                }
+            }
+        }
+    }
+
+    /// §12.4.2: the DR's network-LSA — originated only while DR and
+    /// fully adjacent to at least one other router; flushed on
+    /// losing either condition (§12.4.2's premature-aging rule).
+    fn originate_network_lsa(&mut self, idx: usize, now: u64, out: &mut Vec<WireOut>) {
+        let (state, addr, mask, attached) = {
+            let iface = &self.interfaces[idx];
+            (
+                iface.fsm.state,
+                iface.addr,
+                iface.mask,
+                iface
+                    .neighbors
+                    .values()
+                    .filter(|c| c.state() == NeighborState::Full)
+                    .filter_map(|c| c.peer_router_id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let warranted = state == crate::iface::InterfaceState::Dr && !attached.is_empty();
+        if !warranted {
+            // §12.4.2: "A router that has formerly been the
+            // Designated Router ... should flush the network-LSA".
+            if let Some(key) = self.network_lsas.remove(&idx) {
+                if let Some(maxage) = self.lsdb.premature_age(&key) {
+                    self.flood_own(&maxage, now, out);
+                    info!(iface = %self.interfaces[idx].name, "ospfd: network-LSA flushed (§12.4.2)");
+                }
+            }
+            return;
+        }
+        let adv = InterfaceAdv {
+            state,
+            p2p: false,
+            address: addr,
+            mask,
+            cost: 10, // unused by the network-LSA body
+            p2p_neighbors_full: vec![],
+            attached_routers: attached,
+            dr_address: Some(addr),
+            transit_adjacent: true,
+        };
+        let lsa = crate::origination::build_network_lsa(self.router_id, &adv, addr);
+        let key = lsa.key();
+        match self.lsdb.originate(lsa, now) {
+            Ok(_) => {
+                self.network_lsas.insert(idx, key);
+                if let Some(entry) = self.lsdb.get(&key) {
+                    let stored = entry.lsa.clone();
+                    self.flood_own(&stored, now, out);
+                }
+                self.mark_spf_dirty(now);
+            }
+            Err(e) => {
+                // MinLSInterval — retry on a later tick.
+                debug!(error = %e, "ospfd: network-LSA origination deferred");
+            }
+        }
     }
 
     /// (Re-)originate the router-LSA (§12.4.1) and flood it to Full
@@ -376,8 +616,17 @@ impl Ospfd {
                                     self.originate_external(prefix, ext.metric, now, out);
                                 }
                             }
-                            // The network-LSA re-origination joins with
-                            // the broadcast-network daemon (§12.4.2).
+                            // §13.4 case 2 while still DR: re-originate
+                            // the network-LSA past the adopted instance.
+                            LsaType::NETWORK => {
+                                if let Some(idx) = self
+                                    .interfaces
+                                    .iter()
+                                    .position(|i| u32::from(i.addr) == key.link_state_id.0)
+                                {
+                                    self.network_lsa_dirty.push(idx);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -401,13 +650,26 @@ impl Ospfd {
         }
     }
 
-    /// Flood one self-originated LSA to every Full neighbor (v1: the
-    /// p2p unicast shape; §13.3's retransmission lists armed).
+    /// Flood one self-originated LSA to every Full neighbor, arming
+    /// §13.3's retransmission lists. The wire shape: p2p unicast per
+    /// neighbor; broadcast networks multicast per §13.3/§A.1 — the
+    /// DR and BDR send to AllSPFRouters (224.0.0.5), DR Others to
+    /// AllDRouters (224.0.0.6) so only the DR/BDR process the flood.
+    /// (Retransmissions stay unicast per neighbor — the RxmtInterval
+    /// paths in `exchange`.)
     fn flood_own(&mut self, lsa: &Lsa, now: u64, out: &mut Vec<WireOut>) {
-        // Collect (interface, neighbor ip) targets first, then build
-        // packets (packet() borrows self immutably).
-        let mut targets: Vec<(usize, Vec<Ipv4Addr>)> = Vec::new();
+        // Collect (interface, neighbor ips, broadcast role) first,
+        // then build packets (packet() borrows self immutably).
+        let mut targets: Vec<(usize, Vec<Ipv4Addr>, Option<bool>)> = Vec::new();
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
+            let bcast_role = if iface.p2p {
+                None
+            } else {
+                Some(matches!(
+                    iface.fsm.state,
+                    crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+                ))
+            };
             let ips: Vec<Ipv4Addr> = iface
                 .neighbors
                 .iter_mut()
@@ -417,18 +679,39 @@ impl Ospfd {
                     c.ip
                 })
                 .collect();
-            targets.push((idx, ips));
+            targets.push((idx, ips, bcast_role));
         }
-        for (idx, ips) in targets {
-            for ip in ips {
-                let packet = self.packet(PacketBody::LsUpdate(LsUpdate {
-                    lsas: vec![lsa.clone()],
-                }));
-                out.push(WireOut {
-                    iface: idx,
-                    to: WireTo::Unicast(ip),
-                    packet,
-                });
+        for (idx, ips, bcast_role) in targets {
+            match bcast_role {
+                Some(dr_or_bdr) if !ips.is_empty() => {
+                    // §13.3: one multicast LSU on the broadcast
+                    // network; every Full neighbor is on the
+                    // retransmission list.
+                    let packet = self.packet(PacketBody::LsUpdate(LsUpdate {
+                        lsas: vec![lsa.clone()],
+                    }));
+                    out.push(WireOut {
+                        iface: idx,
+                        to: if dr_or_bdr {
+                            WireTo::Multicast
+                        } else {
+                            WireTo::AllDRouters
+                        },
+                        packet,
+                    });
+                }
+                _ => {
+                    for ip in ips {
+                        let packet = self.packet(PacketBody::LsUpdate(LsUpdate {
+                            lsas: vec![lsa.clone()],
+                        }));
+                        out.push(WireOut {
+                            iface: idx,
+                            to: WireTo::Unicast(ip),
+                            packet,
+                        });
+                    }
+                }
             }
         }
     }
@@ -452,6 +735,18 @@ impl Ospfd {
         if packet.header.area_id != self.area_id {
             debug!(area = packet.header.area_id, src = %received.src, "ospfd: foreign area drop");
             return out;
+        }
+        // §A.1/§13: packets addressed to AllDRouters (224.0.0.6) are
+        // processed only by the DR and BDR on a broadcast network.
+        if received.dst == crate::packet::ALL_D_ROUTERS && !self.interfaces[iface_idx].p2p {
+            let role = self.interfaces[iface_idx].fsm.state;
+            if !matches!(
+                role,
+                crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+            ) {
+                debug!(src = %received.src, "ospfd: AllDRouters packet while DR Other — drop");
+                return out;
+            }
         }
         let peer = packet.header.router_id;
         let hello_params = {
@@ -482,6 +777,17 @@ impl Ospfd {
                 let dead = self.interfaces[iface_idx].cfg.dead_interval as u64;
                 let p2p = self.interfaces[iface_idx].p2p;
                 let params = self.interfaces[iface_idx].conversation_params();
+                // §9.2's bidirectionality before this hello (the
+                // neighbor FSM state prior to the events below).
+                let was_2way = self.interfaces[iface_idx]
+                    .neighbors
+                    .get(&peer)
+                    .is_some_and(|c| c.state().at_least(NeighborState::TwoWay));
+                // §10.4's answer for the 2-Way decision point,
+                // evaluated against the currently elected DR/BDR (the
+                // election below runs after the events).
+                let adj_answer = p2p || self.interfaces[iface_idx].adjacency_ok(received.src);
+                let iface_name = self.interfaces[iface_idx].name.clone();
                 let conv = self.interfaces[iface_idx]
                     .neighbors
                     .entry(peer)
@@ -503,15 +809,28 @@ impl Ospfd {
                     out.extend(sends_into(iface_idx, event_sends));
                     conv.touch_inactivity(now, dead);
                     match event {
-                        NeighborEvent::TwoWayReceived if p2p => {
-                            // §10.4: on p2p every neighbor becomes
-                            // adjacent; broadcast's DR/BDR decision is
-                            // the landed-but-not-driven arm.
-                            let (sends, report) =
-                                conv.fire_and_map(NeighborEvent::AdjOk(true), &self.lsdb, now);
+                        NeighborEvent::TwoWayReceived => {
+                            // §10.3's decision point: AdjOK? with
+                            // §10.4's answer — p2p always adjacent;
+                            // broadcast only with/toward the DR/BDR.
+                            let (sends, report) = conv.fire_and_map(
+                                NeighborEvent::AdjOk(adj_answer),
+                                &self.lsdb,
+                                now,
+                            );
                             out.extend(sends_into(iface_idx, sends));
                             if report.adjacency_up || report.adjacency_down {
                                 adj_change = true;
+                            } else if !p2p && !adj_answer {
+                                // §10.4: "If the decision is made to
+                                // not attempt an adjacency, the state
+                                // of the neighbor communication stops
+                                // at 2-Way."
+                                info!(
+                                    iface = %iface_name,
+                                    neighbor = %peer,
+                                    "ospfd: neighbor stays 2-Way (§10.4: neither side is DR/BDR)"
+                                );
                             }
                         }
                         NeighborEvent::OneWayReceived => {
@@ -523,8 +842,51 @@ impl Ospfd {
                         adj_change = true;
                     }
                 }
+                let is_2way = self.interfaces[iface_idx]
+                    .neighbors
+                    .get(&peer)
+                    .is_some_and(|c| c.state().at_least(NeighborState::TwoWay));
+                if !p2p {
+                    // §9.2/§9.4: the claim snapshot feeds the
+                    // interface events (BackupSeen / NeighborChange)
+                    // and the election inputs.
+                    let new_claims = crate::iface::ElectionNeighbor {
+                        router_id: peer,
+                        address: received.src,
+                        priority: hello.router_priority,
+                        dr: hello.designated_router,
+                        bdr: hello.backup_designated_router,
+                    };
+                    let iface_state = self.interfaces[iface_idx].fsm.state;
+                    let prev_claims = self.interfaces[iface_idx].claims.get(&peer).copied();
+                    let ism_events = crate::iface::hello_interface_events(
+                        iface_state,
+                        prev_claims,
+                        new_claims,
+                        was_2way,
+                        is_2way,
+                    );
+                    self.interfaces[iface_idx].claims.insert(peer, new_claims);
+                    if is_2way && !was_2way && adj_change {
+                        // A new bidirectional neighbor extends the
+                        // election set (§9.2's first cause).
+                        self.network_lsa_dirty.push(iface_idx);
+                    }
+                    for ev in ism_events {
+                        let (_, actions) = self.interfaces[iface_idx].fsm.fire(ev);
+                        if actions.contains(&crate::iface::InterfaceAction::ElectDr) {
+                            self.run_election(iface_idx, now, &mut out);
+                        }
+                    }
+                }
                 if adj_change {
                     self.router_lsa_dirty = true;
+                    if !p2p
+                        && self.interfaces[iface_idx].fsm.state == crate::iface::InterfaceState::Dr
+                    {
+                        // §12.4.2: the attached-router list changed.
+                        self.network_lsa_dirty.push(iface_idx);
+                    }
                 }
             }
             PacketBody::DbDescription(_)
@@ -563,7 +925,7 @@ impl Ospfd {
                 if let Some(lsas) = received_lsas {
                     self.after_self_originated(&lsas, now, &mut out);
                 }
-                self.after_report(iface_idx, &report, now);
+                self.after_report(iface_idx, Some(peer), &report, now);
             }
         }
         out
@@ -580,16 +942,36 @@ impl Ospfd {
         })
     }
 
-    fn after_report(&mut self, iface_idx: usize, report: &ConversationReport, now: u64) {
+    fn after_report(
+        &mut self,
+        iface_idx: usize,
+        peer: Option<RouterId>,
+        report: &ConversationReport,
+        now: u64,
+    ) {
         if report.adjacency_up {
             info!(
                 iface = %self.interfaces[iface_idx].name,
+                neighbor = peer.map(|p| p.to_string()).unwrap_or_default(),
                 "ospfd: adjacency FULL"
             );
             self.router_lsa_dirty = true;
+            // §12.4.2: the attached-router list grew — the DR's
+            // network-LSA re-originates (the not-yet-warranted first
+            // attempt retries here).
+            if !self.interfaces[iface_idx].p2p
+                && self.interfaces[iface_idx].fsm.state == crate::iface::InterfaceState::Dr
+            {
+                self.network_lsa_dirty.push(iface_idx);
+            }
         }
         if report.adjacency_down {
             self.router_lsa_dirty = true;
+            if !self.interfaces[iface_idx].p2p
+                && self.interfaces[iface_idx].fsm.state == crate::iface::InterfaceState::Dr
+            {
+                self.network_lsa_dirty.push(iface_idx);
+            }
         }
         if !report.changed.is_empty() {
             // The SPF throttle (FRR-parity 0/50/5000 ms backoff).
@@ -721,8 +1103,8 @@ impl Ospfd {
         }
     }
 
-    /// The 1-second tick: hellos, neighbor timers, aging, deferred
-    /// originations, SPF.
+    /// The 1-second tick: hellos, the WaitTimer, neighbor timers,
+    /// aging, deferred originations, SPF.
     pub fn tick(&mut self, now: u64, out: &mut Vec<WireOut>, zapi_out: &mut Vec<ZedgeCommand>) {
         // §C.3 Hellos.
         let (router_id, area_id) = (self.router_id, self.area_id);
@@ -737,8 +1119,25 @@ impl Ospfd {
                 });
             }
         }
+        // §9.3's WaitTimer (broadcast): the deferral before the
+        // first election ends — fire it once and elect.
+        let mut wait_fired: Vec<usize> = Vec::new();
+        for (idx, iface) in self.interfaces.iter().enumerate() {
+            if iface.wait_deadline.is_some_and(|d| now >= d) {
+                wait_fired.push(idx);
+            }
+        }
+        for idx in wait_fired {
+            self.interfaces[idx].wait_deadline = None;
+            let (_, actions) = self.interfaces[idx]
+                .fsm
+                .fire(crate::iface::InterfaceEvent::WaitTimer);
+            if actions.contains(&crate::iface::InterfaceAction::ElectDr) {
+                self.run_election(idx, now, out);
+            }
+        }
         // Neighbor timers (inactivity, DD/LSR/LSU retransmits).
-        let mut down_events = Vec::new();
+        let mut down_events: Vec<(usize, RouterId)> = Vec::new();
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
             let keys: Vec<RouterId> = iface.neighbors.keys().copied().collect();
             for key in keys {
@@ -748,14 +1147,21 @@ impl Ospfd {
                 let (sends, report) = conv.tick(now);
                 out.extend(sends_into(idx, sends));
                 if report.adjacency_down {
-                    down_events.push(key);
+                    down_events.push((idx, key));
                 }
             }
         }
         if !down_events.is_empty() {
             self.router_lsa_dirty = true;
-            for key in down_events {
+            for (idx, key) in &down_events {
                 info!(neighbor = %key, "ospfd: neighbor timed out (Inactivity Timer)");
+                // §9.2's second NeighborChange cause: a neighbor left
+                // the bidirectional set — re-elect on broadcast, and
+                // the network-LSA's attached list lost a router.
+                if !self.interfaces[*idx].p2p {
+                    self.run_election(*idx, now, out);
+                    self.network_lsa_dirty.push(*idx);
+                }
             }
         }
         // §14 aging.
@@ -763,6 +1169,17 @@ impl Ospfd {
         for key in report.refresh_due {
             let _ = key;
             self.router_lsa_dirty = true;
+            // §12.4.2 refresh: the network-LSA rides the same
+            // refresh cadence.
+            let matches: Vec<usize> = self
+                .network_lsas
+                .iter()
+                .filter(|(_, v)| **v == key)
+                .map(|(idx, _)| *idx)
+                .collect();
+            for idx in matches {
+                self.network_lsa_dirty.push(idx);
+            }
         }
         if !report.max_age.is_empty() {
             // §14: reflood the MaxAge instances (the flush); removal
@@ -792,6 +1209,10 @@ impl Ospfd {
         // Deferred originations (MinLSInterval retries).
         if self.router_lsa_dirty {
             self.originate_router_lsa(now, out);
+        }
+        let dirty_networks: Vec<usize> = std::mem::take(&mut self.network_lsa_dirty);
+        for idx in dirty_networks {
+            self.originate_network_lsa(idx, now, out);
         }
         // SPF when due.
         self.maybe_spf(now, zapi_out);
@@ -864,8 +1285,19 @@ fn make_hello(router_id: RouterId, area_id: u32, iface: &Interface) -> Packet {
         options: Options(Options::E),
         router_priority: iface.cfg.priority,
         router_dead_interval: iface.cfg.dead_interval,
-        designated_router: Ipv4Addr::UNSPECIFIED,
-        backup_designated_router: Ipv4Addr::UNSPECIFIED,
+        // §A.3.2: our DR/BDR claims — the interface's elected values
+        // on broadcast (0.0.0.0 while Waiting), 0.0.0.0 on p2p (no
+        // election runs there).
+        designated_router: if iface.p2p {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            iface.dr
+        },
+        backup_designated_router: if iface.p2p {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            iface.bdr
+        },
         neighbors: iface
             .neighbors
             .values()
@@ -931,12 +1363,50 @@ pub async fn run(
         redistribute_static = core.redistribute_static,
         "ospfd: running"
     );
+    // §A.1's membership duty: interfaces electing themselves DR/BDR
+    // join AllDRouters (224.0.0.6); the sync runs after every core
+    // step so §9.4 role changes take effect immediately.
+    let mut dr_joined: Vec<bool> = vec![false; sockets.len()];
+    macro_rules! sync_dr_membership {
+        () => {
+            for (idx, sock) in sockets.iter().enumerate() {
+                let need = core
+                    .interfaces
+                    .get(idx)
+                    .is_some_and(|i| {
+                        matches!(
+                            i.fsm.state,
+                            crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+                        )
+                    });
+                if need != dr_joined[idx] {
+                    let result = if need {
+                        sock.join_all_drouters()
+                    } else {
+                        sock.leave_all_drouters()
+                    };
+                    match result {
+                        Ok(()) => {
+                            dr_joined[idx] = need;
+                            info!(
+                                iface = %core.interfaces[idx].name,
+                                joined = need,
+                                "ospfd: AllDRouters membership (§9.4/§A.1)"
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "ospfd: AllDRouters membership change failed"),
+                    }
+                }
+            }
+        };
+    }
     // The first hello and the router-LSA go out at once.
     let mut out = Vec::new();
     let mut zapi_out = Vec::new();
     core.tick(0, &mut out, &mut zapi_out);
     flush_wire(&sockets, &core, out).await;
     flush_zapi(&core, zapi_out).await;
+    sync_dr_membership!();
 
     loop {
         tokio::select! {
@@ -954,6 +1424,7 @@ pub async fn run(
                 let now = start.elapsed().as_secs();
                 let out = core.on_packet(idx, &received, now);
                 flush_wire(&sockets, &core, out).await;
+                sync_dr_membership!();
             }
             _ = tick_interval.tick() => {
                 let now = start.elapsed().as_secs();
@@ -962,6 +1433,7 @@ pub async fn run(
                 core.tick(now, &mut out, &mut zapi_out);
                 flush_wire(&sockets, &core, out).await;
                 flush_zapi(&core, zapi_out).await;
+                sync_dr_membership!();
             }
             route = pushed.recv() => {
                 if let Some(route) = route {
@@ -996,6 +1468,7 @@ async fn flush_wire(sockets: &[Arc<OspfRawSocket>], core: &Ospfd, out: Vec<WireO
         let bytes = wire.packet.encode();
         let result = match wire.to {
             WireTo::Multicast => sock.send_multicast(&bytes).await,
+            WireTo::AllDRouters => sock.send_multicast_drouters(&bytes).await,
             WireTo::Unicast(dst) => sock.send_unicast(&bytes, dst).await,
         };
         if let Err(e) = result {
@@ -1030,12 +1503,20 @@ mod tests {
         Ospfd::new(&parse_config(&text).unwrap()).unwrap()
     }
 
+    /// A broadcast-network core (§C.3 defaults + fast timers).
+    fn bcast_core(router_id: &str, addr: &str, priority: u8) -> Ospfd {
+        let text = format!(
+            "router ospf\n router-id {router_id}\n area 0.0.0.0\n  interface eth0\n   address {addr}/24\n   network-type broadcast\n   priority {priority}\n   hello-interval 1\n   dead-interval 4\n"
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
     /// Extract the packet bodies from one core's wire output.
     fn bodies(out: &[WireOut]) -> Vec<(Option<Ipv4Addr>, Packet)> {
         out.iter()
             .map(|w| {
                 let to = match w.to {
-                    WireTo::Multicast => None,
+                    WireTo::Multicast | WireTo::AllDRouters => None,
                     WireTo::Unicast(dst) => Some(dst),
                 };
                 (to, w.packet.clone())
@@ -1444,5 +1925,327 @@ mod tests {
         assert!(stored.lsa.header.is_max_age(), "flushed, not adopted");
         // The re-adoption did NOT advance any tracking (no want).
         assert!(!a.externals.values().any(|k| *k == key));
+    }
+
+    // ---- broadcast networks (§7.3/§9.4/§10.4/§12.4.2) -----------
+
+    /// Deliver one core's wire output to every other core on the
+    /// shared broadcast network — multicast to all, unicast to the
+    /// addressed neighbor only (§A.1's two addresses). Cores in
+    /// `dead` neither send nor receive (the silent-wire model of a
+    /// crashed router).
+    fn deliver_mesh(
+        cores: &mut [Ospfd],
+        from: usize,
+        outs: &[WireOut],
+        now: u64,
+        dead: &[usize],
+        queue: &mut Vec<(usize, Vec<WireOut>)>,
+    ) {
+        if dead.contains(&from) {
+            return;
+        }
+        let from_addr = cores[from].interfaces[0].addr;
+        // The on-link destinations: multicast reaches every core,
+        // unicast only the addressed neighbor (§A.1).
+        let targets: Vec<usize> = (0..cores.len())
+            .filter(|i| *i != from && !dead.contains(i))
+            .collect();
+        for (dst, packet) in bodies(outs) {
+            let payload = packet.encode();
+            for i in &targets {
+                let i = *i;
+                {
+                    if let Some(d) = dst {
+                        // Unicast: only the addressed neighbor processes.
+                        if cores[i].interfaces[0].addr != d {
+                            continue;
+                        }
+                    }
+                    let replies = cores[i].on_packet(
+                        0,
+                        &crate::transport::Received {
+                            src: from_addr,
+                            dst: crate::packet::ALL_SPF_ROUTERS,
+                            payload: payload.clone(),
+                        },
+                        now,
+                    );
+                    if !replies.is_empty() {
+                        queue.push((i, replies));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run a mesh of broadcast cores (dead ones stay silent) until
+    /// the collective state — neighbor states, DR/BDR, LSDB
+    /// (key,seq,age), routes — holds still for `stable_for`
+    /// consecutive seconds. (Hello traffic is steady-state noise at
+    /// HelloInterval 1; a quiet-wire criterion would never fire.)
+    fn run_mesh(cores: &mut [Ospfd], start: u64, stable_for: u64, dead: &[usize]) -> u64 {
+        fn digest(cores: &[Ospfd], dead: &[usize]) -> u64 {
+            let mut h: u64 = 0x9e37_79b9;
+            for (i, core) in cores.iter().enumerate() {
+                if dead.contains(&i) {
+                    continue;
+                }
+                for iface in &core.interfaces {
+                    h = h.wrapping_mul(31).wrapping_add(u32::from(iface.dr) as u64);
+                    h = h.wrapping_mul(31).wrapping_add(u32::from(iface.bdr) as u64);
+                    h = h.wrapping_mul(31).wrapping_add(iface.fsm.state as u64);
+                    for (rid, c) in &iface.neighbors {
+                        h = h.wrapping_mul(31).wrapping_add(rid.0 as u64);
+                        h = h.wrapping_mul(31).wrapping_add(c.state() as u64);
+                    }
+                }
+                for entry in core.lsdb.all() {
+                    // Ages advance every second (§14 steady state) —
+                    // seq alone captures instance churn.
+                    h = h.wrapping_mul(31).wrapping_add(entry.lsa.header.seq as u64);
+                }
+                h = h.wrapping_mul(31).wrapping_add(core.routes.len() as u64);
+            }
+            h
+        }
+        let mut now = start;
+        let mut queue: Vec<(usize, Vec<WireOut>)> = Vec::new();
+        let mut zap: Vec<crate::zedge::ZedgeCommand> = Vec::new();
+        let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+        for i in 0..cores.len() {
+            if !dead.contains(&i) {
+                cores[i].tick(now, &mut outs[i], &mut zap);
+            }
+        }
+        for (i, o) in outs.iter().enumerate() {
+            if !o.is_empty() {
+                deliver_mesh(cores, i, o, now, dead, &mut queue);
+            }
+        }
+        let mut last = digest(cores, dead);
+        let mut quiet = 0u64;
+        for _ in 0..400 {
+            // Drain all pending traffic first.
+            while !queue.is_empty() {
+                let batch = std::mem::take(&mut queue);
+                for (from, outs) in batch {
+                    deliver_mesh(cores, from, &outs, now, dead, &mut queue);
+                }
+            }
+            let d = digest(cores, dead);
+            if d == last {
+                quiet += 1;
+                if quiet >= stable_for {
+                    return now;
+                }
+            } else {
+                quiet = 0;
+                last = d;
+            }
+            now += 1;
+            let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+            for i in 0..cores.len() {
+                if !dead.contains(&i) {
+                    cores[i].tick(now, &mut outs[i], &mut zap);
+                }
+            }
+            for (i, o) in outs.iter().enumerate() {
+                if !o.is_empty() {
+                    deliver_mesh(cores, i, o, now, dead, &mut queue);
+                }
+            }
+        }
+        panic!("broadcast mesh never settled");
+    }
+
+    #[test]
+    fn broadcast_network_elects_and_builds_adjacencies_per_10_4() {
+        // Four routers on one broadcast network: A (pri 4) DR,
+        // B (pri 3) BDR, C and D DR Others. §10.4: adjacencies exist
+        // only between {DR,BDR} and everyone — the C-D pair stays at
+        // 2-Way. The DR originates the network-LSA listing all four
+        // (§12.4.2), and everyone's SPF routes the transit network.
+        let mut cores = vec![
+            bcast_core("10.255.1.1", "10.78.0.1", 4),
+            bcast_core("10.255.2.1", "10.78.0.2", 3),
+            bcast_core("10.255.3.1", "10.78.0.3", 2),
+            bcast_core("10.255.4.1", "10.78.0.4", 1),
+        ];
+        let [a, b, c, d] = [0, 1, 2, 3];
+        // WaitTimer = RouterDeadInterval = 4 s; run to stability.
+        run_mesh(&mut cores, 0, 8, &[]);
+
+        // §9.4's outcome, identical on all four: DR = A, BDR = B.
+        for (i, core) in cores.iter().enumerate() {
+            assert_eq!(
+                core.interfaces[0].dr,
+                ip("10.78.0.1"),
+                "core {i} agrees on the DR"
+            );
+            assert_eq!(
+                core.interfaces[0].bdr,
+                ip("10.78.0.2"),
+                "core {i} agrees on the BDR"
+            );
+        }
+        use crate::iface::InterfaceState;
+        assert_eq!(cores[a].interfaces[0].fsm.state, InterfaceState::Dr);
+        assert_eq!(cores[b].interfaces[0].fsm.state, InterfaceState::Backup);
+        assert_eq!(cores[c].interfaces[0].fsm.state, InterfaceState::DrOther);
+        assert_eq!(cores[d].interfaces[0].fsm.state, InterfaceState::DrOther);
+
+        // The adjacency matrix (§10.4): Full with/toward DR and BDR;
+        // the two DR Others stay 2-Way with each other.
+        let state_between = |x: usize, y: usize| -> Option<NeighborState> {
+            let peer = cores[y].router_id;
+            cores[x].interfaces[0]
+                .neighbors
+                .get(&peer)
+                .map(|conv| conv.state())
+        };
+        for (x, y) in [(a, b), (a, c), (a, d), (b, c), (b, d)] {
+            assert_eq!(
+                state_between(x, y),
+                Some(NeighborState::Full),
+                "adjacency {x}-{y} (§10.4: DR/BDR pairs)"
+            );
+        }
+        for (x, y) in [(c, d), (d, c)] {
+            assert_eq!(
+                state_between(x, y),
+                Some(NeighborState::TwoWay),
+                "the DR Other pair {x}-{y} stops at 2-Way (§10.4)"
+            );
+        }
+
+        // §12.4.2: the DR's network-LSA — Link State ID = A's
+        // address, all four routers attached, present in every LSDB.
+        let net_key = crate::lsa::LsaKey {
+            ls_type: LsaType::NETWORK,
+            link_state_id: crate::lsa::LinkStateId(ip("10.78.0.1").into()),
+            adv_router: cores[a].router_id,
+        };
+        for (i, core) in cores.iter().enumerate() {
+            let entry = core
+                .lsdb
+                .get(&net_key)
+                .unwrap_or_else(|| panic!("core {i} holds the DR's network-LSA"));
+            let crate::lsa::LsaBody::Network(body) = &entry.lsa.body else {
+                panic!("network body");
+            };
+            let mut attached: Vec<u32> = body.attached.iter().map(|r| r.0).collect();
+            attached.sort_unstable();
+            let mut want: Vec<u32> = cores.iter().map(|c| c.router_id.0).collect();
+            want.sort_unstable();
+            assert_eq!(attached, want, "all four routers attached (§12.4.2)");
+            assert_eq!(body.mask, ip("255.255.255.0"));
+        }
+
+        // §12.4.1.2: every router-LSA carries the type-2 transit link
+        // to the DR's address (Link ID = 10.78.0.1).
+        for (i, core) in cores.iter().enumerate() {
+            let key = crate::lsa::LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(core.router_id.0),
+                adv_router: core.router_id,
+            };
+            let entry = core.lsdb.get(&key).unwrap();
+            let crate::lsa::LsaBody::Router(body) = &entry.lsa.body else {
+                panic!()
+            };
+            assert!(
+                body.links.iter().any(|l| {
+                    l.link_type == crate::lsa::LinkType::Transit
+                        && l.link_id.0 == u32::from(ip("10.78.0.1"))
+                }),
+                "core {i}'s router-LSA numbers the transit link"
+            );
+        }
+
+        // SPF: the transit network itself is a route on the DR
+        // Others (the network-LSA vertex with its mask).
+        let d_routes: Vec<String> = cores[d].routes.keys().cloned().collect();
+        assert!(
+            d_routes.iter().any(|r| r == "10.78.0.0/24"),
+            "D routes the transit network: {d_routes:?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_dr_loss_promotes_bdr_and_re_originate_network_lsa() {
+        // Footnote [5]/§12.4.2: the DR dies (its packets stop);
+        // within RouterDeadInterval the BDR promotes, a new DR/BDR is
+        // elected, adjacencies re-form, and the new DR originates its
+        // own network-LSA (the dead DR's copy ages out on the
+        // normal §14 lifetime — the flush duty died with it).
+        let mut cores = vec![
+            bcast_core("10.255.1.1", "10.79.0.1", 4),
+            bcast_core("10.255.2.1", "10.79.0.2", 3),
+            bcast_core("10.255.3.1", "10.79.0.3", 2),
+        ];
+        let (a, b, c) = (0, 1, 2);
+        let now = run_mesh(&mut cores, 0, 8, &[]);
+        assert_eq!(
+            cores[a].interfaces[0].fsm.state,
+            crate::iface::InterfaceState::Dr
+        );
+        assert_eq!(
+            cores[b].interfaces[0].fsm.state,
+            crate::iface::InterfaceState::Backup
+        );
+
+        // A goes silent: neither ticks nor delivers. Its neighbors'
+        // Inactivity Timers fire within RouterDeadInterval (4 s) and
+        // §9.2's second NeighborChange cause re-runs the election.
+        run_mesh(&mut cores, now + 1, 12, &[a]);
+
+        // B (was BDR) is the new DR; C the new BDR — on both living
+        // cores.
+        for core in [&cores[b], &cores[c]] {
+            assert_eq!(core.interfaces[0].dr, ip("10.79.0.2"), "B is the new DR");
+            assert_eq!(core.interfaces[0].bdr, ip("10.79.0.3"), "C is the new BDR");
+        }
+        assert_eq!(
+            cores[b].interfaces[0].fsm.state,
+            crate::iface::InterfaceState::Dr
+        );
+        assert_eq!(
+            cores[c].interfaces[0].fsm.state,
+            crate::iface::InterfaceState::Backup
+        );
+        // §12.4.2: the new DR's network-LSA — Link State ID = B's
+        // address, attached = B and C (A's adjacency died with it).
+        let new_net_key = crate::lsa::LsaKey {
+            ls_type: LsaType::NETWORK,
+            link_state_id: crate::lsa::LinkStateId(ip("10.79.0.2").into()),
+            adv_router: cores[b].router_id,
+        };
+        for (i, core) in cores.iter().enumerate().skip(1) {
+            let entry = core
+                .lsdb
+                .get(&new_net_key)
+                .unwrap_or_else(|| panic!("living core {i} holds the new DR's network-LSA"));
+            let crate::lsa::LsaBody::Network(body) = &entry.lsa.body else {
+                panic!("network body")
+            };
+            let mut attached: Vec<u32> = body.attached.iter().map(|r| r.0).collect();
+            attached.sort_unstable();
+            assert_eq!(
+                attached,
+                vec![cores[b].router_id.0, cores[c].router_id.0],
+                "the attached list is the living Full set plus the DR"
+            );
+        }
+        // The adjacency re-formed: B-C Full.
+        let peer = cores[c].router_id;
+        assert_eq!(
+            cores[b].interfaces[0]
+                .neighbors
+                .get(&peer)
+                .map(|c| c.state()),
+            Some(NeighborState::Full),
+            "B-C adjacency re-formed after the DR loss"
+        );
     }
 }

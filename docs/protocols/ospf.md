@@ -140,21 +140,61 @@ fork it. The concrete seams, documented where they bite:
   static's nexthop (§12.4.3), so the reverse direction uses a
   blackhole static (FA 0.0.0.0) — a topology note, not a workaround.
 
-## §Deferred (updated day-2 anchors)
+## Day-3 additions (2026-10-11, the N2 night slice: broadcast + §13.4)
 
-- Broadcast networks in the DAEMON: the §9 FSM, §9.4 election and
-  §12.4.2 network-LSA origination are landed and table-tested
-  (`iface.rs`, `origination.rs`) but the daemon drives p2p only
-  (Waiting/DR/BDR wiring + the 224.0.0.6 join-on-role are the
-  remaining work).
-- §13.4 (adopting a newer self-originated LSA received back — a
-  restart with a flushed-but-not-aged peer can otherwise stick at
-  the stale instance; observed in a manual repro, benign on clean
-  startups).
-- Inter-area (§16.2-§16.3) and the type-4 lookup the external
-  calculation shortcuts; incremental SPF (§16.5/§16.6); virtual
-  links (§15); stub/NSSA areas (§3.6); authentication (Appendix D);
-  graceful restart (RFC 3623); DNA honoring; OSPFv3 bodies.
+- **The §9.4 election is exact now** (two W2-e deviations corrected
+  against the FRR 10.2.2 oracle, `ospf_ism.c:ospf_dr_election`):
+  step (2) excludes self-declared-DR routers from BDR election, and
+  step (4)'s repeat runs with our claims updated to the first
+  round — so a lone broadcast router ends **DR with BDR 0.0.0.0**
+  ("No backup designated router on this network", probed live on
+  the oracle). The election reports the step-(7) identity-change
+  flags that drive AdjOK? re-evaluation.
+- **Broadcast networks run in the daemon** (§7.3): Hello-driven
+  claim tracking per neighbor, §9.2's BackupSeen (both forms,
+  Waiting-only) and NeighborChange (all five causes) via the pure
+  `hello_interface_events` table, the WaitTimer
+  (RouterDeadInterval) election, priority-0 interfaces entering
+  DR Other at InterfaceUp (§9.3), our Hellos carrying the elected
+  DR/BDR claims (§A.3.2), §10.4's AdjOK? answer (adjacent only
+  with/toward the DR/BDR; DROther pairs stop at 2-Way), §12.4.2
+  network-LSA origination by the DR (attached = Full set + self,
+  re-originated on adjacency changes, flushed on losing DR or the
+  last Full adjacency), and §12.4.1.2's exact three shapes for the
+  broadcast interface description (type-2 transit with the
+  adjacency gate; the type-3 stub Waiting form otherwise).
+- **§13.3 broadcast flooding + §A.1 memberships**: new LSAs
+  multicast on broadcast networks — AllSPFRouters from the DR/BDR,
+  AllDRouters from DR Others (whose 224.0.0.6 receives are then
+  DR/BDR-only, gated on ingress); retransmissions stay unicast.
+  The run loop joins/leaves AllDRouters on §9.4 role changes
+  (the sockopt surface is interior-mutable — the Arc'd socket
+  shape, no unsafe).
+- **§13.4 re-adoption**: a received newer self-originated LSA (the
+  restart-against-a-stale-peer case) advances the sequence
+  tracking one past the received instance (`Lsdb::
+  readopt_self_originated`) and re-originates; the no-longer-wanted
+  cases (no route, no longer DR, Router-ID-changed network-LSA)
+  prematurely age and reflood (§14.1).
+- **Interop**: `scripts/test-ospf-broadcast-interop.sh` — a
+  four-router broadcast network (FRR DR + rouster BDR + FRR DROther
+  + rouster DROther), exit 0 twice back-to-back: all four agree on
+  the election, the §10.4 matrix holds across implementations
+  (FRR shows our DROther at `2-Way/DROther`; we log the
+  stays-2-Way line for FRR's), the DR's network-LSA lists all four
+  attached routers, and a redistributed static lands in our
+  DROther's kernel `via` the DR's address — the §16.1.1 case-two
+  pseudo-node next hop.
+
+## §Deferred (updated day-3 anchors)
+
+- Inter-area routes (§16.2-§16.3 + the type-4 lookup §16.4-lite
+  shortcuts), incremental SPF (§16.5/§16.6), virtual links (§15),
+  stub/NSSA areas (§3.6), authentication (Appendix D), graceful
+  restart (RFC 3623), DNA honoring, OSPFv3 bodies.
+- NBMA and Point-to-MultiPoint networks (§C.3) — the unicast-hello
+  and per-neighbor-poll machinery; the §9.4 election's NBMA step
+  (6) rides with it.
 - Receive-side TTL verification (needs the recvmsg cmsg walk — a
   libc or socket2 upgrade); SO_BINDTODEVICE-style interface scoping.
 - Interface link-state tracking (InterfaceUp fires at construction

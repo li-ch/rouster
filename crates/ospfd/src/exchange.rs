@@ -666,6 +666,7 @@ mod tests {
                 p2p_neighbors_full: vec![],
                 attached_routers: vec![],
                 dr_address: None,
+                transit_adjacent: false,
             }],
         );
         lsa.with_computed_header()

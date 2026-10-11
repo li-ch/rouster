@@ -105,15 +105,19 @@ pub fn extract_ospf(buf: &[u8]) -> Option<Received> {
 /// note); the daemon demultiplexes by on-link source.
 pub struct OspfRawSocket {
     /// The socket2 handle: the sockopt surface (multicast joins,
-    /// TTLs) on the kernel socket both handles share.
-    socket: Socket,
+    /// TTLs) on the kernel socket both handles share. Mutex so the
+    /// §9.4 DR/BDR role changes can join/leave AllDRouters through
+    /// the shared handle the run loop holds (`Arc`), without
+    /// unsafe or a full-socket lock around the async IO (the join
+    /// and leave lock only for the duration of the sockopt call).
+    socket: std::sync::Mutex<Socket>,
     /// The dup'd-fd tokio handle for the safe async IO path.
     io: tokio::net::UdpSocket,
     /// The interface's own address: the multicast egress selector
     /// and the group-join interface argument.
     pub ifaddr: Ipv4Addr,
     /// Whether 224.0.0.6 (AllDRouters) is currently joined.
-    joined_dr: bool,
+    joined_dr: std::sync::atomic::AtomicBool,
 }
 
 impl OspfRawSocket {
@@ -140,30 +144,38 @@ impl OspfRawSocket {
         let std_sock = std::net::UdpSocket::from(dup);
         let io = tokio::net::UdpSocket::from_std(std_sock)?;
         Ok(Self {
-            socket,
+            socket: std::sync::Mutex::new(socket),
             io,
             ifaddr,
-            joined_dr: false,
+            joined_dr: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// §9.4/§A.1: join AllDRouters when this interface elects itself
     /// DR or BDR (packets to 224.0.0.6 must be received).
-    pub fn join_all_drouters(&mut self) -> io::Result<()> {
-        if !self.joined_dr {
+    pub fn join_all_drouters(&self) -> io::Result<()> {
+        if !self
+            .joined_dr
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             self.socket
+                .lock()
+                .expect("ospf socket lock")
                 .join_multicast_v4(&ALL_D_ROUTERS, &self.ifaddr)?;
-            self.joined_dr = true;
         }
         Ok(())
     }
 
     /// The inverse when the role is lost.
-    pub fn leave_all_drouters(&mut self) -> io::Result<()> {
-        if self.joined_dr {
+    pub fn leave_all_drouters(&self) -> io::Result<()> {
+        if self
+            .joined_dr
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             self.socket
+                .lock()
+                .expect("ospf socket lock")
                 .leave_multicast_v4(&ALL_D_ROUTERS, &self.ifaddr)?;
-            self.joined_dr = false;
         }
         Ok(())
     }
@@ -181,6 +193,14 @@ impl OspfRawSocket {
                 packet,
                 SocketAddr::V4(SocketAddrV4::new(ALL_SPF_ROUTERS, 0)),
             )
+            .await
+    }
+
+    /// Send an OSPF packet to AllDRouters (224.0.0.6) — a DR Other's
+    /// broadcast-network flood (§13.3/§A.1).
+    pub async fn send_multicast_drouters(&self, packet: &[u8]) -> io::Result<usize> {
+        self.io
+            .send_to(packet, SocketAddr::V4(SocketAddrV4::new(ALL_D_ROUTERS, 0)))
             .await
     }
 
@@ -295,12 +315,30 @@ mod tests {
         };
         // §A.1 transmit TTLs, read back through socket2 (std has no
         // getters for the multicast arm).
-        assert_eq!(sock.socket.multicast_ttl_v4().unwrap(), OSPF_TTL);
-        assert_eq!(sock.socket.ttl_v4().unwrap(), OSPF_TTL);
-        assert!(!sock.socket.multicast_loop_v4().unwrap());
-        // AllDRouters join/leave round-trips.
-        let mut sock = sock;
+        assert_eq!(
+            sock.socket
+                .lock()
+                .expect("socket lock")
+                .multicast_ttl_v4()
+                .unwrap(),
+            OSPF_TTL
+        );
+        assert_eq!(
+            sock.socket.lock().expect("socket lock").ttl_v4().unwrap(),
+            OSPF_TTL
+        );
+        assert!(!sock
+            .socket
+            .lock()
+            .expect("socket lock")
+            .multicast_loop_v4()
+            .unwrap());
+        // AllDRouters join/leave round-trips (interior-mutable: the
+        // shared-handle shape the run loop drives on §9.4 role
+        // changes).
         sock.join_all_drouters().unwrap();
+        sock.join_all_drouters().unwrap(); // idempotent
         sock.leave_all_drouters().unwrap();
+        sock.leave_all_drouters().unwrap(); // idempotent
     }
 }

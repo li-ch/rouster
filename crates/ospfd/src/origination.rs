@@ -52,9 +52,14 @@ pub struct InterfaceAdv {
     /// IDs for the network-LSA (§12.4.2).
     pub attached_routers: Vec<RouterId>,
     /// On broadcast, when a DR has been elected (state DR/Backup/
-    /// DROther): the DR's interface address for the type-2 transit
-    /// link (§12.4.1.2).
+    /// DROther, not Waiting): the DR's interface address (§12.4.1.2).
     pub dr_address: Option<Ipv4Addr>,
+    /// §12.4.1.2's adjacency gate for the type-2 transit link: we
+    /// are fully adjacent to the DR, or we are the DR and fully
+    /// adjacent to at least one other router. Without it the
+    /// interface is described in the Waiting form (a type-3 stub of
+    /// the subnet).
+    pub transit_adjacent: bool,
 }
 
 /// Build the router-LSA (§12.4.1). `e_bit` mirrors §12.4.3: set when
@@ -89,20 +94,29 @@ pub fn build_router_lsa(own: RouterId, e_bit: bool, interfaces: &[InterfaceAdv])
                 metric: iface.cost,
                 tos: vec![],
             });
-        } else if let Some(dr) = iface.dr_address {
-            // §12.4.1.2: broadcast/NBMA networks — a type-2 transit
-            // link to the DR: Link ID = the DR's interface address,
-            // Link Data = our own address.
-            links.push(RouterLink {
-                link_id: LinkStateId(u32::from(dr)),
-                link_data: u32::from(iface.address),
-                link_type: LinkType::Transit,
-                metric: iface.cost,
-                tos: vec![],
-            });
         } else {
-            // Waiting: §12.4.1.2's wait — the interface's links
-            // appear once a DR is elected.
+            // §12.4.1.2 broadcast/NBMA: with a DR elected AND the
+            // adjacency gate satisfied, a single type-2 transit link
+            // (Link ID = the DR's interface address — possibly our
+            // own — Link Data = our own address). Otherwise the
+            // Waiting form: the subnet as a type-3 stub.
+            let subnet = u32::from(iface.address) & u32::from(iface.mask);
+            match (iface.dr_address, iface.transit_adjacent) {
+                (Some(dr), true) => links.push(RouterLink {
+                    link_id: LinkStateId(u32::from(dr)),
+                    link_data: u32::from(iface.address),
+                    link_type: LinkType::Transit,
+                    metric: iface.cost,
+                    tos: vec![],
+                }),
+                _ => links.push(RouterLink {
+                    link_id: LinkStateId(subnet),
+                    link_data: u32::from(iface.mask),
+                    link_type: LinkType::Stub,
+                    metric: iface.cost,
+                    tos: vec![],
+                }),
+            }
         }
     }
     Lsa {
@@ -209,6 +223,7 @@ mod tests {
             p2p_neighbors_full: vec![],
             attached_routers: vec![],
             dr_address: None,
+            transit_adjacent: false,
         }
     }
 
@@ -259,6 +274,45 @@ mod tests {
             panic!()
         };
         assert!(body.e_bit);
+    }
+
+    #[test]
+    fn broadcast_transit_and_waiting_forms() {
+        // §12.4.1.2's three shapes for a broadcast interface:
+        // 1. DR elected + adjacent to it (or DR with a Full other):
+        //    the type-2 transit link, Link ID = the DR's address.
+        let mut adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
+        adv.dr_address = Some(ip("10.0.0.9"));
+        adv.transit_adjacent = true;
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let LsaBody::Router(body) = &lsa.body else {
+            panic!()
+        };
+        assert_eq!(body.links.len(), 1);
+        assert_eq!(body.links[0].link_type, LinkType::Transit);
+        assert_eq!(body.links[0].link_id.0, u32::from(ip("10.0.0.9")));
+        assert_eq!(body.links[0].link_data, u32::from(ip("10.0.0.5")));
+        // 2. DR elected but not yet adjacent to it: the Waiting form
+        //    (type-3 stub of the subnet).
+        let mut adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
+        adv.dr_address = Some(ip("10.0.0.9"));
+        adv.transit_adjacent = false;
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let LsaBody::Router(body) = &lsa.body else {
+            panic!()
+        };
+        assert_eq!(body.links.len(), 1);
+        assert_eq!(body.links[0].link_type, LinkType::Stub);
+        assert_eq!(body.links[0].link_id.0, u32::from(ip("10.0.0.0")));
+        assert_eq!(body.links[0].link_data, u32::from(ip("255.255.255.0")));
+        // 3. Still Waiting (no DR): the same stub form.
+        let adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let LsaBody::Router(body) = &lsa.body else {
+            panic!()
+        };
+        assert_eq!(body.links.len(), 1);
+        assert_eq!(body.links[0].link_type, LinkType::Stub);
     }
 
     #[test]
