@@ -29,7 +29,7 @@ use std::net::Ipv4Addr;
 use crate::iface::InterfaceState;
 use crate::lsa::{
     AsExternalLsa, LinkStateId, LinkType, Lsa, LsaBody, LsaHeader, LsaType, NetworkLsa, Options,
-    RouterId, RouterLink, RouterLsa,
+    RouterId, RouterLink, RouterLsa, SummaryLsa,
 };
 
 /// The daemon's per-interface snapshot the router-LSA builder needs.
@@ -63,9 +63,15 @@ pub struct InterfaceAdv {
 }
 
 /// Build the router-LSA (§12.4.1). `e_bit` mirrors §12.4.3: set when
-/// redistributing external routes. The Link State ID of a router-LSA
-/// is the router's own ID (§12.4.1).
-pub fn build_router_lsa(own: RouterId, e_bit: bool, interfaces: &[InterfaceAdv]) -> Lsa {
+/// redistributing external routes (an ASBR); `b_bit` when the router
+/// is an area border router (§A.4.2). The Link State ID of a
+/// router-LSA is the router's own ID (§12.4.1).
+pub fn build_router_lsa(
+    own: RouterId,
+    e_bit: bool,
+    b_bit: bool,
+    interfaces: &[InterfaceAdv],
+) -> Lsa {
     let mut links = Vec::new();
     for iface in interfaces {
         if iface.state < InterfaceState::PointToPoint {
@@ -133,7 +139,7 @@ pub fn build_router_lsa(own: RouterId, e_bit: bool, interfaces: &[InterfaceAdv])
         body: LsaBody::Router(RouterLsa {
             v_bit: false,
             e_bit,
-            b_bit: false,
+            b_bit,
             links,
         }),
     }
@@ -161,6 +167,40 @@ pub fn build_network_lsa(own: RouterId, iface: &InterfaceAdv, dr_address: Ipv4Ad
         body: LsaBody::Network(NetworkLsa {
             mask: iface.mask,
             attached,
+        }),
+    }
+}
+
+/// Build a summary-LSA (§12.4.3 / §A.4.4). Type 3 (network): Link
+/// State ID = the network's address, mask + the routing-table cost.
+/// Type 4 (ASBR): Link State ID = the ASBR's Router ID, mask 0 (the
+/// §A.4.4 type-4 rule).
+pub fn build_summary_lsa(
+    own: RouterId,
+    type4: bool,
+    link_state_id: Ipv4Addr,
+    mask: Ipv4Addr,
+    metric: u32,
+) -> Lsa {
+    Lsa {
+        header: LsaHeader {
+            ls_age: 0,
+            options: Options(Options::E),
+            ls_type: if type4 {
+                LsaType::SUMMARY_ASBR
+            } else {
+                LsaType::SUMMARY_NETWORK
+            },
+            link_state_id: LinkStateId(u32::from(link_state_id)),
+            adv_router: own,
+            seq: 0,
+            checksum: 0,
+            length: 0,
+        },
+        body: LsaBody::Summary(SummaryLsa {
+            mask: if type4 { Ipv4Addr::UNSPECIFIED } else { mask },
+            metric,
+            tos: vec![],
         }),
     }
 }
@@ -233,7 +273,7 @@ mod tests {
         // numbered-subnet type-3 stub.
         let mut adv = iface(true, "10.77.0.1", "255.255.255.252", 10);
         adv.p2p_neighbors_full = vec![rid("10.255.2.1")];
-        let lsa = build_router_lsa(rid("10.255.1.1"), false, &[adv]);
+        let lsa = build_router_lsa(rid("10.255.1.1"), false, false, &[adv]);
         assert_eq!(lsa.header.ls_type, LsaType::ROUTER);
         assert_eq!(lsa.header.link_state_id.0, u32::from(ip("10.255.1.1")));
         let LsaBody::Router(body) = &lsa.body else {
@@ -258,7 +298,7 @@ mod tests {
         let mut adv = iface(true, "10.77.0.1", "255.255.255.252", 10);
         adv.state = Down;
         adv.p2p_neighbors_full = vec![rid("10.255.2.1")];
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -269,7 +309,7 @@ mod tests {
     fn asbr_bit_is_carried() {
         // §12.4.3: originating type-5s makes the router an ASBR —
         // the E-bit lands in the router-LSA.
-        let lsa = build_router_lsa(rid("1.1.1.1"), true, &[]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), true, false, &[]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -284,7 +324,7 @@ mod tests {
         let mut adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
         adv.dr_address = Some(ip("10.0.0.9"));
         adv.transit_adjacent = true;
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -297,7 +337,7 @@ mod tests {
         let mut adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
         adv.dr_address = Some(ip("10.0.0.9"));
         adv.transit_adjacent = false;
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -307,7 +347,7 @@ mod tests {
         assert_eq!(body.links[0].link_data, u32::from(ip("255.255.255.0")));
         // 3. Still Waiting (no DR): the same stub form.
         let adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -335,6 +375,39 @@ mod tests {
         assert_eq!(body.mask, ip("255.255.255.0"));
         let back = Lsa::decode(&lsa.encode()).unwrap();
         assert_eq!(back, lsa.with_computed_header());
+    }
+
+    #[test]
+    fn summary_lsa_shapes() {
+        // §12.4.3/§A.4.4: type 3 carries the network's mask and the
+        // routing-table cost; type 4 names the ASBR (Link State ID =
+        // its Router ID) with mask 0.
+        let net = build_summary_lsa(
+            rid("1.1.1.1"),
+            false,
+            ip("10.20.0.0"),
+            ip("255.255.255.0"),
+            27,
+        );
+        assert_eq!(net.header.ls_type, LsaType::SUMMARY_NETWORK);
+        assert_eq!(net.header.link_state_id.0, u32::from(ip("10.20.0.0")));
+        let LsaBody::Summary(body) = &net.body else {
+            panic!()
+        };
+        assert_eq!(body.mask, ip("255.255.255.0"));
+        assert_eq!(body.metric, 27);
+        let back = Lsa::decode(&net.encode()).unwrap();
+        assert_eq!(back, net.with_computed_header());
+        let asbr = build_summary_lsa(rid("1.1.1.1"), true, ip("9.9.9.9"), ip("0.0.0.0"), 41);
+        assert_eq!(asbr.header.ls_type, LsaType::SUMMARY_ASBR);
+        assert_eq!(asbr.header.link_state_id.0, u32::from(ip("9.9.9.9")));
+        let LsaBody::Summary(body) = &asbr.body else {
+            panic!()
+        };
+        assert_eq!(body.mask, Ipv4Addr::UNSPECIFIED, "type-4 mask 0 (§A.4.4)");
+        assert_eq!(body.metric, 41);
+        let back = Lsa::decode(&asbr.encode()).unwrap();
+        assert_eq!(back, asbr.with_computed_header());
     }
 
     #[test]

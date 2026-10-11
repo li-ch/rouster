@@ -50,6 +50,9 @@ pub type Inbound = (usize, Received);
 /// One OSPF interface under the daemon.
 pub struct Interface {
     pub name: String,
+    /// The area this interface belongs to (§9.1: a router interface
+    /// belongs to one and only one area).
+    pub area: u32,
     pub cfg: InterfaceConfig,
     pub addr: Ipv4Addr,
     pub mask: Ipv4Addr,
@@ -94,32 +97,122 @@ impl Interface {
     }
 }
 
+/// Per-area protocol state: the §12.2 database plus the §12.4/§16
+/// bookkeeping that scopes to one area (router-LSA origination, the
+/// SPF throttle). AS-external LSAs are mirrored into every area's
+/// database (§7: "The list of AS-external-LSAs is also considered
+/// to be part of each area's link-state database").
+pub struct AreaState {
+    pub lsdb: Lsdb,
+    spf_sched: SpfScheduler,
+    spf_dirty: bool,
+    router_lsa_dirty: bool,
+}
+
+impl AreaState {
+    fn new() -> Self {
+        Self {
+            lsdb: Lsdb::new(),
+            spf_sched: SpfScheduler::new(0, 50, 5000),
+            spf_dirty: false,
+            router_lsa_dirty: true,
+        }
+    }
+}
+
 /// The daemon state machine core. `now` is monotonic seconds since
 /// start (clock-injected throughout; `run` owns the real clock).
 pub struct Ospfd {
     pub router_id: RouterId,
-    pub area_id: u32,
     pub interfaces: Vec<Interface>,
-    pub lsdb: Lsdb,
-    spf_sched: SpfScheduler,
+    /// One AreaState per attached area, keyed by area ID.
+    pub areas: BTreeMap<u32, AreaState>,
     /// The exported route table (prefix string -> entry).
     routes: BTreeMap<String, RouteEntry>,
     /// Self-originated external LSAs (prefix string -> key).
     externals: BTreeMap<String, LsaKey>,
-    /// Router-LSA re-origination pending (adjacency change or refresh).
-    router_lsa_dirty: bool,
     /// Self-originated network-LSAs per interface (§12.4.2) — the
     /// flush handles on losing DR.
     network_lsas: HashMap<usize, LsaKey>,
     /// Network-LSA re-origination pending per interface.
     network_lsa_dirty: Vec<usize>,
+    /// Self-originated summary-LSAs ((area, key)), §12.4.3 — the
+    /// withdrawal diff's baseline.
+    summaries: BTreeMap<(u32, LsaKey), ()>,
     /// Whether any external LSA exists (the router-LSA E-bit, §12.4.3).
     asbr: bool,
-    /// SPF pending (an LSA changed contents; §16 runs on the
-    /// throttle window).
-    spf_dirty: bool,
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     redistribute_static: bool,
+}
+
+/// One network destination in the unified routing table (§11's
+/// shape, the intra/inter distinction).
+struct RibPath {
+    prefix: Ipv4Prefix,
+    /// §11's path type: false = intra-area, true = inter-area
+    /// (summary-LSA-derived). External paths never enter the ribs —
+    /// §16.4 builds them separately.
+    inter_area: bool,
+    /// The path's associated area.
+    area: u32,
+    cost: u32,
+    hops: Vec<spf::NextHop>,
+}
+
+/// One per-area path to a router destination (ABR/ASBR, §16.1 step
+/// 4 + §16.2's type-4 form).
+struct RouterPath {
+    area: u32,
+    inter_area: bool,
+    cost: u32,
+    hops: Vec<spf::NextHop>,
+    b_bit: bool,
+    e_bit: bool,
+}
+
+/// §16.4.1's preference (RFC1583Compatibility disabled — FRR 10.2.2's
+/// probed default): intra-area non-backbone paths first; intra-area
+/// backbone and inter-area paths as equals; then least cost, the
+/// largest area ID breaking ties (§16.4 step 3).
+fn preferred_asbr_path(paths: &[RouterPath]) -> Option<&RouterPath> {
+    paths.iter().min_by_key(|p| {
+        let tier = if !p.inter_area && p.area != 0 { 0 } else { 1 };
+        (tier, p.cost, u32::MAX - p.area)
+    })
+}
+
+/// Dedup a hop set (sorted, unique) — the equal-cost merges
+/// accumulate duplicates across §16.2 steps (5)/(7).
+fn dedup_hops(mut hops: Vec<spf::NextHop>) -> Vec<spf::NextHop> {
+    hops.sort();
+    hops.dedup();
+    hops
+}
+
+/// Turn SPF next hops into kernel gateways: a next-hop router
+/// address directly; a p2p first hop (no router address — §16.1.1's
+/// p2p case) through the adjacency's peer address.
+fn decorate_hops(ospfd: &Ospfd, hops: &[spf::NextHop]) -> Vec<Nexthop> {
+    hops.iter()
+        .filter_map(|nh| match nh.router {
+            Some(r) => Some(Nexthop::Ipv4(r)),
+            None => ospfd.p2p_peer_address(nh.interface).map(Nexthop::Ipv4),
+        })
+        .collect()
+}
+
+impl Ospfd {
+    /// The first attached area's ID (single-area convenience).
+    pub fn area_id(&self) -> u32 {
+        *self.areas.keys().next().unwrap_or(&0)
+    }
+
+    /// Whether this router is an area border router (§12.4.3): an
+    /// active attachment to the backbone plus at least one other
+    /// area.
+    fn is_abr(&self) -> bool {
+        self.areas.len() > 1 && self.areas.contains_key(&0)
+    }
 }
 
 /// What the core wants put on the wire after one input.
@@ -147,63 +240,65 @@ impl Ospfd {
             return Err("router-id is required (v1: no zapi router-id request)".into());
         };
         let mut interfaces = Vec::new();
-        for (name, icfg) in &cfg.interfaces {
-            let Some((addr, mask)) = icfg.address else {
-                return Err(format!(
-                    "interface {name}: address <a.b.c.d/m> is required (v1)"
-                ));
-            };
-            if addr.is_unspecified() || addr.is_loopback() {
-                return Err(format!(
-                    "interface {name}: address must be a real interface address"
-                ));
+        let mut areas = BTreeMap::new();
+        for area in &cfg.areas {
+            areas.insert(area.id, AreaState::new());
+            for (name, icfg) in &area.interfaces {
+                let Some((addr, mask)) = icfg.address else {
+                    return Err(format!(
+                        "interface {name}: address <a.b.c.d/m> is required (v1)"
+                    ));
+                };
+                if addr.is_unspecified() || addr.is_loopback() {
+                    return Err(format!(
+                        "interface {name}: address must be a real interface address"
+                    ));
+                }
+                let p2p = icfg.network_type == NetworkType::PointToPoint;
+                let mut fsm = InterfaceFsm::new_with_priority(p2p, icfg.priority);
+                // §9.3 InterfaceUp: the config's address IS the lower
+                // layer's usable-interface signal (v1: no link-state
+                // tracking) — the interface enters PointToPoint/Waiting
+                // (or DR Other at priority 0) at construction.
+                let (_, actions) = fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
+                let wait_deadline =
+                    if actions.contains(&crate::iface::InterfaceAction::StartWaitTimer) {
+                        // The WaitTimer is the RouterDeadInterval (§9.5.1's
+                        // startup form), clocked from the daemon's t=0.
+                        Some(icfg.dead_interval as u64)
+                    } else {
+                        None
+                    };
+                interfaces.push(Interface {
+                    name: name.clone(),
+                    area: area.id,
+                    cfg: icfg.clone(),
+                    addr,
+                    mask,
+                    p2p,
+                    fsm,
+                    dr: Ipv4Addr::UNSPECIFIED,
+                    bdr: Ipv4Addr::UNSPECIFIED,
+                    wait_deadline,
+                    claims: HashMap::new(),
+                    neighbors: HashMap::new(),
+                    hello_deadline: 0,
+                });
             }
-            let p2p = icfg.network_type == NetworkType::PointToPoint;
-            let mut fsm = InterfaceFsm::new_with_priority(p2p, icfg.priority);
-            // §9.3 InterfaceUp: the config's address IS the lower
-            // layer's usable-interface signal (v1: no link-state
-            // tracking) — the interface enters PointToPoint/Waiting
-            // (or DR Other at priority 0) at construction.
-            let (_, actions) = fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
-            let wait_deadline = if actions.contains(&crate::iface::InterfaceAction::StartWaitTimer)
-            {
-                // The WaitTimer is the RouterDeadInterval (§9.5.1's
-                // startup form), clocked from the daemon's t=0.
-                Some(icfg.dead_interval as u64)
-            } else {
-                None
-            };
-            interfaces.push(Interface {
-                name: name.clone(),
-                cfg: icfg.clone(),
-                addr,
-                mask,
-                p2p,
-                fsm,
-                dr: Ipv4Addr::UNSPECIFIED,
-                bdr: Ipv4Addr::UNSPECIFIED,
-                wait_deadline,
-                claims: HashMap::new(),
-                neighbors: HashMap::new(),
-                hello_deadline: 0,
-            });
         }
         if interfaces.is_empty() {
             return Err("no interfaces configured".into());
         }
         Ok(Self {
             router_id: RouterId::from_ipv4(router_id),
-            area_id: cfg.area_id,
             interfaces,
-            lsdb: Lsdb::new(),
-            spf_sched: SpfScheduler::new(0, 50, 5000),
+            areas,
             routes: BTreeMap::new(),
             externals: BTreeMap::new(),
-            router_lsa_dirty: true,
             network_lsas: HashMap::new(),
             network_lsa_dirty: Vec::new(),
+            summaries: BTreeMap::new(),
             asbr: false,
-            spf_dirty: false,
             zapi: None,
             redistribute_static: cfg.redistribute_static,
         })
@@ -227,28 +322,37 @@ impl Ospfd {
             .next()
     }
 
-    /// Mark the routing calculation dirty (§16 runs on the throttle
-    /// window — FRR-parity backoff). EVERY dirtying site must go
-    /// through here: the scheduler's due deadline dies with
+    /// Mark one area's routing calculation dirty (§16 runs on the
+    /// throttle window — FRR-parity backoff). EVERY dirtying site
+    /// must go through here: the scheduler's due deadline dies with
     /// `mark_run`, so a bare `spf_dirty` flag without `on_change`
     /// would never fire again.
-    fn mark_spf_dirty(&mut self, now: u64) {
-        self.spf_sched.on_change(now * 1000);
-        self.spf_dirty = true;
+    fn mark_spf_dirty(&mut self, area: u32, now: u64) {
+        if let Some(a) = self.areas.get_mut(&area) {
+            a.spf_sched.on_change(now * 1000);
+            a.spf_dirty = true;
+        }
     }
 
-    fn packet(&self, body: PacketBody) -> Packet {
-        make_packet(self.router_id, self.area_id, body)
+    /// Mark EVERY area dirty (the AS-scoped changes: type-5s, our
+    /// ASBR status flip).
+    fn mark_all_spf_dirty(&mut self, now: u64) {
+        for area in self.areas.keys().copied().collect::<Vec<_>>() {
+            self.mark_spf_dirty(area, now);
+        }
     }
 
-    fn hello_now(router_id: RouterId, area_id: u32, iface: &Interface) -> Packet {
-        make_hello(router_id, area_id, iface)
+    fn packet(&self, area: u32, body: PacketBody) -> Packet {
+        make_packet(self.router_id, area, body)
     }
 
-    /// Interface advertisement snapshot (§12.4.1's builder input).
-    fn interface_advs(&self) -> Vec<InterfaceAdv> {
+    /// Interface advertisement snapshot for one area (§12.4.1's
+    /// builder input — a router-LSA describes the router's links in
+    /// THAT area only, §12.4.1).
+    fn interface_advs(&self, area: u32) -> Vec<InterfaceAdv> {
         self.interfaces
             .iter()
+            .filter(|i| i.area == area)
             .map(|i| {
                 let full: Vec<RouterId> = i
                     .neighbors
@@ -344,14 +448,21 @@ impl Ospfd {
         }
         if was_role != outcome.role {
             // The transit-link description changed with the role.
-            self.router_lsa_dirty = true;
+            let area = self.interfaces[idx].area;
+            if let Some(a) = self.areas.get_mut(&area) {
+                a.router_lsa_dirty = true;
+            }
             // §12.4.2: a former DR flushes its network-LSA.
             if was_role == crate::iface::InterfaceState::Dr
                 && outcome.role != crate::iface::InterfaceState::Dr
             {
                 if let Some(key) = self.network_lsas.remove(&idx) {
-                    if let Some(maxage) = self.lsdb.premature_age(&key) {
-                        self.flood_own(&maxage, now, out);
+                    let aged = self
+                        .areas
+                        .get_mut(&area)
+                        .and_then(|a| a.lsdb.premature_age(&key));
+                    if let Some(maxage) = aged {
+                        self.flood_own(&maxage, Some(area), now, out);
                         info!(iface = %self.interfaces[idx].name, "ospfd: network-LSA flushed (no longer DR)");
                     }
                 }
@@ -390,13 +501,20 @@ impl Ospfd {
                 None => return,
             }
         };
+        let area = self.interfaces[idx].area;
         let iface = &mut self.interfaces[idx];
+        let Some(area_state) = self.areas.get(&area) else {
+            return;
+        };
         if let Some(conv) = iface.neighbors.get_mut(&peer) {
-            let (sends, report) = conv.fire_and_map(NeighborEvent::AdjOk(answer), &self.lsdb, now);
+            let (sends, report) =
+                conv.fire_and_map(NeighborEvent::AdjOk(answer), &area_state.lsdb, now);
             out.extend(sends_into(idx, sends));
             if report.adjacency_up || report.adjacency_down {
-                let _ = iface;
-                self.router_lsa_dirty = true;
+                let _ = (iface, area_state);
+                if let Some(a) = self.areas.get_mut(&area) {
+                    a.router_lsa_dirty = true;
+                }
                 if self.interfaces[idx].fsm.state == crate::iface::InterfaceState::Dr {
                     self.network_lsa_dirty.push(idx);
                 }
@@ -408,9 +526,10 @@ impl Ospfd {
     /// fully adjacent to at least one other router; flushed on
     /// losing either condition (§12.4.2's premature-aging rule).
     fn originate_network_lsa(&mut self, idx: usize, now: u64, out: &mut Vec<WireOut>) {
-        let (state, addr, mask, attached) = {
+        let (area, state, addr, mask, attached) = {
             let iface = &self.interfaces[idx];
             (
+                iface.area,
                 iface.fsm.state,
                 iface.addr,
                 iface.mask,
@@ -427,8 +546,12 @@ impl Ospfd {
             // §12.4.2: "A router that has formerly been the
             // Designated Router ... should flush the network-LSA".
             if let Some(key) = self.network_lsas.remove(&idx) {
-                if let Some(maxage) = self.lsdb.premature_age(&key) {
-                    self.flood_own(&maxage, now, out);
+                let aged = self
+                    .areas
+                    .get_mut(&area)
+                    .and_then(|a| a.lsdb.premature_age(&key));
+                if let Some(maxage) = aged {
+                    self.flood_own(&maxage, Some(area), now, out);
                     info!(iface = %self.interfaces[idx].name, "ospfd: network-LSA flushed (§12.4.2)");
                 }
             }
@@ -447,14 +570,17 @@ impl Ospfd {
         };
         let lsa = crate::origination::build_network_lsa(self.router_id, &adv, addr);
         let key = lsa.key();
-        match self.lsdb.originate(lsa, now) {
+        let Some(area_state) = self.areas.get_mut(&area) else {
+            return;
+        };
+        match area_state.lsdb.originate(lsa, now) {
             Ok(_) => {
                 self.network_lsas.insert(idx, key);
-                if let Some(entry) = self.lsdb.get(&key) {
+                if let Some(entry) = area_state.lsdb.get(&key) {
                     let stored = entry.lsa.clone();
-                    self.flood_own(&stored, now, out);
+                    self.flood_own(&stored, Some(area), now, out);
                 }
-                self.mark_spf_dirty(now);
+                self.mark_spf_dirty(area, now);
             }
             Err(e) => {
                 // MinLSInterval — retry on a later tick.
@@ -463,13 +589,19 @@ impl Ospfd {
         }
     }
 
-    /// (Re-)originate the router-LSA (§12.4.1) and flood it to Full
-    /// neighbors (§13.3 retransmission lists armed).
-    fn originate_router_lsa(&mut self, now: u64, out: &mut Vec<WireOut>) {
-        let lsa = build_router_lsa(self.router_id, self.asbr, &self.interface_advs());
-        match self.lsdb.originate(lsa, now) {
+    /// (Re-)originate one area's router-LSA (§12.4.1: the LSA
+    /// describes the router's links IN that area; the B-bit is set
+    /// when the router is an area border router, §A.4.2) and flood
+    /// it to the area's Full neighbors (§13.3 lists armed).
+    fn originate_router_lsa(&mut self, area: u32, now: u64, out: &mut Vec<WireOut>) {
+        let advs = self.interface_advs(area);
+        let lsa = build_router_lsa(self.router_id, self.asbr, self.is_abr(), &advs);
+        let Some(area_state) = self.areas.get_mut(&area) else {
+            return;
+        };
+        match area_state.lsdb.originate(lsa, now) {
             Ok(_) => {
-                self.router_lsa_dirty = false;
+                area_state.router_lsa_dirty = false;
                 // Flood the STORED instance — Lsdb::originate stamped
                 // the sequence (§12.1.6); the builder's copy carries
                 // the raw 0.
@@ -478,13 +610,13 @@ impl Ospfd {
                     link_state_id: crate::lsa::LinkStateId(self.router_id.0),
                     adv_router: self.router_id,
                 };
-                if let Some(entry) = self.lsdb.get(&key) {
+                if let Some(entry) = area_state.lsdb.get(&key) {
                     let stored = entry.lsa.clone();
-                    self.flood_own(&stored, now, out);
+                    self.flood_own(&stored, Some(area), now, out);
                     // The area graph changed: §16 runs.
-                    self.mark_spf_dirty(now);
+                    self.mark_spf_dirty(area, now);
                 }
-                info!("ospfd: router-LSA originated");
+                info!(area, "ospfd: router-LSA originated");
             }
             Err(e) => {
                 // MinLSInterval not elapsed — retry on the next tick.
@@ -494,8 +626,11 @@ impl Ospfd {
     }
 
     /// §12.4.3: originate the AS-external-LSA for a redistributed
-    /// route and flood it; the router-LSA turns on its E-bit (the
-    /// router is now an ASBR).
+    /// route and flood it AS-wide (type-5s are AS-scoped: originated
+    /// in the first area's database, the same instance mirrored into
+    /// every other area's — §7's "part of each area's link state
+    /// database"); the router-LSA turns on its E-bit (the router is
+    /// now an ASBR).
     fn originate_external(
         &mut self,
         prefix: Ipv4Prefix,
@@ -511,38 +646,67 @@ impl Ospfd {
             true, // type-2 external (FRR's default)
         );
         let key = lsa.key();
-        match self.lsdb.originate(lsa, now) {
+        let master = *self.areas.keys().next().unwrap_or(&0);
+        let Some(area_state) = self.areas.get_mut(&master) else {
+            return;
+        };
+        match area_state.lsdb.originate(lsa, now) {
             Ok(_) => {
                 self.externals.insert(prefix.to_string(), key);
                 let first = !self.asbr;
                 self.asbr = true;
-                if let Some(entry) = self.lsdb.get(&key) {
-                    let stored = entry.lsa.clone();
-                    self.flood_own(&stored, now, out);
+                let stored = area_state.lsdb.get(&key).map(|e| e.lsa.clone());
+                // Mirror the identical instance into every other area.
+                if let Some(lsa) = &stored {
+                    for other in self
+                        .areas
+                        .keys()
+                        .copied()
+                        .filter(|a| *a != master)
+                        .collect::<Vec<_>>()
+                    {
+                        if let Some(state) = self.areas.get_mut(&other) {
+                            state.lsdb.mirror_originated(lsa, now);
+                        }
+                    }
+                    self.flood_own(lsa, None, now, out);
                 }
-                self.mark_spf_dirty(now);
+                self.mark_all_spf_dirty(now);
                 info!(prefix = %prefix, "ospfd: external LSA originated");
                 if first {
-                    // The E-bit change re-originates the router-LSA.
-                    self.router_lsa_dirty = true;
+                    // The E-bit change re-originates the router-LSA
+                    // (every area).
+                    for area in self.areas.keys().copied().collect::<Vec<_>>() {
+                        if let Some(a) = self.areas.get_mut(&area) {
+                            a.router_lsa_dirty = true;
+                        }
+                    }
                 }
             }
             Err(e) => debug!(error = %e, "ospfd: external origination deferred"),
         }
     }
 
-    /// §12.4.3's withdrawal: premature-age the LSA (§14.1) and flood
-    /// the MaxAge instance.
+    /// §12.4.3's withdrawal: premature-age the LSA in every area
+    /// (§14.1) and flood the MaxAge instance.
     fn withdraw_external(&mut self, prefix_str: &str, now: u64, out: &mut Vec<WireOut>) {
         if let Some(key) = self.externals.remove(prefix_str) {
-            if let Some(lsa) = self.lsdb.premature_age(&key) {
-                self.flood_own(&lsa, now, out);
-                info!(
-                    prefix = prefix_str,
-                    "ospfd: external LSA withdrawn (MaxAge)"
-                );
+            let areas: Vec<u32> = self.areas.keys().copied().collect();
+            let mut aged = false;
+            for area in areas {
+                if let Some(state) = self.areas.get_mut(&area) {
+                    if let Some(lsa) = state.lsdb.premature_age(&key) {
+                        if !aged {
+                            self.flood_own(&lsa, None, now, out);
+                            aged = true;
+                        }
+                    }
+                }
             }
-            let _ = now;
+            info!(
+                prefix = prefix_str,
+                "ospfd: external LSA withdrawn (MaxAge)"
+            );
         }
     }
 
@@ -551,7 +715,7 @@ impl Ospfd {
     /// flush: no advertisable route (externals), no longer DR for
     /// the network (network-LSAs), and the Router-ID-changed shape
     /// is handled by `is_our_network` below.
-    fn wants_to_originate(&self, key: &LsaKey) -> bool {
+    fn wants_to_originate(&self, _area: u32, key: &LsaKey) -> bool {
         match key.ls_type {
             // Our router-LSA: always (the router exists).
             LsaType::ROUTER => true,
@@ -575,7 +739,7 @@ impl Ospfd {
     /// adopted state. Two detections (§13.4): Advertising Router ==
     /// our ID, or a network-LSA whose Link State ID is one of our
     /// interface addresses.
-    fn after_self_originated(&mut self, lsas: &[Lsa], now: u64, out: &mut Vec<WireOut>) {
+    fn after_self_originated(&mut self, area: u32, lsas: &[Lsa], now: u64, out: &mut Vec<WireOut>) {
         for lsa in lsas {
             let is_self = lsa.header.adv_router == self.router_id;
             let is_our_network = lsa.header.ls_type == LsaType::NETWORK
@@ -591,77 +755,151 @@ impl Ospfd {
             // (won §13.1) triggers the special action; older echoes
             // were answered by §13's steps 7/8, MaxAge ones are
             // already flushing.
-            let Some(stored) = self.lsdb.get(&key) else {
+            let Some(state) = self.areas.get(&area) else {
+                continue;
+            };
+            let Some(stored) = state.lsdb.get(&key) else {
                 continue;
             };
             if stored.lsa.header.seq != lsa.header.seq || stored.lsa.header.is_max_age() {
                 continue;
             }
             let stored = stored.lsa.clone();
-            if self.wants_to_originate(&key) {
-                match self.lsdb.readopt_self_originated(lsa) {
-                    Readopt::Advanced => {
-                        info!(key = ?key, "ospfd: adopting newer self-originated LSA (§13.4)");
-                        // Re-originate past it on the next tick
-                        // (MinLSInterval retries included).
-                        match key.ls_type {
-                            LsaType::ROUTER => self.router_lsa_dirty = true,
-                            LsaType::AS_EXTERNAL => {
-                                if let crate::lsa::LsaBody::AsExternal(ext) = &stored.body {
-                                    let prefix = Ipv4Prefix::new(
-                                        stored.header.link_state_id.to_ipv4(),
-                                        u32::from(ext.mask).count_ones() as u8,
-                                    )
-                                    .expect("external mask");
-                                    self.originate_external(prefix, ext.metric, now, out);
-                                }
-                            }
-                            // §13.4 case 2 while still DR: re-originate
-                            // the network-LSA past the adopted instance.
-                            LsaType::NETWORK => {
-                                if let Some(idx) = self
-                                    .interfaces
-                                    .iter()
-                                    .position(|i| u32::from(i.addr) == key.link_state_id.0)
-                                {
-                                    self.network_lsa_dirty.push(idx);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Readopt::NeedsFlush => {
-                        // §12.1.6 met §13.4: prematurely age our copy
-                        // (§14.1) so the sequence can restart.
-                        if let Some(maxage) = self.lsdb.premature_age(&key) {
-                            self.flood_own(&maxage, now, out);
-                        }
-                    }
-                    Readopt::Stale | Readopt::NotOurs => {}
-                }
+            let want = self.wants_to_originate(area, &key);
+            let readopt = if want {
+                self.areas
+                    .get_mut(&area)
+                    .map(|s| s.lsdb.readopt_self_originated(lsa))
+                    .unwrap_or(Readopt::Stale)
             } else {
-                // §13.4's flush list: increment the received LSA's
-                // age to MaxAge and reflood (§14.1).
-                if let Some(maxage) = self.lsdb.premature_age(&key) {
-                    info!(key = ?key, "ospfd: flushing unwanted self-originated LSA (§13.4)");
-                    self.flood_own(&maxage, now, out);
+                Readopt::NotOurs
+            };
+            match readopt {
+                Readopt::Advanced => {
+                    info!(key = ?key, "ospfd: adopting newer self-originated LSA (§13.4)");
+                    // Re-originate past it on the next tick
+                    // (MinLSInterval retries included).
+                    match key.ls_type {
+                        LsaType::ROUTER => {
+                            if let Some(a) = self.areas.get_mut(&area) {
+                                a.router_lsa_dirty = true;
+                            }
+                        }
+                        LsaType::AS_EXTERNAL => {
+                            if let crate::lsa::LsaBody::AsExternal(ext) = &stored.body {
+                                let prefix = Ipv4Prefix::new(
+                                    stored.header.link_state_id.to_ipv4(),
+                                    u32::from(ext.mask).count_ones() as u8,
+                                )
+                                .expect("external mask");
+                                self.originate_external(prefix, ext.metric, now, out);
+                            }
+                        }
+                        // §13.4 case 2 while still DR: re-originate
+                        // the network-LSA past the adopted instance.
+                        LsaType::NETWORK => {
+                            if let Some(idx) = self
+                                .interfaces
+                                .iter()
+                                .position(|i| u32::from(i.addr) == key.link_state_id.0)
+                            {
+                                self.network_lsa_dirty.push(idx);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Readopt::NeedsFlush => {
+                    // §12.1.6 met §13.4: prematurely age our copy
+                    // (§14.1) so the sequence can restart.
+                    let aged = self
+                        .areas
+                        .get_mut(&area)
+                        .and_then(|s| s.lsdb.premature_age(&key));
+                    if let Some(maxage) = aged {
+                        self.flood_own(&maxage, Some(area), now, out);
+                    }
+                }
+                Readopt::Stale | Readopt::NotOurs => {
+                    if !want {
+                        // §13.4's flush list: increment the received
+                        // LSA's age to MaxAge and reflood (§14.1).
+                        let aged = self
+                            .areas
+                            .get_mut(&area)
+                            .and_then(|s| s.lsdb.premature_age(&key));
+                        if let Some(maxage) = aged {
+                            info!(key = ?key, "ospfd: flushing unwanted self-originated LSA (§13.4)");
+                            self.flood_own(&maxage, Some(area), now, out);
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Flood one self-originated LSA to every Full neighbor, arming
-    /// §13.3's retransmission lists. The wire shape: p2p unicast per
-    /// neighbor; broadcast networks multicast per §13.3/§A.1 — the
-    /// DR and BDR send to AllSPFRouters (224.0.0.5), DR Others to
-    /// AllDRouters (224.0.0.6) so only the DR/BDR process the flood.
-    /// (Retransmissions stay unicast per neighbor — the RxmtInterval
-    /// paths in `exchange`.)
-    fn flood_own(&mut self, lsa: &Lsa, now: u64, out: &mut Vec<WireOut>) {
+    /// The AS-scope propagation for received type-5s: install the
+    /// same instance into every other area's database (§7) and flood
+    /// it out their Full adjacencies (§13 step 1f: AS-external LSAs
+    /// go out every interface except the arrival one).
+    fn mirror_as_scoped(
+        &mut self,
+        arrival_area: u32,
+        lsas: &[Lsa],
+        now: u64,
+        out: &mut Vec<WireOut>,
+    ) {
+        for lsa in lsas {
+            if lsa.header.ls_type != LsaType::AS_EXTERNAL {
+                continue;
+            }
+            let areas: Vec<u32> = self
+                .areas
+                .keys()
+                .copied()
+                .filter(|a| *a != arrival_area)
+                .collect();
+            for area in areas {
+                let Some(state) = self.areas.get_mut(&area) else {
+                    continue;
+                };
+                let before = state.lsdb.get(&lsa.key()).map(|e| e.lsa.header.seq);
+                let _ = state.lsdb.install(lsa.clone(), true, now);
+                let after = state.lsdb.get(&lsa.key()).map(|e| e.lsa.header.seq);
+                if before != after || before.is_none() {
+                    // Newly installed or advanced: flood it out this
+                    // area's adjacencies.
+                    if let Some(entry) = state.lsdb.get(&lsa.key()) {
+                        let stored = entry.lsa.clone();
+                        let _ = state;
+                        self.flood_own(&stored, Some(area), now, out);
+                        self.mark_spf_dirty(area, now);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flood one LSA to the Full neighbors in scope, arming §13.3's
+    /// retransmission lists. `scope`: `Some(area)` — the area-scoped
+    /// LSAs (types 1-4, §13 step 1f's same-area rule); `None` — the
+    /// AS-scoped type-5s (every area). The wire shape: p2p unicast
+    /// per neighbor; broadcast networks multicast per §13.3/§A.1 —
+    /// the DR and BDR send to AllSPFRouters (224.0.0.5), DR Others
+    /// to AllDRouters (224.0.0.6) so only the DR/BDR process the
+    /// flood. (Retransmissions stay unicast per neighbor — the
+    /// RxmtInterval paths in `exchange`.)
+    fn flood_own(&mut self, lsa: &Lsa, scope: Option<u32>, now: u64, out: &mut Vec<WireOut>) {
         // Collect (interface, neighbor ips, broadcast role) first,
         // then build packets (packet() borrows self immutably).
-        let mut targets: Vec<(usize, Vec<Ipv4Addr>, Option<bool>)> = Vec::new();
+        let mut targets: Vec<(usize, u32, Vec<Ipv4Addr>, Option<bool>)> = Vec::new();
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
+            if let Some(area) = scope {
+                if iface.area != area {
+                    continue;
+                }
+            }
             let bcast_role = if iface.p2p {
                 None
             } else {
@@ -679,17 +917,20 @@ impl Ospfd {
                     c.ip
                 })
                 .collect();
-            targets.push((idx, ips, bcast_role));
+            targets.push((idx, iface.area, ips, bcast_role));
         }
-        for (idx, ips, bcast_role) in targets {
+        for (idx, area, ips, bcast_role) in targets {
             match bcast_role {
                 Some(dr_or_bdr) if !ips.is_empty() => {
                     // §13.3: one multicast LSU on the broadcast
                     // network; every Full neighbor is on the
                     // retransmission list.
-                    let packet = self.packet(PacketBody::LsUpdate(LsUpdate {
-                        lsas: vec![lsa.clone()],
-                    }));
+                    let packet = self.packet(
+                        area,
+                        PacketBody::LsUpdate(LsUpdate {
+                            lsas: vec![lsa.clone()],
+                        }),
+                    );
                     out.push(WireOut {
                         iface: idx,
                         to: if dr_or_bdr {
@@ -702,9 +943,12 @@ impl Ospfd {
                 }
                 _ => {
                     for ip in ips {
-                        let packet = self.packet(PacketBody::LsUpdate(LsUpdate {
-                            lsas: vec![lsa.clone()],
-                        }));
+                        let packet = self.packet(
+                            area,
+                            PacketBody::LsUpdate(LsUpdate {
+                                lsas: vec![lsa.clone()],
+                            }),
+                        );
                         out.push(WireOut {
                             iface: idx,
                             to: WireTo::Unicast(ip),
@@ -732,8 +976,13 @@ impl Ospfd {
         if packet.header.router_id == self.router_id {
             return out;
         }
-        if packet.header.area_id != self.area_id {
-            debug!(area = packet.header.area_id, src = %received.src, "ospfd: foreign area drop");
+        let area = self.interfaces[iface_idx].area;
+        if packet.header.area_id != area {
+            debug!(
+                area = packet.header.area_id,
+                src = %received.src,
+                "ospfd: foreign area drop"
+            );
             return out;
         }
         // §A.1/§13: packets addressed to AllDRouters (224.0.0.6) are
@@ -792,20 +1041,17 @@ impl Ospfd {
                     .neighbors
                     .entry(peer)
                     .or_insert_with(|| {
-                        Conversation::new(
-                            self.router_id,
-                            self.area_id,
-                            received.src,
-                            now,
-                            dead,
-                            params,
-                        )
+                        Conversation::new(self.router_id, area, received.src, now, dead, params)
                     });
                 conv.peer_router_id = Some(peer);
                 conv.ip = received.src;
                 let mut adj_change = false;
+                let area_lsdb = self.areas.get(&area).map(|a| &a.lsdb);
                 for event in events {
-                    let (event_sends, report) = conv.fire_and_map(event, &self.lsdb, now);
+                    let (event_sends, report) = match area_lsdb {
+                        Some(lsdb) => conv.fire_and_map(event, lsdb, now),
+                        None => continue,
+                    };
                     out.extend(sends_into(iface_idx, event_sends));
                     conv.touch_inactivity(now, dead);
                     match event {
@@ -813,11 +1059,12 @@ impl Ospfd {
                             // §10.3's decision point: AdjOK? with
                             // §10.4's answer — p2p always adjacent;
                             // broadcast only with/toward the DR/BDR.
-                            let (sends, report) = conv.fire_and_map(
-                                NeighborEvent::AdjOk(adj_answer),
-                                &self.lsdb,
-                                now,
-                            );
+                            let (sends, report) = match area_lsdb {
+                                Some(lsdb) => {
+                                    conv.fire_and_map(NeighborEvent::AdjOk(adj_answer), lsdb, now)
+                                }
+                                None => continue,
+                            };
                             out.extend(sends_into(iface_idx, sends));
                             if report.adjacency_up || report.adjacency_down {
                                 adj_change = true;
@@ -880,7 +1127,9 @@ impl Ospfd {
                     }
                 }
                 if adj_change {
-                    self.router_lsa_dirty = true;
+                    if let Some(a) = self.areas.get_mut(&area) {
+                        a.router_lsa_dirty = true;
+                    }
                     if !p2p
                         && self.interfaces[iface_idx].fsm.state == crate::iface::InterfaceState::Dr
                     {
@@ -896,20 +1145,22 @@ impl Ospfd {
                 // Conversation packets from unknown neighbors are
                 // dropped (§10.6 rejects in Down; we have no record).
                 let syncing = self.any_syncing();
+                let mtu = self.interfaces[iface_idx].cfg.mtu;
                 let iface = &mut self.interfaces[iface_idx];
                 let Some(conv) = iface.neighbors.get_mut(&peer) else {
                     debug!(src = %received.src, "ospfd: conversation packet from unknown neighbor");
                     return out;
                 };
+                let Some(area_state) = self.areas.get_mut(&area) else {
+                    return out;
+                };
+                let lsdb = &mut area_state.lsdb;
                 let mut received_lsas: Option<Vec<Lsa>> = None;
                 let (sends, report) = match &packet.body {
-                    PacketBody::DbDescription(dd) => {
-                        conv.handle_dbd(dd, peer, iface.cfg.mtu, &mut self.lsdb, now)
-                    }
-                    PacketBody::LsRequest(lsr) => conv.handle_lsr(lsr, &mut self.lsdb, now),
+                    PacketBody::DbDescription(dd) => conv.handle_dbd(dd, peer, mtu, lsdb, now),
+                    PacketBody::LsRequest(lsr) => conv.handle_lsr(lsr, lsdb, now),
                     PacketBody::LsUpdate(lsu) => {
-                        let (sends, report) =
-                            conv.handle_lsu(&lsu.lsas, &mut self.lsdb, now, syncing);
+                        let (sends, report) = conv.handle_lsu(&lsu.lsas, lsdb, now, syncing);
                         received_lsas = Some(lsu.lsas.clone());
                         (sends, report)
                     }
@@ -920,10 +1171,11 @@ impl Ospfd {
                     PacketBody::Hello(_) => unreachable!(),
                 };
                 out.extend(sends_into(iface_idx, sends));
-                // §13.4's self-originated reception, after the
-                // flooding install (see the method note).
+                // §13.4's self-originated reception + the §7/§13.1f
+                // AS-scope propagation, after the flooding install.
                 if let Some(lsas) = received_lsas {
-                    self.after_self_originated(&lsas, now, &mut out);
+                    self.after_self_originated(area, &lsas, now, &mut out);
+                    self.mirror_as_scoped(area, &lsas, now, &mut out);
                 }
                 self.after_report(iface_idx, Some(peer), &report, now);
             }
@@ -949,13 +1201,16 @@ impl Ospfd {
         report: &ConversationReport,
         now: u64,
     ) {
+        let area = self.interfaces[iface_idx].area;
         if report.adjacency_up {
             info!(
                 iface = %self.interfaces[iface_idx].name,
                 neighbor = peer.map(|p| p.to_string()).unwrap_or_default(),
                 "ospfd: adjacency FULL"
             );
-            self.router_lsa_dirty = true;
+            if let Some(a) = self.areas.get_mut(&area) {
+                a.router_lsa_dirty = true;
+            }
             // §12.4.2: the attached-router list grew — the DR's
             // network-LSA re-originates (the not-yet-warranted first
             // attempt retries here).
@@ -966,7 +1221,9 @@ impl Ospfd {
             }
         }
         if report.adjacency_down {
-            self.router_lsa_dirty = true;
+            if let Some(a) = self.areas.get_mut(&area) {
+                a.router_lsa_dirty = true;
+            }
             if !self.interfaces[iface_idx].p2p
                 && self.interfaces[iface_idx].fsm.state == crate::iface::InterfaceState::Dr
             {
@@ -975,99 +1232,299 @@ impl Ospfd {
         }
         if !report.changed.is_empty() {
             // The SPF throttle (FRR-parity 0/50/5000 ms backoff).
-            self.mark_spf_dirty(now);
+            self.mark_spf_dirty(area, now);
         }
     }
 
-    /// Fire pending SPF when the throttle window opens, diff the
-    /// route table, and emit zapi adds/deletes.
+    /// Fire the §16 routing calculation when any area's throttle
+    /// window opens, then diff the route table and emit zapi
+    /// adds/deletes. The walk is router-wide (§16's routing table is
+    /// global): any area due → recompute everything — intra-area SPF
+    /// per area (§16.1), the inter-area routes from the examined
+    /// area's summary-LSAs (§16.2), the AS external routes with the
+    /// full type-4 ASBR lookup (§16.4/§16.4.1), then the ABR's
+    /// §12.4.3 summary origination off the fresh table.
     pub fn maybe_spf(&mut self, now: u64, zapi_out: &mut Vec<ZedgeCommand>) {
-        if !self.spf_dirty || !self.spf_sched.is_due(now * 1000) {
+        let any_due = self
+            .areas
+            .values()
+            .any(|a| a.spf_dirty && a.spf_sched.is_due(now * 1000));
+        if !any_due {
             return;
         }
-        self.spf_sched.mark_run(now * 1000);
-        self.spf_dirty = false;
-        let result = spf::calculate(self.router_id, &self.lsdb);
-        let mut fresh: BTreeMap<String, RouteEntry> = BTreeMap::new();
-        for route in &result.routes {
-            let Destination::Network { addr, mask } = route.destination else {
-                continue; // Router destinations feed §16.4 below
-            };
-            let prefix = Ipv4Prefix::new(addr, mask_prefix(mask)).expect("valid mask from SPF");
-            let mut nexthops = NexthopGroup::new();
-            for nh in &route.next_hops {
-                nexthops.add(
-                    match nh.router {
-                        Some(r) => Nexthop::Ipv4(r),
-                        // p2p first hop: the adjacency's address (the
-                        // interface-form hop is not a valid gateway).
-                        None => match self.p2p_peer_address(nh.interface) {
-                            Some(peer) => Nexthop::Ipv4(peer),
-                            None => continue,
-                        },
-                    },
-                    1,
-                );
+        let area_ids: Vec<u32> = self.areas.keys().copied().collect();
+        for area in &area_ids {
+            if let Some(a) = self.areas.get_mut(area) {
+                a.spf_sched.mark_run(now * 1000);
+                a.spf_dirty = false;
             }
-            let entry = RouteEntry::new(
-                common::IpPrefix::V4(prefix),
-                RouteProtocol::Ospf,
-                nexthops,
-                route.cost,
-            );
-            fresh.insert(prefix.to_string(), entry);
         }
-        // §16.4-lite: external routes from type-5 LSAs. §16.4.1 steps
-        // 1-5, single-area form: the "distance to the ASBR" is the
-        // intra-area route to the advertising router (§16.4.1 step
-        // 5c); the type-4 summary lookup of a multi-area ASBR is
-        // §Deferred with inter-area routing.
-        let router_routes: HashMap<RouterId, &spf::Route> = result
-            .routes
-            .iter()
-            .filter_map(|r| match r.destination {
-                Destination::Router(id) => Some((id, r)),
-                _ => None,
+
+        // ---- §16.1: the intra-area paths, per attached area ----
+        // The unified routing table (§11's shape): network
+        // destinations keyed by prefix; router destinations (ABR/
+        // ASBR) keyed by Router ID, one path per area.
+        let mut ribs: BTreeMap<(u32, u32), RibPath> = BTreeMap::new();
+        let mut routers: BTreeMap<RouterId, Vec<RouterPath>> = BTreeMap::new();
+        for area in &area_ids {
+            let Some(state) = self.areas.get(area) else {
+                continue;
+            };
+            let result = spf::calculate(self.router_id, &state.lsdb);
+            for route in &result.routes {
+                match route.destination {
+                    Destination::Network { addr, mask } => {
+                        let prefix =
+                            Ipv4Prefix::new(addr, mask_prefix(mask)).expect("valid mask from SPF");
+                        let key = (u32::from(addr), u32::from(mask));
+                        let hops = dedup_hops(route.next_hops.clone());
+                        match ribs.get_mut(&key) {
+                            // §16.2 step (6) analog: the intra-area
+                            // minimum wins; equal costs merge hops.
+                            Some(existing) if existing.cost < route.cost => {}
+                            Some(existing) if existing.cost == route.cost => {
+                                existing.hops.extend(hops);
+                            }
+                            Some(existing) => {
+                                *existing = RibPath {
+                                    prefix,
+                                    inter_area: false,
+                                    area: *area,
+                                    cost: route.cost,
+                                    hops,
+                                };
+                            }
+                            None => {
+                                ribs.insert(
+                                    key,
+                                    RibPath {
+                                        prefix,
+                                        inter_area: false,
+                                        area: *area,
+                                        cost: route.cost,
+                                        hops,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Destination::Router(id) => {
+                        let flags = result
+                            .router_flags
+                            .get(&id)
+                            .copied()
+                            .unwrap_or((false, false));
+                        routers.entry(id).or_default().push(RouterPath {
+                            area: *area,
+                            inter_area: false,
+                            cost: route.cost,
+                            hops: dedup_hops(route.next_hops.clone()),
+                            b_bit: flags.0,
+                            e_bit: flags.1,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ---- §16.2: the inter-area routes from summary-LSAs ----
+        // "If the router has active attachments to multiple areas,
+        // only backbone summary-LSAs are examined. Routers attached
+        // to a single area examine that area's summary-LSAs."
+        let summary_area = if self.areas.len() > 1 {
+            if self.areas.contains_key(&0) {
+                0
+            } else {
+                return;
+            }
+        } else {
+            area_ids[0]
+        };
+        let summaries: Vec<Lsa> = self
+            .areas
+            .get(&summary_area)
+            .map(|a| {
+                a.lsdb
+                    .all()
+                    .filter(|e| {
+                        matches!(
+                            e.lsa.header.ls_type,
+                            LsaType::SUMMARY_NETWORK | LsaType::SUMMARY_ASBR
+                        )
+                    })
+                    .map(|e| e.lsa.clone())
+                    .collect()
             })
-            .collect();
-        for entry in self.lsdb.all() {
-            if entry.lsa.header.ls_type != LsaType::AS_EXTERNAL
-                || entry.lsa.header.is_max_age()
-                || entry.lsa.header.adv_router == self.router_id
-            {
+            .unwrap_or_default();
+        for lsa in &summaries {
+            // (1) LSInfinity or MaxAge: examine the next LSA.
+            let crate::lsa::LsaBody::Summary(body) = &lsa.body else {
+                continue;
+            };
+            if body.metric >= crate::LS_INFINITY || lsa.header.is_max_age() {
                 continue;
             }
-            let crate::lsa::LsaBody::AsExternal(ext) = &entry.lsa.body else {
+            // (2) Self-originated: examine the next LSA.
+            if lsa.header.adv_router == self.router_id {
+                continue;
+            }
+            // (3) The own-range check needs configured area ranges —
+            // v1 has none (disclosed); every summary is examined.
+            // (4) BR must be reachable in the examined area.
+            let Some(br) = routers.get(&lsa.header.adv_router).and_then(|paths| {
+                paths
+                    .iter()
+                    .find(|p| p.area == summary_area && !p.inter_area)
+            }) else {
                 continue;
             };
-            let Some(asbr_route) = router_routes.get(&entry.lsa.header.adv_router) else {
-                continue; // ASBR unreachable — §16.4.1 step 5
+            let (br_cost, br_hops) = (br.cost, br.hops.clone());
+            let iac = br_cost.saturating_add(body.metric);
+            match lsa.header.ls_type {
+                LsaType::SUMMARY_NETWORK => {
+                    // (4): N's address = Link State ID masked by the
+                    // body's mask.
+                    let addr = Ipv4Addr::from(lsa.header.link_state_id.0 & u32::from(body.mask));
+                    let key = (u32::from(addr), u32::from(body.mask));
+                    let prefix =
+                        Ipv4Prefix::new(addr, mask_prefix(body.mask)).expect("summary mask");
+                    match ribs.get_mut(&key) {
+                        // (5) no entry: install.
+                        None => {
+                            ribs.insert(
+                                key,
+                                RibPath {
+                                    prefix,
+                                    inter_area: true,
+                                    area: summary_area,
+                                    cost: iac,
+                                    hops: br_hops.clone(),
+                                },
+                            );
+                        }
+                        // (6) intra-area paths present: do nothing.
+                        Some(existing) if !existing.inter_area => {}
+                        // (7) inter-area: cheaper overrides, equal merges.
+                        Some(existing) if existing.cost < iac => {}
+                        Some(existing) if existing.cost == iac => {
+                            existing.hops.extend(br_hops.iter().copied());
+                        }
+                        Some(existing) => {
+                            *existing = RibPath {
+                                prefix,
+                                inter_area: true,
+                                area: summary_area,
+                                cost: iac,
+                                hops: br_hops.clone(),
+                            };
+                        }
+                    }
+                }
+                LsaType::SUMMARY_ASBR => {
+                    // (5) the router form: install an inter-area path
+                    // for the ASBR unless an intra-area path exists
+                    // (6) or a cheaper inter-area one does (7).
+                    let id = RouterId(lsa.header.link_state_id.0);
+                    let paths = routers.entry(id).or_default();
+                    if paths.iter().any(|p| !p.inter_area) {
+                        continue; // (6)
+                    }
+                    match paths
+                        .iter_mut()
+                        .find(|p| p.inter_area && p.area == summary_area)
+                    {
+                        Some(p) if p.cost < iac => {}
+                        Some(p) if p.cost == iac => p.hops.extend(br_hops.iter().copied()),
+                        Some(p) => {
+                            *p = RouterPath {
+                                area: summary_area,
+                                inter_area: true,
+                                cost: iac,
+                                hops: br_hops.clone(),
+                                b_bit: false,
+                                e_bit: true,
+                            }
+                        }
+                        None => paths.push(RouterPath {
+                            area: summary_area,
+                            inter_area: true,
+                            cost: iac,
+                            hops: br_hops,
+                            b_bit: false,
+                            e_bit: true,
+                        }),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ---- §16.4: the AS external routes ----
+        // Externals are AS-scoped (mirrored into every area's
+        // database); the examined area's copy is authoritative.
+        let mut fresh: BTreeMap<String, RouteEntry> = BTreeMap::new();
+        let external_lsas: Vec<Lsa> = self
+            .areas
+            .get(&summary_area)
+            .map(|a| {
+                a.lsdb
+                    .all()
+                    .filter(|e| e.lsa.header.ls_type == LsaType::AS_EXTERNAL)
+                    .map(|e| e.lsa.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for entry in &external_lsas {
+            // (1) LSInfinity/MaxAge, (2) self-originated.
+            if entry.header.is_max_age() {
+                continue;
+            }
+            if entry.header.adv_router == self.router_id {
+                continue;
+            }
+            let crate::lsa::LsaBody::AsExternal(ext) = &entry.body else {
+                continue;
             };
+            if ext.metric >= crate::LS_INFINITY {
+                continue;
+            }
+            // (3) the preferred ASBR path (§16.4.1, RFC1583Compatibility
+            // disabled — FRR 10.2.2's default): intra-area non-backbone
+            // paths first, then intra-backbone and inter-area as
+            // equals; least cost, largest area ID breaking ties.
+            let Some(asbr_path) = routers
+                .get(&entry.header.adv_router)
+                .and_then(|paths| preferred_asbr_path(paths))
+            else {
+                continue; // ASBR unreachable
+            };
+            // The forwarding address (§16.4 step 3b).
+            let (x, hops) = if ext.forwarding_address != Ipv4Addr::UNSPECIFIED {
+                let fa = ext.forwarding_address;
+                let Some(fa_path) = ribs.values().find(|r| r.prefix.contains(fa)) else {
+                    continue; // FA must have an intra/inter-area path
+                };
+                (fa_path.cost, fa_path.hops.clone())
+            } else {
+                (asbr_path.cost, asbr_path.hops.clone())
+            };
+            // (4)/(5): X (the intra-AS distance) + Y (the LSA metric).
             let cost = if ext.e_bit {
                 ext.metric.min(crate::LS_INFINITY)
             } else {
-                asbr_route.cost.saturating_add(ext.metric)
+                x.saturating_add(ext.metric)
             };
             let prefix = Ipv4Prefix::new(
-                entry.lsa.header.link_state_id.to_ipv4(),
+                entry.header.link_state_id.to_ipv4(),
                 u32::from(ext.mask).count_ones() as u8,
             )
             .expect("external mask");
-            let hops: Vec<Nexthop> = if ext.forwarding_address != Ipv4Addr::UNSPECIFIED {
-                vec![Nexthop::Ipv4(ext.forwarding_address)]
-            } else {
-                asbr_route
-                    .next_hops
-                    .iter()
-                    .filter_map(|nh| match nh.router {
-                        Some(r) => Some(Nexthop::Ipv4(r)),
-                        None => self.p2p_peer_address(nh.interface).map(Nexthop::Ipv4),
-                    })
-                    .collect()
-            };
             let mut group = NexthopGroup::new();
-            for hop in hops {
+            for hop in decorate_hops(self, &hops) {
                 group.add(hop, 1);
+            }
+            if group.is_empty() {
+                continue;
             }
             let entry_out = RouteEntry::new(
                 common::IpPrefix::V4(prefix),
@@ -1077,7 +1534,29 @@ impl Ospfd {
             );
             fresh.insert(prefix.to_string(), entry_out);
         }
-        // Diff against the installed table.
+
+        // ---- the intra/inter-area export ----
+        for path in ribs.values() {
+            let mut group = NexthopGroup::new();
+            for hop in decorate_hops(self, &path.hops) {
+                group.add(hop, 1);
+            }
+            if group.is_empty() {
+                continue;
+            }
+            let entry = RouteEntry::new(
+                common::IpPrefix::V4(path.prefix),
+                RouteProtocol::Ospf,
+                group,
+                path.cost,
+            );
+            fresh.insert(path.prefix.to_string(), entry);
+        }
+
+        // ---- §12.4.3: the ABR's summary-LSA origination ----
+        self.originate_summaries(&ribs, &routers, now, zapi_out);
+
+        // ---- the export diff ----
         let old_keys: Vec<String> = self.routes.keys().cloned().collect();
         for key in old_keys {
             if !fresh.contains_key(&key) {
@@ -1103,15 +1582,217 @@ impl Ospfd {
         }
     }
 
+    /// §12.4.3's ABR duties, run off the fresh routing table: for
+    /// every attached area A, originate type-3 summaries for the
+    /// inter-area-eligible networks and type-4s for the preferred
+    /// ASBR paths, and flush the summaries no longer justified.
+    /// v1 scope (disclosed): no configured address ranges — the
+    /// §12.4.3 default (one type-3 per network) applies; the
+    /// coalescing/aggregation rules land with `area range` config.
+    fn originate_summaries(
+        &mut self,
+        ribs: &BTreeMap<(u32, u32), RibPath>,
+        routers: &BTreeMap<RouterId, Vec<RouterPath>>,
+        now: u64,
+        _zapi_out: &mut Vec<ZedgeCommand>,
+    ) {
+        if !self.is_abr() {
+            // Not an ABR: flush anything we may still hold (a lost
+            // area), then done.
+            let stale: Vec<(u32, LsaKey)> = self.summaries.keys().copied().collect();
+            self.flush_summaries(&stale, now);
+            return;
+        }
+        // The desired set: (area, key) -> metric.
+        let mut desired: BTreeMap<(u32, LsaKey), u32> = BTreeMap::new();
+        let area_ids: Vec<u32> = self.areas.keys().copied().collect();
+        for area_a in &area_ids {
+            for path in ribs.values() {
+                // §12.4.3's gating, in the RFC's order:
+                // - Destination Type network (yes — ribs holds
+                //   networks; externals never reach here).
+                // - "the area associated with this set of paths is
+                //   the Area A itself": skip.
+                if path.area == *area_a {
+                    continue;
+                }
+                // - "the next hops ... belong to Area A itself"
+                //   (split horizon): skip.
+                if self.hops_in_area(&path.hops) == Some(*area_a) {
+                    continue;
+                }
+                // - "routing table cost equals or exceeds
+                //   LSInfinity": skip.
+                if path.cost >= crate::LS_INFINITY {
+                    continue;
+                }
+                // - Inter-area routes: advertised into the OTHER
+                //   areas only ("only intra-area routes are
+                //   advertised into the backbone").
+                if path.inter_area && *area_a == 0 {
+                    continue;
+                }
+                let key = LsaKey {
+                    ls_type: LsaType::SUMMARY_NETWORK,
+                    link_state_id: crate::lsa::LinkStateId(u32::from(path.prefix.addr())),
+                    adv_router: self.router_id,
+                };
+                desired.insert((*area_a, key), path.cost);
+            }
+            // Type-4: the ASBR-summary (ASBR destinations only —
+            // ABR destinations are skipped per §12.4.3's first
+            // bullet).
+            for (rid, paths) in routers {
+                let Some(preferred) = preferred_asbr_path(paths) else {
+                    continue;
+                };
+                // §12.4.3's first bullet: ABR destinations are
+                // skipped — only AS boundary routers get type-4s.
+                if !preferred.e_bit || preferred.b_bit {
+                    continue;
+                }
+                if preferred.area == *area_a {
+                    continue;
+                }
+                if self.hops_in_area(&preferred.hops) == Some(*area_a) {
+                    continue;
+                }
+                if preferred.cost >= crate::LS_INFINITY {
+                    continue;
+                }
+                let key = LsaKey {
+                    ls_type: LsaType::SUMMARY_ASBR,
+                    link_state_id: crate::lsa::LinkStateId(rid.0),
+                    adv_router: self.router_id,
+                };
+                desired.insert((*area_a, key), preferred.cost);
+            }
+        }
+        // Originate the new/changed; flush the stale.
+        let mut wire_out = Vec::new();
+        let current: Vec<((u32, LsaKey), u32)> = self
+            .summaries
+            .iter()
+            .map(|(k, ())| {
+                let metric = self
+                    .areas
+                    .get(&k.0)
+                    .and_then(|a| a.lsdb.get(&k.1))
+                    .and_then(|e| match &e.lsa.body {
+                        crate::lsa::LsaBody::Summary(s) => Some(s.metric),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                (*k, metric)
+            })
+            .collect();
+        for ((area, key), metric) in current {
+            match desired.get(&(area, key)) {
+                Some(&want) if want == metric => {} // unchanged
+                Some(_) => {
+                    // cost changed: re-originate below (flush first
+                    // through the premature-age + new instance).
+                    self.summaries.remove(&(area, key));
+                }
+                None => {
+                    self.summaries.remove(&(area, key));
+                }
+            }
+        }
+        for ((area, key), metric) in &desired {
+            if self.summaries.contains_key(&(*area, *key)) {
+                continue;
+            }
+            // Type 3: the network's mask comes from the RIB path
+            // (the prefix's own length); type 4 carries mask 0
+            // (§A.4.4) and names the ASBR by its Router ID.
+            let type4 = key.ls_type == LsaType::SUMMARY_ASBR;
+            let mask = if type4 {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                match ribs
+                    .values()
+                    .find(|r| u32::from(r.prefix.addr()) == key.link_state_id.0)
+                    .map(|r| r.prefix)
+                {
+                    Some(prefix) => Ipv4Addr::from(u32::MAX << (32 - prefix.prefix_len())),
+                    None => continue,
+                }
+            };
+            let lsa = crate::origination::build_summary_lsa(
+                self.router_id,
+                type4,
+                Ipv4Addr::from(key.link_state_id.0),
+                mask,
+                *metric,
+            );
+            let Some(state) = self.areas.get_mut(area) else {
+                continue;
+            };
+            match state.lsdb.originate(lsa, now) {
+                Ok(_) => {
+                    self.summaries.insert((*area, *key), ());
+                    let stored = state.lsdb.get(key).map(|e| e.lsa.clone());
+                    let _ = state;
+                    if let Some(stored) = stored {
+                        info!(area, key = ?key, "ospfd: summary-LSA originated (§12.4.3)");
+                        self.flood_own(&stored, Some(*area), now, &mut wire_out);
+                        self.mark_spf_dirty(*area, now);
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "ospfd: summary origination deferred");
+                }
+            }
+        }
+        // Flush the withdrawn summaries.
+        let stale: Vec<(u32, LsaKey)> = self
+            .summaries
+            .keys()
+            .filter(|k| !desired.contains_key(k))
+            .copied()
+            .collect();
+        self.flush_summaries(&stale, now);
+    }
+
+    /// §12.4.3's withdrawal: "If a router advertises a summary-LSA
+    /// for a destination which then becomes unreachable ... the LSA
+    /// should also be flushed" — premature age (§14.1) + reflood.
+    fn flush_summaries(&mut self, stale: &[(u32, LsaKey)], now: u64) {
+        let mut wire_out = Vec::new();
+        for (area, key) in stale {
+            self.summaries.remove(&(*area, *key));
+            let aged = self
+                .areas
+                .get_mut(area)
+                .and_then(|a| a.lsdb.premature_age(key));
+            if let Some(maxage) = aged {
+                info!(area, key = ?key, "ospfd: summary-LSA flushed (§12.4.3)");
+                self.flood_own(&maxage, Some(*area), now, &mut wire_out);
+                self.mark_spf_dirty(*area, now);
+            }
+        }
+    }
+
+    /// The area an interface address belongs to (the next hops'
+    /// associated area, §12.4.3's split-horizon input).
+    fn hops_in_area(&self, hops: &[spf::NextHop]) -> Option<u32> {
+        let first = hops.first()?;
+        self.interfaces
+            .iter()
+            .find(|i| i.addr == first.interface)
+            .map(|i| i.area)
+    }
+
     /// The 1-second tick: hellos, the WaitTimer, neighbor timers,
     /// aging, deferred originations, SPF.
     pub fn tick(&mut self, now: u64, out: &mut Vec<WireOut>, zapi_out: &mut Vec<ZedgeCommand>) {
         // §C.3 Hellos.
-        let (router_id, area_id) = (self.router_id, self.area_id);
+        let router_id = self.router_id;
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
             if now >= iface.hello_deadline {
                 iface.hello_deadline = now + iface.cfg.hello_interval as u64;
-                let packet = Self::hello_now(router_id, area_id, iface);
+                let packet = make_hello(router_id, iface.area, iface);
                 out.push(WireOut {
                     iface: idx,
                     to: WireTo::Multicast,
@@ -1152,9 +1833,12 @@ impl Ospfd {
             }
         }
         if !down_events.is_empty() {
-            self.router_lsa_dirty = true;
             for (idx, key) in &down_events {
                 info!(neighbor = %key, "ospfd: neighbor timed out (Inactivity Timer)");
+                let area = self.interfaces[*idx].area;
+                if let Some(a) = self.areas.get_mut(&area) {
+                    a.router_lsa_dirty = true;
+                }
                 // §9.2's second NeighborChange cause: a neighbor left
                 // the bidirectional set — re-elect on broadcast, and
                 // the network-LSA's attached list lost a router.
@@ -1164,51 +1848,83 @@ impl Ospfd {
                 }
             }
         }
-        // §14 aging.
-        let report = self.lsdb.tick_aging(now);
-        for key in report.refresh_due {
-            let _ = key;
-            self.router_lsa_dirty = true;
-            // §12.4.2 refresh: the network-LSA rides the same
-            // refresh cadence.
-            let matches: Vec<usize> = self
-                .network_lsas
-                .iter()
-                .filter(|(_, v)| **v == key)
-                .map(|(idx, _)| *idx)
-                .collect();
-            for idx in matches {
-                self.network_lsa_dirty.push(idx);
-            }
-        }
-        if !report.max_age.is_empty() {
-            // §14: reflood the MaxAge instances (the flush); removal
-            // follows flush_ready below once acked.
-            let lsas: Vec<Lsa> = report
-                .max_age
-                .iter()
-                .filter_map(|k| self.lsdb.get(k).map(|e| e.lsa.clone()))
-                .collect();
-            if !lsas.is_empty() {
-                let packet = self.packet(PacketBody::LsUpdate(LsUpdate { lsas }));
-                for idx in 0..self.interfaces.len() {
-                    out.push(WireOut {
-                        iface: idx,
-                        to: WireTo::Multicast,
-                        packet: packet.clone(),
-                    });
+        // §14 aging, per area. MaxAge instances reflood with the
+        // area's own packet header on each interface. The syncing
+        // fact is evaluated once per tick (no adjacency state changes
+        // inside this pass).
+        let syncing = self.any_syncing();
+        let area_ids: Vec<u32> = self.areas.keys().copied().collect();
+        for area in area_ids {
+            let Some(state) = self.areas.get_mut(&area) else {
+                continue;
+            };
+            let report = state.lsdb.tick_aging(now);
+            for key in report.refresh_due {
+                let _ = key;
+                state.router_lsa_dirty = true;
+                // §12.4.2 refresh: the network-LSA rides the same
+                // refresh cadence.
+                let matches: Vec<usize> = self
+                    .network_lsas
+                    .iter()
+                    .filter(|(_, v)| **v == key)
+                    .map(|(idx, _)| *idx)
+                    .collect();
+                for idx in matches {
+                    self.network_lsa_dirty.push(idx);
                 }
             }
-        }
-        for key in self.lsdb.flush_ready(self.any_syncing()) {
-            if let Some(removed) = self.lsdb.remove(&key) {
-                debug!(key = ?key, len = removed.header.length, "ospfd: LSA flushed (MaxAge)");
-                self.mark_spf_dirty(now);
+            if !report.max_age.is_empty() {
+                // §14: reflood the MaxAge instances (the flush);
+                // removal follows flush_ready below once acked.
+                let lsas: Vec<Lsa> = report
+                    .max_age
+                    .iter()
+                    .filter_map(|k| state.lsdb.get(k).map(|e| e.lsa.clone()))
+                    .collect();
+                if !lsas.is_empty() {
+                    let packet = make_packet(
+                        self.router_id,
+                        area,
+                        PacketBody::LsUpdate(LsUpdate { lsas }),
+                    );
+                    for idx in 0..self.interfaces.len() {
+                        if self.interfaces[idx].area != area {
+                            continue;
+                        }
+                        out.push(WireOut {
+                            iface: idx,
+                            to: WireTo::Multicast,
+                            packet: packet.clone(),
+                        });
+                    }
+                }
+            }
+            let flushable = state.lsdb.flush_ready(syncing);
+            let mut spf_needed = false;
+            for key in flushable {
+                if state.lsdb.remove(&key).is_some() {
+                    debug!(key = ?key, "ospfd: LSA flushed (MaxAge)");
+                    spf_needed = true;
+                    // A withdrawn summary changes the inter-area
+                    // table.
+                    self.summaries.remove(&(area, key));
+                }
+            }
+            if spf_needed {
+                self.mark_spf_dirty(area, now);
             }
         }
-        // Deferred originations (MinLSInterval retries).
-        if self.router_lsa_dirty {
-            self.originate_router_lsa(now, out);
+        // Deferred originations (MinLSInterval retries): every
+        // area's router-LSA, the pending network-LSAs.
+        let dirty_areas: Vec<u32> = self
+            .areas
+            .iter()
+            .filter(|(_, a)| a.router_lsa_dirty)
+            .map(|(id, _)| *id)
+            .collect();
+        for area in dirty_areas {
+            self.originate_router_lsa(area, now, out);
         }
         let dirty_networks: Vec<usize> = std::mem::take(&mut self.network_lsa_dirty);
         for idx in dirty_networks {
@@ -1492,6 +2208,17 @@ mod tests {
     use crate::packet::PacketBody;
     use std::net::Ipv4Addr;
 
+    /// Single-area convenience: the (first) area's LSDB.
+    fn lsdb_of(core: &Ospfd) -> &Lsdb {
+        &core.areas.values().next().unwrap().lsdb
+    }
+
+    fn mark_router_lsa_dirty(core: &mut Ospfd) {
+        for a in core.areas.values_mut() {
+            a.router_lsa_dirty = true;
+        }
+    }
+
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
     }
@@ -1635,7 +2362,7 @@ mod tests {
                 link_state_id: crate::lsa::LinkStateId(ip(other).into()),
                 adv_router: RouterId::from_ipv4(ip(other)),
             };
-            assert!(me.lsdb.contains(&key), "{other}'s router-LSA installed");
+            assert!(lsdb_of(me).contains(&key), "{other}'s router-LSA installed");
         }
 
         // Route export: the walk's ticks ran SPF through its
@@ -1680,7 +2407,7 @@ mod tests {
             "the external LSA flooded to the Full neighbor"
         );
         // A is now an ASBR (the router-LSA E-bit): re-originate.
-        a.router_lsa_dirty = true;
+        mark_router_lsa_dirty(&mut a);
         let mut out2 = Vec::new();
         a.tick(now + 11, &mut out2, &mut Vec::new());
         let mut staged: Vec<(bool, Vec<WireOut>)> = vec![(true, out)];
@@ -1814,7 +2541,7 @@ mod tests {
             link_state_id: crate::lsa::LinkStateId(ip("10.255.1.1").into()),
             adv_router: RouterId::from_ipv4(ip("10.255.1.1")),
         };
-        let pre_restart = b.lsdb.get(&key).unwrap().lsa.clone();
+        let pre_restart = lsdb_of(&b).get(&key).unwrap().lsa.clone();
         let seq = pre_restart.header.seq;
         assert!(
             seq > crate::lsa::INITIAL_SEQUENCE_NUMBER,
@@ -1829,7 +2556,7 @@ mod tests {
         let mut oa = Vec::new();
         a2.tick(now, &mut oa, &mut zap);
         assert_eq!(
-            a2.lsdb.get(&key).unwrap().lsa.header.seq,
+            lsdb_of(&a2).get(&key).unwrap().lsa.header.seq,
             crate::lsa::INITIAL_SEQUENCE_NUMBER
         );
         // The re-established adjacency delivers B's copy through the
@@ -1841,10 +2568,10 @@ mod tests {
         // first, hence the quiet ticks) consumed it — the stored
         // instance carries S+1 (asserted below, after the drain).
         assert!(
-            a2.lsdb.next_seq_for(&key).unwrap() > seq as i32,
+            lsdb_of(&a2).next_seq_for(&key).unwrap() > seq as i32,
             "tracking advanced past the received instance"
         );
-        let mut a2_seq = a2.lsdb.get(&key).unwrap().lsa.header.seq;
+        let mut a2_seq = lsdb_of(&a2).get(&key).unwrap().lsa.header.seq;
         let mut settled = now2;
         for _ in 0..12 {
             if a2_seq == seq + 1 {
@@ -1865,15 +2592,15 @@ mod tests {
                     let _ = pump(&mut a2, &mut b, replies, settled);
                 }
             }
-            a2_seq = a2.lsdb.get(&key).unwrap().lsa.header.seq;
+            a2_seq = lsdb_of(&a2).get(&key).unwrap().lsa.header.seq;
         }
         assert_eq!(
-            a2.lsdb.get(&key).unwrap().lsa.header.seq,
+            lsdb_of(&a2).get(&key).unwrap().lsa.header.seq,
             seq + 1,
             "the re-originated instance is one past the adopted one (§13.4)"
         );
         // B accepted it (§13.1: S+1 beats S).
-        assert_eq!(b.lsdb.get(&key).unwrap().lsa.header.seq, seq + 1);
+        assert_eq!(lsdb_of(&b).get(&key).unwrap().lsa.header.seq, seq + 1);
     }
 
     #[test]
@@ -1902,9 +2629,12 @@ mod tests {
         // The packet must carry B's Router ID (A drops packets it
         // originates, §A.3.1's self-check).
         let payload = b
-            .packet(PacketBody::LsUpdate(LsUpdate {
-                lsas: vec![foreign.clone()],
-            }))
+            .packet(
+                b.area_id(),
+                PacketBody::LsUpdate(LsUpdate {
+                    lsas: vec![foreign.clone()],
+                }),
+            )
             .encode();
         let out = a.on_packet(
             0,
@@ -1921,7 +2651,7 @@ mod tests {
                 .any(|w| matches!(w.packet.body, PacketBody::LsUpdate(_))),
             "the MaxAge instance is reflooded (§14.1)"
         );
-        let stored = a.lsdb.get(&key).unwrap();
+        let stored = lsdb_of(&a).get(&key).unwrap();
         assert!(stored.lsa.header.is_max_age(), "flushed, not adopted");
         // The re-adoption did NOT advance any tracking (no want).
         assert!(!a.externals.values().any(|k| *k == key));
@@ -2000,10 +2730,12 @@ mod tests {
                         h = h.wrapping_mul(31).wrapping_add(c.state() as u64);
                     }
                 }
-                for entry in core.lsdb.all() {
-                    // Ages advance every second (§14 steady state) —
-                    // seq alone captures instance churn.
-                    h = h.wrapping_mul(31).wrapping_add(entry.lsa.header.seq as u64);
+                for state in core.areas.values() {
+                    for entry in state.lsdb.all() {
+                        // Ages advance every second (§14 steady
+                        // state) — seq alone captures instance churn.
+                        h = h.wrapping_mul(31).wrapping_add(entry.lsa.header.seq as u64);
+                    }
                 }
                 h = h.wrapping_mul(31).wrapping_add(core.routes.len() as u64);
             }
@@ -2127,8 +2859,7 @@ mod tests {
             adv_router: cores[a].router_id,
         };
         for (i, core) in cores.iter().enumerate() {
-            let entry = core
-                .lsdb
+            let entry = lsdb_of(core)
                 .get(&net_key)
                 .unwrap_or_else(|| panic!("core {i} holds the DR's network-LSA"));
             let crate::lsa::LsaBody::Network(body) = &entry.lsa.body else {
@@ -2150,7 +2881,7 @@ mod tests {
                 link_state_id: crate::lsa::LinkStateId(core.router_id.0),
                 adv_router: core.router_id,
             };
-            let entry = core.lsdb.get(&key).unwrap();
+            let entry = lsdb_of(core).get(&key).unwrap();
             let crate::lsa::LsaBody::Router(body) = &entry.lsa.body else {
                 panic!()
             };
@@ -2170,6 +2901,459 @@ mod tests {
             d_routes.iter().any(|r| r == "10.78.0.0/24"),
             "D routes the transit network: {d_routes:?}"
         );
+    }
+
+    // ---- inter-area (§16.2/§16.4/§12.4.3) ----------------------------
+
+    /// An ABR core: eth0 in area 0 (to the area-0 peer), eth1 in
+    /// area 1 (to the area-1 peer), p2p both.
+    fn abr_core() -> Ospfd {
+        let text = concat!(
+            "router ospf\n",
+            " router-id 10.255.2.1\n",
+            " area 0.0.0.0\n",
+            "  interface eth0\n",
+            "   address 10.10.0.1/30\n",
+            "   network-type point-to-point\n",
+            "   hello-interval 1\n",
+            "   dead-interval 4\n",
+            " area 0.0.0.1\n",
+            "  interface eth1\n",
+            "   address 10.20.0.1/30\n",
+            "   network-type point-to-point\n",
+            "   hello-interval 1\n",
+            "   dead-interval 4\n",
+            " redistribute static\n",
+        );
+        Ospfd::new(&parse_config(text).unwrap()).unwrap()
+    }
+
+    fn area0_core() -> Ospfd {
+        let text = "router ospf\n router-id 10.255.1.1\n area 0.0.0.0\n  interface eth0\n   address 10.10.0.2/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n";
+        Ospfd::new(&parse_config(text).unwrap()).unwrap()
+    }
+
+    fn area1_core(redistribute: bool) -> Ospfd {
+        let text = format!(
+            "router ospf\n router-id 10.255.3.1\n area 0.0.0.1\n  interface eth1\n   address 10.20.0.2/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n{}",
+            if redistribute { " redistribute static\n" } else { "" }
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// The multi-interface deliver: the source address is the SENDING
+    /// interface's (WireOut.iface), the area check keeps foreign-area
+    /// packets out (B and C share the wire but not an area).
+    fn deliver_multi(
+        cores: &mut [Ospfd],
+        from: usize,
+        outs: &[WireOut],
+        now: u64,
+        queue: &mut Vec<(usize, Vec<WireOut>)>,
+    ) {
+        for w in outs {
+            let src = cores[from].interfaces[w.iface].addr;
+            let payload = w.packet.encode();
+            let pkt_area = w.packet.header.area_id;
+            let dst = match w.to {
+                WireTo::Unicast(d) => Some(d),
+                _ => None,
+            };
+            for (i, core) in cores.iter_mut().enumerate() {
+                if i == from {
+                    continue;
+                }
+                // The run loop's on-link demux, area-aware: process
+                // on the receiver's interface in the packet's area
+                // (a unicast must also match the addressed interface).
+                let Some(rx) = core.interfaces.iter().position(|x| x.area == pkt_area) else {
+                    continue;
+                };
+                if let Some(d) = dst {
+                    if core.interfaces[rx].addr != d {
+                        continue;
+                    }
+                }
+                let replies = core.on_packet(
+                    rx,
+                    &crate::transport::Received {
+                        src,
+                        dst: crate::packet::ALL_SPF_ROUTERS,
+                        payload: payload.clone(),
+                    },
+                    now,
+                );
+                if !replies.is_empty() {
+                    queue.push((i, replies));
+                }
+            }
+        }
+    }
+
+    /// Run a multi-interface mesh to state-stability (the run_mesh
+    /// digest, generalized).
+    fn run_multi(cores: &mut [Ospfd], start: u64, stable_for: u64) -> u64 {
+        let mut now = start;
+        let mut queue: Vec<(usize, Vec<WireOut>)> = Vec::new();
+        let mut zap: Vec<crate::zedge::ZedgeCommand> = Vec::new();
+        let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+        for i in 0..cores.len() {
+            cores[i].tick(now, &mut outs[i], &mut zap);
+        }
+
+        for (i, o) in outs.iter().enumerate() {
+            deliver_multi(cores, i, o, now, &mut queue);
+        }
+        let digest = |cores: &[Ospfd]| -> u64 {
+            let mut h: u64 = 0x9e37_79b9;
+            for core in cores {
+                for iface in &core.interfaces {
+                    for (rid, c) in &iface.neighbors {
+                        h = h.wrapping_mul(31).wrapping_add(rid.0 as u64);
+                        h = h.wrapping_mul(31).wrapping_add(c.state() as u64);
+                    }
+                }
+                for state in core.areas.values() {
+                    for entry in state.lsdb.all() {
+                        h = h.wrapping_mul(31).wrapping_add(entry.lsa.header.seq as u64);
+                    }
+                    h = h.wrapping_mul(31).wrapping_add(state.lsdb.len() as u64);
+                }
+                h = h.wrapping_mul(31).wrapping_add(core.routes.len() as u64);
+                h = h.wrapping_mul(31).wrapping_add(core.summaries.len() as u64);
+            }
+            h
+        };
+        let mut last = digest(cores);
+        let mut quiet = 0u64;
+        for _ in 0..600 {
+            while !queue.is_empty() {
+                let batch = std::mem::take(&mut queue);
+                for (from, outs) in batch {
+                    deliver_multi(cores, from, &outs, now, &mut queue);
+                }
+            }
+            let d = digest(cores);
+            if d == last {
+                quiet += 1;
+                if quiet >= stable_for {
+                    return now;
+                }
+            } else {
+                if now > 30 && now < 42 {
+                    for (i, core) in cores.iter().enumerate() {
+                        for (area, state) in &core.areas {
+                            for e in state.lsdb.all() {
+                                eprintln!(
+                                    "t={now} core {i} area {area} {:?} id={:08x} adv={:08x} seq={:08x} age={}",
+                                    e.lsa.header.ls_type,
+                                    e.lsa.header.link_state_id.0,
+                                    e.lsa.header.adv_router.0,
+                                    e.lsa.header.seq,
+                                    e.lsa.header.ls_age,
+                                );
+                            }
+                        }
+                    }
+                }
+                quiet = 0;
+                last = d;
+            }
+            now += 1;
+            let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+            for i in 0..cores.len() {
+                cores[i].tick(now, &mut outs[i], &mut zap);
+            }
+            for (i, o) in outs.iter().enumerate() {
+                deliver_multi(cores, i, o, now, &mut queue);
+            }
+        }
+        panic!("inter-area mesh never settled");
+    }
+
+    /// §16.2 step (6): intra-area paths are always preferred over
+    /// the summary-LSA form — a type-3 for a destination the area
+    /// already routes internally changes nothing.
+    #[test]
+    fn intra_area_beats_the_summary_lsa() {
+        let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+        let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+        let now = run_to_full(&mut a, &mut b, 0);
+        // Inject a foreign type-3 into A's area-0 database for the
+        // SAME prefix B's stub already provides (10.77.0.0/30, intra
+        // cost 10), advertised by B at a LOWER metric (3): the
+        // intra-area path must still win (§16.2 step 6).
+        let forged = crate::origination::build_summary_lsa(
+            b.router_id,
+            false,
+            ip("10.77.0.0"),
+            ip("255.255.255.252"),
+            3,
+        )
+        .with_computed_header();
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        // Install via the flooding path (as if received).
+        let payload = b
+            .packet(
+                b.area_id(),
+                PacketBody::LsUpdate(LsUpdate { lsas: vec![forged] }),
+            )
+            .encode();
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 1,
+        );
+        // Let the SPF throttle open.
+        a.tick(now + 3, &mut out, &mut zap);
+        let route = a.routes.get("10.77.0.0/30").expect("the route exists");
+        assert_eq!(
+            route.metric, 10,
+            "the intra-area path (cost 10) wins over the cheaper summary (§16.2 step 6)"
+        );
+    }
+
+    /// §16.4 step (1): a type-5 whose metric is LSInfinity
+    /// describes no usable path — no route is installed.
+    #[test]
+    fn ls_infinity_external_installs_no_route() {
+        let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+        let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+        let now = run_to_full(&mut a, &mut b, 0);
+        let lsa = crate::origination::build_external_lsa(
+            b.router_id,
+            ip("203.0.113.0"),
+            ip("255.255.255.0"),
+            crate::LS_INFINITY,
+            true,
+        )
+        .with_computed_header();
+        let payload = b
+            .packet(
+                b.area_id(),
+                PacketBody::LsUpdate(LsUpdate { lsas: vec![lsa] }),
+            )
+            .encode();
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 1,
+        );
+        a.tick(now + 3, &mut out, &mut zap);
+        assert!(
+            !a.routes.contains_key("203.0.113.0/24"),
+            "LSInfinity externals install no route (§16.4 step 1)"
+        );
+    }
+
+    /// §16.4 step 3b: a type-5 with a non-zero forwarding address
+    /// resolves through the routing table's path to the FA, not the
+    /// ASBR.
+    #[test]
+    fn external_forwarding_address_resolves_via_the_fa_path() {
+        let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+        let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+        let now = run_to_full(&mut a, &mut b, 0);
+        // A type-5 from B (the ASBR) with FA = B's own address: the
+        // FA falls inside the on-link stub 10.77.0.0/30 — the FA
+        // path (cost 10) supplies the next hop.
+        let mut lsa = crate::origination::build_external_lsa(
+            b.router_id,
+            ip("203.0.113.0"),
+            ip("255.255.255.0"),
+            50,
+            true,
+        )
+        .with_computed_header();
+        if let crate::lsa::LsaBody::AsExternal(ext) = &mut lsa.body {
+            ext.forwarding_address = b.interfaces[0].addr;
+        }
+        let lsa = lsa.with_computed_header();
+        let payload = b
+            .packet(
+                b.area_id(),
+                PacketBody::LsUpdate(LsUpdate { lsas: vec![lsa] }),
+            )
+            .encode();
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 1,
+        );
+        a.tick(now + 3, &mut out, &mut zap);
+        let route = a.routes.get("203.0.113.0/24").expect("the external route");
+        assert_eq!(route.metric, 50, "type-2 external: the LSA metric");
+        assert!(
+            route
+                .nexthops
+                .hops()
+                .iter()
+                .any(|(nh, _)| matches!(nh, Nexthop::Ipv4(x) if *x == b.interfaces[0].addr)),
+            "the next hop is the forwarding address (§16.4 step 3b)"
+        );
+    }
+
+    #[test]
+    fn abr_summarizes_routes_inter_area_and_resolves_type4() {
+        // §12.4.3/§16.2/§16.4 in one topology: A (us) is the ABR
+        // between area 0 (peer B) and area 1 (peer C, an ASBR
+        // redistributing a static). B and C share no area.
+        let mut cores = vec![abr_core(), area0_core(), area1_core(true)];
+        let (a, b, c) = (0, 1, 2);
+        let now = run_multi(&mut cores, 0, 8);
+
+        // The adjacencies: A-B in area 0, A-C in area 1.
+        let full = |x: usize, y: usize| {
+            let peer = cores[y].router_id;
+            cores[x]
+                .interfaces
+                .iter()
+                .any(|i| i.neighbors.get(&peer).map(|c| c.state()) == Some(NeighborState::Full))
+        };
+        assert!(full(a, b) && full(b, a), "A-B Full (area 0)");
+        assert!(full(a, c) && full(c, a), "A-C Full (area 1)");
+
+        // A is an ABR: both router-LSAs carry the B-bit (§A.4.2).
+        for area in [0u32, 1] {
+            let key = crate::lsa::LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(cores[a].router_id.0),
+                adv_router: cores[a].router_id,
+            };
+            let entry = cores[a].areas.get(&area).unwrap().lsdb.get(&key).unwrap();
+            let crate::lsa::LsaBody::Router(body) = &entry.lsa.body else {
+                panic!()
+            };
+            assert!(body.b_bit, "area {area} router-LSA carries the B-bit");
+        }
+
+        // §12.4.3: A's summaries — type-3 for each area's stubs into
+        // the other area (split horizon keeps the own-area route out),
+        // and a type-4 for C (the ASBR in area 1) into area 0.
+        let summary = |core: &Ospfd, area: u32, t: LsaType, id: u32| {
+            core.areas
+                .get(&area)
+                .unwrap()
+                .lsdb
+                .get(&LsaKey {
+                    ls_type: t,
+                    link_state_id: crate::lsa::LinkStateId(id),
+                    adv_router: core.router_id,
+                })
+                .is_some()
+        };
+        assert!(
+            summary(
+                &cores[a],
+                0,
+                LsaType::SUMMARY_NETWORK,
+                u32::from(ip("10.20.0.0"))
+            ),
+            "A summarizes the area-1 stub into the backbone"
+        );
+        assert!(
+            summary(
+                &cores[a],
+                1,
+                LsaType::SUMMARY_NETWORK,
+                u32::from(ip("10.10.0.0"))
+            ),
+            "A summarizes the area-0 stub into area 1"
+        );
+        assert!(
+            !summary(
+                &cores[a],
+                0,
+                LsaType::SUMMARY_NETWORK,
+                u32::from(ip("10.10.0.0"))
+            ),
+            "split horizon: the backbone's own network is not re-advertised into it"
+        );
+        // §16.2 on B: the inter-area route via A's type-3 — cost =
+        // B→A (10) + A's summary metric (10).
+        let b_route = cores[b].routes.get("10.20.0.0/30").unwrap();
+        assert_eq!(b_route.metric, 20, "the inter-area cost is BR + summary");
+        assert!(
+            b_route
+                .nexthops
+                .hops()
+                .iter()
+                .any(|(nh, _)| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.10.0.1"))),
+            "the inter-area next hop is the BR (A)"
+        );
+        // §16.2 on C: the backbone stub via A's type-3.
+        assert!(
+            cores[c].routes.contains_key("10.10.0.0/30"),
+            "C routes the area-0 network through the summary"
+        );
+
+        // §16.4 on B: C's redistributed static resolves through the
+        // type-4 ASBR path — B installs the external route via A.
+        // C becomes an ASBR only when the static is pushed (§12.4.3:
+        // the E-bit follows the external origination).
+        let mut out: Vec<WireOut> = Vec::new();
+        cores[c].on_redistribute_add(
+            crate::zedge::RedistributedRoute {
+                prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 24).unwrap()),
+                metric: 20,
+            },
+            now + 1,
+            &mut out,
+        );
+        deliver_multi(&mut cores, c, &out, now + 1, &mut Vec::new());
+        let now2 = run_multi(&mut cores, now + 2, 10);
+        // Now C is an ASBR: A's §12.4.3 duties include the type-4
+        // for C into the backbone — and only there.
+        assert!(
+            summary(&cores[a], 0, LsaType::SUMMARY_ASBR, cores[c].router_id.0),
+            "A originates the type-4 for C (the ASBR) into the backbone"
+        );
+        assert!(
+            !summary(&cores[a], 1, LsaType::SUMMARY_ASBR, cores[c].router_id.0),
+            "no type-4 into C's own area (§12.4.3's own-area rule)"
+        );
+        assert!(
+            cores[b].routes.contains_key("203.0.113.0/24"),
+            "B resolves C's external through A's type-4 (§16.4)"
+        );
+        let b_ext = cores[b].routes.get("203.0.113.0/24").unwrap();
+        assert!(
+            b_ext
+                .nexthops
+                .hops()
+                .iter()
+                .any(|(nh, _)| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.10.0.1"))),
+            "the external next hop is the ABR on the ASBR path"
+        );
+        // The type-5 reached B's database through the AS-scope
+        // mirroring (§7) — B holds it in area 0.
+        let ext_key = LsaKey {
+            ls_type: LsaType::AS_EXTERNAL,
+            link_state_id: crate::lsa::LinkStateId(u32::from(ip("203.0.113.0"))),
+            adv_router: cores[c].router_id,
+        };
+        assert!(
+            cores[b].areas.get(&0).unwrap().lsdb.contains(&ext_key),
+            "the type-5 lives in B's area-0 database (§7 mirroring)"
+        );
+        let _ = now2;
     }
 
     #[test]
@@ -2222,8 +3406,7 @@ mod tests {
             adv_router: cores[b].router_id,
         };
         for (i, core) in cores.iter().enumerate().skip(1) {
-            let entry = core
-                .lsdb
+            let entry = lsdb_of(core)
                 .get(&new_net_key)
                 .unwrap_or_else(|| panic!("living core {i} holds the new DR's network-LSA"));
             let crate::lsa::LsaBody::Network(body) = &entry.lsa.body else {

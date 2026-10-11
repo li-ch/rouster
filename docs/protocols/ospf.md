@@ -186,12 +186,60 @@ fork it. The concrete seams, documented where they bite:
   DROther's kernel `via` the DR's address — the §16.1.1 case-two
   pseudo-node next hop.
 
+## Inter-area (2026-10-11, the N2 M4 slice)
+
+- **Multi-area landed**: the config takes multiple `area` stanzas
+  (interfaces bind to their area), the daemon keeps one LSDB + SPF
+  throttle + router-LSA origination per area, AS-external LSAs are
+  mirrored into every area's database (§7: "considered to be part
+  of each area's link-state database" — one origination, identical
+  instances, `Lsdb::mirror_originated`), and flooding is scoped
+  (types 1-4 same-area; type-5 AS-wide, received ones re-flooded
+  out the other areas per §13 step 1f). The router-LSA's B-bit
+  follows ABR status (§A.4.2).
+- **§16's walk is router-wide now**: intra-area SPF per area, the
+  §16.2 inter-area routes from the examined area's summary-LSAs
+  (backbone when multi-area — "only backbone summary-LSAs are
+  examined"; the single area otherwise), with steps (1)-(7)
+  verbatim including the intra-always-preferred rule and the
+  equal-cost merge; the full §16.4 external calculation with the
+  type-4 ASBR lookup and §16.4.1's preference order
+  (RFC1583Compatibility disabled — FRR 10.2.2's probed default:
+  intra-non-backbone first, intra-backbone and inter-area equal,
+  then least cost, largest area ID) and the forwarding-address
+  resolution; export diff over intra + inter + external.
+- **§12.4.3's ABR duties**: type-3 summaries for the
+  inter-area-eligible networks (intra routes into every other area
+  incl. the backbone; inter-area routes into non-backbone areas
+  only), type-4s for the preferred ASBR paths (ABR destinations
+  skipped per the first bullet), the split-horizon and own-area and
+  LSInfinity gates, metric = the routing-table cost, and the
+  withdrawal flush (premature age + reflood) for summaries no
+  longer justified. **Disclosed**: no configured `area range`
+  support yet — the §12.4.3 default (one type-3 per network)
+  applies; the coalescing/aggregation rules land with range config.
+- **Interop**: `scripts/test-ospf-interarea-interop.sh` — rouster as
+  the ABR between two real FRR ospfd (an FRR ABR with a dummy area
+  2 on the area-0 side; an FRR ASBR redistributing a blackhole
+  static in area 1), exit 0 twice back-to-back: our type-3 for the
+  area-1 network sits in FRR's area-0 database beside FRR's own and
+  lands in FRR's KERNEL via us (O IA); FRR's type-3 for its area-2
+  network reaches our §16.2 and our kernel via FRR; our type-4 for
+  the area-1 ASBR sits in FRR's asbr-summary table and FRR resolves
+  the redistributed static through us into its kernel.
+
 ## §Deferred (updated day-3 anchors)
 
-- Inter-area routes (§16.2-§16.3 + the type-4 lookup §16.4-lite
-  shortcuts), incremental SPF (§16.5/§16.6), virtual links (§15),
-  stub/NSSA areas (§3.6), authentication (Appendix D), graceful
-  restart (RFC 3623), DNA honoring, OSPFv3 bodies.
+- §16.3 (transit areas' summary-LSAs — only meaningful with virtual
+  links, which set TransitCapability); incremental SPF (§16.5/§16.6);
+  virtual links (§15); stub/NSSA areas (§3.6); authentication
+  (Appendix D); graceful restart (RFC 3623); DNA honoring; OSPFv3
+  bodies (the ladder's codecs-only scope).
+- `area range` configuration — §12.4.3's address-range
+  coalescing/DoNotAdvertise (the per-network default is implemented);
+  §16.2 step (3)'s own-active-range check rides with it.
+- RFC1583Compatibility is fixed at "disabled" (FRR parity) — no
+  configuration knob yet.
 - NBMA and Point-to-MultiPoint networks (§C.3) — the unicast-hello
   and per-neighbor-poll machinery; the §9.4 election's NBMA step
   (6) rides with it.

@@ -657,6 +657,7 @@ mod tests {
         let lsa = build_router_lsa(
             own,
             false,
+            false,
             &[InterfaceAdv {
                 state: InterfaceState::PointToPoint,
                 p2p: true,

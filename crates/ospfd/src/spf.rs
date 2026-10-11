@@ -111,6 +111,10 @@ pub struct SpfResult {
     /// §16.1 step 2: TRUE when any router-LSA on the tree has the
     /// V-bit set (a virtual link uses this area as transit).
     pub transit_capability: bool,
+    /// Every seen router-LSA's (B, E) flags (§A.4.2) — the ABR/ASBR
+    /// classification §12.4.3 and §16.4 need. Present whether or not
+    /// the router ended up on the tree.
+    pub router_flags: HashMap<RouterId, (bool, bool)>,
     /// Distance to every reachable transit vertex.
     pub distances: HashMap<Vertex, u32>,
     /// The intra-area routes, deterministically ordered.
@@ -162,12 +166,14 @@ pub fn calculate(root: RouterId, lsdb: &Lsdb) -> SpfResult {
     // LSAs are treated as absent.
     let mut router_lsas: HashMap<RouterId, &RouterLsa> = HashMap::new();
     let mut network_lsas: HashMap<u32, (Ipv4Addr, Vec<RouterId>)> = HashMap::new();
+    let mut router_flags: HashMap<RouterId, (bool, bool)> = HashMap::new();
     for entry in lsdb.all() {
         if entry.lsa.header.is_max_age() {
             continue;
         }
         match &entry.lsa.body {
             LsaBody::Router(r) => {
+                router_flags.insert(entry.lsa.header.adv_router, (r.b_bit, r.e_bit));
                 router_lsas.insert(entry.lsa.header.adv_router, r);
             }
             LsaBody::Network(n) => {
@@ -180,7 +186,10 @@ pub fn calculate(root: RouterId, lsdb: &Lsdb) -> SpfResult {
         }
     }
 
-    let mut result = SpfResult::default();
+    let mut result = SpfResult {
+        router_flags,
+        ..SpfResult::default()
+    };
     let mut tree: HashMap<Vertex, TreeEntry> = HashMap::new();
     // The root's own LSA may be absent (a router with no links yet);
     // the tree still starts at the root with distance 0.
@@ -817,6 +826,62 @@ mod tests {
     }
 
     // ---- golden shapes -------------------------------------------
+
+    #[test]
+    fn router_flags_report_the_b_and_e_bits() {
+        // §A.4.2: the router-LSA flags surface for every seen router
+        // (the §12.4.3/§16.4 ABR/ASBR classification input).
+        let own = RouterId(u32::from(ip("1.1.1.1")));
+        let mut lsdb = Lsdb::new();
+        // Two p2p neighbors back-linking to us.
+        let links = vec![RouterLink {
+            link_id: LinkStateId(u32::from(ip("1.1.1.1"))),
+            link_data: u32::from(ip("10.0.0.2")),
+            link_type: LinkType::PointToPoint,
+            metric: 5,
+            tos: vec![],
+        }];
+        let mut abr = router("2.2.2.2", links.clone(), false);
+        if let LsaBody::Router(r) = &mut abr.body {
+            r.b_bit = true;
+        }
+        let mut asbr = router("3.3.3.3", links, false);
+        if let LsaBody::Router(r) = &mut asbr.body {
+            r.e_bit = true;
+        }
+        let _ = lsdb.install(abr.with_computed_header(), true, 0);
+        let _ = lsdb.install(asbr.with_computed_header(), true, 0);
+        // Our own LSA with links back to both (bidirectionality).
+        let own_links = vec![
+            RouterLink {
+                link_id: LinkStateId(u32::from(ip("2.2.2.2"))),
+                link_data: u32::from(ip("10.0.0.1")),
+                link_type: LinkType::PointToPoint,
+                metric: 5,
+                tos: vec![],
+            },
+            RouterLink {
+                link_id: LinkStateId(u32::from(ip("3.3.3.3"))),
+                link_data: u32::from(ip("10.0.0.1")),
+                link_type: LinkType::PointToPoint,
+                metric: 5,
+                tos: vec![],
+            },
+        ];
+        let own_lsa = router("1.1.1.1", own_links, false);
+        let _ = lsdb.install(own_lsa.with_computed_header(), true, 0);
+        let result = calculate(own, &lsdb);
+        assert_eq!(
+            result.router_flags.get(&RouterId(u32::from(ip("2.2.2.2")))),
+            Some(&(true, false)),
+            "the ABR's B-bit"
+        );
+        assert_eq!(
+            result.router_flags.get(&RouterId(u32::from(ip("3.3.3.3")))),
+            Some(&(false, true)),
+            "the ASBR's E-bit"
+        );
+    }
 
     #[test]
     fn two_routers_point_to_point() {

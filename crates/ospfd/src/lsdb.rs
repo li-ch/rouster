@@ -437,6 +437,22 @@ impl Lsdb {
         Readopt::Advanced
     }
 
+    /// Install an already-originated instance into this database
+    /// and track its sequence — the AS-scope mirroring path (§7: the
+    /// AS-external list is part of every area's database; one
+    /// origination, identical instances everywhere).
+    pub fn mirror_originated(&mut self, lsa: &Lsa, now: u64) {
+        let key = lsa.key();
+        let next = lsa
+            .header
+            .seq
+            .wrapping_add(1)
+            .max(crate::lsa::INITIAL_SEQUENCE_NUMBER);
+        let _ = self.install(lsa.clone(), false, now);
+        self.self_seq.insert(key, SeqState::Ready { next });
+        self.self_originated_at.insert(key, now);
+    }
+
     /// The next sequence number the LSDB would stamp for `key`
     /// (operator surface / tests; `None` when never originated).
     pub fn next_seq_for(&self, key: &LsaKey) -> Option<i32> {
@@ -1007,6 +1023,22 @@ mod tests {
             INITIAL_SEQUENCE_NUMBER,
             "the sequence restarted at InitialSequenceNumber"
         );
+    }
+
+    #[test]
+    fn mirror_originated_installs_and_tracks() {
+        // §7's AS-scope mirroring: the identical type-5 instance
+        // lands in another area's database with the sequence
+        // tracking aligned (one origination, consistent instances).
+        let mut db = Lsdb::new();
+        let lsa = normalize_local(&router_lsa(0x8000_0007, 0, 10)).with_computed_header();
+        db.mirror_originated(&lsa, 42);
+        let key = lsa.key();
+        assert_eq!(db.get(&key).unwrap().lsa.header.seq, 0x8000_0007);
+        assert_eq!(db.next_seq_for(&key), Some(0x8000_0008u32 as i32));
+        // The same instance mirrored again: no seq churn.
+        db.mirror_originated(&lsa, 43);
+        assert_eq!(db.get(&key).unwrap().lsa.header.seq, 0x8000_0007);
     }
 
     #[test]

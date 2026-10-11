@@ -46,14 +46,31 @@ pub struct OspfdConfig {
     /// edge — absent means run standalone).
     pub zapi_socket: Option<String>,
     pub router_id: Option<Ipv4Addr>,
-    /// The single area (v1). Keyed by area ID; OSPF area IDs are
-    /// 32-bit dotted quads but compare as raw u32.
-    pub area_id: u32,
-    pub interfaces: BTreeMap<String, InterfaceConfig>,
-    /// network-prefix -> area bindings (frr's classic form).
+    /// The areas, keyed by area ID (OSPF area IDs are 32-bit dotted
+    /// quads but compare as raw u32). Multiple areas make the
+    /// router an ABR (§12.4.3's summary duties); area 0.0.0.0 is
+    /// the backbone (§3.1).
+    pub areas: Vec<AreaConfig>,
+    /// network-prefix -> area bindings (frr's classic form; v1
+    /// parses them, the interface stanzas are the source of truth).
     pub networks: Vec<(u32, u8, u32)>,
     /// `redistribute static`.
     pub redistribute_static: bool,
+}
+
+impl OspfdConfig {
+    /// The single-area convenience (v1 callers, tests): the first
+    /// area's ID.
+    pub fn area_id(&self) -> u32 {
+        self.areas.first().map(|a| a.id).unwrap_or(0)
+    }
+}
+
+/// One area and its interfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AreaConfig {
+    pub id: u32,
+    pub interfaces: BTreeMap<String, InterfaceConfig>,
 }
 
 /// The network type (§C.3): p2p skips the DR election entirely.
@@ -111,13 +128,11 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
     let mut cfg = OspfdConfig {
         zapi_socket: None,
         router_id: None,
-        area_id: 0,
-        interfaces: BTreeMap::new(),
+        areas: Vec::new(),
         networks: vec![],
         redistribute_static: false,
     };
     let mut in_router = false;
-    let mut current_area: Option<u32> = None;
 
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
@@ -193,16 +208,18 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                             return Err(parse_error(line_no, "bad area id"));
                         };
                         let raw = u32::from(area);
-                        if cfg.interfaces.contains_key(&area.to_string())
-                            || current_area.replace(raw).is_some()
-                        {
+                        if cfg.areas.iter().any(|a| a.id == raw) {
                             return Err(parse_error(line_no, "duplicate area stanza"));
                         }
-                        cfg.area_id = raw;
+                        cfg.areas.push(AreaConfig {
+                            id: raw,
+                            interfaces: BTreeMap::new(),
+                        });
                     }
                     "network" => {
                         // network <prefix> area <id> — the classic
-                        // binding; must match the single area (v1).
+                        // binding (parsed; interface stanzas are the
+                        // v1 source of truth).
                         if words.len() != 4 || words[2] != "area" {
                             return Err(parse_error(
                                 line_no,
@@ -238,7 +255,10 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                         if words.len() != 2 {
                             return Err(parse_error(line_no, "expected: interface <name>"));
                         }
-                        if cfg
+                        let Some(area) = cfg.areas.last_mut() else {
+                            return Err(parse_error(line_no, "interface without an area stanza"));
+                        };
+                        if area
                             .interfaces
                             .insert(words[1].to_string(), InterfaceConfig::defaults())
                             .is_some()
@@ -264,11 +284,14 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                     "cost" | "hello-interval" | "dead-interval" | "priority" | "address"
                     | "network-type" | "mtu" => {
                         // Interface parameter inside the LAST interface
-                        // stanza; BTreeMap order cannot express
-                        // "last", so we require the parameter to
+                        // stanza of the LAST area; BTreeMap order cannot
+                        // express "last", so we require the parameter to
                         // follow its interface line directly — strict
                         // and deterministic.
-                        let Some((_, iface)) = cfg.interfaces.iter_mut().next_back() else {
+                        let Some(area) = cfg.areas.last_mut() else {
+                            return Err(parse_error(line_no, "parameter without an area stanza"));
+                        };
+                        let Some((_, iface)) = area.interfaces.iter_mut().next_back() else {
                             return Err(parse_error(line_no, "parameter without an interface"));
                         };
                         match first {
@@ -333,6 +356,9 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
             "missing `router ospf` stanza",
         ));
     }
+    if cfg.areas.is_empty() {
+        return Err(parse_error(text.lines().count(), "missing `area` stanza"));
+    }
     Ok(cfg)
 }
 
@@ -369,8 +395,9 @@ router ospf
         let cfg = parse(SAMPLE).unwrap();
         assert_eq!(cfg.zapi_socket.as_deref(), Some("/run/rouster/zapi.api"));
         assert_eq!(cfg.router_id, Some("10.9.9.1".parse().unwrap()));
-        assert_eq!(cfg.area_id, 0);
-        let eth0 = cfg.interfaces.get("eth0").unwrap();
+        assert_eq!(cfg.area_id(), 0);
+        assert_eq!(cfg.areas.len(), 1);
+        let eth0 = cfg.areas[0].interfaces.get("eth0").unwrap();
         assert_eq!(eth0.cost, 5);
         assert_eq!(eth0.hello_interval, 10);
         assert_eq!(eth0.dead_interval, 40);
@@ -385,8 +412,42 @@ router ospf
     #[test]
     fn defaults_apply() {
         let cfg = parse("router ospf\n area 0.0.0.1\n  interface lo\n").unwrap();
-        assert_eq!(cfg.area_id, 1);
-        assert_eq!(cfg.interfaces["lo"], InterfaceConfig::defaults());
+        assert_eq!(cfg.area_id(), 1);
+        assert_eq!(cfg.areas[0].interfaces["lo"], InterfaceConfig::defaults());
+    }
+
+    #[test]
+    fn area_stanza_is_required() {
+        // A router stanza with no area (and no interfaces) is a
+        // configuration error, not an empty daemon.
+        let err = parse("router ospf\n router-id 1.1.1.1\n").unwrap_err();
+        assert!(err.to_string().contains("missing `area`"), "{err}");
+    }
+
+    #[test]
+    fn multiple_areas_parse() {
+        // The ABR shape (§12.4.3): backbone + one non-backbone area,
+        // each with its own interfaces.
+        let cfg = parse(
+            "router ospf\n router-id 10.255.2.1\n area 0.0.0.0\n  interface eth0\n   address 10.10.0.2/30\n   network-type point-to-point\n area 0.0.0.1\n  interface eth1\n   address 10.20.0.1/30\n   network-type point-to-point\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.areas.len(), 2);
+        assert_eq!(cfg.areas[0].id, 0);
+        assert!(cfg.areas[0].interfaces.contains_key("eth0"));
+        assert_eq!(cfg.areas[1].id, 1);
+        assert!(cfg.areas[1].interfaces.contains_key("eth1"));
+        // Duplicate area IDs are rejected with the line number.
+        let err =
+            parse("router ospf\n area 0.0.0.0\n  interface a\n area 0.0.0.0\n  interface b\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("line 4"), "{err}");
+        // Interfaces without an area are rejected.
+        let err = parse("router ospf\n  interface a\n").unwrap_err();
+        assert!(
+            err.to_string().contains("interface without an area"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -419,7 +480,7 @@ router ospf
             "router ospf\n area 0.0.0.0\n  interface eth0\n   address 10.77.0.2/30\n   network-type point-to-point\n   mtu 1500\n",
         )
         .unwrap();
-        let eth0 = cfg.interfaces.get("eth0").unwrap();
+        let eth0 = cfg.areas[0].interfaces.get("eth0").unwrap();
         assert_eq!(
             eth0.address,
             Some((
@@ -444,7 +505,10 @@ router ospf
         let cfg =
             parse("router ospf\n area 0.0.0.0\n  interface eth0\n  interface eth1\n   cost 7\n")
                 .unwrap();
-        assert_eq!(cfg.interfaces["eth1"].cost, 7);
-        assert_eq!(cfg.interfaces["eth0"].cost, 10, "default untouched");
+        assert_eq!(cfg.areas[0].interfaces["eth1"].cost, 7);
+        assert_eq!(
+            cfg.areas[0].interfaces["eth0"].cost, 10,
+            "default untouched"
+        );
     }
 }

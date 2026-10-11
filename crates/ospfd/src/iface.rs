@@ -742,6 +742,30 @@ mod tests {
     }
 
     #[test]
+    fn unloop_returns_to_the_network_type_state() {
+        // §9.3 UnloopInd: Loopback -> the InterfaceUp state again —
+        // p2p -> PointToPoint, broadcast-eligible -> Waiting (with a
+        // fresh WaitTimer), broadcast priority 0 -> DR Other.
+        let mut f = InterfaceFsm::new(true);
+        f.fire(InterfaceEvent::InterfaceUp);
+        f.fire(InterfaceEvent::LoopInd);
+        let (s, a) = f.fire(InterfaceEvent::UnloopInd);
+        assert_eq!(s, InterfaceState::PointToPoint);
+        assert!(a.contains(&InterfaceAction::StartHello));
+        let mut f = InterfaceFsm::new_with_priority(false, 0);
+        f.fire(InterfaceEvent::InterfaceUp);
+        f.fire(InterfaceEvent::LoopInd);
+        let (s, _) = f.fire(InterfaceEvent::UnloopInd);
+        assert_eq!(s, InterfaceState::DrOther);
+        let mut f = InterfaceFsm::new(false);
+        f.fire(InterfaceEvent::InterfaceUp);
+        f.fire(InterfaceEvent::LoopInd);
+        let (s, a) = f.fire(InterfaceEvent::UnloopInd);
+        assert_eq!(s, InterfaceState::Waiting);
+        assert!(a.contains(&InterfaceAction::StartWaitTimer));
+    }
+
+    #[test]
     fn priority_zero_interface_enters_dr_other_directly() {
         // §9.3 InterfaceUp: broadcast + priority 0 skips Waiting —
         // "if the router is not eligible ... the interface state
