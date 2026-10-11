@@ -8,12 +8,18 @@
 //! (all-routers addresses, no network mask in hellos) live at the
 //! transport/hello layer.
 //!
-//! v1 scope disclosure: the daemon drives interfaces as
-//! PointToPoint only (the interop topology); the broadcast arm
-//! (Waiting, DR/Backup/DR Other, network-LSA origination by the DR,
-//! §12.4.2) is landed and table-tested here but not yet driven by
-//! the binary — the §9.4 role changes' socket effects
-//! (join/leave 224.0.0.6) are wired in `transport`.
+//! The election implements §9.4's steps (1)-(5) verbatim, including
+//! step (4)'s repeat with our own claims updated to the first
+//! round's result (the RFC's "X will no longer be eligible for
+//! Backup Designated Router election"). The resulting lone-router
+//! outcome — DR self, BDR 0.0.0.0 — was probed against the FRR
+//! 10.2.2 oracle (`ospf_ism.c:ospf_dr_election`, one repeat, self
+//! excluded from BDR election once it declares DR): "State DR ...
+//! No backup designated router on this network".
+//!
+//! v1 scope disclosure: the daemon drives PointToPoint and
+//! broadcast interfaces; NBMA (§C.3) is §Deferred with the
+//! unicast-hello machinery it requires.
 
 use crate::lsa::RouterId;
 use std::net::Ipv4Addr;
@@ -90,10 +96,15 @@ pub enum InterfaceAction {
 /// The per-interface machine. `p2p` pins the network type
 /// (§C.3): InterfaceUp lands directly in PointToPoint, skipping the
 /// WaitTimer/election arm entirely (§9.3's "otherwise" branch).
+/// `priority` is our §C.3 Router Priority: a broadcast interface
+/// with priority 0 enters DR Other at InterfaceUp (§9.3: "if the
+/// router is not eligible to become Designated Router the interface
+/// state transitions to DR Other").
 #[derive(Debug, Clone)]
 pub struct InterfaceFsm {
     pub state: InterfaceState,
     pub p2p: bool,
+    pub priority: u8,
 }
 
 impl InterfaceFsm {
@@ -101,23 +112,38 @@ impl InterfaceFsm {
         Self {
             state: InterfaceState::Down,
             p2p,
+            priority: 1,
+        }
+    }
+
+    pub fn new_with_priority(p2p: bool, priority: u8) -> Self {
+        Self {
+            state: InterfaceState::Down,
+            p2p,
+            priority,
         }
     }
 
     /// Fire one §9.3 event; returns the resulting state (unchanged
-    /// where the table says so) and the prescribed actions.
+    /// where the table says so) and the prescribed actions. The
+    /// Waiting rows' `ElectDr` actions leave the state Waiting —
+    /// §9.4 steps (5)/(7) then set DR/Backup/DR Other (the caller
+    /// applies [`crate::iface::elect_dr`]'s outcome).
     pub fn fire(&mut self, event: InterfaceEvent) -> (InterfaceState, Vec<InterfaceAction>) {
         use InterfaceAction as A;
         use InterfaceEvent as E;
         use InterfaceState as S;
         let mut actions = Vec::new();
         let next = match (&self.state, event) {
-            // §9.3, InterfaceUp row: Down -> hello starts; broadcast
-            // networks further wait (the WaitTimer) before electing.
+            // §9.3, InterfaceUp row: Down -> hello starts; p2p ->
+            // PointToPoint; broadcast-eligible -> Waiting (WaitTimer);
+            // broadcast-ineligible (priority 0) -> DR Other.
             (S::Down, E::InterfaceUp) => {
                 actions.push(A::StartHello);
                 if self.p2p {
                     S::PointToPoint
+                } else if self.priority == 0 {
+                    S::DrOther
                 } else {
                     actions.push(A::StartWaitTimer);
                     S::Waiting
@@ -151,6 +177,8 @@ impl InterfaceFsm {
                 actions.push(A::StartHello);
                 if self.p2p {
                     S::PointToPoint
+                } else if self.priority == 0 {
+                    S::DrOther
                 } else {
                     actions.push(A::StartWaitTimer);
                     S::Waiting
@@ -207,64 +235,196 @@ pub struct ElectionNeighbor {
 
 /// The §9.4 election outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ElectionResult {
+pub struct ElectionOutcome {
     pub dr: Ipv4Addr,
     pub bdr: Ipv4Addr,
-    /// Our resulting role.
+    /// Our resulting role (§9.4 step 5).
     pub role: InterfaceState,
+    /// Step (7)'s signal: the DR identity changed → adjacencies on
+    /// this interface must be re-evaluated (AdjOK? on every
+    /// neighbor ≥ 2-Way).
+    pub dr_changed: bool,
+    /// Step (7)'s signal: the BDR identity changed.
+    pub bdr_changed: bool,
 }
 
-/// §9.4's electing function, steps 1-4, verbatim order:
+/// Whether a router is currently declaring itself DR/BDR in its
+/// hellos (§9.4's "listing themselves ... in their Hello Packets"):
+/// the claim names its own interface address, and 0.0.0.0 is "no
+/// claim" (§9.4's initialization).
+fn declares_dr(n: &ElectionNeighbor) -> bool {
+    n.dr != Ipv4Addr::UNSPECIFIED && n.dr == n.address
+}
+
+fn declares_bdr(n: &ElectionNeighbor) -> bool {
+    n.bdr != Ipv4Addr::UNSPECIFIED && n.bdr == n.address
+}
+
+/// §9.4's electing function, steps (1)-(5).
 ///
-/// 1. Calculate the BDR: among eligible routers (priority > 0,
-///    state ≥ 2-Way — the caller filters), prefer those that claim
-///    themselves BDR ("BackupSeen"), highest (priority, Router ID)
-///    wins; if none claims, the highest eligible.
-/// 2. Calculate the DR: among those claiming themselves DR, highest
-///    (priority, Router ID); if none, the BDR just elected (§9.4.3).
-/// 3. If we are the DR (the elected DR is our own interface
-///    address), we are DR; else BDR; else DR Other.
-/// 4. The caller fires NeighborChange-equivalent re-evaluation when
-///    the result differs from the previous election.
-pub fn elect_dr(own: ElectionNeighbor, neighbors: &[ElectionNeighbor]) -> ElectionResult {
-    /// §9.4.1/§9.4.2's comparison: highest priority first, Router ID
-    /// breaking ties ("largest ... Router ID").
+/// Inputs: `own` is ourselves (address, priority, and the DR/BDR we
+/// are currently claiming in our hellos); `neighbors` is every
+/// bidirectional (state ≥ 2-Way, §9.4's opening) neighbor's claim
+/// snapshot; `prev` is the interface's current (DR, BDR) — the
+/// values this election may replace (§9.4 step 1 notes them for
+/// the step-7 comparison; before the first election they are
+/// 0.0.0.0, §9.4's initialization).
+///
+/// `own` is the caller's live claim state, so the step-(4) repeat
+/// runs with our claims updated to the first round's result ("if
+/// Router X is now the Designated Router, when step 2 is repeated X
+/// will no longer be eligible for Backup Designated Router
+/// election") — one repeat, exactly FRR 10.2.2's
+/// `ospf_dr_election` shape.
+pub fn elect_dr(
+    own: ElectionNeighbor,
+    neighbors: &[ElectionNeighbor],
+    prev: (Ipv4Addr, Ipv4Addr),
+) -> ElectionOutcome {
+    /// §9.4.1/§9.4.2's comparison: highest Router Priority first,
+    /// the largest Router ID breaking ties.
     fn rank(n: &ElectionNeighbor) -> (u8, RouterId) {
         (n.priority, n.router_id)
     }
-    // Eligible set: ourselves plus priority > 0 neighbors.
-    let mut eligible: Vec<&ElectionNeighbor> =
-        neighbors.iter().filter(|n| n.priority > 0).collect();
-    if own.priority > 0 {
-        eligible.push(&own);
+    /// Steps (2)+(3) over one claim snapshot. The eligible set is
+    /// ourselves plus the priority > 0 neighbors (§9.4's "Discard
+    /// all routers ... having Router Priority of 0"); the ≥ 2-Way
+    /// filter is the caller's (the snapshot IS the bidirectional
+    /// set).
+    fn elect_once(own: &ElectionNeighbor, neighbors: &[ElectionNeighbor]) -> (Ipv4Addr, Ipv4Addr) {
+        let mut eligible: Vec<&ElectionNeighbor> =
+            neighbors.iter().filter(|n| n.priority > 0).collect();
+        if own.priority > 0 {
+            eligible.push(own);
+        }
+        // Step (2): the BDR. "Only those routers ... that have not
+        // declared themselves to be Designated Router are eligible
+        // to become Backup Designated Router"; among them, the
+        // self-declared BDRs win, else the highest rank of the
+        // remaining.
+        let non_dr: Vec<&ElectionNeighbor> = eligible
+            .iter()
+            .copied()
+            .filter(|n| !declares_dr(n))
+            .collect();
+        let bdr = non_dr
+            .iter()
+            .copied()
+            .filter(|n| declares_bdr(n))
+            .max_by_key(|n| rank(n))
+            .or_else(|| non_dr.iter().copied().max_by_key(|n| rank(n)))
+            .map(|n| n.address)
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        // Step (3): the DR. The self-declared DRs first; "if no
+        // routers have declared themselves Designated Router, assign
+        // the Designated Router to be the same as the newly elected
+        // Backup Designated Router" (the promotion).
+        let dr = eligible
+            .iter()
+            .copied()
+            .filter(|n| declares_dr(n))
+            .max_by_key(|n| rank(n))
+            .map(|n| n.address)
+            .unwrap_or(bdr);
+        (dr, bdr)
     }
-    // §9.4.1 step 1: the BDR claimants first, then every eligible.
-    let bdr = eligible
-        .iter()
-        .filter(|n| n.bdr != Ipv4Addr::UNSPECIFIED && n.bdr == n.address)
-        .copied()
-        .max_by_key(|n| rank(n))
-        .or_else(|| eligible.iter().copied().max_by_key(|n| rank(n)))
-        .map(|n| n.address)
-        .unwrap_or(Ipv4Addr::UNSPECIFIED);
-    // §9.4.2 step 2: the DR claimants, else the BDR promotes
-    // (§9.4.3).
-    let dr = eligible
-        .iter()
-        .filter(|n| n.dr != Ipv4Addr::UNSPECIFIED && n.dr == n.address)
-        .copied()
-        .max_by_key(|n| rank(n))
-        .map(|n| n.address)
-        .unwrap_or(bdr);
-    // §9.4.4 step 3: our role.
-    let role = if dr == own.address {
-        InterfaceState::Dr
-    } else if bdr == own.address {
-        InterfaceState::Backup
-    } else {
-        InterfaceState::DrOther
+
+    let role_of = |dr: Ipv4Addr, bdr: Ipv4Addr| {
+        if dr == own.address {
+            InterfaceState::Dr
+        } else if bdr == own.address {
+            InterfaceState::Backup
+        } else {
+            InterfaceState::DrOther
+        }
     };
-    ElectionResult { dr, bdr, role }
+
+    let mut round = own;
+    let (mut dr, mut bdr) = elect_once(&round, neighbors);
+    // Step (4): "If Router X is now newly the Designated Router or
+    // newly the Backup Designated Router, or is now no longer ...,
+    // repeat steps 2 and 3" — the DROther-from-below transition
+    // (e.g. Waiting → DR Other) is not a role change (FRR's
+    // `new_state == ISM_DROther && old_state < ISM_DROther` guard).
+    let prev_role = role_of(prev.0, prev.1);
+    let new_role = role_of(dr, bdr);
+    let was_dr_or_bdr = matches!(prev_role, InterfaceState::Dr | InterfaceState::Backup);
+    if new_role != prev_role && !(new_role == InterfaceState::DrOther && !was_dr_or_bdr) {
+        // Our claims become the first round's result; the repeat
+        // then excludes a now-DR self from BDR election.
+        round.dr = dr;
+        round.bdr = bdr;
+        let (dr2, bdr2) = elect_once(&round, neighbors);
+        dr = dr2;
+        bdr = bdr2;
+    }
+    ElectionOutcome {
+        dr,
+        bdr,
+        role: role_of(dr, bdr),
+        dr_changed: dr != prev.0,
+        bdr_changed: bdr != prev.1,
+    }
+}
+
+/// §9.2's interface events derived from one received Hello — the
+/// pure half of the hello-processing integration (the daemon owns
+/// the neighbor/claims bookkeeping and feeds this the deltas).
+///
+/// `prev` is the neighbor's previous claim snapshot (`None` on the
+/// first hello); `new` the just-received claims;
+/// `was_bidirectional`/`is_bidirectional` carry the neighbor FSM's
+/// ≥ 2-Way status before/after this hello. FRR 10.2.2 parity
+/// (`ospf_packet.c:ospf_hello`):
+///
+/// - **BackupSeen** (§9.2, both forms, Waiting only, and only when
+///   bidirectional — "the router must also appear in the neighbor's
+///   Hello Packet"): the neighbor claims itself BDR; or claims
+///   itself DR while indicating no BDR.
+/// - **NeighborChange** (§9.2's five causes): bidirectionality
+///   established or lost; the neighbor newly/no-longer declares
+///   itself DR or BDR; its priority changed.
+///
+/// The Waiting gate on NeighborChange is the §9.3 table's (the
+/// event is disregarded there); the function reports it regardless
+/// and `InterfaceFsm::fire` absorbs it.
+pub fn hello_interface_events(
+    state: InterfaceState,
+    prev: Option<ElectionNeighbor>,
+    new: ElectionNeighbor,
+    was_bidirectional: bool,
+    is_bidirectional: bool,
+) -> Vec<InterfaceEvent> {
+    let mut events = Vec::new();
+    if !is_bidirectional {
+        // §9.2: every NeighborChange cause requires the neighbor to
+        // be (or have just been) bidirectional.
+        if was_bidirectional {
+            events.push(InterfaceEvent::NeighborChange);
+        }
+        return events;
+    }
+    // §9.2's BackupSeen, Waiting only.
+    if state == InterfaceState::Waiting {
+        let claims_bdr = declares_bdr(&new);
+        let claims_dr_without_bdr = declares_dr(&new) && new.bdr == Ipv4Addr::UNSPECIFIED;
+        if claims_bdr || claims_dr_without_bdr {
+            events.push(InterfaceEvent::BackupSeen);
+        }
+    }
+    // §9.2's NeighborChange causes.
+    if !was_bidirectional {
+        events.push(InterfaceEvent::NeighborChange);
+    }
+    if let Some(prev) = prev {
+        if declares_dr(&prev) != declares_dr(&new)
+            || declares_bdr(&prev) != declares_bdr(&new)
+            || prev.priority != new.priority
+        {
+            events.push(InterfaceEvent::NeighborChange);
+        }
+    }
+    events
 }
 
 #[cfg(test)]
@@ -351,6 +511,7 @@ mod tests {
             let mut f = InterfaceFsm {
                 state: start,
                 p2p: false,
+                priority: 1,
             };
             let (s, a) = f.fire(InterfaceEvent::InterfaceDown);
             assert_eq!(s, InterfaceState::Down);
@@ -365,6 +526,7 @@ mod tests {
         let mut f = InterfaceFsm {
             state: InterfaceState::Waiting,
             p2p: false,
+            priority: 1,
         };
         let (s, a) = f.fire(InterfaceEvent::NeighborChange);
         assert_eq!(s, InterfaceState::Waiting);
@@ -373,67 +535,334 @@ mod tests {
 
     // ---- §9.4 election ----------------------------------------------
 
+    fn no_prev() -> (Ipv4Addr, Ipv4Addr) {
+        // §9.4's initialization: the first election sees 0.0.0.0 for
+        // both (the lack of a DR/BDR).
+        (Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED)
+    }
+
+    /// One election-table row: (name, own, neighbors, prev, expected
+    /// (dr, bdr, role)).
+    type ElectionRow = (
+        &'static str,
+        ElectionNeighbor,
+        Vec<ElectionNeighbor>,
+        (Ipv4Addr, Ipv4Addr),
+        (Ipv4Addr, Ipv4Addr, InterfaceState),
+    );
+
+    /// One hello-event-table row: (name, state, prev claims, new
+    /// claims, was 2-Way, is 2-Way, expected events).
+    type HelloEventRow = (
+        &'static str,
+        InterfaceState,
+        Option<ElectionNeighbor>,
+        ElectionNeighbor,
+        bool,
+        bool,
+        Vec<InterfaceEvent>,
+    );
+
+    /// The §9.4 tiebreak-order table: every row cites the step that
+    /// decides it.
     #[test]
-    fn sole_router_becomes_dr() {
-        // §9.4.3: with no other claimants the router elects itself
-        // BDR then DR.
-        let own = nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "0.0.0.0");
-        let r = elect_dr(own, &[]);
-        assert_eq!(r.dr, ip("10.0.0.1"));
-        assert_eq!(r.bdr, ip("10.0.0.1"));
-        assert_eq!(r.role, InterfaceState::Dr);
+    fn election_table() {
+        let cases: &[ElectionRow] = &[
+            // §9.4 step (3)+(4) + the FRR 10.2.2 probe: sole router
+            // elects itself BDR then DR; the step-(4) repeat removes
+            // the now-DR-declaring self from BDR election, leaving
+            // BDR 0.0.0.0 ("No backup designated router on this
+            // network").
+            (
+                "sole router: DR self, BDR none",
+                nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "0.0.0.0"),
+                vec![],
+                no_prev(),
+                (ip("10.0.0.1"), ip("0.0.0.0"), InterfaceState::Dr),
+            ),
+            // Step (2): "the one having highest Router Priority";
+            // priority wins outright.
+            (
+                "higher priority is DR",
+                nb("1.1.1.1", "10.0.0.1", 5, "0.0.0.0", "0.0.0.0"),
+                vec![nb("9.9.9.9", "10.0.0.9", 2, "0.0.0.0", "0.0.0.0")],
+                no_prev(),
+                (ip("10.0.0.1"), ip("10.0.0.9"), InterfaceState::Dr),
+            ),
+            // Step (2): "In case of a tie, the one having the highest
+            // Router ID is chosen" — same for step (3).
+            (
+                "router-id tiebreak at equal priority",
+                nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "0.0.0.0"),
+                vec![nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "0.0.0.0")],
+                no_prev(),
+                (ip("10.0.0.2"), ip("10.0.0.2"), InterfaceState::DrOther),
+            ),
+            // §9.4's eligibility: "Routers having Router Priority of
+            // 0 are ineligible" — the eligible set is the other
+            // router alone; it declares DR (and BDR, the transient
+            // both-claim), so step (2)'s non-DR-declarer set is
+            // empty and the BDR stays 0.0.0.0 on our side.
+            (
+                "priority 0 is ineligible",
+                nb("1.1.1.1", "10.0.0.1", 0, "10.0.0.1", "10.0.0.1"),
+                vec![nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.2")],
+                no_prev(),
+                (ip("10.0.0.2"), ip("0.0.0.0"), InterfaceState::DrOther),
+            ),
+            // Step (2)'s claimant restriction: a router declaring
+            // itself DR is excluded from BDR election even when it
+            // also declares itself BDR (the transient both-claim
+            // shape).
+            (
+                "DR declarer excluded from BDR election",
+                nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "10.0.0.1"),
+                vec![nb("2.2.2.2", "10.0.0.2", 9, "10.0.0.2", "10.0.0.2")],
+                no_prev(),
+                (ip("10.0.0.2"), ip("10.0.0.1"), InterfaceState::Backup),
+            ),
+            // Step (3): "If no routers have declared themselves
+            // Designated Router, assign the Designated Router to be
+            // the same as the newly elected Backup Designated Router".
+            (
+                "BDR claimant promotes to DR",
+                nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "10.0.0.1"),
+                vec![nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "10.0.0.2")],
+                no_prev(),
+                (ip("10.0.0.2"), ip("10.0.0.2"), InterfaceState::DrOther),
+            ),
+            // §7.3/§9.4.2's stability: DR selection happens among DR
+            // CLAIMANTS only — a higher-priority router that does not
+            // claim DR cannot displace the incumbent.
+            (
+                "incumbent DR claimant stays DR",
+                nb("1.1.1.1", "10.0.0.1", 5, "0.0.0.0", "10.0.0.1"),
+                vec![nb("9.9.9.9", "10.0.0.9", 1, "10.0.0.9", "0.0.0.0")],
+                (ip("10.0.0.9"), Ipv4Addr::UNSPECIFIED),
+                (ip("10.0.0.9"), ip("10.0.0.1"), InterfaceState::Backup),
+            ),
+            // Three routers, the incumbent DR and BDR both claiming:
+            // nobody's role changes → no repeat, claims win.
+            (
+                "established DR/BDR pair re-elected",
+                nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "0.0.0.0"),
+                vec![
+                    nb("8.8.8.8", "10.0.0.8", 5, "10.0.0.8", "0.0.0.0"),
+                    nb("9.9.9.9", "10.0.0.9", 3, "0.0.0.0", "10.0.0.9"),
+                ],
+                (ip("10.0.0.8"), ip("10.0.0.9")),
+                (ip("10.0.0.8"), ip("10.0.0.9"), InterfaceState::DrOther),
+            ),
+        ];
+        for (name, own, neighbors, prev, (dr, bdr, role)) in cases {
+            let out = elect_dr(*own, neighbors, *prev);
+            assert_eq!((out.dr, out.bdr, out.role), (*dr, *bdr, *role), "{name}");
+            // Step (7)'s comparison flags are exactly the identity
+            // changes against `prev`.
+            assert_eq!(out.dr_changed, out.dr != prev.0, "{name} dr_changed");
+            assert_eq!(out.bdr_changed, out.bdr != prev.1, "{name} bdr_changed");
+        }
     }
 
     #[test]
-    fn priority_then_router_id_breaks_ties() {
-        // Higher priority wins regardless of ID.
-        let own = nb("1.1.1.1", "10.0.0.1", 5, "10.0.0.1", "10.0.0.1");
-        let other = nb("9.9.9.9", "10.0.0.9", 2, "10.0.0.9", "10.0.0.9");
-        let r = elect_dr(own, &[other]);
-        assert_eq!(r.dr, ip("10.0.0.1"), "priority 5 beats 2");
-        assert_eq!(r.role, InterfaceState::Dr);
-        // Equal priority: higher Router ID wins both claimant sets.
-        let own = nb("1.1.1.1", "10.0.0.1", 1, "10.0.0.1", "10.0.0.1");
-        let other = nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.2");
-        let r = elect_dr(own, &[other]);
-        assert_eq!(r.dr, ip("10.0.0.2"), "Router ID tiebreak");
-        assert_eq!(r.bdr, ip("10.0.0.2"));
-        assert_eq!(r.role, InterfaceState::DrOther);
-    }
-
-    #[test]
-    fn priority_zero_is_ineligible() {
-        // §9.4: priority 0 routers never become DR/BDR.
-        let own = nb("1.1.1.1", "10.0.0.1", 0, "10.0.0.1", "10.0.0.1");
-        let other = nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.2");
-        let r = elect_dr(own, &[other]);
-        assert_eq!(r.dr, ip("10.0.0.2"));
-        assert_eq!(r.role, InterfaceState::DrOther);
-    }
-
-    #[test]
-    fn bdr_promotes_to_dr_when_no_claimants() {
-        // §9.4.3: "If no routers claim to be the DR, the router just
-        // elected BDR becomes the DR" — nobody claims DR; both claim
-        // BDR; the higher Router ID wins BDR and promotes.
+    fn dr_loss_promotes_bdr_and_repeats() {
+        // Footnote [5]'s scenario: the DR (10.0.0.9) vanishes; the
+        // BDR (ours, 10.0.0.1, priority 1) and one other (10.0.0.2,
+        // priority 1, no claims) remain. We were Backup → newly DR:
+        // step (4) repeats, and the repeat elects the highest other
+        // non-DR-declarer as the new BDR.
         let own = nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "10.0.0.1");
-        let other = nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "10.0.0.2");
-        let r = elect_dr(own, &[other]);
-        assert_eq!(r.bdr, ip("10.0.0.2"));
-        assert_eq!(r.dr, ip("10.0.0.2"), "the BDR promotes to DR");
-        assert_eq!(r.role, InterfaceState::DrOther);
+        let other = nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "0.0.0.0");
+        let out = elect_dr(own, &[other], (ip("10.0.0.9"), ip("10.0.0.1")));
+        assert_eq!(out.dr, ip("10.0.0.1"), "the BDR promotes to DR");
+        assert_eq!(out.bdr, ip("10.0.0.2"), "the remaining router takes BDR");
+        assert_eq!(out.role, InterfaceState::Dr);
+        // Footnote [5]: both identities change — the BDR (us)
+        // becomes DR, and "the remaining router having highest
+        // Router Priority will be selected as Backup Designated
+        // Router" (§9.4 step 7 fires on either change).
+        assert!(out.dr_changed && out.bdr_changed);
     }
 
     #[test]
-    fn established_dr_stays_dr_without_claims() {
-        // The classic stability case: DR selection happens among DR
-        // CLAIMANTS only (§9.4.2) — a higher-priority router that
-        // does not claim DR cannot displace the incumbent.
-        let own = nb("1.1.1.1", "10.0.0.1", 5, "0.0.0.0", "10.0.0.1");
-        let incumbent_dr = nb("9.9.9.9", "10.0.0.9", 1, "10.0.0.9", "0.0.0.0");
-        let r = elect_dr(own, &[incumbent_dr]);
-        assert_eq!(r.dr, ip("10.0.0.9"), "the DR claimant stays DR");
-        assert_eq!(r.bdr, ip("10.0.0.1"), "we claim and win BDR");
-        assert_eq!(r.role, InterfaceState::Backup);
+    fn simultaneous_boot_pair_converges() {
+        // Two routers boot at once (both Waiting, no claims); the
+        // WaitTimer fires on both. The higher Router ID (B)
+        // elects itself DR and — via the step-(4) repeat — A as BDR;
+        // A's single pass yields the transient DR=B/BDR=B of
+        // footnote [5]'s flavor, and A's re-election after seeing
+        // B's claims converges to the same pair.
+        let a = nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "0.0.0.0");
+        let b = nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "0.0.0.0");
+        // B's first election: DR=B (BDR promotes, step 3), then the
+        // repeat with B claiming DR leaves A the BDR.
+        let out_b = elect_dr(b, &[a], no_prev());
+        assert_eq!((out_b.dr, out_b.bdr), (ip("10.0.0.2"), ip("10.0.0.1")));
+        assert_eq!(out_b.role, InterfaceState::Dr);
+        // A's first election: A is neither newly DR nor BDR → no
+        // repeat; the BDR elected (B) also becomes DR.
+        let out_a = elect_dr(a, &[b], no_prev());
+        assert_eq!((out_a.dr, out_a.bdr), (ip("10.0.0.2"), ip("10.0.0.2")));
+        assert_eq!(out_a.role, InterfaceState::DrOther);
+        // B's hellos now claim DR=B, BDR=A (its post-election
+        // values); A re-elects (§9.2's NeighborChange: B newly
+        // declares itself DR) and converges.
+        let b_claiming = nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.1");
+        let out_a2 = elect_dr(a, &[b_claiming], (out_a.dr, out_a.bdr));
+        assert_eq!((out_a2.dr, out_a2.bdr), (ip("10.0.0.2"), ip("10.0.0.1")));
+        assert_eq!(out_a2.role, InterfaceState::Backup);
+    }
+
+    #[test]
+    fn waiting_to_dr_other_needs_no_repeat() {
+        // §9.4 step (4) read with FRR's guard: a router that was
+        // neither DR nor BDR (e.g. Waiting, prev 0.0.0.0/0.0.0.0)
+        // and still elects DR Other does not repeat — the result
+        // already names others both roles.
+        let own = nb("1.1.1.1", "10.0.0.1", 1, "0.0.0.0", "0.0.0.0");
+        let dr = nb("8.8.8.8", "10.0.0.8", 5, "10.0.0.8", "0.0.0.0");
+        let bdr = nb("9.9.9.9", "10.0.0.9", 3, "0.0.0.0", "10.0.0.9");
+        let out = elect_dr(own, &[dr, bdr], no_prev());
+        assert_eq!(
+            (out.dr, out.bdr, out.role),
+            (ip("10.0.0.8"), ip("10.0.0.9"), InterfaceState::DrOther)
+        );
+    }
+
+    #[test]
+    fn no_eligible_routers_leaves_both_unset() {
+        // Everyone priority 0 (or nobody bidirectional): §9.4's
+        // eligible set is empty; both stay 0.0.0.0 and the role is
+        // DR Other.
+        let own = nb("1.1.1.1", "10.0.0.1", 0, "0.0.0.0", "0.0.0.0");
+        let out = elect_dr(own, &[], no_prev());
+        assert_eq!(out.dr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(out.bdr, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(out.role, InterfaceState::DrOther);
+    }
+
+    #[test]
+    fn priority_zero_interface_enters_dr_other_directly() {
+        // §9.3 InterfaceUp: broadcast + priority 0 skips Waiting —
+        // "if the router is not eligible ... the interface state
+        // transitions to DR Other"; no WaitTimer.
+        let mut f = InterfaceFsm::new_with_priority(false, 0);
+        let (s, a) = f.fire(InterfaceEvent::InterfaceUp);
+        assert_eq!(s, InterfaceState::DrOther);
+        assert_eq!(a, vec![InterfaceAction::StartHello]);
+    }
+
+    // ---- §9.2 hello-driven events -----------------------------------
+
+    #[test]
+    fn hello_event_table() {
+        use InterfaceEvent as E;
+        let cases: &[HelloEventRow] = &[
+            // §9.2 form one: neighbor claims itself BDR while we
+            // wait → BackupSeen.
+            (
+                "bdr claim during waiting",
+                InterfaceState::Waiting,
+                None,
+                nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "10.0.0.2"),
+                false,
+                true,
+                vec![E::BackupSeen, E::NeighborChange],
+            ),
+            // §9.2 form two: neighbor claims itself DR and indicates
+            // no BDR.
+            (
+                "dr claim without bdr during waiting",
+                InterfaceState::Waiting,
+                None,
+                nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "0.0.0.0"),
+                false,
+                true,
+                vec![E::BackupSeen, E::NeighborChange],
+            ),
+            // The DR-claim form requires "there is no Backup
+            // Designated Router" — a named BDR does not fire.
+            (
+                "dr claim with bdr named: no backup seen",
+                InterfaceState::Waiting,
+                None,
+                nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.3"),
+                false,
+                true,
+                vec![E::NeighborChange],
+            ),
+            // BackupSeen is Waiting-only (§9.2: "signals an end to
+            // the Waiting state" — no meaning elsewhere); the first
+            // bidirectional hello still reports NeighborChange.
+            (
+                "bdr claim outside waiting",
+                InterfaceState::DrOther,
+                None,
+                nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "10.0.0.2"),
+                false,
+                true,
+                vec![E::NeighborChange],
+            ),
+            // §9.2: "In either case there must be bidirectional
+            // communication" — one-way hellos fire nothing.
+            (
+                "one-way first hello: nothing",
+                InterfaceState::Waiting,
+                None,
+                nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "0.0.0.0"),
+                false,
+                false,
+                vec![],
+            ),
+            // Priority change (§9.2's fifth cause).
+            (
+                "priority change",
+                InterfaceState::Dr,
+                Some(nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "0.0.0.0")),
+                nb("2.2.2.2", "10.0.0.2", 3, "0.0.0.0", "0.0.0.0"),
+                true,
+                true,
+                vec![E::NeighborChange],
+            ),
+            // New self-DR declaration (§9.2's third cause).
+            (
+                "neighbor newly declares dr",
+                InterfaceState::DrOther,
+                Some(nb("2.2.2.2", "10.0.0.2", 1, "0.0.0.0", "0.0.0.0")),
+                nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "0.0.0.0"),
+                true,
+                true,
+                vec![E::NeighborChange],
+            ),
+            // Lost bidirectionality (§9.2's second cause) — claims
+            // not examined on a one-way hello.
+            (
+                "bidirectionality lost",
+                InterfaceState::DrOther,
+                Some(nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "0.0.0.0")),
+                nb("2.2.2.2", "10.0.0.2", 5, "10.0.0.2", "0.0.0.0"),
+                true,
+                false,
+                vec![E::NeighborChange],
+            ),
+            // Steady state: same claims, same priority, still
+            // bidirectional → nothing.
+            (
+                "steady state",
+                InterfaceState::Backup,
+                Some(nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.1")),
+                nb("2.2.2.2", "10.0.0.2", 1, "10.0.0.2", "10.0.0.1"),
+                true,
+                true,
+                vec![],
+            ),
+        ];
+        for (name, state, prev, new, was, is, expected) in cases {
+            assert_eq!(
+                hello_interface_events(*state, *prev, *new, *was, *is),
+                *expected,
+                "{name}"
+            );
+        }
     }
 }
