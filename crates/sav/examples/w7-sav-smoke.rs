@@ -10,6 +10,10 @@
 //! monitor-mode route-lookup counting; `counts` reads the backend's
 //! monitor counters (the dataplane-first path — the nft backend
 //! answers from kernel counters; rp_filter answers Unsupported);
+//! `monitor-round` does install → counter read → traffic → counter
+//! read in ONE process (the per-op attribution is install-scoped, so
+//! the one-process shape is what proves it against the kernel), one
+//! aggregate line and one per-op row per placed op at each phase;
 //! `clear` removes what was installed.
 //!
 //! Usage (no external crates — manual arg parsing):
@@ -20,6 +24,8 @@
 //!                       [--backend rp_filter|nft]
 //! w7-sav-smoke simulate --mode ... --iba ... --observe <ip>@<ifindex> [...]
 //! w7-sav-smoke counts   [--backend rp_filter|nft]
+//! w7-sav-smoke monitor-round --mode ... --action ... --iba ... \
+//!                       --run "<shell command>" [--run ...] [--backend ...]
 //! w7-sav-smoke clear    [--backend rp_filter|nft]
 //! ```
 //!
@@ -32,7 +38,7 @@
 use std::net::IpAddr;
 use std::process::ExitCode;
 
-use common::{Dataplane, IpPrefix};
+use common::{Dataplane, DataplaneError, IpPrefix, SavProgram};
 use netlink_dp::sav_nft::SavBackend;
 use netlink_dp::NetlinkDataplane;
 use sav::gen::UrpfMode;
@@ -54,14 +60,17 @@ fn main() -> ExitCode {
         Some("install") => run(&args[1..], Command::Install),
         Some("simulate") => run(&args[1..], Command::Simulate),
         Some("counts") => run(&args[1..], Command::Counts),
+        Some("monitor-round") => run(&args[1..], Command::MonitorRound),
         Some("clear") => run(&args[1..], Command::Clear),
         _ => {
-            eprintln!("usage: w7-sav-smoke install|simulate|counts|clear [options]");
+            eprintln!("usage: w7-sav-smoke install|simulate|counts|monitor-round|clear [options]");
             eprintln!("  install|simulate: --mode strict|loose --action monitor|drop");
             eprintln!("                    --iba <ifindex>[:<prefix>[,<prefix>...]]");
             eprintln!("                      (repeatable; entries for one ifindex merge)");
             eprintln!("  simulate also:     --observe <ip>@<ifindex> (repeatable)");
             eprintln!("  counts:            reads the backend's monitor counters");
+            eprintln!("  monitor-round:     install + counts before/around traffic, one");
+            eprintln!("                      process (--run <shell command>, repeatable)");
             eprintln!("  all kernel cmds:   --backend rp_filter|nft (default rp_filter)");
             ExitCode::FAILURE
         }
@@ -73,6 +82,7 @@ enum Command {
     Install,
     Simulate,
     Counts,
+    MonitorRound,
     Clear,
 }
 
@@ -88,6 +98,7 @@ fn run(args: &[String], command: Command) -> ExitCode {
     let mut backend = SavBackend::RpFilter;
     let mut ibas: Vec<Iba> = Vec::new();
     let mut observes: Vec<(IpAddr, u32)> = Vec::new();
+    let mut runs: Vec<String> = Vec::new();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -141,6 +152,13 @@ fn run(args: &[String], command: Command) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+            }
+            "--run" => {
+                let Some(cmd) = it.next() else {
+                    eprintln!("--run needs <shell command>");
+                    return ExitCode::FAILURE;
+                };
+                runs.push(cmd.to_string());
             }
             other => {
                 eprintln!("unknown option {other:?}");
@@ -211,6 +229,7 @@ fn run(args: &[String], command: Command) -> ExitCode {
                     c.invalid, c.valid, c.unknown
                 );
             }),
+            Command::MonitorRound => monitor_round(&dp, &program(&ops, mode), &runs).await,
             Command::Clear => dp.sav_clear().await,
             Command::Simulate => unreachable!("simulate returned above"),
         };
@@ -235,6 +254,60 @@ fn run(args: &[String], command: Command) -> ExitCode {
             }
         }
     })
+}
+
+/// One install → read → traffic → read round, deliberately in ONE
+/// process: the nft backend's per-op attribution is install-scoped
+/// (counter names are minted at install time), so the per-op readback
+/// is provable only where the installer and the reader are the same
+/// handle — exactly savd's daemon shape, and this smoke's shape. The
+/// traffic commands run through `sh -c`; a nonzero exit (busybox ping
+/// on 100% loss) is an answer, not an error.
+async fn monitor_round(
+    dp: &NetlinkDataplane,
+    program: &SavProgram,
+    runs: &[String],
+) -> Result<(), DataplaneError> {
+    dp.sav_install(program).await?;
+    println!(
+        "sav-install ok: {} iba op(s) (monitor round; {} traffic command(s))",
+        program.ops().len(),
+        runs.len()
+    );
+    read_round(dp, "before").await;
+    for cmd in runs {
+        match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
+            Ok(status) if !status.success() => {
+                eprintln!("traffic command exited {status} (kept going)");
+            }
+            Err(e) => eprintln!("traffic command failed to spawn: {e}"),
+            Ok(_) => {}
+        }
+    }
+    read_round(dp, "after").await;
+    Ok(())
+}
+
+/// The counter readout of one round phase: the aggregate line, then
+/// one row per placed op when the backend answers per-op reads (the
+/// nft shape; a backend that cannot answers honestly and prints no
+/// rows).
+async fn read_round(dp: &NetlinkDataplane, phase: &str) {
+    match dp.sav_monitor_counts().await {
+        Ok(c) => println!(
+            "sav-round-{phase}: invalid={} valid={} unknown={}",
+            c.invalid, c.valid, c.unknown
+        ),
+        Err(e) => eprintln!("sav-round-{phase}: aggregate read failed: {e}"),
+    }
+    match dp.sav_monitor_per_op().await {
+        Ok(rows) => {
+            for (op, c) in rows {
+                println!("sav-round-op-{phase}: {op} {c}");
+            }
+        }
+        Err(e) => eprintln!("sav-round-op-{phase}: per-op read failed: {e}"),
+    }
 }
 
 /// `ifindex` or `ifindex:prefix[,prefix...]` — a missing or empty

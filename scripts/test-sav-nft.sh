@@ -26,6 +26,9 @@
 # itself; no docker pulls happen.
 #
 # Legs: ENFORCE+MONITOR (counters rise, nothing drops, sysctl stays 0)
+# → PER-OP (N6B: one process installs, drives traffic, reads the
+# kernel counters back per op — the deny-all op owns the invalid
+# packets, the allowlist op the valid ones)
 # → ENFORCE+DROP (spoof 100% loss, legit 0% loss, sysctl still 0)
 # → DIFFERENTIAL (/26 allowlist: FIB-legit .200 blocked 100%, .9
 # passes 0% — against the rp_filter baseline's 0% for both)
@@ -187,6 +190,40 @@ VAL1="$(grep -o ' valid=[0-9]*' "$QUARANTINE/monitor-counts.log" | head -1 | cut
 [ "$INV1" -ge $(( ${INV0:-0} + 3 )) ]
 [ "$VAL1" -ge $(( ${VAL0:-0} + 3 )) ]
 echo "    MONITOR-DEFAULT: kernel counters rose (invalid ${INV0:-0}->$INV1, valid ${VAL0:-0}->$VAL1)"
+
+echo "==> [per-op leg] N6B: one process — install (churn-guarded), traffic, per-op readback"
+# The nft per-op attribution is install-scoped (counter names are
+# minted at install time), so the proof runs where the installer and
+# the reader are one process: `monitor-round` re-installs the SAME
+# program (the churn guard skips the rewrite — the earlier legs'
+# counters must carry over), runs both traffic classes, and prints the
+# aggregate line plus one row per placed op before and after.
+docker exec "$NAME" w7-sav-smoke monitor-round --mode strict --action monitor \
+    --backend nft \
+    --iba "$LEGIT_IF:198.51.100.0/24" --iba "$SPOOF_IF" \
+    --run "$SPOOF_CMD" --run "$LEGIT_CMD" \
+    >"$QUARANTINE/monitor-per-op.log" 2>&1
+grep -q 'sav-install ok' "$QUARANTINE/monitor-per-op.log"
+# Churn guard held: the round's BEFORE aggregate is at least what the
+# previous legs accumulated (a rewrite would have reset it to ~0).
+ROUND_INV_BEFORE="$(grep -o 'sav-round-before: invalid=[0-9]*' "$QUARANTINE/monitor-per-op.log" | cut -d= -f2)"
+[ "$ROUND_INV_BEFORE" -ge "$INV1" ]
+op_row_invalid() { # <phase> <ifindex>
+    grep "sav-round-op-$1: allow if#$2 \[" "$QUARANTINE/monitor-per-op.log" \
+        | grep -o 'invalid=[0-9]*' | cut -d= -f2
+}
+op_row_valid() { # <phase> <ifindex>
+    grep "sav-round-op-$1: allow if#$2 \[" "$QUARANTINE/monitor-per-op.log" \
+        | grep -o ' valid=[0-9]*' | cut -d= -f2
+}
+SPOOF_INV_BEFORE="$(op_row_invalid before "$SPOOF_IF")"
+SPOOF_INV_AFTER="$(op_row_invalid after "$SPOOF_IF")"
+LEGIT_VAL_BEFORE="$(op_row_valid before "$LEGIT_IF")"
+LEGIT_VAL_AFTER="$(op_row_valid after "$LEGIT_IF")"
+[ -n "$SPOOF_INV_AFTER" ] && [ -n "$LEGIT_VAL_AFTER" ]
+[ "$SPOOF_INV_AFTER" -ge $(( ${SPOOF_INV_BEFORE:-0} + 3 )) ]
+[ "$LEGIT_VAL_AFTER" -ge $(( ${LEGIT_VAL_BEFORE:-0} + 3 )) ]
+echo "    PER-OP: deny-all op invalid ${SPOOF_INV_BEFORE:-?}->$SPOOF_INV_AFTER, allowlist op valid ${LEGIT_VAL_BEFORE:-?}->$LEGIT_VAL_AFTER (counters carried over: before-aggregate $ROUND_INV_BEFORE)"
 
 echo "==> [drop leg] strict IBA, explicit Drop action"
 docker exec "$NAME" w7-sav-smoke install --mode strict --action drop \
