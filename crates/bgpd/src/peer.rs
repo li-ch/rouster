@@ -1303,7 +1303,7 @@ mod tests {
         use crate::attr::{AsPath, MpNextHop, MpReach, Origin, PathAttribute};
         use crate::message::BgpNotification;
         use std::sync::Mutex as StdMutex;
-        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{duplex, AsyncWriteExt};
 
         /// An agent that records every event (the contract-test
         /// shape from the sav crate, local copy so the wiring is
@@ -1352,7 +1352,7 @@ mod tests {
             )
             .with_shared(Arc::new(SessionShared::default()))
             .with_sav_agent(Arc::clone(&agent) as Arc<dyn sav::agent::SavAgent>);
-            let mut sink = SharedSink(Arc::new(std::sync::Mutex::new(NullSink)));
+            let sink = SharedSink(Arc::new(std::sync::Mutex::new(NullSink)));
             let driver_sink = sink.clone();
             let driver = tokio::spawn(async move { session.run(&mut { driver_sink }).await });
 

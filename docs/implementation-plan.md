@@ -279,3 +279,31 @@ The phase text above is unchanged; this block is status only.
   recommendation — zero lock changes. Evidence:
   away/2026-10-11/weekend/reports/ (W1-a, W1-b, W1-c, W2-d, W2-e,
   W2-f, W3-integration).
+
+- 2026-10-11 (night program, stage N4) — **C2 executed + the SAVNET
+  agent interface landed** (4 commits, 927f358..138d731): the SIB
+  consumes the S1 explicit rib surfaces — bindings derive from the
+  merged `best_with_connected` view (a connected candidate masks a
+  protocol best at distance 0) and gateway egress resolves through
+  `resolve_nexthop_recursive` (S1 deviations carried: no
+  fall-through, /0 never answers; kernel mirror walks, never binds).
+  The property suite's reference model learned both sources and
+  re-pinned (8 properties) plus 3 new ones (connected fold-in over an
+  interface mirror, walk-stress with in-prefix gateways,
+  empty-surface equivalence vs the legacy derivation — the
+  byte-identical-when-empty bar). The `experimental-savnet` feature
+  (default OFF, the workspace's first) gates the in-process
+  `SavAgent` interface: bgpd's `on_message` UPDATE arm reports
+  installs/withdraws (Adj-RIB-In granularity) + Established/teardown
+  adjacency; ospfd reports the `InstallAndFlood` changed-key products
+  as LsaChanged events + adjacency from both report consumers; savd
+  hosts the monitor-only default `MonitorAgent` (log-before-drop:
+  suggestions log, nothing enforces — no landed path turns one into a
+  Binding or a rule). No wire protocols, no serialization, no
+  sockets; no new crates (optional path-deps, rpki precedent). Gates:
+  default workspace 1106/0, fmt+clippy -D warnings clean, and the
+  three cfg-on legs green (sav 121, bgpd 173, ospfd 173; the prompt's
+  singular "one cfg-on compile+test leg" read as one per wired crate
+  — disclosed). 23 new tests (7 default + 16 cfg-on). Design note:
+  docs/protocols/savnet.md (interface, flag, what stays out until
+  drafts stabilize).
