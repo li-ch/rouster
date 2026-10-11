@@ -99,6 +99,21 @@
 //! from the hysteresis clock (tokio's pausable runtime `Instant`, which
 //! the deferred-delete tests drive through `start_paused`).
 //!
+//! # Hosted SAVNET agent (experimental-savnet, default OFF)
+//!
+//! Behind the flag, savd hosts the default [`crate::agent::MonitorAgent`]
+//! ([`SavDaemon::set_agent`]): the daemon's own ZAPI RIB view feeds it
+//! route events and every evaluate logs its binding suggestions —
+//! **monitor-only** (the log-before-drop rule): no suggestion is
+//! enforced, stored as a binding, or compiled into a rule; the
+//! enforcement path is deliberately unwired until the SAVNET drafts
+//! stabilize (docs/protocols/savnet.md). The interface itself is
+//! in-process hooks only — no serialization, no sockets, no wire
+//! codecs — so an anchor's hook calls reach an agent inside the
+//! anchor's process (tests compose them; the architecture's
+//! single-binary default deployment makes the composition
+//! production-real); savd's own feed is the production-visible half.
+//!
 //! # Config (`/etc/savd.conf`-shaped)
 //!
 //! Simple line grammar consistent with rousterd's (blank/`!`/`#`
@@ -148,6 +163,9 @@ use tokio::time::{timeout, Instant};
 use tracing::{debug, info, warn};
 use zapi::{route_type, ZapiClient, ZapiMessage};
 
+// The hosted agent's trait methods (experimental-savnet only).
+#[cfg(feature = "experimental-savnet")]
+use crate::agent::SavAgent;
 use crate::gen::{generate_urpf, RuleOrigin, UrpfMode};
 use crate::mode::{SavAction, SavConfig, ValidationMode};
 use crate::monitor::SpoofMonitor;
@@ -933,6 +951,17 @@ pub struct SavDaemon<IO> {
     /// so the switch is asserted, not just eyeballed in logs. The
     /// pre-first-evaluate value is the simulation's zero counts.
     last_counts: (CountsSource, SavMonitorCounts),
+    /// The hosted SAVNET agent (experimental-savnet, default OFF and
+    /// then default None): savd's own ZAPI RIB view feeds it events
+    /// and every evaluate logs its suggestions — monitor-only, the
+    /// log-before-drop rule. See [`crate::agent`] for the interface
+    /// and its honest process-topology scoping.
+    #[cfg(feature = "experimental-savnet")]
+    agent: Option<crate::agent::MonitorAgent>,
+    /// The suggestions the last evaluate logged (test-visible evidence
+    /// of the monitor-only contract: logged, never enforced).
+    #[cfg(feature = "experimental-savnet")]
+    last_suggestions: Vec<crate::agent::SavBindingSuggestion>,
 }
 
 impl<IO> SavDaemon<IO>
@@ -953,7 +982,36 @@ where
             clock: Box::new(std::time::Instant::now),
             last_swept: Vec::new(),
             last_counts: (CountsSource::Simulation, SavMonitorCounts::default()),
+            #[cfg(feature = "experimental-savnet")]
+            agent: None,
+            #[cfg(feature = "experimental-savnet")]
+            last_suggestions: Vec::new(),
         }
+    }
+
+    /// Host the SAVNET agent (experimental-savnet). From the next
+    /// push/evaluate on: savd's own ZAPI RIB view feeds the agent
+    /// route events, and every evaluate logs the agent's binding
+    /// suggestions — **monitor-only**: no suggestion becomes a
+    /// [`Binding`] or a rule without explicit operator config, and no
+    /// landed path turns one into either (draft-dependent; see
+    /// docs/protocols/savnet.md).
+    #[cfg(feature = "experimental-savnet")]
+    pub fn set_agent(&mut self, agent: crate::agent::MonitorAgent) {
+        self.agent = Some(agent);
+    }
+
+    /// The hosted agent, if any.
+    #[cfg(feature = "experimental-savnet")]
+    pub fn agent(&self) -> Option<&crate::agent::MonitorAgent> {
+        self.agent.as_ref()
+    }
+
+    /// The suggestions the last evaluate logged (monitor-only
+    /// evidence; empty until an evaluate runs with an agent hosted).
+    #[cfg(feature = "experimental-savnet")]
+    pub fn last_suggestions(&self) -> &[crate::agent::SavBindingSuggestion] {
+        &self.last_suggestions
     }
 
     /// Replace the running configuration (SIGHUP semantics; the caller
@@ -1137,6 +1195,33 @@ where
                     // there too; this is the same pin).
                     entry.table = MAIN_TABLE;
                     debug!(prefix = %entry.prefix, "savd: rib push add");
+                    // The hosted SAVNET agent's production feed
+                    // (experimental-savnet): savd's own RIB view, no
+                    // peer granularity (the agent's RibView source).
+                    // Monitor-only — the event is recorded/logged,
+                    // nothing derives from it without explicit config.
+                    #[cfg(feature = "experimental-savnet")]
+                    if let Some(agent) = &self.agent {
+                        let nexthop =
+                            entry
+                                .nexthops
+                                .hops()
+                                .first()
+                                .and_then(|&(hop, _)| match hop {
+                                    common::Nexthop::Ipv4(g) | common::Nexthop::Ipv4If(g, _) => {
+                                        Some(std::net::IpAddr::V4(g))
+                                    }
+                                    common::Nexthop::Ipv6(g) | common::Nexthop::Ipv6If(g, _) => {
+                                        Some(std::net::IpAddr::V6(g))
+                                    }
+                                    _ => None,
+                                });
+                        agent.on_event(crate::agent::SavAgentEvent::RouteInstalled {
+                            source: crate::agent::SavEventSource::RibView,
+                            prefix: entry.prefix,
+                            nexthop,
+                        });
+                    }
                     self.rib.add_route(entry);
                     self.dirty = true;
                 } else {
@@ -1146,6 +1231,13 @@ where
             ZapiMessage::RedistributeRouteDel(route) => match route.protocol() {
                 Some(protocol) => {
                     debug!(prefix = %route.prefix, "savd: rib push del");
+                    #[cfg(feature = "experimental-savnet")]
+                    if let Some(agent) = &self.agent {
+                        agent.on_event(crate::agent::SavAgentEvent::RouteWithdrawn {
+                            source: crate::agent::SavEventSource::RibView,
+                            prefix: route.prefix,
+                        });
+                    }
                     self.rib
                         .table_mut(MAIN_TABLE)
                         .remove(&route.prefix, protocol);
@@ -1573,6 +1665,28 @@ where
                     "savd: per-rule monitor tallies (GSC §4 count; simulation)"
                 );
             }
+        }
+
+        // The hosted SAVNET agent's suggestions (experimental-savnet):
+        // every suggestion logs, NOTHING enforces — the log-before-drop
+        // rule. No suggestion becomes a Binding or a rule tonight; the
+        // enforcement path is deliberately unwired until the drafts
+        // stabilize and the owner decides the confirmation protocol
+        // (docs/protocols/savnet.md).
+        #[cfg(feature = "experimental-savnet")]
+        {
+            let suggestions = self
+                .agent
+                .as_ref()
+                .map(|agent| agent.binding_suggestions())
+                .unwrap_or_default();
+            for suggestion in &suggestions {
+                info!(
+                    suggestion = %suggestion,
+                    "savd: savnet agent suggestion (monitor-only, not enforced)"
+                );
+            }
+            self.last_suggestions = suggestions;
         }
         Ok(())
     }
@@ -3200,5 +3314,96 @@ mod tests {
             NexthopGroup::new(),
             RouteProtocol::Static,
         )
+    }
+
+    // ---- hosted SAVNET agent (experimental-savnet only) ----
+
+    #[cfg(feature = "experimental-savnet")]
+    mod savnet_host {
+        use super::*;
+
+        #[tokio::test]
+        async fn the_agent_defaults_to_none() {
+            let (client_io, _server) = spawn_fake_zebra(vec![]);
+            let daemon = SavDaemon::new(ZapiClient::new(client_io));
+            assert!(daemon.agent().is_none(), "no agent until set_agent");
+            assert!(daemon.last_suggestions().is_empty());
+        }
+
+        /// The production feed: pushes report RibView route events to
+        /// the hosted agent; the evaluate's suggestion pass stays empty
+        /// (no adjacency, no peer granularity) and the installed
+        /// program is exactly the no-agent shape.
+        #[tokio::test]
+        async fn ribview_pushes_feed_the_agent_and_nothing_enforces() {
+            let (client_io, server) =
+                spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+            let mut daemon = daemon_with_interfaces(client_io);
+            daemon.set_agent(crate::agent::MonitorAgent::new());
+            daemon.initial_sync().await.unwrap();
+            // A push after sync (the event-driven path).
+            daemon.apply_push(ZapiMessage::RedistributeRouteDel(route_del()));
+
+            // Every registration re-dumps the route (the fake zebra's
+            // per-registration behavior): 7 types x 2 AFIs = 14 adds
+            // during sync, then the explicit del.
+            let events = daemon.agent().unwrap().events();
+            assert_eq!(events.len(), 15, "14 dump adds + 1 push del reported");
+            assert!(events[..14]
+                .iter()
+                .all(|event| matches!(event, crate::agent::SavAgentEvent::RouteInstalled { .. })));
+            assert!(matches!(
+                events[14],
+                crate::agent::SavAgentEvent::RouteWithdrawn { .. }
+            ));
+
+            let dp = MockSavDp::default();
+            daemon.evaluate(&dp).await.unwrap();
+            assert!(
+                daemon.last_suggestions().is_empty(),
+                "RibView has no peer granularity: no suggestion, nothing enforced"
+            );
+            // The del removed the only route: the strict allowlist on
+            // if#2 empties (the program IS the no-agent shape — the
+            // agent never touched it).
+            assert_eq!(
+                daemon.installed().unwrap().ops(),
+                &[monitor_allow(2, &[]), monitor_allow(3, &[])]
+            );
+            drop(daemon);
+            let _ = server.await;
+        }
+
+        /// The monitor-only contract, program-equality form: with and
+        /// without a hosted agent, the same push/evaluate sequence
+        /// installs byte-identical programs (the agent changes logs,
+        /// never enforcement — feature-on equivalence with the
+        /// default-off build's daemon).
+        #[tokio::test]
+        async fn a_hosted_agent_changes_no_installed_program() {
+            async fn sequence(with_agent: bool) -> SavProgram {
+                let (client_io, server) =
+                    spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+                let mut daemon = daemon_with_interfaces(client_io);
+                if with_agent {
+                    daemon.set_agent(crate::agent::MonitorAgent::new());
+                }
+                daemon.initial_sync().await.unwrap();
+                let dp = MockSavDp::default();
+                daemon.evaluate(&dp).await.unwrap();
+                let program = daemon.installed().unwrap().clone();
+                drop(daemon);
+                let _ = server.await;
+                program
+            }
+            let bare = sequence(false).await;
+            let hosted = sequence(true).await;
+            assert_eq!(
+                bare.ops(),
+                hosted.ops(),
+                "hosting the monitor agent changes no installed op"
+            );
+            assert_eq!(bare.ops()[0], monitor_allow(2, &["198.51.100.0/24"]));
+        }
     }
 }

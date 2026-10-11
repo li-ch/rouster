@@ -56,6 +56,9 @@ pub mod program;
 pub mod savd;
 pub mod table;
 
+#[cfg(feature = "experimental-savnet")]
+pub mod agent;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
