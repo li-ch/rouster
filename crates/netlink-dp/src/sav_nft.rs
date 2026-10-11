@@ -36,6 +36,13 @@
 //!   counter past an accepted sub-chain never increments), which is
 //!   what makes the decisive chains decisive.
 //!
+//! Interval sets declare `auto-merge`: a daemon-fed allowlist can hold
+//! a covering and a covered prefix at once (the SIB merges the
+//! interface mirror's connected prefixes with RIB-derived ones), and a
+//! plain interval set rejects overlapping elements ("conflicting
+//! intervals specified", nftables v1.0.9) — auto-merge resolves them
+//! to the union, which is the list's own semantics either way.
+//!
 //! The uRPF generator-semantics hint ([`common::SavUrpf`]) is ignored,
 //! as `common::dataplane` documents for real rule engines: this backend
 //! enforces the allowlist content itself. The pre-registered idiom for
@@ -606,7 +613,15 @@ fn emit_set(text: &mut String, name: &str, addr_type: &str, elements: Vec<String
     }
     text.push_str(&format!("    set {name} {{\n"));
     text.push_str(&format!("        type {addr_type}\n"));
+    // auto-merge: an allowlist may hold a covering and a covered
+    // prefix at once (the daemon's SIB merges the interface mirror's
+    // connected prefixes with RIB-derived ones); a plain interval set
+    // rejects overlapping elements ("conflicting intervals specified",
+    // nftables v1.0.9). The resolution is the union — the list's own
+    // semantics either way — and the declared elements stay the SIB's
+    // list verbatim (nft itself stores the merged form).
     text.push_str("        flags interval\n");
+    text.push_str("        auto-merge\n");
     text.push_str(&format!(
         "        elements = {{ {} }}\n",
         elements.join(", ")
@@ -790,6 +805,46 @@ mod tests {
         let text = ruleset(&program, &names(&[(6, "vethspoof")])).unwrap().text;
         assert!(text.contains(r#"counter name "i_vethspoof_6" accept"#));
         assert!(!text.contains("drop"), "monitor never drops");
+    }
+
+    /// savd-on-nft (ADD-C1, failing first): the daemon's SIB merges
+    /// the interface mirror's CONNECTED /24 with the redistribute
+    /// push's RIB /25 into one IBA allowlist — a covering and a
+    /// covered prefix in the same set. nftables rejects overlapping
+    /// intervals in a plain interval set ("conflicting intervals
+    /// specified", reproduced against nftables v1.0.9 — the first
+    /// live savd `backend nft` start failed on exactly this), so
+    /// every interval set declares `auto-merge`: the resolution is
+    /// the union, which is the list's own semantics either way (a
+    /// source in ANY listed prefix is allowed; blocklists the same
+    /// for denying), and the declared elements stay the SIB's list
+    /// verbatim (operator evidence; nft itself stores the merged
+    /// form).
+    #[test]
+    fn overlapping_prefixes_in_one_allowlist_stay_loadable() {
+        let program = SavProgram::from_ops([allow(
+            4,
+            &["198.51.100.0/24", "198.51.100.0/25", "fe80::/64"],
+            SavEnforce::Monitor,
+        )]);
+        let rs = ruleset(&program, &names(&[(4, "vethlegit")])).unwrap();
+        let set = rs
+            .text
+            .split("set a4_vethlegit_4 {")
+            .nth(1)
+            .expect("allowlist set present")
+            .split("    }")
+            .next()
+            .unwrap();
+        assert!(
+            set.contains("flags interval") && set.contains("auto-merge"),
+            "interval sets must auto-merge overlapping elements:\n{set}"
+        );
+        assert!(
+            rs.text
+                .contains("elements = { 198.51.100.0/24, 198.51.100.0/25 }"),
+            "both prefixes stay declared (the SIB's list verbatim)"
+        );
     }
 
     /// IBB: match rules are terminal denies, but the chain has NO
