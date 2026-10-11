@@ -18,6 +18,12 @@ impl NetlinkDataplane {
         ))
     }
 
+    /// Compile-compat with the Linux handle: construction already
+    /// fails on non-Linux, so the backend selector is inert here.
+    pub fn with_sav_backend(self, _backend: crate::sav_nft::SavBackend) -> Self {
+        self
+    }
+
     pub async fn dump_route_count(&self) -> Result<usize, DataplaneError> {
         Err(DataplaneError::Unsupported(
             "netlink dataplane is only available on Linux",

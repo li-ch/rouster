@@ -66,6 +66,23 @@ pub fn encode(boot_id: &str, map: &AppliedMap) -> String {
     out
 }
 
+/// The boot-id stamp check both state files share: the first line must
+/// be exactly `boot-id <id>`; `Some(body)` when it vouches for the
+/// reading boot, `None` when it names another boot, is absent (legacy
+/// or foreign format), malformed, or not on the first line — the boot
+/// is then unknowable, so the state is never trusted.
+fn stamped_body<'a>(text: &'a str, boot_id: &str) -> Option<&'a str> {
+    let (first, rest) = match text.split_once('\n') {
+        Some((first, rest)) => (first, rest),
+        None => (text, ""),
+    };
+    let mut header = first.split_whitespace();
+    match (header.next(), header.next(), header.next()) {
+        (Some("boot-id"), Some(id), None) if id == boot_id => Some(rest),
+        _ => None,
+    }
+}
+
 /// Parse an applied-state file against the boot that is reading it.
 ///
 /// A stamp mismatch — different boot, missing stamp (legacy or foreign
@@ -74,19 +91,9 @@ pub fn encode(boot_id: &str, map: &AppliedMap) -> String {
 /// state as absent. Body decoding stays lenient (see module docs);
 /// there is no error case.
 pub fn decode(text: &str, boot_id: &str) -> DecodeOutcome {
-    // The stamp must be the first line, exactly `boot-id <id>`.
-    let (first, rest) = match text.split_once('\n') {
-        Some((first, rest)) => (first, rest),
-        None => (text, ""),
-    };
-    let mut header = first.split_whitespace();
-    let stamp_matches = match (header.next(), header.next(), header.next()) {
-        (Some("boot-id"), Some(id), None) => id == boot_id,
-        _ => false,
-    };
-    if !stamp_matches {
+    let Some(rest) = stamped_body(text, boot_id) else {
         return DecodeOutcome::ForeignBoot;
-    }
+    };
 
     let mut map = AppliedMap::new();
     for line in rest.lines() {
@@ -117,6 +124,48 @@ pub fn decode(text: &str, boot_id: &str) -> DecodeOutcome {
         map.insert(ifindex, (name.to_string(), prior, value));
     }
     DecodeOutcome::Current(map)
+}
+
+/// The nft backend's applied marker — a NAMESPACED format sharing this
+/// module's machinery (the boot-id stamp discipline and the lenient
+/// body), one `<ifindex> <name>` line per interface carrying a chain.
+///
+/// Why so little state (disclosure): the nft backend's table is
+/// WHOLLY OWNED — installing it writes nothing outside
+/// `table inet rouster_sav`, so there are no pre-SAV kernel values to
+/// restore and clear is a single `destroy table`; the sysctl triple
+/// `(name, prior, applied)` would be meaningless here. What the marker
+/// carries is crash-observability: a fresh process can see — and log —
+/// which interfaces a SIGKILLed predecessor left enforced, instead of
+/// discovering it by listing the kernel table. An empty interface list
+/// encodes as an empty file, same rule as the sysctl state.
+pub fn encode_nft(boot_id: &str, ifaces: &[(u32, String)]) -> String {
+    if ifaces.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("boot-id {boot_id}\n");
+    for (ifindex, name) in ifaces {
+        out.push_str(&format!("{ifindex} {name}\n"));
+    }
+    out
+}
+
+/// Parse the nft marker against the reading boot: `None` is the same
+/// verdict as [`DecodeOutcome::ForeignBoot`] (state from another boot,
+/// or no state at all — treat as absent); body lines stay lenient.
+pub fn decode_nft(text: &str, boot_id: &str) -> Option<Vec<(u32, String)>> {
+    let rest = stamped_body(text, boot_id)?;
+    let mut ifaces = Vec::new();
+    for line in rest.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(ifindex), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if let Ok(ifindex) = ifindex.parse::<u32>() {
+            ifaces.push((ifindex, name.to_string()));
+        }
+    }
+    Some(ifaces)
 }
 
 /// The churn-guard verdict for replaying a resolved install against
@@ -351,5 +400,49 @@ mod tests {
         let delta = replay_delta(&planned, &AppliedMap::new());
         assert_eq!(delta.writes, planned);
         assert!(delta.reverts.is_empty());
+    }
+
+    /// The nft marker (namespaced format): round-trips within one boot;
+    /// an empty interface list is an empty file; foreign-boot and
+    /// stamp-less files are absent, exactly the sysctl state's rules.
+    #[test]
+    fn nft_marker_round_trips_and_respects_the_boot_stamp() {
+        let ifaces = vec![
+            (4u32, "vethlegit".to_string()),
+            (6, "vethspoof".to_string()),
+        ];
+        assert_eq!(
+            decode_nft(&encode_nft(BOOT, &ifaces), BOOT),
+            Some(ifaces.clone())
+        );
+        assert_eq!(
+            encode_nft(BOOT, &ifaces),
+            format!("boot-id {BOOT}\n4 vethlegit\n6 vethspoof\n")
+        );
+        assert!(encode_nft(BOOT, &[]).is_empty());
+        assert_eq!(decode_nft("", BOOT), None, "no state = absent");
+        assert_eq!(
+            decode_nft(&encode_nft(BOOT, &ifaces), OTHER_BOOT),
+            None,
+            "another boot's marker is never trusted"
+        );
+        assert_eq!(decode_nft("4 vethlegit\n", BOOT), None, "stamp-less legacy");
+    }
+
+    /// The nft marker's body is lenient: malformed lines skip without
+    /// losing the healthy ones (the sysctl decoder's stance).
+    #[test]
+    fn nft_marker_skips_malformed_lines() {
+        let text = format!(
+            "boot-id {BOOT}\n\
+             6 vethspoof\n\
+             garbage\n\
+             4 vethlegit extra\n\
+             x nonnumeric\n"
+        );
+        assert_eq!(
+            decode_nft(&text, BOOT),
+            Some(vec![(6u32, "vethspoof".to_string())])
+        );
     }
 }

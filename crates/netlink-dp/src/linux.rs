@@ -25,6 +25,7 @@ use rtnetlink::sys::{protocols::NETLINK_ROUTE, AsyncSocket, SocketAddr, TokioSoc
 use tracing::{debug, info, instrument, warn};
 
 use crate::sav::SysctlPlan;
+use crate::sav_nft::{self, SavBackend};
 use crate::sav_state;
 
 /// Where the applied-SAV state file lives (the daemon run dir AGENTS.md
@@ -36,6 +37,14 @@ use crate::sav_state;
 /// (ifindexes are per-boot and a reboot may have reordered them).
 const SAV_STATE_DIR: &str = "/run/rouster";
 const SAV_STATE_PATH: &str = "/run/rouster/sav-applied";
+/// The nft backend's applied marker (same run dir, namespaced format —
+/// see [`sav_state::encode_nft`]).
+const NFT_STATE_PATH: &str = "/run/rouster/sav-nft-applied";
+/// The ruleset file the nft backend applies with `nft -f`: operator
+/// evidence first (the enforced ruleset, verbatim), and the churn
+/// guard's comparison key second (an identical replay must not rewrite
+/// the table — a rewrite would reset the kernel counters).
+const NFT_RULESET_PATH: &str = "/run/rouster/sav-nft.ruleset";
 /// The machine's boot identity. Not the wall clock: a value that
 /// changes iff the kernel rebooted (and with it, the ifindex
 /// allocation order the state file's keys depend on).
@@ -44,9 +53,11 @@ const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 /// Netlink-backed dataplane handle.
 ///
 /// Owns the multicast event receiver; `next_event` drives the kernel→RIB
-/// direction of the mirror. SAV enforcement state (`sav_applied`) records
-/// the rp_filter values this handle wrote and the pre-SAV values to
-/// restore on clear/replace.
+/// direction of the mirror. SAV enforcement routes through
+/// [`SavBackend`] (rp_filter sysctls, the default, or the nftables
+/// ruleset — see [`crate::sav_nft`]); the rp_filter state
+/// (`sav_applied`) records the values this handle wrote and the
+/// pre-SAV values to restore on clear/replace.
 pub struct NetlinkDataplane {
     handle: rtnetlink::Handle,
     messages: futures::channel::mpsc::UnboundedReceiver<(
@@ -57,6 +68,9 @@ pub struct NetlinkDataplane {
     /// applied value). Interior-mutable so the `&self` trait methods
     /// can update it; never held across an await.
     sav_applied: Mutex<BTreeMap<u32, (String, u8, u8)>>,
+    /// Which enforcement surface the SAV trait ops route to (default
+    /// rp_filter — the long-landed behavior).
+    sav_backend: SavBackend,
 }
 
 impl NetlinkDataplane {
@@ -84,9 +98,19 @@ impl NetlinkDataplane {
                 handle,
                 messages,
                 sav_applied: Mutex::new(BTreeMap::new()),
+                sav_backend: SavBackend::default(),
             },
             connection,
         ))
+    }
+
+    /// Select the SAV enforcement surface (rp_filter sysctls by
+    /// default; `SavBackend::Nft` routes the SAV trait ops to the
+    /// nftables ruleset — see [`crate::sav_nft`]). Builder form on the
+    /// constructed handle: `NetlinkDataplane::new()?.0.with_sav_backend(..)`.
+    pub fn with_sav_backend(mut self, backend: SavBackend) -> Self {
+        self.sav_backend = backend;
+        self
     }
 
     pub fn handle(&self) -> &rtnetlink::Handle {
@@ -752,9 +776,57 @@ impl Dataplane for NetlinkDataplane {
         Ok(())
     }
 
-    /// Install or replace a SAV program on the rp_filter backend
-    /// (see [`crate::sav`] for the mapping and its disclosed
-    /// approximations).
+    /// Install or replace a SAV program on the configured backend
+    /// ([`SavBackend`]): the rp_filter sysctl surface (default; see
+    /// [`crate::sav`] for the mapping and its disclosed approximations)
+    /// or the nftables ruleset ([`crate::sav_nft`] — the content-
+    /// enforcing surface with kernel monitor counters). Both sides
+    /// honor replace semantics and carry a churn guard; their
+    /// backend-specific contracts are on the private install methods.
+    #[instrument(skip(self))]
+    async fn sav_install(&self, program: &SavProgram) -> Result<(), DataplaneError> {
+        match self.sav_backend {
+            SavBackend::RpFilter => self.sav_install_rp_filter(program).await,
+            SavBackend::Nft => self.sav_install_nft(program).await,
+        }
+    }
+
+    /// Monitor counters: the nft backend reads its named counters back
+    /// from the kernel (the A18 dataplane-first path's first answering
+    /// backend); the rp_filter surface has no per-rule counters — its
+    /// pre-registered answer stays `Unsupported`, and monitor counting
+    /// runs in the sav layer's route-lookup simulation.
+    async fn sav_monitor_counts(&self) -> Result<SavMonitorCounts, DataplaneError> {
+        match self.sav_backend {
+            SavBackend::RpFilter => Err(DataplaneError::Unsupported(
+                "rp_filter backend has no per-rule kernel counters; monitor counting runs in the \
+                 sav layer (route-lookup simulation)",
+            )),
+            SavBackend::Nft => {
+                let out = run_nft(&["list", "counters"])?;
+                let packets = sav_nft::parse_counter_packets(&out, sav_nft::NFT_TABLE);
+                let counts = sav_nft::aggregate_counts(&packets);
+                debug!(%counts, "sav nft monitor counters read");
+                Ok(counts)
+            }
+        }
+    }
+
+    /// Remove every installed SAV rule on the configured backend: the
+    /// sysctl side restores each interface's pre-SAV rp_filter value;
+    /// the nft side destroys the wholly-owned table (a single command —
+    /// nothing outside it was ever touched).
+    #[instrument(skip(self))]
+    async fn sav_clear(&self) -> Result<(), DataplaneError> {
+        match self.sav_backend {
+            SavBackend::RpFilter => self.sav_clear_rp_filter().await,
+            SavBackend::Nft => self.sav_clear_nft(),
+        }
+    }
+}
+
+impl NetlinkDataplane {
+    /// The rp_filter install path (default backend).
     ///
     /// Replace semantics: interfaces the previous program covered but
     /// this one does not are restored to their pre-SAV values. Failures
@@ -768,8 +840,7 @@ impl Dataplane for NetlinkDataplane {
     /// savd re-evaluates on every dirtying event, so identical
     /// replays are the common case; a restarted process replays onto
     /// the state its predecessor left the same way.
-    #[instrument(skip(self))]
-    async fn sav_install(&self, program: &SavProgram) -> Result<(), DataplaneError> {
+    async fn sav_install_rp_filter(&self, program: &SavProgram) -> Result<(), DataplaneError> {
         let plan = SysctlPlan::from_program(program);
         for (op, reason) in &plan.rejected {
             warn!(op = ?op, reason, "sav op not expressible on the rp_filter backend");
@@ -850,23 +921,11 @@ impl Dataplane for NetlinkDataplane {
         }
     }
 
-    /// The rp_filter backend exposes no per-rule kernel counters (a
-    /// strict/loose value drops, it does not count) — the pre-registered
-    /// answer is `Unsupported`, and monitor counting runs in the sav
-    /// layer's route-lookup simulation (`sav::monitor`).
-    async fn sav_monitor_counts(&self) -> Result<SavMonitorCounts, DataplaneError> {
-        Err(DataplaneError::Unsupported(
-            "rp_filter backend has no per-rule kernel counters; monitor counting runs in the \
-             sav layer (route-lookup simulation)",
-        ))
-    }
-
-    /// Remove every installed SAV rule, restoring each interface's
-    /// pre-SAV rp_filter value. Interfaces that vanished (no name in a
-    /// link dump) have nothing left to restore and are dropped from
-    /// the applied set with a debug note.
-    #[instrument(skip(self))]
-    async fn sav_clear(&self) -> Result<(), DataplaneError> {
+    /// The rp_filter clear path: restore each interface's pre-SAV
+    /// rp_filter value. Interfaces that vanished (no name in a link
+    /// dump) have nothing left to restore and are dropped from the
+    /// applied set with a debug note (in `merge_applied_from_disk`).
+    async fn sav_clear_rp_filter(&self) -> Result<(), DataplaneError> {
         self.merge_applied_from_disk();
         let applied: Vec<(u32, String, u8)> = {
             let map = self.sav_applied.lock().unwrap();
@@ -893,6 +952,147 @@ impl Dataplane for NetlinkDataplane {
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// The nft install path (SavBackend::Nft).
+    ///
+    /// Exec choice (disclosed): the ruleset is applied by executing the
+    /// `nft` binary (`nft -f <file>`, and `destroy table` for the
+    /// replace pre-clean) — nftables' only sanctioned config channel;
+    /// there is no rtnetlink API for it (the same reason the sysctl
+    /// backend writes procfs), and a libnftn* dependency is not
+    /// authorized. All dataplane I/O stays inside this crate
+    /// (invariant #6). The execs are short-lived local subprocesses —
+    /// the same blocking class as the procfs writes above.
+    ///
+    /// Replace semantics: the table is wholly owned, so replace is
+    /// destroy-and-recreate. The generated file lands at
+    /// [`NFT_RULESET_PATH`] first (operator evidence — the enforced
+    /// ruleset verbatim) and is the churn guard's comparison key: an
+    /// identical replay (file bytes match AND the table is still
+    /// present) touches nothing — notably it does not reset the kernel
+    /// counters, which savd's event-driven re-evaluations must not do.
+    async fn sav_install_nft(&self, program: &SavProgram) -> Result<(), DataplaneError> {
+        let names = self.link_names().await?;
+        let rs =
+            sav_nft::ruleset(program, &names).map_err(|e| DataplaneError::Other(e.to_string()))?;
+        for (op, reason) in &rs.ignored {
+            warn!(op = ?op, reason, "sav op not placed in the nft ruleset");
+        }
+
+        // Churn guard (file is the truth; presence cross-checked
+        // against the kernel so an externally destroyed table is
+        // reinstalled, never skipped over).
+        let applied_text = std::fs::read_to_string(NFT_RULESET_PATH).unwrap_or_default();
+        let table_present = self.nft_table_exists();
+        let want_table = !rs.text.is_empty();
+        if applied_text == rs.text && table_present == want_table {
+            debug!("sav nft replay matches the applied ruleset; no table rewrite");
+            return Ok(());
+        }
+
+        // Crash observability: name what a previous process left
+        // enforced (the marker is diagnostics — clear/replace work
+        // without it; see sav_state::encode_nft for why that is enough).
+        if let Ok(text) = std::fs::read_to_string(NFT_STATE_PATH) {
+            if let Ok(boot_id) = read_boot_id() {
+                if let Some(predecessor) = sav_state::decode_nft(&text, &boot_id) {
+                    if !predecessor.is_empty() {
+                        let names: Vec<&str> =
+                            predecessor.iter().map(|(_, name)| name.as_str()).collect();
+                        info!(interfaces = ?names, "sav nft: replacing a previously applied table");
+                    }
+                }
+            }
+        }
+
+        // Replace: destroy-or-noop (rc nonzero here only logs — the
+        // apply below surfaces real trouble), then apply the fresh
+        // file. An empty program leaves no table at all.
+        match run_nft(&["destroy", "table", sav_nft::NFT_FAMILY, sav_nft::NFT_TABLE]) {
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "sav nft: pre-install destroy failed; applying anyway"),
+        }
+        if rs.text.is_empty() {
+            remove_run_file(NFT_RULESET_PATH);
+            remove_run_file(NFT_STATE_PATH);
+            info!("sav nft: empty program — table destroyed, nothing applied");
+            return Ok(());
+        }
+        std::fs::create_dir_all(SAV_STATE_DIR)?;
+        std::fs::write(NFT_RULESET_PATH, &rs.text)?;
+        run_nft(&["-f", NFT_RULESET_PATH])?;
+        info!(
+            interfaces = ?rs.interfaces.len(),
+            "sav nft ruleset applied ({} bytes)",
+            rs.text.len()
+        );
+        self.persist_nft_marker(&rs.interfaces)
+    }
+
+    /// The nft clear path: one `destroy table` (the table is wholly
+    /// owned — nothing outside it was ever written), then the ruleset
+    /// file and marker go too. `destroy` answers rc 0 for an absent
+    /// table as well, so a fresh process with nothing applied still
+    /// clears cleanly.
+    fn sav_clear_nft(&self) -> Result<(), DataplaneError> {
+        run_nft(&["destroy", "table", sav_nft::NFT_FAMILY, sav_nft::NFT_TABLE])?;
+        remove_run_file(NFT_RULESET_PATH);
+        remove_run_file(NFT_STATE_PATH);
+        info!("sav nft table destroyed");
+        Ok(())
+    }
+
+    /// Persist the applied marker (boot-id stamped; see
+    /// [`sav_state::encode_nft`]).
+    fn persist_nft_marker(
+        &self,
+        ifaces: &[(u32, String, common::SavEnforce)],
+    ) -> Result<(), DataplaneError> {
+        std::fs::create_dir_all(SAV_STATE_DIR)?;
+        let boot_id = read_boot_id()?;
+        let ifaces: Vec<(u32, String)> = ifaces
+            .iter()
+            .map(|(ifindex, name, _)| (*ifindex, name.clone()))
+            .collect();
+        std::fs::write(NFT_STATE_PATH, sav_state::encode_nft(&boot_id, &ifaces))?;
+        Ok(())
+    }
+
+    /// Whether the rouster table exists in the kernel. Best-effort by
+    /// design: a false "absent" only means the churn guard re-applies
+    /// (the safe direction — enforcement is never skipped over); real
+    /// failures surface on the apply/destroy paths.
+    fn nft_table_exists(&self) -> bool {
+        run_nft(&["list", "table", sav_nft::NFT_FAMILY, sav_nft::NFT_TABLE]).is_ok()
+    }
+}
+
+/// Execute `nft <args>`, returning stdout; a spawn failure (no binary)
+/// and a nonzero exit both error — stderr rides along for the caller's
+/// log. Blocking by design (short-lived local subprocess, the procfs
+/// write class; see `sav_install_nft`'s exec disclosure).
+fn run_nft(args: &[&str]) -> Result<String, DataplaneError> {
+    let output = std::process::Command::new("nft")
+        .args(args)
+        .output()
+        .map_err(DataplaneError::Io)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(DataplaneError::Other(format!(
+            "nft {args:?} failed ({}): {stderr}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Remove a run-dir file quietly when absent (clear paths).
+fn remove_run_file(path: &str) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path, error = %e, "run file removal failed");
         }
     }
 }
