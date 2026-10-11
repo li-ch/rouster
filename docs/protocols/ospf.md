@@ -389,12 +389,54 @@ fork it. The concrete seams, documented where they bite:
   forced-full twin, identical routing tables every step and strictly
   fewer §16.1 runs.
 
+## Virtual links (2026-10-11, the N3 M5 slice — §15/§D.3)
+
+- **`area <id> virtual-link <router-id>`** (FRR grammar; the
+  directive lives under the TRANSIT area's stanza). Validation:
+  virtual links never transit the backbone (§15) and never a stub
+  area (§3.6).
+- **One synthetic interface per virtual link** — a member of the
+  BACKBONE (its conversations, Hellos and floods carry area 0; the
+  LSDB is area 0's) riding the transit area. Unnumbered-p2p shape:
+  no DR election, no network-LSA, no stub link.
+- **Endpoint resolution** (§15: "the other endpoint's address is
+  discovered by looking up the router ID in the routing table"):
+  after each area walk, the transit area's intra-area path to the
+  peer Router ID supplies the endpoint address (the p2p adjacency's
+  peer address). No Hellos before resolution; the conversation's
+  destination tracks re-resolution. Disclosed v1: the directly-
+  connected transit shape (the resolved next hop IS the endpoint's
+  own address); multi-hop transit endpoints take the §15 routing
+  refinement.
+- **Wire shape**: virtual-link Hellos are unicast to the resolved
+  endpoint; backbone-area packets arriving on a non-backbone
+  interface demultiplex to our virtual link for that area (§15's
+  tunneled-in-IP model at the daemon level). The daemon's bin opens
+  the vlink's socket on the transit interface's address (v1).
+- **§D.3/§12.4.1**: the backbone router-LSA carries one type-4
+  (virtual) link per Full endpoint — Link ID = the endpoint's Router
+  ID, Link Data = our address on the transit network (RFC 2328 names
+  the MIB-II ifIndex for the unnumbered form — disclosed deviation;
+  SPF treats type 4 exactly like a type-1 router edge). The TRANSIT
+  area's router-LSA sets the V-bit (§A.4.2) — the TransitCapability
+  input to §16.1.
+- **The e2e proof** (`virtual_link_joins_a_partitioned_backbone`):
+  two ABRs split area 0 between them, joined only by the vlink over
+  area 1 — the vlink resolves, forms Full over unicast
+  backbone-area packets, the type-4 links land in the backbone
+  router-LSAs, the V-bit in the transit router-LSAs, and the two
+  halves route each other's stub networks. §16.3's
+  transit-summary refinement rides §Deferred below.
+
 ## §Deferred (updated day-3 anchors)
 
-- §16.3 (transit areas' summary-LSAs — only meaningful with virtual
-  links, which set TransitCapability); virtual links (§15); graceful
+- §16.3 (transit areas' summary-LSAs — the V-bit now lands with the
+  virtual links, the summary rules themselves remain); graceful
   restart (RFC 3623); DNA honoring; OSPFv3 bodies (the ladder's
   codecs-only scope).
+- Virtual-link remainder: multi-hop transit endpoint refinement,
+  ifIndex Link Data, vlink auth (v1 rides the transit interface's
+  auth), and the live FRR virtual-link interop leg.
 - NSSA remainder: translator election (Nt bit, Candidate role,
   TranslatorStabilityInterval — RFC 3101 §3.1), Type-7 address
   ranges, §3.2 LS-ID remapping, the Appendix E P-bit-default

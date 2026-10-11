@@ -78,6 +78,17 @@ pub struct Interface {
     /// interface — strictly increasing across the interface's whole
     /// packet stream.
     auth_tx_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// §15/§D.3: this interface is a virtual link endpoint — its OSPF
+    /// area is the BACKBONE (the link extends area 0); `transit_area`
+    /// names the area the packets ride.
+    pub virtual_link: bool,
+    pub transit_area: Option<u32>,
+    /// The other endpoint's Router ID.
+    pub peer_router: Option<RouterId>,
+    /// The other endpoint's IP address — §15: "discovered by looking
+    /// up the router ID in the routing table" (the transit area's
+    /// intra-area path). None until resolved: no Hellos before that.
+    pub vlink_peer_ip: Option<Ipv4Addr>,
 }
 
 impl Interface {
@@ -363,8 +374,49 @@ impl Ospfd {
                     neighbors: HashMap::new(),
                     hello_deadline: 0,
                     auth_tx_seq: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    virtual_link: false,
+                    transit_area: None,
+                    peer_router: None,
+                    vlink_peer_ip: None,
                 });
             }
+        }
+        // §D.3: one synthetic interface per configured virtual link —
+        // a member of the BACKBONE riding the transit area.
+        let mut vlinks: Vec<(u32, u32)> = Vec::new();
+        for area in &cfg.areas {
+            for peer in &area.virtual_links {
+                vlinks.push((area.id, *peer));
+            }
+        }
+        for (transit, peer) in vlinks {
+            let addr = interfaces
+                .iter()
+                .find(|i| i.area == transit)
+                .map(|i| i.addr)
+                .unwrap_or(Ipv4Addr::UNSPECIFIED);
+            let mut fsm = InterfaceFsm::new_with_priority(true, 1);
+            let _ = fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
+            interfaces.push(Interface {
+                name: format!("vl-{peer}"),
+                area: 0,
+                cfg: InterfaceConfig::defaults(),
+                addr,
+                mask: Ipv4Addr::from(0xffff_ffff),
+                p2p: true,
+                fsm,
+                dr: Ipv4Addr::UNSPECIFIED,
+                bdr: Ipv4Addr::UNSPECIFIED,
+                wait_deadline: None,
+                claims: HashMap::new(),
+                neighbors: HashMap::new(),
+                hello_deadline: 0,
+                auth_tx_seq: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                virtual_link: true,
+                transit_area: Some(transit),
+                peer_router: Some(RouterId(peer)),
+                vlink_peer_ip: None,
+            });
         }
         if interfaces.is_empty() {
             return Err("no interfaces configured".into());
@@ -496,6 +548,7 @@ impl Ospfd {
                     attached_routers: full,
                     dr_address: if elected { Some(i.dr) } else { None },
                     transit_adjacent,
+                    virtual_link: i.virtual_link,
                 }
             })
             .collect()
@@ -669,6 +722,7 @@ impl Ospfd {
         let adv = InterfaceAdv {
             state,
             p2p: false,
+            virtual_link: false,
             address: addr,
             mask,
             cost: 10, // unused by the network-LSA body
@@ -704,7 +758,13 @@ impl Ospfd {
     /// it to the area's Full neighbors (§13.3 lists armed).
     fn originate_router_lsa(&mut self, area: u32, now: u64, out: &mut Vec<WireOut>) {
         let advs = self.interface_advs(area);
-        let lsa = build_router_lsa(self.router_id, self.asbr, self.is_abr(), &advs);
+        // §A.4.2's V-bit: the router is an endpoint of a virtual link
+        // using THIS area as transit (spf's TransitCapability input).
+        let v_bit = self
+            .interfaces
+            .iter()
+            .any(|i| i.virtual_link && i.transit_area == Some(area));
+        let lsa = build_router_lsa(self.router_id, self.asbr, self.is_abr(), v_bit, &advs);
         let Some(area_state) = self.areas.get_mut(&area) else {
             return;
         };
@@ -1313,7 +1373,7 @@ impl Ospfd {
     /// Process one inbound datagram (already demultiplexed to its
     /// interface by the run loop's on-link test).
     pub fn on_packet(&mut self, iface_idx: usize, received: &Received, now: u64) -> Vec<WireOut> {
-        let mut out = Vec::new();
+        let out = Vec::new();
         // Appendix D.5: authenticate before ANY further processing
         // ("processing of the received packet, as described in
         // Section 8.2, continues only if the packet is
@@ -1333,6 +1393,16 @@ impl Ospfd {
         }
         let area = self.interfaces[iface_idx].area;
         if packet.header.area_id != area {
+            // §15: a backbone-area packet riding a non-backbone
+            // interface is virtual-link traffic — process it on our
+            // virtual link for that area.
+            if let Some(vl) = self
+                .interfaces
+                .iter()
+                .position(|i| i.virtual_link && i.area == packet.header.area_id)
+            {
+                return self.on_packet_on(vl, packet, received, now);
+            }
             debug!(
                 area = packet.header.area_id,
                 src = %received.src,
@@ -1340,6 +1410,20 @@ impl Ospfd {
             );
             return out;
         }
+        self.on_packet_on(iface_idx, packet, received, now)
+    }
+
+    /// The per-interface packet processing after authentication and
+    /// demultiplexing.
+    fn on_packet_on(
+        &mut self,
+        iface_idx: usize,
+        packet: Packet,
+        received: &Received,
+        now: u64,
+    ) -> Vec<WireOut> {
+        let mut out = Vec::new();
+        let area = self.interfaces[iface_idx].area;
         // §A.1/§13: packets addressed to AllDRouters (224.0.0.6) are
         // processed only by the DR and BDR on a broadcast network.
         if received.dst == crate::packet::ALL_D_ROUTERS && !self.interfaces[iface_idx].p2p {
@@ -2112,6 +2196,54 @@ impl Ospfd {
                 self.routes.insert(key, entry);
             }
         }
+
+        // ---- §15: virtual-link endpoint resolution ----
+        // "The other endpoint of the virtual link is discovered by
+        // looking up the virtual link's neighbor router ID in the
+        // routing table" — the transit area's intra-area path to the
+        // peer; the first next-hop router address is the endpoint's
+        // own address in the directly-connected shape.
+        for (area, result) in &results {
+            let vlinks: Vec<usize> = self
+                .interfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.virtual_link && i.transit_area == Some(*area))
+                .map(|(idx, _)| idx)
+                .collect();
+            for idx in vlinks {
+                let Some(peer) = self.interfaces[idx].peer_router else {
+                    continue;
+                };
+                let resolved = result.routes.iter().find_map(|r| {
+                    match r.destination {
+                        Destination::Router(rid) if rid == peer => {
+                            r.next_hops.first().and_then(|nh| {
+                                nh.router.or_else(|| {
+                                    // A p2p first hop: the adjacency's
+                                    // peer address on that interface.
+                                    self.p2p_peer_address(nh.interface)
+                                })
+                            })
+                        }
+                        _ => None,
+                    }
+                });
+                if resolved != self.interfaces[idx].vlink_peer_ip {
+                    self.interfaces[idx].vlink_peer_ip = resolved;
+                    if let Some(ip) = resolved {
+                        info!(iface = %self.interfaces[idx].name, peer = %ip,
+                              "ospfd: virtual link endpoint resolved (§15)");
+                        if let Some(conv) = self.interfaces[idx].neighbors.get_mut(&peer) {
+                            conv.ip = ip;
+                        }
+                        if let Some(a) = self.areas.get_mut(&0) {
+                            a.router_lsa_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// §12.4.3's ABR duties, run off the fresh routing table: for
@@ -2611,6 +2743,11 @@ impl Ospfd {
         // §C.3 Hellos.
         let router_id = self.router_id;
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
+            // §15: a virtual link sends nothing until its other
+            // endpoint's address is discovered by the routing table.
+            if iface.virtual_link && iface.vlink_peer_ip.is_none() {
+                continue;
+            }
             if now >= iface.hello_deadline {
                 iface.hello_deadline = now + iface.cfg.hello_interval as u64;
                 let kind = self
@@ -2622,9 +2759,15 @@ impl Ospfd {
                 let mut packet = make_hello(router_id, iface.area, iface, kind);
                 packet.header.au_type = iface.cfg.auth.au_type();
                 packet.header.authentication = iface.cfg.auth.auth_field(seq);
+                // §15: virtual-link packets are unicast to the other
+                // endpoint's (resolved) address.
+                let to = match iface.vlink_peer_ip {
+                    Some(peer) => WireTo::Unicast(peer),
+                    None => WireTo::Multicast,
+                };
                 out.push(WireOut {
                     iface: idx,
-                    to: WireTo::Multicast,
+                    to,
                     packet,
                 });
             }
@@ -5426,6 +5569,231 @@ mod tests {
                 "incremental ({inc0}+{inc1}) did less work than full ({full0}+{full1})"
             );
         }
+    }
+
+    // ---- virtual links (§15/§D.3, N3 M5) -----------------------------
+
+    fn vlabr(router_id: &str, a0_addr: &str, a1_addr: &str, peer: &str) -> Ospfd {
+        let text = format!(
+            "router ospf\n router-id {router_id}\n area 0.0.0.0\n  interface eth0\n   address {a0_addr}/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n area 0.0.0.1\n  interface eth1\n   address {a1_addr}/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n area 0.0.0.1 virtual-link {peer}\n"
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// The §15 partitioned backbone: R1 and R2 split area 0 between
+    /// them, joined only by the virtual link over area 1. R3 hangs
+    /// off R1's half, R4 off R2's — routes cross only through the
+    /// virtual link: the transit-area adjacency resolves the
+    /// endpoint (§15), the vlink adjacency forms over unicast
+    /// backbone-area packets, the backbone router-LSAs grow type-4
+    /// links (§D.3), and the transit router-LSAs set the V-bit.
+    #[test]
+    fn virtual_link_joins_a_partitioned_backbone() {
+        let mut cores = vec![
+            vlabr("10.255.1.1", "10.10.0.1", "10.20.0.1", "10.255.2.1"),
+            vlabr("10.255.2.1", "10.30.0.1", "10.20.0.2", "10.255.1.1"),
+            area0_core(), // 10.10.0.2, R3
+            area0_core(), // 10.10.0.2 -> patch to 10.30.0.2, R4
+        ];
+        // Patch the fourth core onto R2's half (its own address).
+        {
+            let r4 = "router ospf\n router-id 10.255.4.1\n area 0.0.0.0\n  interface eth0\n   address 10.30.0.2/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n";
+            cores[3] = Ospfd::new(&parse_config(r4).unwrap()).unwrap();
+        }
+        // R3's core from area0_core() has the right address already
+        // (10.10.0.2).
+
+        // Delivery: unicast by destination address (any interface of
+        // any core — virtual-link packets ride the transit wire but
+        // carry the backbone area); multicast to every core with an
+        // interface in the packet's area.
+        fn deliver_vl(
+            cores: &mut [Ospfd],
+            from: usize,
+            outs: &[WireOut],
+            now: u64,
+            queue: &mut Vec<(usize, Vec<WireOut>)>,
+        ) {
+            for w in outs {
+                let src = cores[from].interfaces[w.iface].addr;
+                let payload = crate::auth::encode_for_wire(
+                    &w.packet,
+                    &cores[from].interfaces[w.iface].cfg.auth,
+                );
+                let pkt_area = w.packet.header.area_id;
+                let dst = match w.to {
+                    WireTo::Unicast(d) => Some(d),
+                    _ => None,
+                };
+                for (i, core) in cores.iter_mut().enumerate() {
+                    if i == from {
+                        continue;
+                    }
+                    let Some(rx) = core.interfaces.iter().position(|x| match dst {
+                        Some(d) => x.addr == d,
+                        None => x.area == pkt_area,
+                    }) else {
+                        continue;
+                    };
+                    let replies = core.on_packet(
+                        rx,
+                        &crate::transport::Received {
+                            src,
+                            dst: crate::packet::ALL_SPF_ROUTERS,
+                            payload: payload.clone(),
+                        },
+                        now,
+                    );
+                    if !replies.is_empty() {
+                        queue.push((i, replies));
+                    }
+                }
+            }
+        }
+
+        // Settle loop (the run_multi digest shape).
+        let mut now = 0u64;
+        let mut queue: Vec<(usize, Vec<WireOut>)> = Vec::new();
+        let mut zap: Vec<crate::zedge::ZedgeCommand> = Vec::new();
+        let digest = |cores: &[Ospfd]| -> u64 {
+            let mut h: u64 = 0x9e37_79b9;
+            for core in cores {
+                for iface in &core.interfaces {
+                    for (rid, c) in &iface.neighbors {
+                        h = h.wrapping_mul(31).wrapping_add(rid.0 as u64);
+                        h = h.wrapping_mul(31).wrapping_add(c.state() as u64);
+                    }
+                }
+                for state in core.areas.values() {
+                    for entry in state.lsdb.all() {
+                        h = h.wrapping_mul(31).wrapping_add(entry.lsa.header.seq as u64);
+                    }
+                }
+                h = h.wrapping_mul(31).wrapping_add(core.routes.len() as u64);
+            }
+            h
+        };
+        let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+        for (i, o) in outs.iter_mut().enumerate() {
+            cores[i].tick(now, o, &mut zap);
+        }
+        for (i, o) in outs.iter_mut().enumerate() {
+            if !o.is_empty() {
+                let taken = std::mem::take(o);
+                deliver_vl(&mut cores, i, &taken, now, &mut queue);
+            }
+        }
+        let mut last = digest(&cores);
+        let mut quiet = 0u64;
+        for _ in 0..700 {
+            while !queue.is_empty() {
+                let batch = std::mem::take(&mut queue);
+                for (from, o) in batch {
+                    deliver_vl(&mut cores, from, &o, now, &mut queue);
+                }
+            }
+            let d = digest(&cores);
+            if d == last {
+                quiet += 1;
+                if quiet >= 12 {
+                    break;
+                }
+            } else {
+                quiet = 0;
+                last = d;
+            }
+            now += 1;
+            let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+            for (i, o) in outs.iter_mut().enumerate() {
+                cores[i].tick(now, o, &mut zap);
+            }
+            for (i, o) in outs.iter().enumerate() {
+                if !o.is_empty() {
+                    deliver_vl(&mut cores, i, o, now, &mut queue);
+                }
+            }
+        }
+        let (r1, r2, r3, r4) = (0usize, 1, 2, 3);
+
+        // The transit adjacency is Full and the vlink resolved + Full.
+        let vlfull = |core: &Ospfd, peer: RouterId| {
+            core.interfaces
+                .iter()
+                .find(|i| i.virtual_link)
+                .and_then(|i| i.neighbors.get(&peer))
+                .is_some_and(|c| c.state() == NeighborState::Full)
+        };
+        assert!(vlfull(&cores[r1], cores[r2].router_id), "R1's vlink Full");
+        assert!(vlfull(&cores[r2], cores[r1].router_id), "R2's vlink Full");
+        assert_eq!(
+            cores[r1]
+                .interfaces
+                .iter()
+                .find(|i| i.virtual_link)
+                .unwrap()
+                .vlink_peer_ip,
+            Some(ip("10.20.0.2")),
+            "§15: the endpoint resolved from the area-1 routing table"
+        );
+
+        // §D.3: the backbone router-LSAs carry the type-4 link.
+        let r1_a0 = cores[r1]
+            .areas
+            .get(&0)
+            .unwrap()
+            .lsdb
+            .get(&LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(cores[r1].router_id.0),
+                adv_router: cores[r1].router_id,
+            })
+            .unwrap()
+            .lsa
+            .clone();
+        let crate::lsa::LsaBody::Router(body) = &r1_a0.body else {
+            panic!()
+        };
+        assert!(
+            body.links
+                .iter()
+                .any(|l| l.link_type == crate::lsa::LinkType::Virtual
+                    && l.link_id.0 == cores[r2].router_id.0),
+            "R1's backbone router-LSA carries the type-4 virtual link"
+        );
+        // The V-bit rides the TRANSIT area's router-LSA (§A.4.2).
+        let r1_a1 = cores[r1]
+            .areas
+            .get(&1)
+            .unwrap()
+            .lsdb
+            .get(&LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(cores[r1].router_id.0),
+                adv_router: cores[r1].router_id,
+            })
+            .unwrap()
+            .lsa
+            .clone();
+        let crate::lsa::LsaBody::Router(body1) = &r1_a1.body else {
+            panic!()
+        };
+        assert!(
+            body1.v_bit,
+            "the transit-area router-LSA sets V (§16.1 step 2)"
+        );
+
+        // The proof of the whole milestone: R3 routes R4's half of
+        // the backbone and vice versa — through the virtual link.
+        assert!(
+            cores[r3].routes.contains_key("10.30.0.0/30"),
+            "R3 routes the far half of the partitioned backbone: {:?}",
+            cores[r3].routes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cores[r4].routes.contains_key("10.10.0.0/30"),
+            "R4 routes the near half"
+        );
+        let _ = r2;
     }
 
     #[test]

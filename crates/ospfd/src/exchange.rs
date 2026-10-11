@@ -687,6 +687,7 @@ mod tests {
             own,
             false,
             false,
+            false,
             &[InterfaceAdv {
                 state: InterfaceState::PointToPoint,
                 p2p: true,
@@ -697,6 +698,7 @@ mod tests {
                 attached_routers: vec![],
                 dr_address: None,
                 transit_adjacent: false,
+                virtual_link: false,
             }],
         );
         lsa.with_computed_header()

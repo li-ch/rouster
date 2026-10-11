@@ -71,6 +71,10 @@ impl OspfdConfig {
 pub struct AreaConfig {
     pub id: u32,
     pub kind: AreaKind,
+    /// `area <id> virtual-link <router-id>` (§D.3/§15): the virtual
+    /// links using this area as transit, by the other endpoint's
+    /// Router ID.
+    pub virtual_links: Vec<u32>,
     /// `area <id> default-cost` (§C.2): the metric of the default
     /// summary-LSA an ABR advertises into a stub area. FRR parity:
     /// default 1.
@@ -311,6 +315,47 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                     default_information_originate: true,
                                 })
                             }
+                            ["virtual-link", peer] => {
+                                // §15/§D.3: the other endpoint's
+                                // Router ID.
+                                let Some(peer) = parse_ipv4(peer) else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: virtual-link <router-id>",
+                                    ));
+                                };
+                                let peer = u32::from(peer);
+                                if raw == 0 {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "virtual links do not transit the backbone (§15)",
+                                    ));
+                                }
+                                match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                    Some(existing) => {
+                                        if existing.kind.external_capable()
+                                            || matches!(existing.kind, AreaKind::Nssa { .. })
+                                        {
+                                            if !existing.virtual_links.contains(&peer) {
+                                                existing.virtual_links.push(peer);
+                                            }
+                                        } else {
+                                            return Err(parse_error(
+                                                line_no,
+                                                "virtual links cannot be configured through stub areas (§3.6)",
+                                            ));
+                                        }
+                                    }
+                                    None => cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Normal,
+                                        default_cost: 1,
+                                        virtual_links: vec![peer],
+                                        interfaces: BTreeMap::new(),
+                                    }),
+                                }
+                                continue;
+                            }
                             ["default-cost", n] => {
                                 let cost = n.parse().ok().filter(|v| *v <= 0x00ff_ffff).ok_or_else(
                                     || {
@@ -329,6 +374,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                         id: raw,
                                         kind: AreaKind::Normal,
                                         default_cost: cost,
+                                        virtual_links: Vec::new(),
                                         interfaces: BTreeMap::new(),
                                     });
                                 }
@@ -357,6 +403,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                     id: raw,
                                     kind: set,
                                     default_cost: 1,
+                                    virtual_links: Vec::new(),
                                     interfaces: BTreeMap::new(),
                                 }),
                             }
@@ -369,6 +416,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                             id: raw,
                             kind: AreaKind::Normal,
                             default_cost: 1,
+                            virtual_links: Vec::new(),
                             interfaces: BTreeMap::new(),
                         });
                     }
@@ -861,6 +909,29 @@ router ospf
             parse("router ospf\n area 0.0.0.0\n  interface eth0\n   message-digest-key 1 md5 k\n")
                 .unwrap_err();
         assert!(err.to_string().contains("line 4"), "{err}");
+    }
+
+    #[test]
+    fn virtual_link_directives_parse() {
+        let cfg = parse(
+            "router ospf\n area 0.0.0.1\n  interface eth1\n area 0.0.0.1 virtual-link 10.255.2.1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.areas[0].virtual_links,
+            vec![u32::from(Ipv4Addr::new(10, 255, 2, 1))]
+        );
+        // §3.6: virtual links cannot be configured through stub areas.
+        let err = parse("router ospf\n area 0.0.0.1 stub\n area 0.0.0.1 virtual-link 10.255.2.1\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("stub areas"), "{err}");
+        // §15: they do not transit the backbone.
+        let err = parse("router ospf\n area 0.0.0.0\n area 0.0.0.0 virtual-link 10.255.2.1\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("backbone"), "{err}");
+        // Bad router-id.
+        let err = parse("router ospf\n area 0.0.0.1 virtual-link not-an-ip\n").unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
     }
 
     #[test]
