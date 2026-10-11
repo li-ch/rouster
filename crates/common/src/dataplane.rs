@@ -492,6 +492,30 @@ pub trait Dataplane {
         )))
     }
 
+    /// Read the monitor counters PER OP — the GSC §4 "count" policy's
+    /// per-rule view (each row: the program op and the verdict-bucket
+    /// counts its rules produced). The per-op refinement of
+    /// [`Self::sav_monitor_counts`]: when a backend answers here, the
+    /// rows are authoritative per op AND in aggregate (they sum to what
+    /// `sav_monitor_counts` answers — callers may derive the aggregate
+    /// from the rows instead of a second read). Ops whose rules carry
+    /// no counters report zeros; `unknown` rows cannot exist on a
+    /// backend that answers (packets no rule judged are never counted,
+    /// by construction) and are absent rather than fabricated.
+    ///
+    /// A backend that cannot attribute counters per op answers
+    /// [`DataplaneError::Unsupported`] and the caller falls back to
+    /// [`Self::sav_monitor_counts`] for the aggregate — the per-op
+    /// view is then the caller's own (the sav layer's simulation).
+    fn sav_monitor_per_op(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(SavProgramOp, SavMonitorCounts)>, DataplaneError>> + Send
+    {
+        std::future::ready(Err(DataplaneError::Unsupported(
+            "SAV enforcement not implemented by this backend",
+        )))
+    }
+
     /// Remove every installed SAV rule, restoring pre-SAV state.
     fn sav_clear(&self) -> impl Future<Output = Result<(), DataplaneError>> + Send {
         std::future::ready(Err(DataplaneError::Unsupported(
@@ -731,6 +755,10 @@ mod tests {
         assert!(matches!(err, Err(DataplaneError::Unsupported(_))));
         assert!(matches!(
             futures_ready(dp.sav_monitor_counts()),
+            Err(DataplaneError::Unsupported(_))
+        ));
+        assert!(matches!(
+            futures_ready(dp.sav_monitor_per_op()),
             Err(DataplaneError::Unsupported(_))
         ));
         assert!(matches!(
