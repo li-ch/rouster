@@ -36,6 +36,7 @@ pub mod error;
 pub mod exchange;
 pub mod iface;
 pub mod lsa;
+pub mod lsa_v3;
 pub mod lsdb;
 pub mod neighbor;
 pub mod origination;
