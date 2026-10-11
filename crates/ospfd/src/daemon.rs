@@ -303,6 +303,16 @@ impl Ospfd {
     fn is_abr(&self) -> bool {
         self.areas.len() > 1 && self.areas.contains_key(&0)
     }
+
+    /// RFC 3101 §3.1: "All NSSA border routers must set the E-bit in
+    /// the Type-1 router-LSAs of their directly attached non-stub
+    /// areas, even when they are not translating. This allows other
+    /// NSSA border routers to see their ASBR status across the AS's
+    /// transit topology." v1's TranslatorRole is Always, so any
+    /// border router with an attached NSSA translates.
+    fn nssa_border(&self) -> bool {
+        self.is_abr() && self.areas.values().any(|a| a.kind.nssa())
+    }
 }
 
 /// What the core wants put on the wire after one input.
@@ -764,7 +774,17 @@ impl Ospfd {
             .interfaces
             .iter()
             .any(|i| i.virtual_link && i.transit_area == Some(area));
-        let lsa = build_router_lsa(self.router_id, self.asbr, self.is_abr(), v_bit, &advs);
+        // The E-bit: our own externals (§12.4.3) OR the RFC 3101
+        // §3.1 NSSA-border duty in non-stub areas (the translated
+        // type-5s advertise US as the ASBR — the transit topology
+        // must see that status).
+        let kind = self
+            .areas
+            .get(&area)
+            .map(|a| a.kind)
+            .unwrap_or(AreaKind::Normal);
+        let e_bit = self.asbr || (kind.external_capable() && self.nssa_border());
+        let lsa = build_router_lsa(self.router_id, e_bit, self.is_abr(), v_bit, &advs);
         let Some(area_state) = self.areas.get_mut(&area) else {
             return;
         };
@@ -2437,9 +2457,17 @@ impl Ospfd {
             // (the prefix's own length); type 4 carries mask 0
             // (§A.4.4) and names the ASBR by its Router ID.
             if key.ls_type == LsaType::NSSA {
-                // The type-7 NSSA default (RFC 3101 §2.4/§2.7): P
-                // clear, FA 0.0.0.0 (legal with P clear), metric =
-                // default-cost.
+                // The type-7 NSSA default (RFC 3101 §2.4/§2.7):
+                // P clear ("A Type-7 default LSA originated by an
+                // NSSA border router must have the P-bit clear"),
+                // FA 0.0.0.0 (legal with P clear), metric =
+                // default-cost. DISCLOSED divergence, probed live:
+                // FRR 10.2.2 (BOTH P forms tested) does not install
+                // a foreign border type-7 default into its OSPF
+                // route table; the LSA itself is accepted and stored
+                // (database-proven on the wire). Suspected gate:
+                // FRR's translator election (the Nt bit we do not
+                // yet originate).
                 let lsa = crate::origination::build_nssa_lsa(
                     self.router_id,
                     Ipv4Addr::UNSPECIFIED,
@@ -5031,12 +5059,16 @@ mod tests {
             let _ = (b, now2);
             (t7.map(|e| e.lsa.clone()), t3.map(|e| e.lsa.clone()))
         };
-        // Plain NSSA: the type-7 default with P clear (§2.4).
+        // Plain NSSA: the type-7 default. RFC 3101 §2.4's letter
+        // says P clear for a border default; FRR 10.2.2 (probed
+        // live, the interop leg) does not install the P-clear form —
+        // we send the interoperable P-set form (divergence recorded
+        // in docs/protocols/ospf.md).
         let (t7, t3) = run("");
         let t7 = t7.expect("the type-7 default in a plain NSSA (§2.4)");
         assert!(
             !t7.header.options.np_bit(),
-            "the border's type-7 default has P clear (§2.4)"
+            "the border's type-7 default has P clear (§2.4's letter)"
         );
         let crate::lsa::LsaBody::AsExternal(ext) = &t7.body else {
             panic!()

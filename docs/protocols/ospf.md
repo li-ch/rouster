@@ -228,6 +228,33 @@ fork it. The concrete seams, documented where they bite:
   the area-1 ASBR sits in FRR's asbr-summary table and FRR resolves
   the redistributed static through us into its kernel.
 
+## NSSA interop (2026-10-11, the N3 wire proof)
+
+- **`scripts/test-ospf-nssa-interop.sh`** — rouster as the NSSA
+  border router between real FRR 10.2.2 (r1 backbone-only; r3 the
+  NSSA-internal ASBR redistributing a blackhole static), exit 0
+  twice back-to-back, quarantine under the night program's n3/nssa.
+  The wire proofs: r2-r3 Full ACROSS the NSSA (the N-bit agreement
+  with real FRR, RFC 3101 §2.1); FRR's type-7 arrives with **P set
+  and FA = its own NSSA interface address** (the captured §2.4 wire
+  shape — FRR fills the type-7 FA where its type-5s use 0.0.0.0 for
+  blackholes); **our §3.2 translation lands as a type-5 in r1's
+  area-0 database (advertising router = us, FA copied) and r1's
+  KERNEL routes the external proto ospf via us**; our own §2.5 calc
+  installs the type-7's route via r3; our type-7 default sits in
+  r3's NSSA database.
+- **Two FRR divergences pinned live** (the A19/A23 discipline):
+  1. RFC 3101 §3.1's "NSSA border routers must set the E-bit in the
+     Type-1 router-LSAs of their non-stub areas" is LOAD-BEARING —
+     without it FRR will not resolve our translated type-5s at all
+     (the ASBR lookup fails); we set it via `nssa_border()`.
+  2. FRR 10.2.2 does NOT install a foreign border type-7 default
+     into its OSPF route table — neither the RFC's P-clear form
+     (§2.4's letter, what we send) nor a P-set form (tested). The
+     LSA is accepted and stored (database-proven). Suspected gate:
+     FRR's translator election (the Nt bit, §3.1 — §Deferred with
+     the election machinery).
+
 ## Stub areas (2026-10-11, the N3 M1 slice)
 
 - **`area <id> stub [no-summary]` + `area <id> default-cost <n>`**
