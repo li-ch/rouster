@@ -480,7 +480,10 @@ fork it. The concrete seams, documented where they bite:
   libc or socket2 upgrade); SO_BINDTODEVICE-style interface scoping.
 - Interface link-state tracking (InterfaceUp fires at construction
   v1); the zapi interface dump as the address source.
-- The SAVNET intra-domain IGP signaling hook
-  (`experimental-savnet`) — anchor `crates/ospfd/src/neighbor.rs`
-  (`flood_step`'s InstallAndFlood) once the draft's wire format is
-  pinned.
+- The SAVNET intra-domain IGP signaling wire protocol
+  (`experimental-savnet`) once the draft's format is pinned. The
+  in-process half LANDED (2026-10-11) behind the flag: the
+  `InstallAndFlood { changed: true }` products and the adjacency
+  transitions report to a hosted `sav::agent::SavAgent` through the
+  conversation reports (`after_report` / `reevaluate_adjacency`) —
+  see [savnet.md](savnet.md).

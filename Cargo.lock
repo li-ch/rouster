@@ -27,6 +27,7 @@ dependencies = [
  "common",
  "policy",
  "rpki",
+ "sav",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -358,6 +359,7 @@ name = "ospfd"
 version = "0.0.0"
 dependencies = [
  "common",
+ "sav",
  "socket2",
  "thiserror 2.0.21",
  "tokio",

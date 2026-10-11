@@ -233,6 +233,16 @@ pub struct Ospfd {
     table_dirty: bool,
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     redistribute_static: bool,
+    /// The SAVNET agent hooks (experimental-savnet, default OFF, then
+    /// default None — no agent hosted, no calls made): in-process
+    /// reporting of SAV-relevant events. Changed LSAs report from the
+    /// conversation reports' `changed` keys (exactly what the
+    /// `InstallAndFlood { changed: true }` arm produced — the LSDB
+    /// invalidation feed the IGP-side SAVNET designs key on);
+    /// adjacency transitions report from every report consumer that
+    /// sees them fire. Nothing on the wire depends on any of it.
+    #[cfg(feature = "experimental-savnet")]
+    sav_agent: Option<Arc<dyn sav::agent::SavAgent>>,
 }
 
 /// One network destination in the unified routing table (§11's
@@ -459,11 +469,65 @@ impl Ospfd {
             table_dirty: true,
             zapi: None,
             redistribute_static: cfg.redistribute_static,
+            #[cfg(feature = "experimental-savnet")]
+            sav_agent: None,
         })
     }
 
     pub fn attach_zapi(&mut self, tx: mpsc::UnboundedSender<ZedgeCommand>) {
         self.zapi = Some(tx);
+    }
+
+    /// Host a SAVNET agent (experimental-savnet; see
+    /// docs/protocols/savnet.md): the daemon reports changed LSAs and
+    /// adjacency transitions in-process. Monitor-only by contract —
+    /// the agent's suggestions are logged observations, never
+    /// enforcement inputs. Default None even under the flag: nothing
+    /// hosts an agent in tonight's multi-process deployment (the
+    /// in-process composition is a test/single-binary-deployment
+    /// concern).
+    #[cfg(feature = "experimental-savnet")]
+    pub fn set_sav_agent(&mut self, agent: Arc<dyn sav::agent::SavAgent>) {
+        self.sav_agent = Some(agent);
+    }
+
+    /// The hosted SAVNET agent, if any (experimental-savnet).
+    #[cfg(feature = "experimental-savnet")]
+    pub fn sav_agent(&self) -> Option<&Arc<dyn sav::agent::SavAgent>> {
+        self.sav_agent.as_ref()
+    }
+
+    /// Report one SAVNET adjacency transition (experimental-savnet),
+    /// called from every ConversationReport consumer that sees
+    /// adjacency_up/adjacency_down fire. The interface model carries
+    /// no kernel ifindex yet, so the event names the peer without
+    /// one.
+    #[cfg(feature = "experimental-savnet")]
+    fn sav_report_adjacency(&self, idx: usize, peer: RouterId, up: bool) {
+        let Some(agent) = &self.sav_agent else {
+            return;
+        };
+        let address = self.interfaces[idx]
+            .neighbors
+            .get(&peer)
+            .map(|conv| std::net::IpAddr::V4(conv.ip))
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let peer = sav::agent::SavPeer {
+            address,
+            remote_id: peer.0,
+        };
+        agent.on_event(if up {
+            sav::agent::SavAgentEvent::AdjacencyUp {
+                protocol: sav::agent::SavProtocol::Ospf,
+                peer,
+                ifindex: None,
+            }
+        } else {
+            sav::agent::SavAgentEvent::AdjacencyDown {
+                protocol: sav::agent::SavProtocol::Ospf,
+                peer,
+            }
+        });
     }
 
     /// The p2p neighbor's IP address on the interface whose own
@@ -683,7 +747,11 @@ impl Ospfd {
                 conv.fire_and_map(NeighborEvent::AdjOk(answer), &area_state.lsdb, now);
             out.extend(sends_into(idx, sends));
             if report.adjacency_up || report.adjacency_down {
+                // The SAVNET adjacency report (experimental-savnet)
+                // runs after the conversation borrows release.
                 let _ = (iface, area_state);
+                #[cfg(feature = "experimental-savnet")]
+                self.sav_report_adjacency(idx, peer, report.adjacency_up);
                 if let Some(a) = self.areas.get_mut(&area) {
                     a.router_lsa_dirty = true;
                 }
@@ -1669,6 +1737,40 @@ impl Ospfd {
         now: u64,
     ) {
         let area = self.interfaces[iface_idx].area;
+        // The SAVNET reports (experimental-savnet): adjacency
+        // transitions and changed LSAs, in-process and monitor-only.
+        #[cfg(feature = "experimental-savnet")]
+        if let Some(peer_id) = peer {
+            if report.adjacency_up {
+                self.sav_report_adjacency(iface_idx, peer_id, true);
+            }
+            if report.adjacency_down {
+                self.sav_report_adjacency(iface_idx, peer_id, false);
+            }
+            if !report.changed.is_empty() {
+                if let Some(agent) = &self.sav_agent {
+                    let peer = sav::agent::SavPeer {
+                        address: self.interfaces[iface_idx]
+                            .neighbors
+                            .get(&peer_id)
+                            .map(|conv| std::net::IpAddr::V4(conv.ip))
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                        remote_id: peer_id.0,
+                    };
+                    // Exactly the InstallAndFlood { changed: true }
+                    // products: each changed key is one LSA the §13
+                    // flood installed with new contents.
+                    for key in &report.changed {
+                        agent.on_event(sav::agent::SavAgentEvent::LsaChanged {
+                            peer: peer.clone(),
+                            ls_type: key.ls_type.0,
+                            link_state_id: Ipv4Addr::from(key.link_state_id.0),
+                            adv_router: Ipv4Addr::from(key.adv_router.0),
+                        });
+                    }
+                }
+            }
+        }
         if report.adjacency_up {
             info!(
                 iface = %self.interfaces[iface_idx].name,
@@ -5902,5 +6004,109 @@ mod tests {
             Some(NeighborState::Full),
             "B-C adjacency re-formed after the DR loss"
         );
+    }
+
+    // --- SAVNET agent hooks (experimental-savnet only) ---
+
+    #[cfg(feature = "experimental-savnet")]
+    mod savnet_hooks {
+        use super::*;
+        use std::sync::Mutex as StdMutex;
+
+        /// An agent that records every event (the contract-test shape
+        /// from the sav crate, local copy so the wiring is proven
+        /// against the daemon's own call sites).
+        #[derive(Default)]
+        struct RecordingAgent {
+            events: StdMutex<Vec<sav::agent::SavAgentEvent>>,
+        }
+
+        impl sav::agent::SavAgent for RecordingAgent {
+            fn on_event(&self, event: sav::agent::SavAgentEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+            fn binding_suggestions(&self) -> Vec<sav::agent::SavBindingSuggestion> {
+                Vec::new()
+            }
+        }
+
+        /// No agent hosted by default (the anchors' default-none
+        /// shape): the flag compiles the hooks, but nothing hosts an
+        /// agent in tonight's multi-process deployment.
+        #[test]
+        fn the_agent_defaults_to_none() {
+            let core = core_for("10.255.1.1", "eth0", "10.77.0.1");
+            assert!(core.sav_agent().is_none());
+        }
+
+        /// Two cores pumped to mutual Full adjacency with agents
+        /// hosted: each daemon reports the adjacency transition (up,
+        /// with the peer's address and router-id bits) and the changed
+        /// LSAs the InstallAndFlood arm installed — the other's
+        /// type-1 router-LSA at minimum.
+        #[test]
+        fn adjacency_and_lsa_events_report_over_a_real_exchange() {
+            let agent_a = std::sync::Arc::new(RecordingAgent::default());
+            let agent_b = std::sync::Arc::new(RecordingAgent::default());
+            let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+            let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+            a.set_sav_agent(
+                std::sync::Arc::clone(&agent_a) as std::sync::Arc<dyn sav::agent::SavAgent>
+            );
+            b.set_sav_agent(
+                std::sync::Arc::clone(&agent_b) as std::sync::Arc<dyn sav::agent::SavAgent>
+            );
+            for core in [&mut a, &mut b] {
+                core.interfaces[0]
+                    .fsm
+                    .fire(crate::iface::InterfaceEvent::InterfaceUp);
+            }
+            run_to_full(&mut a, &mut b, 0);
+
+            for (agent, me, other_addr, other_id) in [
+                (&agent_a, "A", "10.77.0.2", "10.255.2.1"),
+                (&agent_b, "B", "10.77.0.1", "10.255.1.1"),
+            ] {
+                let events = agent.events.lock().unwrap();
+                // The adjacency-up transition for the other router
+                // (its interface address and router-id bits).
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        sav::agent::SavAgentEvent::AdjacencyUp { peer, .. }
+                            if peer.address == ip(other_addr)
+                                && peer.remote_id == u32::from(ip(other_id))
+                    )),
+                    "{me}: adjacency up reported with the peer identity"
+                );
+                // The changed-LSA feed: the other's router-LSA
+                // (type 1) arrived through the InstallAndFlood arm.
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        sav::agent::SavAgentEvent::LsaChanged { ls_type, adv_router, .. }
+                            if *ls_type == 1 && *adv_router == ip(other_id)
+                    )),
+                    "{me}: the peer's router-LSA change reported"
+                );
+            }
+        }
+
+        /// Equivalence inside the feature-on build: with NO agent
+        /// hosted, the same exchange settles to Full exactly as the
+        /// feature-off daemon does (the hooks never fire — the
+        /// default-off contract's in-flag mirror).
+        #[test]
+        fn without_a_hosted_agent_the_exchange_is_unchanged() {
+            let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+            let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+            for core in [&mut a, &mut b] {
+                core.interfaces[0]
+                    .fsm
+                    .fire(crate::iface::InterfaceEvent::InterfaceUp);
+            }
+            run_to_full(&mut a, &mut b, 0);
+            assert!(a.sav_agent().is_none() && b.sav_agent().is_none());
+        }
     }
 }

@@ -208,6 +208,19 @@ pub struct PeerSession<IO> {
     end: Option<SessionEnd>,
     /// Daemon-side observability (None in tests).
     shared: Option<Arc<SessionShared>>,
+    /// The SAVNET agent hooks (experimental-savnet, default OFF, then
+    /// default None — no agent hosted, no calls made): in-process
+    /// reporting of SAV-relevant session events. Route installs and
+    /// withdraws report at this file's `on_message` UPDATE arm
+    /// (Adj-RIB-In granularity, pre-best-path); the adjacency reports
+    /// ride the Established transition and the session's teardown.
+    /// Nothing on the wire depends on any of it.
+    #[cfg(feature = "experimental-savnet")]
+    agent: Option<Arc<dyn sav::agent::SavAgent>>,
+    /// Whether the adjacency-up report already fired (the exactly-once
+    /// guard for the matching down report across the teardown paths).
+    #[cfg(feature = "experimental-savnet")]
+    sav_adjacency_up_reported: bool,
 }
 
 impl<IO> PeerSession<IO>
@@ -248,6 +261,48 @@ where
             now: Instant::now,
             end: None,
             shared: None,
+            #[cfg(feature = "experimental-savnet")]
+            agent: None,
+            #[cfg(feature = "experimental-savnet")]
+            sav_adjacency_up_reported: false,
+        }
+    }
+
+    /// Host a SAVNET agent (experimental-savnet; see
+    /// docs/protocols/savnet.md): the session reports SAV-relevant
+    /// events in-process — route installs/withdraws at the UPDATE arm,
+    /// adjacency up at Established, adjacency down at teardown.
+    /// Monitor-only by contract: the agent's suggestions are logged
+    /// observations, never enforcement inputs.
+    #[cfg(feature = "experimental-savnet")]
+    pub fn with_sav_agent(mut self, agent: Arc<dyn sav::agent::SavAgent>) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    /// Report the SAVNET adjacency-down (experimental-savnet), exactly
+    /// once, on the canonical teardown paths (the FSM Idle exit, the
+    /// received NOTIFICATION, the transport failure). Mid-send error
+    /// paths rely on the agent's documented unordered-input tolerance.
+    #[cfg(feature = "experimental-savnet")]
+    fn sav_adjacency_down(&mut self) {
+        if self.sav_adjacency_up_reported {
+            self.sav_adjacency_up_reported = false;
+            if let Some(agent) = &self.agent {
+                agent.on_event(sav::agent::SavAgentEvent::AdjacencyDown {
+                    protocol: sav::agent::SavProtocol::Bgp,
+                    peer: self.sav_peer(),
+                });
+            }
+        }
+    }
+
+    /// The SAV-layer peer identity for this session.
+    #[cfg(feature = "experimental-savnet")]
+    fn sav_peer(&self) -> sav::agent::SavPeer {
+        sav::agent::SavPeer {
+            address: self.peer.address,
+            remote_id: self.peer.remote_as,
         }
     }
 
@@ -330,6 +385,8 @@ where
                         Err(io_err) => {
                             let actions = self.fsm.fire(Event::TcpConnectionFails);
                             let _ = self.perform_all(actions, sink).await;
+                            #[cfg(feature = "experimental-savnet")]
+                            self.sav_adjacency_down();
                             self.end = Some(SessionEnd::Transport(io_err.to_string()));
                             return self.end.clone().unwrap();
                         }
@@ -410,6 +467,19 @@ where
                 hold = n.map(|x| x.hold_time).unwrap_or(0),
                 "bgpd: session Established"
             );
+            // The SAVNET adjacency-up report (experimental-savnet):
+            // in-process, monitor-only consumer; the session knows
+            // addresses, not kernel interfaces, so no ifindex rides
+            // tonight.
+            #[cfg(feature = "experimental-savnet")]
+            if let Some(agent) = &self.agent {
+                self.sav_adjacency_up_reported = true;
+                agent.on_event(sav::agent::SavAgentEvent::AdjacencyUp {
+                    protocol: sav::agent::SavProtocol::Bgp,
+                    peer: self.sav_peer(),
+                    ifindex: None,
+                });
+            }
             if let Some(shared) = &self.shared {
                 shared.note_established();
             }
@@ -419,6 +489,8 @@ where
             }
         }
         if self.fsm.state() == State::Idle {
+            #[cfg(feature = "experimental-savnet")]
+            self.sav_adjacency_down();
             self.end = Some(match event {
                 Event::ManualStop => SessionEnd::ManualStop,
                 _ => self
@@ -484,6 +556,28 @@ where
                     withdrawn = withdrawn.len(),
                     "bgpd: UPDATE received"
                 );
+                // The SAVNET route-event reports (experimental-savnet):
+                // Adj-RIB-In granularity — every announced/withdrawn
+                // prefix at the same point the RIB sink learns it
+                // (pre-best-path, the RFC 8704 §3.1 candidate space).
+                #[cfg(feature = "experimental-savnet")]
+                if let Some(agent) = &self.agent {
+                    let source = sav::agent::SavEventSource::Bgp(self.sav_peer());
+                    let nexthop = bgp_next_hop(&update);
+                    for prefix in update.announced() {
+                        agent.on_event(sav::agent::SavAgentEvent::RouteInstalled {
+                            source: source.clone(),
+                            prefix,
+                            nexthop,
+                        });
+                    }
+                    for prefix in &withdrawn {
+                        agent.on_event(sav::agent::SavAgentEvent::RouteWithdrawn {
+                            source: source.clone(),
+                            prefix: *prefix,
+                        });
+                    }
+                }
                 sink.announce(&self.peer, &update);
                 sink.withdraw(&self.peer, &withdrawn);
                 self.step(Event::UpdateMsg, sink).await
@@ -497,6 +591,8 @@ where
                 );
                 let actions = self.fsm.fire(Event::NotifMsg);
                 let _ = self.perform_all(actions, sink).await;
+                #[cfg(feature = "experimental-savnet")]
+                self.sav_adjacency_down();
                 self.end = Some(SessionEnd::PeerNotified {
                     code: n.code,
                     subcode: n.subcode,
@@ -848,6 +944,27 @@ pub fn withdrawal_update(prefixes: &[IpPrefix]) -> BgpUpdate {
     update
 }
 
+/// The UPDATE's next hop for the SAVNET route-event reports
+/// (experimental-savnet): the v4 NEXT_HOP attribute or the MP_REACH
+/// next hop, whichever the update carries first; `None` when neither.
+#[cfg(feature = "experimental-savnet")]
+fn bgp_next_hop(update: &BgpUpdate) -> Option<IpAddr> {
+    for attr in &update.attrs {
+        match attr {
+            crate::attr::PathAttribute::NextHop(v4) => return Some(IpAddr::V4(*v4)),
+            crate::attr::PathAttribute::MpReach(mp) => match &mp.next_hop {
+                crate::attr::MpNextHop::V4(v4) => return Some(IpAddr::V4(*v4)),
+                crate::attr::MpNextHop::V6 { global, .. } => {
+                    return Some(IpAddr::V6(*global));
+                }
+                crate::attr::MpNextHop::Raw(_) => return None,
+            },
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,5 +1293,214 @@ mod tests {
             update.attrs.last(),
             Some(PathAttribute::MpUnreach(_))
         ));
+    }
+
+    // --- SAVNET agent hooks (experimental-savnet only) ---
+
+    #[cfg(feature = "experimental-savnet")]
+    mod savnet_hooks {
+        use super::*;
+        use crate::attr::{AsPath, MpNextHop, MpReach, Origin, PathAttribute};
+        use crate::message::BgpNotification;
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+        /// An agent that records every event (the contract-test
+        /// shape from the sav crate, local copy so the wiring is
+        /// proven against the anchor's own call sites).
+        #[derive(Default)]
+        struct RecordingAgent {
+            events: StdMutex<Vec<sav::agent::SavAgentEvent>>,
+        }
+
+        impl sav::agent::SavAgent for RecordingAgent {
+            fn on_event(&self, event: sav::agent::SavAgentEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+            fn binding_suggestions(&self) -> Vec<sav::agent::SavBindingSuggestion> {
+                Vec::new()
+            }
+        }
+
+        fn sav_peer_of(address: &str, remote_as: u32) -> sav::agent::SavPeer {
+            sav::agent::SavPeer {
+                address: address.parse().unwrap(),
+                remote_id: remote_as,
+            }
+        }
+
+        /// The full sequence: Established reports adjacency up, an
+        /// UPDATE reports installs and withdraws at the on_message
+        /// UPDATE arm (Adj-RIB-In granularity, pre-best-path), and the
+        /// session teardown (received NOTIFICATION) reports adjacency
+        /// down — exactly once.
+        #[tokio::test]
+        async fn session_reports_the_savnet_event_sequence() {
+            let agent = Arc::new(RecordingAgent::default());
+            let (ours, mut theirs) = duplex(4096);
+            let mut session = PeerSession::new(
+                ours,
+                SessionConfig::new(65000, "192.0.2.1".parse().unwrap(), 90),
+                PeerInfo {
+                    address: "192.0.2.9".parse().unwrap(),
+                    remote_as: 65001,
+                    bgp_id: None,
+                },
+                "192.0.2.1".parse().unwrap(),
+                None,
+                Duration::ZERO,
+            )
+            .with_shared(Arc::new(SessionShared::default()))
+            .with_sav_agent(Arc::clone(&agent) as Arc<dyn sav::agent::SavAgent>);
+            let mut sink = SharedSink(Arc::new(std::sync::Mutex::new(NullSink)));
+            let driver_sink = sink.clone();
+            let driver = tokio::spawn(async move { session.run(&mut { driver_sink }).await });
+
+            // OPEN + KEEPALIVE -> Established.
+            let open = BgpMessage::Open(crate::message::BgpOpen::new(
+                65001,
+                30,
+                "10.9.9.9".parse().unwrap(),
+                vec![],
+            ))
+            .encode(true)
+            .unwrap();
+            theirs.write_all(&open).await.unwrap();
+            let keepalive = BgpMessage::Keepalive.encode(true).unwrap();
+            theirs.write_all(&keepalive).await.unwrap();
+
+            // One UPDATE: announce 203.0.113.0/24 via 192.0.2.9 and
+            // withdraw 198.51.100.0/24.
+            let update = BgpMessage::Update(BgpUpdate {
+                withdrawn: vec!["198.51.100.0/24".parse().unwrap()],
+                attrs: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::sequence([65001])),
+                    PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+                ],
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+            })
+            .encode(true)
+            .unwrap();
+            theirs.write_all(&update).await.unwrap();
+
+            // Teardown by NOTIFICATION (Cease): adjacency down fires.
+            let notification = BgpMessage::Notification(BgpNotification::cease(3))
+                .encode(true)
+                .unwrap();
+            theirs.write_all(&notification).await.unwrap();
+
+            let end = driver.await.unwrap();
+            assert!(matches!(end, SessionEnd::PeerNotified { .. }));
+
+            let events = agent.events.lock().unwrap().clone();
+            let peer = sav_peer_of("192.0.2.9", 65001);
+            assert_eq!(
+                events,
+                vec![
+                    sav::agent::SavAgentEvent::AdjacencyUp {
+                        protocol: sav::agent::SavProtocol::Bgp,
+                        peer: peer.clone(),
+                        ifindex: None,
+                    },
+                    sav::agent::SavAgentEvent::RouteInstalled {
+                        source: sav::agent::SavEventSource::Bgp(peer.clone()),
+                        prefix: "203.0.113.0/24".parse().unwrap(),
+                        nexthop: Some("192.0.2.9".parse().unwrap()),
+                    },
+                    sav::agent::SavAgentEvent::RouteWithdrawn {
+                        source: sav::agent::SavEventSource::Bgp(peer.clone()),
+                        prefix: "198.51.100.0/24".parse().unwrap(),
+                    },
+                    sav::agent::SavAgentEvent::AdjacencyDown {
+                        protocol: sav::agent::SavProtocol::Bgp,
+                        peer,
+                    },
+                ],
+                "adjacency up -> install -> withdraw -> adjacency down, exactly once each"
+            );
+        }
+
+        /// The v6 arm of the next-hop extraction: an MP_REACH
+        /// announcement reports the global next-hop address.
+        #[tokio::test]
+        async fn v6_mp_reach_updates_report_the_global_next_hop() {
+            let agent = Arc::new(RecordingAgent::default());
+            let (ours, mut theirs) = duplex(4096);
+            let mut session = PeerSession::new(
+                ours,
+                SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90),
+                PeerInfo {
+                    address: "2001:db8::9".parse().unwrap(),
+                    remote_as: 65001,
+                    bgp_id: None,
+                },
+                "2001:db8::1".parse().unwrap(),
+                None,
+                Duration::ZERO,
+            )
+            .with_sav_agent(Arc::clone(&agent) as Arc<dyn sav::agent::SavAgent>);
+            let mut sink = NullSink;
+            let driver = tokio::spawn(async move { session.run(&mut sink).await });
+
+            let open = BgpMessage::Open(crate::message::BgpOpen::new(
+                65001,
+                30,
+                "10.9.9.9".parse().unwrap(),
+                vec![],
+            ))
+            .encode(true)
+            .unwrap();
+            theirs.write_all(&open).await.unwrap();
+            theirs
+                .write_all(&BgpMessage::Keepalive.encode(true).unwrap())
+                .await
+                .unwrap();
+
+            let update = BgpMessage::Update(BgpUpdate {
+                withdrawn: vec![],
+                attrs: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::sequence([65001])),
+                    PathAttribute::MpReach(MpReach {
+                        afi: 2,
+                        safi: 1,
+                        next_hop: MpNextHop::V6 {
+                            global: "2001:db8::9".parse().unwrap(),
+                            link_local: None,
+                        },
+                        nlri: vec!["2001:db8:aa::/48".parse().unwrap()],
+                    }),
+                ],
+                nlri: vec![],
+            })
+            .encode(true)
+            .unwrap();
+            theirs.write_all(&update).await.unwrap();
+            // Teardown.
+            theirs
+                .write_all(
+                    &BgpMessage::Notification(BgpNotification::cease(3))
+                        .encode(true)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = driver.await.unwrap();
+
+            let events = agent.events.lock().unwrap().clone();
+            let install = events.iter().find_map(|event| match event {
+                event @ sav::agent::SavAgentEvent::RouteInstalled { .. } => Some(event.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                install,
+                Some(sav::agent::SavAgentEvent::RouteInstalled {
+                    source: sav::agent::SavEventSource::Bgp(sav_peer_of("2001:db8::9", 65001)),
+                    prefix: "2001:db8:aa::/48".parse().unwrap(),
+                    nexthop: Some("2001:db8::9".parse().unwrap()),
+                })
+            );
+        }
     }
 }

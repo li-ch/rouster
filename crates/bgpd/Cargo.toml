@@ -20,7 +20,19 @@ tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 thiserror.workspace = true
 zapi = { workspace = true }
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true }
+# The SAVNET agent hooks (experimental-savnet, default OFF): in-process
+# reporting of SAV-relevant session events to a sav::agent::SavAgent.
+# Optional path-dep on the pre-existing workspace member (the rpki
+# precedent); the feature forwards into sav so the cfg-gated agent
+# items exist when the anchor hooks compile.
+sav = { workspace = true, optional = true }
+
+[features]
+# See docs/protocols/savnet.md: in-process hooks only, no wire
+# protocols; default OFF (the default workspace gate exercises none of
+# it, and feature-off compiles zero hooks).
+experimental-savnet = ["dep:sav", "sav/experimental-savnet"]
 
 # start_paused tokio tests + duplex sockets, dev-only (sav precedent).
 [dev-dependencies]

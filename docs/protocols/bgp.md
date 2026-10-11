@@ -161,6 +161,12 @@ full two-connection §6.8 daemon integration test (the verdict table,
 replay adapter, and session observability are tested; the accept-path
 dance is smoke-covered by its dormancy) · route-server mode · route
 next-hop resolution (v1: single-hop peers only) · v6 listener side ·
-the `experimental-savnet` BGP-signaling hook (trait seam absent by
-mission; anchor: `peer.rs` `on_message`) · graceful-restart ·
+graceful-restart ·
 ADD-PATH · interface up/down mirror tracking.
+
+The `experimental-savnet` hook LANDED (2026-10-11) behind the flag,
+in-process only: `peer.rs` `on_message`'s UPDATE arm reports
+installs/withdraws (Adj-RIB-In granularity) and the Established /
+teardown transitions report adjacency to a hosted
+`sav::agent::SavAgent` — see [savnet.md](savnet.md). The
+draft-dependent BGP-signaling wire protocol stays deferred with it.
