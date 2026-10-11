@@ -224,7 +224,7 @@ pub struct Ospfd {
     /// Self-originated summary-LSAs ((area, key)), §12.4.3 — the
     /// withdrawal diff's baseline.
     summaries: BTreeMap<(u32, LsaKey), ()>,
-    /// Whether any external LSA exists (the router-LSA E-bit, §12.4.3).
+    /// Whether any external LSA exists (the router-LSA E-bit, §12.4.4).
     asbr: bool,
     /// The router-wide §16 walk is due WITHOUT any area's §16.1
     /// recompute — the AS-scope class (type-5 installs, summary
@@ -842,7 +842,7 @@ impl Ospfd {
             .interfaces
             .iter()
             .any(|i| i.virtual_link && i.transit_area == Some(area));
-        // The E-bit: our own externals (§12.4.3) OR the RFC 3101
+        // The E-bit: our own externals (§12.4.4) OR the RFC 3101
         // §3.1 NSSA-border duty in non-stub areas (the translated
         // type-5s advertise US as the ASBR — the transit topology
         // must see that status).
@@ -882,7 +882,7 @@ impl Ospfd {
         }
     }
 
-    /// §12.4.3: originate the AS-external-LSA for a redistributed
+    /// §12.4.4: originate the AS-external-LSA for a redistributed
     /// route and flood it AS-wide (type-5s are AS-scoped: originated
     /// in the first area's database, the same instance mirrored into
     /// every other area's — §7's "part of each area's link state
@@ -1043,7 +1043,7 @@ impl Ospfd {
         }
     }
 
-    /// §12.4.3's withdrawal: premature-age the LSA in every area
+    /// §12.4.4's withdrawal: premature-age the LSA in every area
     /// (§14.1) and flood the MaxAge instance.
     fn withdraw_external(&mut self, prefix_str: &str, now: u64, out: &mut Vec<WireOut>) {
         // RFC 3101 §2.4: the type-7s of the same prefix go too.
@@ -3087,7 +3087,7 @@ impl Ospfd {
         self.maybe_spf(now, out, zapi_out);
     }
 
-    /// A redistributed static route from zebra (§12.4.3).
+    /// A redistributed static route from zebra (§12.4.4).
     pub fn on_redistribute_add(
         &mut self,
         route: RedistributedRoute,
@@ -4466,7 +4466,7 @@ mod tests {
 
         // §16.4 on B: C's redistributed static resolves through the
         // type-4 ASBR path — B installs the external route via A.
-        // C becomes an ASBR only when the static is pushed (§12.4.3:
+        // C becomes an ASBR only when the static is pushed (§12.4.4:
         // the E-bit follows the external origination).
         let mut out: Vec<WireOut> = Vec::new();
         cores[c].on_redistribute_add(

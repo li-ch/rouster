@@ -1,6 +1,6 @@
 //! LSA origination builders (RFC 2328 §12.4): the router-LSA
 //! (§12.4.1), the network-LSA a DR originates (§12.4.2), and the
-//! AS-external-LSA for redistributed routes (§12.4.3).
+//! AS-external-LSA for redistributed routes (§12.4.4).
 //!
 //! Pure builders: they take a snapshot of what the daemon knows
 //! (interface states, adjacencies, the LSDB's sequence state) and
@@ -16,10 +16,10 @@
 //!   and interface stubs (type-3). Virtual links (type-4) are
 //!   §Deferred with §15.
 //! - The E-bit of the router-LSA (ASBR status) turns on exactly
-//!   when an AS-external LSA is being originated — §12.4.3's "the
+//!   when an AS-external LSA is being originated — §12.4.4's "the
 //!   router then becomes an AS boundary router" sequencing, wired at
 //!   the daemon.
-//! - §12.4.3's Link State ID allocation handles the no-conflict
+//! - §12.4.4's Link State ID allocation handles the no-conflict
 //!   case (the prefix's own network number); the collision path
 //!   (ID already used by a different prefix → +1 walk) is v1
 //!   omitted, disclosed.
@@ -68,7 +68,7 @@ pub struct InterfaceAdv {
     pub virtual_link: bool,
 }
 
-/// Build the router-LSA (§12.4.1). `e_bit` mirrors §12.4.3: set when
+/// Build the router-LSA (§12.4.1). `e_bit` mirrors §12.4.4: set when
 /// redistributing external routes (an ASBR); `b_bit` when the router
 /// is an area border router (§A.4.2). The Link State ID of a
 /// router-LSA is the router's own ID (§12.4.1).
@@ -267,9 +267,9 @@ pub fn build_nssa_lsa(
     }
 }
 
-/// Build the AS-external-LSA for one redistributed route (§12.4.3).
+/// Build the AS-external-LSA for one redistributed route (§12.4.4).
 /// Type-2 (E-bit) with FRR's default metric 20; forwarding address
-/// 0.0.0.0 (the ASBR itself — §12.4.3's default when no dedicated
+/// 0.0.0.0 (the ASBR itself — §12.4.4's default when no dedicated
 /// forwarding address is configured).
 pub fn build_external_lsa(
     own: RouterId,
@@ -283,7 +283,7 @@ pub fn build_external_lsa(
             ls_age: 0,
             options: Options(Options::E),
             ls_type: LsaType::AS_EXTERNAL,
-            // §12.4.3: the Link State ID is the external network
+            // §12.4.4: the Link State ID is the external network
             // number (the no-conflict allocation; see module note).
             link_state_id: LinkStateId(u32::from(network)),
             adv_router: own,
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn asbr_bit_is_carried() {
-        // §12.4.3: originating type-5s makes the router an ASBR —
+        // §12.4.4: originating type-5s makes the router an ASBR —
         // the E-bit lands in the router-LSA.
         let lsa = build_router_lsa(rid("1.1.1.1"), true, false, false, &[]);
         let LsaBody::Router(body) = &lsa.body else {
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn external_lsa_shape() {
-        // §A.4.5/§12.4.3: ID = network number, mask, E-bit for
+        // §A.4.5/§12.4.4: ID = network number, mask, E-bit for
         // type-2, forwarding 0.0.0.0.
         let lsa = build_external_lsa(
             rid("1.1.1.1"),

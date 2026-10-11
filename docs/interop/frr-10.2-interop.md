@@ -476,6 +476,6 @@ kept for reuse:
   form (one field per line); pipe-greps need the unfiltered summary
   table.
 - FRR sets a redistributed static's type-5 forwarding address to the
-  static's nexthop (§12.4.3) — the reverse (REDIST-IN) direction
+  static's nexthop (§12.4.4) — the reverse (REDIST-IN) direction
   uses a blackhole static (FA 0.0.0.0) so the two routers don't
   loop through each other.

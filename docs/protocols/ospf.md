@@ -3,8 +3,14 @@
 Status: core opened 2026-10-11 (W2-e day 1, commits `2fda837`..):
 the LSA codec, the link-state database, the intra-area SPF engine and
 the neighbor/adjacency cores, all pure, clock-injected and
-RFC-cited. The daemon shell (config parser landed; sockets/interop)
-is the day-2 pickup.
+RFC-cited. Day 2 added the raw-socket transport, the daemon and the
+FRR interop. The N2/N3 night slices (2026-10-11/12) added broadcast
+networks (§9.4 election, §12.4.2, §13.3), multi-area inter-area
+routing — the router-wide §16.2/§16.4 walk and the §12.4.3 ABR
+duties — stub areas and NSSA (RFC 3101), Appendix D + RFC 5709
+authentication, incremental SPF (§16.5/§16.6), virtual links
+(§15/§D.3), and the OSPFv3 codecs (N2B, RFC 5340 — runtime
+remains §Deferred).
 
 ## Layout
 
@@ -18,8 +24,16 @@ is the day-2 pickup.
 | `spf` | The §16.1 two-stage Dijkstra (stub networks in stage two), §16.1.1 per-path next hops, §16.1 step-3 network-before-router tiebreak, equal-cost accumulation, TransitCapability; the pure throttle scheduler |
 | `packet` | §A.3 codecs: header, Hello, DBD, LSR, LSU, LSAck with packet checksum verification |
 | `neighbor` | The §10.3 neighbor state table, §10.5 Hello processing, §10.6-§10.8 DBD master/slave exchange, §13 flooding steps 1-8 as `flood_step` |
+| `iface` | The §9 interface state machine and the §9.4 DR election (broadcast networks), pure and AF-generic |
+| `origination` | The §12.4 LSA builders: router (§12.4.1), network (§12.4.2), summary incl. type-4 (§12.4.3/§A.4.4), AS-external (§12.4.4/§A.4.5) |
+| `auth` | OSPFv2 packet authentication: Appendix D AuTypes (null/password/crypto) + the RFC 5709 HMAC-SHA-256 trailer |
+| `transport` | The raw-socket transport (§A.1): IP proto 89, AllSPF/AllDR multicast joins, TTL 1 (socket2) |
+| `exchange` | The §10.6-§10.9 adjacency conversation as daemon-side bookkeeping: DD drain, request lists, §13.3-§13.7 retransmissions |
+| `daemon` | The run loop: per-interface sockets, §14 aging/hellos, the router-wide §16 walk (intra/inter/external), the ABR/ASBR duties |
+| `zedge` | ospfd as a zebra client: HELLO attach, `redistribute static` → §12.4.4 origination/withdrawal, route export |
+| `wire` | Checked little helpers over byte slices — the house codec convention (A19: never trust counts) |
 | `config` | `ospfd.conf` grammar (A11/B7 conventions): router-id, area, interface stanzas, network bindings, redistribute static |
-| `bin/ospfd` | Day 2 (see §Deferred) |
+| `bin/ospfd` | Thin shell (bgpd/savd shape): config → sockets → zedge → the daemon run loop |
 
 ## Pinned design decisions
 
@@ -171,12 +185,12 @@ follow-up below.
   retransmission lists (RxmtInterval 5 s), §14 aging/flush,
   §12.4.1/.2/.3 origination with MinLSInterval retries, the FRR-parity
   SPF throttle, route diffing to ZEBRA_ROUTE_ADD/DELETE, and a
-  §16.4-lite external calculation (§16.4.1 steps 1-5 in the
+  §16.4-lite external calculation (§16.4 steps 1-5 in the
   single-area form: ASBR distance from the intra-area table; the
   type-4 inter-area lookup is deferred with §16.2-§16.3).
 - **The zapi edge** (`zedge.rs`, the bgpd idioms): HELLO as OSPF
   (7), `redistribute static` registration → the
-  REDISTRIBUTE_ROUTE_ADD/DEL pushes become §12.4.3
+  REDISTRIBUTE_ROUTE_ADD/DEL pushes become §12.4.4
   origination/withdrawal. Router ID and interface addresses come
   from config (no ROUTER_ID_ADD/INTERFACE_ADD_REQUEST — the zapi
   client exposes no raw send; disclosed).
@@ -189,7 +203,7 @@ follow-up below.
   static→redistribute BOTH directions (ours → FRR's kernel; FRR's →
   our §16.4 → kernel via rousterd), 30 s soak, exit 0 twice
   back-to-back. FRR sets the type-5 forwarding address to a via-us
-  static's nexthop (§12.4.3), so the reverse direction uses a
+  static's nexthop (§12.4.4), so the reverse direction uses a
   blackhole static (FA 0.0.0.0) — a topology note, not a workaround.
 
 ## Day-3 additions (2026-10-11, the N2 night slice: broadcast + §13.4)

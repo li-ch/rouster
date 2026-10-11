@@ -307,3 +307,26 @@ The phase text above is unchanged; this block is status only.
   — disclosed). 23 new tests (7 default + 16 cfg-on). Design note:
   docs/protocols/savnet.md (interface, flag, what stays out until
   drafts stabilize).
+
+- 2026-10-11/12 (night program, closed by the M5 close-out) — all
+  thirteen LEDGER lines PASS: the OSPF breadth slices (N2 broadcast
+  networks + inter-area/ABR, N2B the OSPFv3 codecs on the AF-generic
+  seams, N3 stub areas + NSSA per RFC 3101, Appendix D + RFC 5709
+  auth, §16.5 incremental SPF, §15 virtual links), the SAVNET SIB
+  fold-in + agent interface (N4, ticked above), bgpd (N5 RFC 7606
+  revised error handling + route-server v1 + RFC 4724 graceful
+  restart; N5B ADD-PATH receive per RFC 7911), the nft SAV backend
+  on the Dataplane trait with the spoof-differential smoke (N6) and
+  per-op monitor counters through to rousterctl/vty (N6B), the gortr
+  real-cache RPKI interop runbook + client fixes (N7), the
+  common::rundir reader consolidation (N8), and micros M1 (bgpd's
+  single-hop BFD register family pinned, first DEREGISTER/UPDATE
+  wire evidence), M2 (`call` + zebra-style access-lists + the
+  `set comm-list` token-order fix), M4 (the vtyd config-apply
+  design recorded in docs/protocols/vty.md). Close-out swept the
+  docs index one-liners and fixed the P1-noted ospf citation drift
+  (AS-external/forwarding-address sites cite §12.4.4, not §12.4.3;
+  the external calculation's numbered steps are §16.4's — in
+  ospf.md, the interop doc, and the mirrored ospfd code comments).
+  Gate re-run at close by M5: fmt + clippy -D warnings clean,
+  workspace 1262/0 (night baseline 1052/0).

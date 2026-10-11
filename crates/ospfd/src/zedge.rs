@@ -4,7 +4,7 @@
 //! - **HELLO as OSPF** (route type 7) — the z5c-proven attach.
 //! - **`redistribute static`** registration (REDISTRIBUTE_ADD,
 //!   afi v4 STATIC): zebra's REDISTRIBUTE_ROUTE_ADD/DELETE pushes
-//!   become the §12.4.3 external-LSA origination/withdrawal feed.
+//!   become the §12.4.4 external-LSA origination/withdrawal feed.
 //! - **Export**: SPF route changes become ZEBRA_ROUTE_ADD/_DELETE
 //!   (protocol OSPF) so OSPF-learned routes reach the kernel through
 //!   rousterd.
