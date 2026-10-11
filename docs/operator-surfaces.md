@@ -89,7 +89,7 @@ Line-based; today's shape:
 
 ```text
 savd 0.0.0 pid 4242
-config mode strict-uRPF action monitor poll 5s interfaces 2 bindings 0
+config mode strict-uRPF action monitor poll 5s interfaces 2 bindings 0 collision ignore hysteresis 3s backend rp_filter
 installed 2 rules                       (or: installed 0 rules (never evaluated))
 rule allow if#2 [198.51.100.0/24] strict monitor     (IBA)
 rule block if#7 [192.0.2.0/26] drop                  (IBB)

@@ -9,6 +9,31 @@ workstream rules). This note records what the flag gates, what the
 interface promises, and — load-bearing — what deliberately stays out
 until the drafts stabilize.
 
+## Enforcement backends (savd `backend` knob)
+
+SAV programs install through the `Dataplane` trait ops on either of
+two landed surfaces, selected by savd.conf's `backend <rp_filter|nft>`
+(default `rp_filter`, unchanged since W7):
+
+- **rp_filter** — per-interface sysctls approximating the compiled
+  ops with the kernel FIB's own uRPF (strict=1/loose=2); no monitor
+  counters (monitor counting runs in savd's route-lookup simulation);
+  IPv4-only; IBB/PBA/PBB rejected with logged reasons.
+- **nft** (N6) — a wholly-owned `table inet rouster_sav` enforcing
+  the compiled rule CONTENT: per-interface allowlists as interval
+  sets, blocklists, router-scale prefix ops, IPv4 and IPv6, monitor
+  actions as named kernel counters (`sav_monitor_counts` answers from
+  them — the dataplane-first path), drop actions as enforced denies.
+  Enforcement lives only in the table: the sysctl surface is never
+  touched and clear is a single `destroy table`. Evidence:
+  `scripts/test-sav-nft.sh` (spoof-differential vs the rp_filter
+  baseline, same topology; both scripts' readouts recorded under the
+  stage's quarantine).
+
+The verdict semantics are backend-independent: the nft ruleset's
+interpreted decisions are pinned equal to the reference pipeline
+(`sav::table::evaluate`, GSC §3) by `crates/sav/tests/nft_semantics.rs`.
+
 ## What landed (2026-10-11, the N4 slice)
 
 Two things, one behind the flag and one not:

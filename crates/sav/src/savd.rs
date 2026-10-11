@@ -126,6 +126,7 @@
 //! hysteresis <secs>                 ! RFC 8704 §3.6.2 deletion window (default 3)
 //! collision-policy <ignore|subtract>
 //!                                   ! GSC §3 collision resolution (default ignore)
+//! backend <rp_filter|nft>           ! enforcement surface (default rp_filter)
 //! i-understand-drop-mode yes        ! required friction to start in drop mode
 //! interface <name>                  ! opens a per-interface stanza
 //!   mode <strict|loose|fp|efp>      ! per-interface mode override
@@ -242,6 +243,35 @@ pub struct BindingLine {
     pub interfaces: Vec<String>,
 }
 
+/// The enforcement surface the daemon asks the dataplane to install
+/// SAV programs on — the config knob selecting between the two landed
+/// backends behind the same [`common::Dataplane`] trait ops.
+///
+/// This enum is the sav-side mirror of `netlink_dp::sav_nft::SavBackend`
+/// (the dependency direction forbids sharing: the dataplane crate must
+/// not see the sav layer, so the binary translates between the two —
+/// the same orphan-rule pattern the action enums use).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SavdBackend {
+    /// rp_filter sysctls: kernel FIB uRPF, no monitor counters (the
+    /// landed W7 surface; still the default).
+    #[default]
+    RpFilter,
+    /// The nftables ruleset backend (N6): per-interface allowlist
+    /// content enforced in `table inet rouster_sav`, monitor actions
+    /// as kernel counters (`sav_monitor_counts` answers from them).
+    Nft,
+}
+
+impl fmt::Display for SavdBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SavdBackend::RpFilter => "rp_filter",
+            SavdBackend::Nft => "nft",
+        })
+    }
+}
+
 /// The parsed savd configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavdConfig {
@@ -254,14 +284,18 @@ pub struct SavdConfig {
     pub poll_secs: u64,
     /// The RFC 8704 §3.6.2 deletion-hysteresis window in seconds
     /// (A10's fixed 3 s is the default). Parsed ≥ 1 — a zero window
-    /// would re-introduce the withdraw/re-advertise flap the hysteresis
-    /// exists to absorb, so the parser rejects it.
+    /// would re-introduce the withdraw/re-advertise flap the
+    /// hysteresis exists to absorb, so the parser rejects it.
     pub hysteresis_secs: u64,
     /// GSC §3 collision resolution handed to [`crate::table::compile_with`]
     /// (default [`CollisionPolicy::Ignore`], today's behavior; the uRPF
     /// generators emit only IBA rules, which cannot collide — the knob
     /// is wiring for the first IBB/PBB rule source).
     pub collision_policy: CollisionPolicy,
+    /// The enforcement surface SAV programs install on (default
+    /// [`SavdBackend::RpFilter`] — unchanged since W7; `nft` selects
+    /// the content-enforcing, counter-bearing ruleset backend).
+    pub backend: SavdBackend,
     /// `i-understand-drop-mode yes` — the friction line drop mode
     /// requires.
     pub drop_ack: bool,
@@ -279,6 +313,7 @@ impl Default for SavdConfig {
             poll_secs: DEFAULT_POLL_SECS,
             hysteresis_secs: DEFAULT_HYSTERESIS_SECS,
             collision_policy: CollisionPolicy::Ignore,
+            backend: SavdBackend::RpFilter,
             drop_ack: false,
             interfaces: Vec::new(),
             bindings: Vec::new(),
@@ -290,14 +325,16 @@ impl fmt::Display for SavdConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "mode {} action {} poll {}s interfaces {} bindings {} collision {} hysteresis {}s",
+            "mode {} action {} poll {}s interfaces {} bindings {} collision {} hysteresis {}s \
+             backend {}",
             self.mode,
             self.action,
             self.poll_secs,
             self.interfaces.len(),
             self.bindings.len(),
             self.collision_policy,
-            self.hysteresis_secs
+            self.hysteresis_secs,
+            self.backend
         )
     }
 }
@@ -361,6 +398,7 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
     let mut seen_poll = false;
     let mut seen_hysteresis = false;
     let mut seen_collision_policy = false;
+    let mut seen_backend = false;
     let mut seen_drop_ack = false;
 
     for (idx, raw) in input.lines().enumerate() {
@@ -509,6 +547,19 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                 }
                 seen_collision_policy = true;
             }
+            // Enforcement surface selection (N6): the dataplane backend
+            // SAV programs install on. Default unchanged (rp_filter).
+            ["backend", b] => {
+                if seen_backend {
+                    return Err(fail(line_no, "duplicate `backend` line"));
+                }
+                match *b {
+                    "rp_filter" => config.backend = SavdBackend::RpFilter,
+                    "nft" => config.backend = SavdBackend::Nft,
+                    _ => return Err(fail(line_no, format!("bad backend `{b}` (rp_filter|nft)"))),
+                }
+                seen_backend = true;
+            }
             ["i-understand-drop-mode", ack] => {
                 if seen_drop_ack {
                     return Err(fail(line_no, "duplicate `i-understand-drop-mode` line"));
@@ -532,6 +583,7 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                         "expected `mode <strict|loose|fp|efp>`, `action <monitor|drop>`, \
                          `poll <secs>`, `hysteresis <secs>`, \
                          `collision-policy <ignore|subtract>`, \
+                         `backend <rp_filter|nft>`, \
                          `i-understand-drop-mode <yes|no>`, `interface <name>`, or \
                          `binding <prefix> interface <name>...`, got `{line}`"
                     ),
@@ -1920,7 +1972,7 @@ mod tests {
     #[test]
     fn knob_defaults_preserve_todays_behavior() {
         let absent = cfg("");
-        let explicit = cfg("hysteresis 3\ncollision-policy ignore\n");
+        let explicit = cfg("hysteresis 3\ncollision-policy ignore\nbackend rp_filter\n");
         assert_eq!(absent, SavdConfig::default());
         assert_eq!(
             explicit, absent,
@@ -1929,14 +1981,41 @@ mod tests {
         assert_eq!(absent.hysteresis_secs, DEFAULT_HYSTERESIS_SECS);
         assert_eq!(absent.hysteresis_delay(), DEFERRED_DELETE_DELAY);
         assert_eq!(absent.collision_policy, CollisionPolicy::Ignore);
+        assert_eq!(absent.backend, SavdBackend::RpFilter, "default unchanged");
         // The Display (status/config log lines) appends the knobs after
         // the existing fields — additive, never reordered.
         assert_eq!(
             explicit.to_string(),
             format!(
                 "mode strict-uRPF action monitor poll {DEFAULT_POLL_SECS}s interfaces 0 \
-                 bindings 0 collision ignore hysteresis {DEFAULT_HYSTERESIS_SECS}s"
+                 bindings 0 collision ignore hysteresis {DEFAULT_HYSTERESIS_SECS}s \
+                 backend rp_filter"
             )
+        );
+    }
+
+    /// KNOB, backend: `backend nft` selects the nftables enforcement
+    /// surface; duplicates and unknown values refuse (A11's grammar
+    /// discipline), and the Display carries the selection.
+    #[test]
+    fn backend_knob_selects_the_nft_surface() {
+        let config = cfg("backend nft\n");
+        assert_eq!(config.backend, SavdBackend::Nft);
+        assert_eq!(config.backend.to_string(), "nft");
+        assert!(config.to_string().ends_with("backend nft"));
+
+        assert_eq!(
+            parse_savd_config("backend nft\nbackend rp_filter\n")
+                .unwrap_err()
+                .to_string(),
+            "line 2: duplicate `backend` line"
+        );
+        let err = parse_savd_config("backend iptables\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bad backend `iptables` (rp_filter|nft)"),
+            "{err}"
         );
     }
 

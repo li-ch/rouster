@@ -34,8 +34,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use netlink_dp::sav_nft::SavBackend as DpBackend;
 use netlink_dp::NetlinkDataplane;
-use sav::savd::{parse_savd_config, SavDaemon};
+use sav::savd::{parse_savd_config, SavDaemon, SavdBackend};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -201,6 +202,16 @@ fn load_config(path: &Path) -> Result<sav::savd::SavdConfig, String> {
     parse_savd_config(&text).map_err(|e| e.to_string())
 }
 
+/// The config's backend knob → the dataplane's backend enum (two
+/// crates, two enums — the orphan-rule pattern; the mapping is total
+/// and one-to-one).
+fn dp_backend(backend: SavdBackend) -> DpBackend {
+    match backend {
+        SavdBackend::RpFilter => DpBackend::RpFilter,
+        SavdBackend::Nft => DpBackend::Nft,
+    }
+}
+
 /// Connects to the ZAPI socket, tolerating a rousterd that is still
 /// starting (staticd's yield-then-sleep retry).
 async fn connect(socket: &Path) -> io::Result<SavDaemon<tokio::net::UnixStream>> {
@@ -282,8 +293,12 @@ async fn run(
     info!(path = %pidfile_path.display(), "savd: pidfile written");
 
     // Dataplane: enforcement installs/clears AND the live interface
-    // mirror (names for the config's interface lines).
-    let (mut dp, conn) = NetlinkDataplane::new()?;
+    // mirror (names for the config's interface lines). The config's
+    // `backend` knob selects the SAV enforcement surface (default
+    // rp_filter; `nft` routes the SAV trait ops to the nftables
+    // ruleset backend, kernel monitor counters included).
+    let (dp, conn) = NetlinkDataplane::new()?;
+    let mut dp = dp.with_sav_backend(dp_backend(config.backend));
     tokio::spawn(conn);
 
     let mut hangup = signal(SignalKind::hangup())?;
@@ -430,6 +445,14 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backend knob's two enums map one-to-one (the binary is the
+    /// only translation point; total by construction).
+    #[test]
+    fn backend_knob_maps_one_to_one() {
+        assert_eq!(dp_backend(SavdBackend::RpFilter), DpBackend::RpFilter);
+        assert_eq!(dp_backend(SavdBackend::Nft), DpBackend::Nft);
+    }
 
     /// A unique-per-run scratch dir (the nested path exercises
     /// Pidfile's parent-dir creation).
