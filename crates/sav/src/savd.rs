@@ -1003,6 +1003,14 @@ pub struct SavDaemon<IO> {
     /// so the switch is asserted, not just eyeballed in logs. The
     /// pre-first-evaluate value is the simulation's zero counts.
     last_counts: (CountsSource, SavMonitorCounts),
+    /// The backend's per-op counter rows when the last evaluate's
+    /// per-op read answered (N6B): `Some` means the count lines render
+    /// from these kernel-sourced rows (and `last_counts` is their sum,
+    /// source [`CountsSource::Dataplane`]); `None` means the backend
+    /// could not attribute per op and the simulation's per-op tallies
+    /// render instead, exactly as before. Never evaluates leave it
+    /// `None`.
+    last_per_op: Option<Vec<(SavProgramOp, SavMonitorCounts)>>,
     /// The hosted SAVNET agent (experimental-savnet, default OFF and
     /// then default None): savd's own ZAPI RIB view feeds it events
     /// and every evaluate logs its suggestions — monitor-only, the
@@ -1034,6 +1042,7 @@ where
             clock: Box::new(std::time::Instant::now),
             last_swept: Vec::new(),
             last_counts: (CountsSource::Simulation, SavMonitorCounts::default()),
+            last_per_op: None,
             #[cfg(feature = "experimental-savnet")]
             agent: None,
             #[cfg(feature = "experimental-savnet")]
@@ -1091,11 +1100,22 @@ where
 
     /// The source and numbers of the last evaluate's monitor-counts
     /// log line: dataplane when the backend answered
-    /// `sav_monitor_counts`, the simulation otherwise. [`Self::counts`]
+    /// `sav_monitor_counts` (directly, or via the per-op read whose
+    /// rows were summed), the simulation otherwise. [`Self::counts`]
     /// keeps reporting the simulation counter either way (it is the
     /// spoof counter, not whatever the backend last said).
     pub fn last_counts(&self) -> (CountsSource, SavMonitorCounts) {
         self.last_counts
+    }
+
+    /// The backend's per-op counter rows from the last evaluate
+    /// (N6B): `Some` when the backend answered
+    /// [`Dataplane::sav_monitor_per_op`] — these rows feed the status
+    /// `count` lines and `last_counts` is their sum; `None` when it
+    /// could not (per-op lines fall back to the simulation's
+    /// tallies).
+    pub fn last_per_op(&self) -> Option<&[(SavProgramOp, SavMonitorCounts)]> {
+        self.last_per_op.as_deref()
     }
 
     /// Replace the clock the per-evaluate SIB TTL sweep reads (A22).
@@ -1147,14 +1167,40 @@ where
         }
         let (source, counts) = self.last_counts;
         out.push_str(&format!("monitor source {source} {counts}\n"));
-        // GSC §4 "count", per-rule: the simulation's per-op verdict
-        // tallies (no landed backend reports per-rule counters — the
-        // aggregate `monitor` line above is the backend view). Only
-        // ops that have judged anything render; ops are in effective
-        // order (ifindex/prefix ascending).
-        for (op, tallies) in self.monitor.per_op() {
-            if tallies_judged(tallies) {
-                out.push_str(&format!("count {op} {tallies}\n"));
+        // GSC §4 "count", per-rule. When the backend answered the
+        // per-op read (N6B), its kernel-sourced rows render — each
+        // program op paired back to the effective op it was compiled
+        // from, so the line is the SAME rendering the simulation rows
+        // use (provenance included). Otherwise the simulation's per-op
+        // verdict tallies render, exactly as before (this can coexist
+        // with a `dataplane` aggregate line only for a backend that
+        // answers the aggregate but not per-op — none landed today;
+        // disclosed). Only ops that have judged anything render;
+        // backend rows are in canonical op order, simulation rows in
+        // effective order (ifindex/prefix ascending).
+        match &self.last_per_op {
+            Some(rows) => {
+                for (op, tallies) in rows {
+                    if tallies_judged(tallies) {
+                        match program_op_sav(&self.effective_ops, op) {
+                            Some(sav_op) => {
+                                out.push_str(&format!("count {sav_op} {tallies}\n"));
+                            }
+                            // Unreachable in the daemon flow (every
+                            // installed op compiles from an effective
+                            // one); the program op's own rendering
+                            // keeps a foreign row honest, never lost.
+                            None => out.push_str(&format!("count {op} {tallies}\n")),
+                        }
+                    }
+                }
+            }
+            None => {
+                for (op, tallies) in self.monitor.per_op() {
+                    if tallies_judged(tallies) {
+                        out.push_str(&format!("count {op} {tallies}\n"));
+                    }
+                }
             }
         }
         out
@@ -1675,28 +1721,62 @@ where
             _ => debug!("savd: rule set unchanged; nothing installed"),
         }
 
-        // Dataplane-first monitor counts (A18): when a backend can
-        // read real per-rule counters, its numbers feed the line;
-        // Unsupported (today's rp_filter backend — a strict/loose
-        // value drops, it does not count) and failed reads both fall
-        // back to the simulation's counts rather than failing the
-        // evaluate (diagnostics never take enforcement down), and the
-        // line names which source fed it.
-        let (source, counts) = match dp.sav_monitor_counts().await {
-            Ok(counts) => (CountsSource::Dataplane, counts),
+        // Dataplane-first monitor counts (A18), per-op first (N6B): a
+        // backend that can attribute its counters per op answers
+        // `sav_monitor_per_op` and its rows ARE the monitor view — the
+        // aggregate line renders their sum (the rows sum to the
+        // aggregate by construction) and the status `count` lines ride
+        // the same kernel-sourced rows. A backend that cannot
+        // (Unsupported — today's rp_filter backend: a strict/loose
+        // value drops, it does not count) falls back to the aggregate
+        // read, then to the simulation's counts; failed reads fall
+        // back the same way rather than failing the evaluate
+        // (diagnostics never take enforcement down), and the line
+        // names which source fed it.
+        let (source, counts, per_op) = match dp.sav_monitor_per_op().await {
+            Ok(rows) => {
+                let total = rows
+                    .iter()
+                    .fold(SavMonitorCounts::default(), |mut acc, (_, c)| {
+                        acc.invalid += c.invalid;
+                        acc.valid += c.valid;
+                        acc.unknown += c.unknown;
+                        acc
+                    });
+                (CountsSource::Dataplane, total, Some(rows))
+            }
             Err(DataplaneError::Unsupported(reason)) => {
                 debug!(
                     reason,
-                    "savd: backend has no monitor counters; simulation feeds the line"
+                    "savd: backend has no per-op monitor counters; trying the aggregate read"
                 );
-                (CountsSource::Simulation, self.monitor.counts())
+                let (source, counts) = match dp.sav_monitor_counts().await {
+                    Ok(counts) => (CountsSource::Dataplane, counts),
+                    Err(DataplaneError::Unsupported(reason)) => {
+                        debug!(
+                            reason,
+                            "savd: backend has no monitor counters; simulation feeds the line"
+                        );
+                        (CountsSource::Simulation, self.monitor.counts())
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "savd: backend monitor-count read failed; simulation feeds the line");
+                        (CountsSource::Simulation, self.monitor.counts())
+                    }
+                };
+                (source, counts, None)
             }
             Err(err) => {
-                warn!(error = %err, "savd: backend monitor-count read failed; simulation feeds the line");
-                (CountsSource::Simulation, self.monitor.counts())
+                warn!(error = %err, "savd: backend per-op monitor-count read failed; trying the aggregate read");
+                let (source, counts) = match dp.sav_monitor_counts().await {
+                    Ok(counts) => (CountsSource::Dataplane, counts),
+                    Err(_) => (CountsSource::Simulation, self.monitor.counts()),
+                };
+                (source, counts, None)
             }
         };
         self.last_counts = (source, counts);
+        self.last_per_op = per_op;
         info!(
             source = %source,
             invalid = counts.invalid,
@@ -1705,17 +1785,35 @@ where
             "savd: monitor counts (invalid = spoof counter)"
         );
         // Per-rule verdict tallies (GSC §4 "count"), the periodic debug
-        // line: one per op that has judged anything, simulation-sourced
-        // (the same tallies `status_text` renders).
-        for (op, tallies) in self.monitor.per_op() {
-            if tallies_judged(tallies) {
-                debug!(
-                    rule = %op,
-                    invalid = tallies.invalid,
-                    valid = tallies.valid,
-                    unknown = tallies.unknown,
-                    "savd: per-rule monitor tallies (GSC §4 count; simulation)"
-                );
+        // line: one per op that has judged anything — kernel-sourced
+        // when the per-op read answered, the simulation's tallies
+        // otherwise (the same rows `status_text` renders either way).
+        match &self.last_per_op {
+            Some(rows) => {
+                for (op, tallies) in rows {
+                    if tallies_judged(tallies) {
+                        debug!(
+                            rule = %op,
+                            invalid = tallies.invalid,
+                            valid = tallies.valid,
+                            unknown = tallies.unknown,
+                            "savd: per-rule monitor tallies (GSC §4 count; kernel counters)"
+                        );
+                    }
+                }
+            }
+            None => {
+                for (op, tallies) in self.monitor.per_op() {
+                    if tallies_judged(tallies) {
+                        debug!(
+                            rule = %op,
+                            invalid = tallies.invalid,
+                            valid = tallies.valid,
+                            unknown = tallies.unknown,
+                            "savd: per-rule monitor tallies (GSC §4 count; simulation)"
+                        );
+                    }
+                }
             }
         }
 
@@ -1768,20 +1866,30 @@ fn tallies_judged(tallies: &SavMonitorCounts) -> bool {
     tallies.invalid + tallies.valid + tallies.unknown > 0
 }
 
-/// The provenance of one installed program op (A7 riding A21): the
-/// origin the effective [`SavOp`] it was compiled from carries, found
-/// by re-deriving each effective op's program form and matching it
-/// against the installed one — identity-exact (every field the
-/// program op holds, action and uRPF hint included). `None` when no
-/// effective op matches or the op recorded no origin: an origin-less
-/// or disagreeing merge never guesses a source (B5 observation 5).
-fn program_op_origin(effective: &[(UrpfMode, SavOp)], op: &SavProgramOp) -> Option<RuleOrigin> {
+/// The effective [`SavOp`] one installed program op was compiled
+/// from, found by re-deriving each effective op's program form and
+/// matching it against the installed one — identity-exact (every
+/// field the program op holds, action and uRPF hint included). `None`
+/// when no effective op matches. The pairing behind the `rule` lines'
+/// provenance suffix and the backend-sourced `count` lines' rendering
+/// (they render the effective op so the line shape is the same
+/// whichever source fed the numbers).
+fn program_op_sav<'a>(effective: &'a [(UrpfMode, SavOp)], op: &SavProgramOp) -> Option<&'a SavOp> {
     for (mode, sav_op) in effective {
         if program(std::slice::from_ref(sav_op), *mode).ops().first() == Some(op) {
-            return sav_op.origin();
+            return Some(sav_op);
         }
     }
     None
+}
+
+/// The provenance of one installed program op (A7 riding A21): the
+/// origin the effective [`SavOp`] it was compiled from carries.
+/// `None` when no effective op matches or the op recorded no origin:
+/// an origin-less or disagreeing merge never guesses a source (B5
+/// observation 5).
+fn program_op_origin(effective: &[(UrpfMode, SavOp)], op: &SavProgramOp) -> Option<RuleOrigin> {
+    program_op_sav(effective, op).and_then(|sav_op| sav_op.origin())
 }
 
 #[cfg(test)]
@@ -2281,15 +2389,17 @@ mod tests {
 
     // ---- daemon over a duplex fake zebra (the staticd test shape) ----
 
-    /// What the mock's `sav_monitor_counts` answers: `Unsupported` (the
+    /// What the mock's counter reads answer: `Unsupported` (the
     /// default — the trait-default shape today's rp_filter backend
-    /// keeps), `Counts` (a backend with real per-rule counters), or
-    /// `Failed` (a read that errors).
+    /// keeps for both reads), `Counts` (an aggregate-only answering
+    /// backend), `PerOp` (a backend that attributes per op — the
+    /// nft shape), or `Failed` (a read that errors).
     #[derive(Default)]
     enum MockCounts {
         #[default]
         Unsupported,
         Counts(SavMonitorCounts),
+        PerOp(Vec<(SavProgramOp, SavMonitorCounts)>),
         Failed,
     }
 
@@ -2325,13 +2435,32 @@ mod tests {
         fn sav_monitor_counts(
             &self,
         ) -> impl Future<Output = Result<SavMonitorCounts, DataplaneError>> + Send {
-            std::future::ready(match *self.counts_answer.lock().unwrap() {
+            std::future::ready(match &*self.counts_answer.lock().unwrap() {
                 MockCounts::Unsupported => Err(DataplaneError::Unsupported(
                     "mock: no per-rule counters (trait-default shape)",
                 )),
-                MockCounts::Counts(counts) => Ok(counts),
+                MockCounts::Counts(counts) => Ok(*counts),
+                // The daemon flow never reaches the aggregate read when
+                // per-op answered; keep the mode's aggregate honest.
+                MockCounts::PerOp(_) => Err(DataplaneError::Unsupported(
+                    "mock: per-op mode answers sav_monitor_per_op",
+                )),
                 MockCounts::Failed => Err(DataplaneError::Other(
                     "mock: monitor-count read failed".into(),
+                )),
+            })
+        }
+        fn sav_monitor_per_op(
+            &self,
+        ) -> impl Future<Output = Result<Vec<(SavProgramOp, SavMonitorCounts)>, DataplaneError>> + Send
+        {
+            std::future::ready(match &*self.counts_answer.lock().unwrap() {
+                MockCounts::Unsupported | MockCounts::Counts(_) => {
+                    Err(DataplaneError::Unsupported("mock: no per-op counters"))
+                }
+                MockCounts::PerOp(rows) => Ok(rows.clone()),
+                MockCounts::Failed => Err(DataplaneError::Other(
+                    "mock: per-op monitor-count read failed".into(),
                 )),
             })
         }
@@ -3165,6 +3294,120 @@ mod tests {
         assert!(daemon
             .status_text(4242)
             .contains("count iba permit #3 [] monitor invalid=2 valid=0 unknown=0"));
+        drop(daemon);
+        let _ = server.await;
+    }
+
+    /// N6B: when the backend answers the PER-OP read (the nft shape),
+    /// its kernel-sourced rows ARE the count-line view — same line
+    /// rendering as the simulation rows (effective-op vocabulary,
+    /// provenance included), but the numbers are the backend's, the
+    /// aggregate line is the rows' sum with source dataplane, and the
+    /// simulation's own tallies (moved by neighbour observations in
+    /// parallel) never leak into the lines. A row for an op the daemon
+    /// did not compile (foreign residue) renders the program op's own
+    /// vocabulary rather than being dropped. When the backend stops
+    /// answering per op, the next evaluate falls back to the
+    /// simulation rows and the aggregate path, exactly as before.
+    #[tokio::test]
+    async fn per_op_backend_rows_feed_the_count_lines() {
+        let (client_io, server) =
+            spawn_fake_zebra(vec![ZapiMessage::RedistributeRouteAdd(dumped_route())]);
+        let mut daemon = daemon_with_interfaces(client_io);
+        daemon.initial_sync().await.unwrap();
+        let dp = MockSavDp::default();
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(daemon.last_per_op().is_none(), "default mock: no per-op");
+
+        // Backend rows keyed by the daemon's own installed ops, plus
+        // one foreign row (an op no effective op pairs with).
+        let (op2, op3) = (
+            monitor_allow(2, &["198.51.100.0/24"]),
+            monitor_allow(3, &[]),
+        );
+        let foreign = monitor_allow(9, &["203.0.113.0/24"]);
+        let rows = vec![
+            (
+                op2.clone(),
+                SavMonitorCounts {
+                    invalid: 1,
+                    valid: 6,
+                    unknown: 0,
+                },
+            ),
+            (
+                op3.clone(),
+                SavMonitorCounts {
+                    invalid: 13,
+                    valid: 0,
+                    unknown: 0,
+                },
+            ),
+            (
+                foreign.clone(),
+                SavMonitorCounts {
+                    invalid: 2,
+                    valid: 0,
+                    unknown: 0,
+                },
+            ),
+        ];
+        *dp.counts_answer.lock().unwrap() = MockCounts::PerOp(rows);
+        // In parallel the simulation judges different numbers (1
+        // valid, 2 invalid) — the lines must show the BACKEND's.
+        daemon.apply_event(&neighbour_new("198.51.100.9", 2)); // valid
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3)); // invalid
+        daemon.apply_event(&neighbour_new("198.51.100.9", 3)); // invalid
+        daemon.evaluate(&dp).await.unwrap();
+
+        assert_eq!(
+            daemon.last_counts(),
+            (
+                CountsSource::Dataplane,
+                SavMonitorCounts {
+                    invalid: 16,
+                    valid: 6,
+                    unknown: 0
+                }
+            ),
+            "the aggregate line is the per-op rows' sum, backend-sourced"
+        );
+        let status = daemon.status_text(4242);
+        assert!(
+            status.contains(
+                "count iba permit #2 [198.51.100.0/24] monitor (from fib) invalid=1 valid=6 unknown=0"
+            ),
+            "backend row, effective-op rendering with provenance: {status}"
+        );
+        assert!(
+            status.contains("count iba permit #3 [] monitor invalid=13 valid=0 unknown=0"),
+            "the deny-all's backend numbers, not the simulation's 2: {status}"
+        );
+        assert!(
+            status.contains("count allow if#9 [203.0.113.0/24] strict monitor invalid=2"),
+            "a foreign row keeps the program-op rendering (never dropped): {status}"
+        );
+        assert_eq!(
+            status.matches("count ").count(),
+            3,
+            "every judged backend row renders, simulation rows do not mix in"
+        );
+
+        // The backend stops answering per op: the next evaluate
+        // re-decides — simulation rows return, last_per_op clears.
+        *dp.counts_answer.lock().unwrap() = MockCounts::Unsupported;
+        daemon.evaluate(&dp).await.unwrap();
+        assert!(daemon.last_per_op().is_none());
+        assert_eq!(
+            daemon.last_counts(),
+            (CountsSource::Simulation, daemon.counts()),
+            "the aggregate falls back the A18 way"
+        );
+        let status = daemon.status_text(4242);
+        assert!(
+            status.contains("count iba permit #3 [] monitor invalid=2 valid=0 unknown=0"),
+            "simulation rows render again: {status}"
+        );
         drop(daemon);
         let _ = server.await;
     }

@@ -101,9 +101,11 @@ impl SpoofMonitor {
 
     /// The per-op verdict tallies so far (GSC §4 count), aligned with
     /// the op list: one row per op, `zero` for ops no observation has
-    /// decided. Simulation-sourced — no landed backend reports
-    /// per-rule counters (the dataplane's aggregate
-    /// [`common::SavMonitorCounts`] is the backend view).
+    /// decided. Simulation-sourced: when the backend answers
+    /// [`common::Dataplane::sav_monitor_per_op`] (the nft backend),
+    /// the daemon's count lines render the backend's kernel-sourced
+    /// rows instead — these tallies are then the fallback view (and
+    /// the `SpoofMonitor`-less consumers' only one).
     pub fn per_op(&self) -> impl Iterator<Item = (&SavOp, &SavMonitorCounts)> {
         self.ops.iter().zip(self.tallies.iter())
     }
