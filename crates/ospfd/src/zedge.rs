@@ -2,6 +2,10 @@
 //! client.
 //!
 //! - **HELLO as OSPF** (route type 7) — the z5c-proven attach.
+//! - **The interface dump** (ADD-C2): [`crate::ifdump::sync`] runs on
+//!   the same session this edge keeps — the dump's merged live
+//!   addresses/link-state are the core's construction input, then the
+//!   session becomes the resident edge (one socket, one HELLO).
 //! - **`redistribute static`** registration (REDISTRIBUTE_ADD,
 //!   afi v4 STATIC): zebra's REDISTRIBUTE_ROUTE_ADD/DELETE pushes
 //!   become the §12.4.4 external-LSA origination/withdrawal feed.
@@ -9,10 +13,11 @@
 //!   (protocol OSPF) so OSPF-learned routes reach the kernel through
 //!   rousterd.
 //!
-//! v1 disclosures: the ROUTER_ID_ADD request and the
-//! INTERFACE_ADD_REQUEST dump are not sent (`ZapiClient` exposes no
-//! raw send — the bgpd P2-b deviation-2 precedent): the router ID
-//! comes from config, interface addresses from the config stanzas.
+//! v1 disclosures: the ROUTER_ID_ADD request is not sent (`ZapiClient`
+//! exposes no raw send — the bgpd P2-b deviation-2 precedent): the
+//! router ID comes from config. Interface addresses now come from the
+//! zapi interface dump when a socket is configured (`ifdump`), static
+//! config as the fallback.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -74,6 +79,13 @@ where
     pub async fn start(&mut self) -> io::Result<()> {
         self.client.handshake(route_type::OSPF).await?;
         info!("ospfd: zapi session established (protocol=7)");
+        self.register().await
+    }
+
+    /// The post-handshake registrations (an already-established
+    /// session — e.g. one that just ran the [`crate::ifdump`] sync —
+    /// calls this directly; `start` is handshake + this).
+    pub async fn register(&mut self) -> io::Result<()> {
         if self.redistribute_static {
             // afi 1 (v4), STATIC, instance 0 — the z5d byte shape.
             self.client
@@ -170,26 +182,54 @@ impl TryFrom<&ZapiRoute> for RedistributedRoute {
     }
 }
 
+/// Connect to the zebra socket with bounded retry (30 attempts, 1 s
+/// apart — the bgpd/staticd pattern): the session a [`spawn`] or an
+/// [`crate::ifdump::sync`] runs on.
+pub async fn connect(
+    socket: &std::path::Path,
+) -> io::Result<zapi::ZapiClient<tokio::net::UnixStream>> {
+    for _ in 0..30 {
+        match ZapiClient::connect(socket).await {
+            Ok(client) => return Ok(client),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "zebra socket never appeared",
+    ))
+}
+
+/// Run the resident edge on an ALREADY-ESTABLISHED session (the
+/// ADD-C2 flow: [`crate::ifdump::sync`] handshook and dumped on it):
+/// the redistribute registration, then the select loop. Returns the
+/// command sender.
+pub async fn spawn_with_client(
+    client: zapi::ZapiClient<tokio::net::UnixStream>,
+    redistribute_static: bool,
+    pushed: mpsc::UnboundedSender<RedistributedRoute>,
+    withdrawn: mpsc::UnboundedSender<RedistributedRoute>,
+) -> io::Result<mpsc::UnboundedSender<ZedgeCommand>> {
+    let mut zedge = Zedge::new(client, redistribute_static, pushed, withdrawn);
+    zedge.register().await?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        if let Err(e) = zedge.run(rx).await {
+            warn!(error = %e, "ospfd: zedge task exited");
+        }
+    });
+    Ok(tx)
+}
+
 /// Spawn the zedge task against the real socket (connect-with-retry,
-/// the bgpd/staticd pattern). Returns the command sender.
+/// HELLO, then the resident loop). Returns the command sender.
 pub async fn spawn(
     socket: std::path::PathBuf,
     redistribute_static: bool,
     pushed: mpsc::UnboundedSender<RedistributedRoute>,
     withdrawn: mpsc::UnboundedSender<RedistributedRoute>,
 ) -> io::Result<mpsc::UnboundedSender<ZedgeCommand>> {
-    let mut client = None;
-    for _ in 0..30 {
-        match ZapiClient::connect(&socket).await {
-            Ok(c) => {
-                client = Some(c);
-                break;
-            }
-            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
-    let client = client
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "zebra socket never appeared"))?;
+    let client = connect(&socket).await?;
     let mut zedge = Zedge::new(client, redistribute_static, pushed, withdrawn);
     zedge.start().await?;
     let (tx, rx) = mpsc::unbounded_channel();

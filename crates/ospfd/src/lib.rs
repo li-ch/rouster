@@ -42,6 +42,7 @@ pub mod daemon;
 pub mod error;
 pub mod exchange;
 pub mod iface;
+pub mod ifdump;
 pub mod lsa;
 pub mod lsa_v3;
 pub mod lsdb;

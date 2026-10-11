@@ -120,6 +120,17 @@ where
         .await
     }
 
+    /// INTERFACE_ADD (0) with an empty body — the client→zebra
+    /// interface-state registration request. Zebra answers with one
+    /// INTERFACE_ADD dump per interface (each followed by its
+    /// INTERFACE_ADDRESS_ADDes), then event-driven pushes. Read them
+    /// with [`Self::read_message`] (the savd/ospfd collectors do).
+    /// E: the empty-body form every connecting daemon sends (pinned
+    /// doc, command table row 0).
+    pub async fn send_interface_dump_request(&mut self) -> io::Result<()> {
+        self.send(&ZapiMessage::InterfaceAddRequest).await
+    }
+
     /// REDISTRIBUTE_ADD (12): register interest in best-route pushes
     /// (`zclient_redistribute_set`; the zebra side answers with the
     /// current best-route dump of that type, then event-driven
@@ -369,6 +380,20 @@ mod tests {
         send.await.unwrap().unwrap();
         assert_eq!(header.command, 12);
         assert_eq!(body, unhex("01040000"));
+    }
+
+    /// The dump request is the empty-body INTERFACE_ADD (command 0,
+    /// zero body bytes) — the registration form every connecting
+    /// daemon sends.
+    #[tokio::test]
+    async fn interface_dump_request_encodes_empty_interface_add() {
+        let (client_io, mut server_io) = duplex(4096);
+        let mut client = ZapiClient::new(client_io);
+        let send = tokio::spawn(async move { client.send_interface_dump_request().await });
+        let (header, body) = server_read_frame(&mut server_io).await;
+        send.await.unwrap().unwrap();
+        assert_eq!(header.command, 0);
+        assert!(body.is_empty());
     }
 
     /// next_nexthop_update skips an interface push standing in front of

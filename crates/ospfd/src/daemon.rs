@@ -356,7 +356,8 @@ impl Ospfd {
             for (name, icfg) in &area.interfaces {
                 let Some((addr, mask)) = icfg.address else {
                     return Err(format!(
-                        "interface {name}: address <a.b.c.d/m> is required (v1)"
+                        "interface {name}: address <a.b.c.d/m> is required (no static \
+                         address and none in the zapi interface dump)"
                     ));
                 };
                 if addr.is_unspecified() || addr.is_loopback() {
@@ -366,11 +367,20 @@ impl Ospfd {
                 }
                 let p2p = icfg.network_type == NetworkType::PointToPoint;
                 let mut fsm = InterfaceFsm::new_with_priority(p2p, icfg.priority);
-                // §9.3 InterfaceUp: the config's address IS the lower
-                // layer's usable-interface signal (v1: no link-state
-                // tracking) — the interface enters PointToPoint/Waiting
-                // (or DR Other at priority 0) at construction.
-                let (_, actions) = fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
+                // §9.3 InterfaceUp: the lower layer's usable-interface
+                // signal. Static config (no dump): the config's address
+                // IS the signal — v1 behavior, InterfaceUp fires at
+                // construction. With the zapi interface dump merged in
+                // (`ifdump`), the LIVE link state is the signal: an
+                // interface the dump reports down (or loopback) stays in
+                // Down — no Hellos, no router-LSA links — until ongoing
+                // link-state tracking lands (§Deferred).
+                let (_, actions) = if icfg.link_state == Some(false) {
+                    // Stay Down; no WaitTimer is armed.
+                    (crate::iface::InterfaceState::Down, Vec::new())
+                } else {
+                    fsm.fire(crate::iface::InterfaceEvent::InterfaceUp)
+                };
                 let wait_deadline =
                     if actions.contains(&crate::iface::InterfaceAction::StartWaitTimer) {
                         // The WaitTimer is the RouterDeadInterval (§9.5.1's
@@ -2876,6 +2886,14 @@ impl Ospfd {
             // §15: a virtual link sends nothing until its other
             // endpoint's address is discovered by the routing table.
             if iface.virtual_link && iface.vlink_peer_ip.is_none() {
+                continue;
+            }
+            // §9.3/§C.3: an interface in Down sends no Hellos ("the
+            // interface is unusable... no protocol traffic"). Only the
+            // merged live link state leaves an interface Down at
+            // construction today (the ifdump down/loopback case);
+            // static-config interfaces fire InterfaceUp as before.
+            if iface.fsm.state == crate::iface::InterfaceState::Down {
                 continue;
             }
             if now >= iface.hello_deadline {

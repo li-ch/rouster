@@ -20,11 +20,11 @@
 //! one area (the backbone or an area ID — multiple areas are
 //! §Deferred), interface stanzas carrying the §C.3 parameters SPF and
 //! Hello actually consume (cost, hello/dead intervals, priority,
-//! network type, explicit address — the Day-2 daemon needs the
-//! interface's own address/mask for Hellos and router-LSA links, and
-//! v1 takes it from config rather than a zapi interface dump), plus
-//! `network <prefix> area <id>` for the classic interface-by-address
-//! binding. `redistribute static` is collected for the zapi edge.
+//! network type, explicit address — the STATIC address source; the
+//! zapi interface dump (`ifdump`) overrides it when a zapi socket is
+//! configured), plus `network <prefix> area <id>` for the classic
+//! interface-by-address binding. `redistribute static` is collected
+//! for the zapi edge.
 //!
 //! The socket layer note below is Day-1's record; socket2 WAS
 //! adopted for ospfd on Day 2 (owner decision A1, adopted
@@ -139,11 +139,21 @@ pub struct InterfaceConfig {
     pub hello_interval: u16,
     pub dead_interval: u32,
     pub priority: u8,
-    /// The interface's own address/mask (v1: config-supplied — the
-    /// zapi interface dump is not requested).
+    /// The interface's own address/mask. The STATIC source: the zapi
+    /// interface dump (`ifdump`) overrides it per interface when it
+    /// knows a live non-secondary IPv4 address; this stays the
+    /// fallback (standalone mode, unknown interfaces, v6-only).
     pub address: Option<(Ipv4Addr, Ipv4Addr)>,
+    /// The LIVE link state from the zapi interface dump: `Some(true)`
+    /// operative (and not loopback), `Some(false)` down/loopback —
+    /// the interface does not fire §9.3's InterfaceUp at construction
+    /// and stays Down. `None` = no dump (standalone v1: InterfaceUp
+    /// fires at construction, the config's address IS the lower
+    /// layer's usable signal).
+    pub link_state: Option<bool>,
     pub network_type: NetworkType,
-    /// Interface MTU (DD's MTU field).
+    /// Interface MTU (DD's MTU field). The dump's MTU overrides it
+    /// when one was reported.
     pub mtu: u16,
     /// Packet authentication (Appendix D): None / simple password /
     /// HMAC-SHA-256 cryptographic.
@@ -161,6 +171,7 @@ impl InterfaceConfig {
             dead_interval: 40,
             priority: 1,
             address: None,
+            link_state: None,
             network_type: NetworkType::Broadcast,
             mtu: 1500,
             auth: crate::auth::AuthConfig::None,

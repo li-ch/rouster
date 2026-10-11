@@ -47,7 +47,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let config = match parse_config(&text) {
+    let mut config = match parse_config(&text) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("ospfd: {e}");
@@ -60,6 +60,37 @@ fn main() {
         .build()
         .expect("tokio runtime");
     runtime.block_on(async move {
+        // The zapi edge (optional): the interface dump FIRST — the
+        // merged live addresses/link-state are the core's construction
+        // input (ADD-C2) — then the resident edge on the same session.
+        let (pushed_tx, pushed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (withdrawn_tx, withdrawn_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut zapi_client = None;
+        if let Some(socket) = &config.zapi_socket {
+            let mut client = match zedge::connect(std::path::Path::new(socket)).await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!(error = %e, "ospfd: zapi edge failed");
+                    std::process::exit(1);
+                }
+            };
+            let dump = match ospfd::ifdump::sync(&mut client).await {
+                Ok(dump) => dump,
+                Err(e) => {
+                    error!(error = %e, "ospfd: zapi interface dump failed");
+                    std::process::exit(1);
+                }
+            };
+            let report = dump.merge_into(&mut config);
+            info!(
+                dynamic = report.dynamic_address,
+                fallback = report.static_fallback,
+                down = report.down,
+                "ospfd: interface config merged with the zapi dump"
+            );
+            zapi_client = Some(client);
+        }
+
         let mut core = match Ospfd::new(&config) {
             Ok(core) => core,
             Err(e) => {
@@ -69,7 +100,7 @@ fn main() {
         };
 
         // §A.1 sockets: one per configured interface, opened on the
-        // config-supplied address.
+        // (merged) interface address.
         let mut sockets = Vec::new();
         for iface in &core.interfaces {
             match OspfRawSocket::open(iface.addr) {
@@ -84,13 +115,11 @@ fn main() {
             }
         }
 
-        // The zapi edge (optional): route export + redistribute
-        // static pushes.
-        let (pushed_tx, pushed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (withdrawn_tx, withdrawn_rx) = tokio::sync::mpsc::unbounded_channel();
-        if let Some(socket) = &config.zapi_socket {
-            match zedge::spawn(
-                socket.clone().into(),
+        // The resident edge on the dump's session (route export +
+        // redistribute static pushes).
+        if let Some(client) = zapi_client {
+            match zedge::spawn_with_client(
+                client,
                 config.redistribute_static,
                 pushed_tx.clone(),
                 withdrawn_tx.clone(),

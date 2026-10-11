@@ -56,6 +56,18 @@ pub mod iff {
     pub const MULTICAST: u64 = 0x1000;
 }
 
+/// `ZEBRA_IFA_*` bits for the flags u8 of INTERFACE_ADDRESS_ADD/DELETE
+/// (frr-10.2.2 `lib/zclient.h`). SPEC: our zebra answers every dump
+/// address with flags 0, so these bits only distinguish primaries from
+/// a real FRR zebra dump (the consumer is ospfd's interface merge).
+pub mod ifa_flag {
+    /// A secondary address of the interface — protocol daemons run on
+    /// the primary.
+    pub const SECONDARY: u8 = 0x01;
+    /// The address carries a peer address (point-to-point form).
+    pub const PEER: u8 = 0x02;
+}
+
 /// ZEBRA_ROUTE_* type numbers — sequential from 0 over frr-10.2.2's
 /// `lib/route_types.txt` as expanded by `lib/route_types.pl` (its loop
 /// assigns `#define <name> <index>` starting at 0). `ZEBRA_ROUTE_LOCAL`
