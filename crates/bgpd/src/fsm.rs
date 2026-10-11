@@ -163,6 +163,11 @@ pub struct Negotiated {
     /// Time. Presence alone switches the receiving-side retention
     /// rules on (§4.1).
     pub graceful_restart: Option<GracefulRestartInfo>,
+    /// The peer's ADD-PATH Send/Receive value per unicast family
+    /// (RFC 7911 §2; 0 = off). The per-path NLRI decode keys off
+    /// these — §Deferred (N5B landed the capability + negotiation).
+    pub add_path_v4: u8,
+    pub add_path_v6: u8,
 }
 
 /// The RFC 4724 §3 facts a receiving speaker needs from the peer's
@@ -390,6 +395,8 @@ impl Fsm {
                     internal: open.peer_as4() == self.config.local_as,
                     route_refresh: open.supports_route_refresh(),
                     graceful_restart: open.graceful_restart(),
+                    add_path_v4: open.add_path(1, 1),
+                    add_path_v6: open.add_path(2, 1),
                 };
                 let zero_hold = negotiated.hold_time == 0;
                 self.negotiated = Some(negotiated);
@@ -886,6 +893,32 @@ mod tests {
         f.fire(Event::TcpConnectionConfirmed);
         f.fire(Event::BgpOpen(open));
         assert_eq!(f.negotiated().unwrap().graceful_restart, None);
+    }
+
+    /// RFC 7911 §2: the ADD-PATH Send/Receive values land per family
+    /// (N5B foundation).
+    #[test]
+    fn negotiation_records_add_path_per_family() {
+        let mut f = Fsm::new(SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90));
+        let open = BgpOpen::new(
+            65001,
+            90,
+            "10.9.9.9".parse().unwrap(),
+            vec![
+                crate::capability::Capability::Multiprotocol { afi: 1, safi: 1 },
+                crate::capability::Capability::AddPath {
+                    afi: 1,
+                    safi: 1,
+                    send_receive: 3, // both
+                },
+            ],
+        );
+        f.fire(Event::Start { passive: false });
+        f.fire(Event::TcpConnectionConfirmed);
+        f.fire(Event::BgpOpen(open));
+        let n = f.negotiated().unwrap();
+        assert_eq!(n.add_path_v4, 3);
+        assert_eq!(n.add_path_v6, 0, "no v6 triple advertised");
     }
 
     /// Session-identity facts: iBGP detection and AS_TRANS peers.

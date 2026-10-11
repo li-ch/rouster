@@ -689,7 +689,7 @@ where
                     if self.update_handling.is_rfc7606() {
                         let gone = update.announced();
                         if !gone.is_empty() {
-                            warn!(peer = %self.peer.address, missing = sub,
+                            warn!(peer = %self.peer.address, detail = %err,
                                 "bgpd: UPDATE missing well-known attribute, routes withdrawn (RFC 7606 §7)");
                             sink.withdraw(&self.peer, &gone);
                         }

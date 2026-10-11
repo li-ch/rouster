@@ -6,7 +6,9 @@ RFC 4271 base + capabilities + MP-BGP v4/v6 unicast + route refresh +
 edge, and a two-green-runs interop smoke against real FRR 10.2.2
 bgpd. W2-d (2026-10-11, `f034b08`..) added the typed policy engine in
 the decision path, RPKI/ROV + OTC roles, ASPA verification, §6.8
-collision detection, and the policy interop smoke.
+collision detection, and the policy interop smoke. N5 (2026-10-11,
+`ff58d91`..) added RFC 7606 revised error handling, route-server
+mode v1, and RFC 4724 graceful restart.
 
 ## Layout
 
@@ -22,7 +24,7 @@ collision detection, and the policy interop smoke.
 | `rov` | RPKI-derived validation: RFC 6811 §2 ROV, RFC 9234 §5 OTC ingress/egress by role, ASPA verification (draft-ietf-sidrops-aspa-verification-28 §5.5/§5.6), `vrp-file` fixture grammar, RTR table source |
 | `zedge` | ZAPI client edge: NHT for peer addresses (connector gate), interface mirror, best-path export to the zebra |
 | `daemon` | Listener (TCP 179 default, `listen-port` knob), per-neighbor connectors (§10 ConnectRetry, exponential 1 s→120 s), §6.8 collision resolution (BGP-ID tiebreak, Cease 6/7 to losers, challenger adoption via stream replay), graceful stop |
-| `config` | `bgpd.conf` grammar (A11/B7 conventions) + policy-stanza extraction + `rpki`/`aspa`/role knobs |
+| `config` | `bgpd.conf` grammar (A11/B7 conventions) + policy-stanza extraction + `rpki`/`aspa`/role knobs + N5 neighbor knobs (`update-error-handling`, `route-server`, `graceful-restart`) |
 | `bin/bgpd` | Thin shell (savd shape): config → filters/validation → Loc-RIB → zedge → daemon |
 
 ## Pinned design decisions
@@ -78,6 +80,95 @@ collision detection, and the policy interop smoke.
 - **Unconfigured = accept-all = v1 behavior** — both interop smokes
   (the unmodified P2-b one and the policy one) run the same daemon.
 
+### RFC 7606 revised error handling (N5 M1)
+
+The UPDATE decoder applies the §7 per-attribute disposition table
+(`attr::rfc7606_disposition`, table-driven and cited row by row) by
+default; the RFC 4271 §6.3 session-reset behavior remains available
+per neighbor as `neighbor X update-error-handling strict-rfc4271`
+(default `rfc7606`). The implemented rows (subcodes as the strict
+decoder produces them):
+
+- **Treat-as-withdraw**: ORIGIN (any malformation), AS_PATH, NEXT_HOP,
+  MULTI_EXIT_DISC, COMMUNITIES ("not a non-zero multiple of 4"), AS4_PATH,
+  OTC (disclosed judgment — §7 does not list type 35; discarding a
+  malformed OTC would silently change leak eligibility), LOCAL_PREF
+  from iBGP, missing well-known mandatory attributes, and
+  Optional/Transitive flag conflicts for every attribute (§7's general
+  flags rule).
+- **Attribute discard**: LOCAL_PREF from eBGP, ATOMIC_AGGREGATE (len ≠ 0),
+  AGGREGATOR/AS4_AGGREGATOR (wrong length) — the route processes
+  normally without the attribute; later occurrences of a duplicate
+  attribute (§7) are discarded too.
+- **Session reset** (unchanged by RFC 7606): message-level framing
+  overruns (Malformed Attribute List), unrecognized well-known
+  attributes (§6.3), unparseable MP_REACH/MP_UNREACH content
+  (§5: next-hop length inconsistencies and bad NLRI keep the reset),
+  and duplicate MP_REACH/MP_UNREACH.
+
+Treat-as-withdraw withdraws the UPDATE's own NLRI from the
+Adj-RIB-In (`peer.rs` logs "treated as withdrawal"); attribute
+discards log and process. The strict mode also now carries the
+§6.3-prescribed subcode on its NOTIFICATION (previously flattened
+to 1).
+
+### Route-server mode v1 (N5 M2)
+
+`neighbor X route-server` marks an RS client (FRR
+`neighbor PEER route-server-client`, doc/user/routeserver.rst: it
+"enables the transparent mode for the specified peer. This means
+that some BGP attributes (as-path, next-hop and MED) of the routes
+announced to that peer are not modified"). v1 semantics:
+
+- Client→client reflection is **transparent**: the client's own
+  AS_PATH (no RS AS prepended), the origin client's NEXT_HOP, and
+  the MED ride through unchanged; the never-reflect-to-origin floor
+  stays.
+- FRR's transparency check requires BOTH ends to be clients
+  (bgp_route.c); likewise an RS-client target receives only other
+  clients' routes — "Those peers that are configured as RS-clients do
+  not receive any announce from the `Main` Loc-RIB". Normal peers
+  still receive client routes through the Main Loc-RIB with the usual
+  eBGP AS prepend.
+- **The RS RIB stays out of the kernel**: bests learned from RS
+  clients never produce ZAPI route adds (`rib::zebra_commands` —
+  FRR's view semantics: "Routes selected by the view are not
+  installed into the kernel routing table").
+- Interop: `scripts/test-bgp-rs-interop.sh` — our RS between two real
+  FRR 10.2.2 clients; asserts path exactly the origin client's,
+  preserved next hop + MED 77, and an empty RS kernel. FRR clients
+  need `no bgp enforce-first-as` (FRR's own docs note) and
+  `no bgp ebgp-requires-policy`.
+- §Deferred: per-client Loc-RIBs and route-server-maps (FRR's
+  dedicated-RIB model with import/export policies per client),
+  client→normal-peer policy mediation.
+
+### Graceful restart (N5 M3, RFC 4724)
+
+- **Capability** (code 64): the R bit (top bit of the 2-octet field) +
+  12-bit Restart Time + per-family `<AFI, SAFI, flags>` triples with
+  the F bit.
+- **Receiving side (§4.1)** — on for any peer that advertises the
+  capability: a lost session RETAINS the peer's routes marked stale
+  (still best-path candidates) instead of deleting them; on
+  re-establishment the R bit decides — set: stale kept until the
+  per-family End-of-RIB marker; clear: flushed immediately at
+  Established. The per-family EOR flush and the daemon-armed
+  restart-timer flush (advertised Restart Time after session loss)
+  sweep what remains. A received NOTIFICATION or our own ManualStop is
+  a deliberate close — the RFC 4271 delete.
+- **Sending side (disclosed scope)**: `neighbor X graceful-restart
+  <1-4095>` advertises the capability with that Restart Time (R
+  clear, F bits clear) and Established closes each family's initial
+  dump with its End-of-RIB marker (v4: the bare minimum UPDATE; MP:
+  an empty MP_UNREACH — sent unconditionally, RFC 4724 §3 recommends
+  EOR generally). The full restarting-speaker machinery (preserving
+  forwarding state, setting the R bit, deferring route selection) is
+  §Deferred.
+- §Deferred: per-family F-bit granularity (v1 treats the family
+  presence + R bit coarsely), the RFC 8542 long-lived stale timers,
+  BFD-triggered early flush.
+
 ### RPKI (W2-d)
 
 - **ROV** (RFC 6811 §2): validity computed at import from the VRP
@@ -116,6 +207,9 @@ router bgp 65000
  neighbor 192.0.2.9 timers 10 30
  neighbor 192.0.2.9 mrai 5              # default 0 (off)
  neighbor 192.0.2.9 role peer           # RFC 9234: customer|peer|provider
+ neighbor 192.0.2.9 update-error-handling rfc7606   # default | strict-rfc4271 (N5)
+ neighbor 192.0.2.9 route-server        # RS client, transparent reflection (N5)
+ neighbor 192.0.2.9 graceful-restart 120  # sending-side capability 1..=4095 (N5)
  network 203.0.113.0/24
  import INBOUND                         # names a route-map (below)
  export OUTBOUND
@@ -154,15 +248,23 @@ grammar: `vrp <prefix> max <len> as <asn>` and
 Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime
 policy/config reload (the soft-reset mechanism exists; reload is
 rousterd/YANG territory) · iBGP propagation of ROV/ASPA validity ·
-ROV-informed path selection (ANP) · RFC 9234 RS/RS-client roles (with
-route-server mode) and the role-mismatch NOTIFICATION (subcode 11) ·
-RFC 7606 treat-as-withdraw (malformed OTC currently notifies) ·
-full two-connection §6.8 daemon integration test (the verdict table,
-replay adapter, and session observability are tested; the accept-path
-dance is smoke-covered by its dormancy) · route-server mode · route
-next-hop resolution (v1: single-hop peers only) · v6 listener side ·
-graceful-restart ·
-ADD-PATH · interface up/down mirror tracking.
+ROV-informed path selection (ANP) · RFC 9234 RS/RS-client roles and
+the role-mismatch NOTIFICATION (subcode 11) · RFC 7606: AFI/SAFI
+disable (the fourth §2 approach) — receive-side treats unparseable MP
+content as a session reset · full two-connection §6.8 daemon
+integration test (the verdict table, replay adapter, and session
+observability are tested; the accept-path dance is smoke-covered by
+its dormancy) · route-server: per-client Loc-RIBs + route-server-maps
+(FRR's dedicated-RIB model), client→normal-peer policy mediation ·
+graceful restart: the restarting-speaker machinery (forwarding-state
+preservation, R bit on our restart, selection deferral), per-family
+F-bit granularity, RFC 8542 long-lived stale, BFD early flush ·
+route next-hop resolution (v1: single-hop peers only) · v6 listener
+side · ADD-PATH (RFC 7911): capability 69 codec + per-family
+Send/Receive negotiation landed (N5B foundation, `Negotiated.add_path_v4/v6`);
+the per-path NLRI decode (4-octet Path Identifier before each prefix)
+and Adj-RIB-In storage keyed by (peer, path-id, prefix) are the next
+slice · interface up/down mirror tracking.
 
 The `experimental-savnet` hook LANDED (2026-10-11) behind the flag,
 in-process only: `peer.rs` `on_message`'s UPDATE arm reports

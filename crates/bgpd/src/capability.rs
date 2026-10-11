@@ -17,6 +17,8 @@ pub mod capability_code {
     pub const FOUR_OCTET_AS_NUMBER: u8 = 65;
     /// Graceful Restart (RFC 4724 §3).
     pub const GRACEFUL_RESTART: u8 = 64;
+    /// Multiple Paths / ADD-PATH (RFC 7911 §2).
+    pub const ADD_PATH: u8 = 69;
 }
 
 /// One advertised capability.
@@ -38,6 +40,13 @@ pub enum Capability {
         restart_time: u16,
         families: Vec<(u16, u8, bool)>,
     },
+    /// Code 69 (RFC 7911 §2): `<AFI(2), SAFI(1), Send/Receive(1)>` per
+    /// triple — 1 = willing to receive, 2 = willing to send, 3 = both.
+    AddPath {
+        afi: u16,
+        safi: u8,
+        send_receive: u8,
+    },
     /// Unrecognized code: value kept verbatim for logging.
     Unknown { code: u8, value: Vec<u8> },
 }
@@ -49,6 +58,7 @@ impl Capability {
             Self::RouteRefresh => capability_code::ROUTE_REFRESH,
             Self::FourOctetAsNumber { .. } => capability_code::FOUR_OCTET_AS_NUMBER,
             Self::GracefulRestart { .. } => capability_code::GRACEFUL_RESTART,
+            Self::AddPath { .. } => capability_code::ADD_PATH,
             Self::Unknown { code, .. } => *code,
         }
     }
@@ -74,6 +84,15 @@ impl Capability {
                     out.push(*safi);
                     out.push((*forwarding as u8) << 7);
                 }
+            }
+            Self::AddPath {
+                afi,
+                safi,
+                send_receive,
+            } => {
+                out.extend_from_slice(&afi.to_be_bytes());
+                out.push(*safi);
+                out.push(*send_receive);
             }
             Self::Unknown { value, .. } => out.extend_from_slice(value),
         }
@@ -124,6 +143,17 @@ pub fn decode_capabilities(buf: &[u8]) -> BgpResult<Vec<Capability>> {
                     }
                 } else {
                     return Err(BgpError::local("four-octet AS capability not 4 bytes"));
+                }
+            }
+            capability_code::ADD_PATH => {
+                if value.len() == 4 {
+                    Capability::AddPath {
+                        afi: u16::from_be_bytes([value[0], value[1]]),
+                        safi: value[2],
+                        send_receive: value[3],
+                    }
+                } else {
+                    return Err(BgpError::local("add-path capability not 4 bytes"));
                 }
             }
             capability_code::GRACEFUL_RESTART => {
@@ -211,7 +241,7 @@ mod tests {
         encode_capabilities(
             &[
                 Capability::Unknown {
-                    code: 69,
+                    code: 80,
                     value: vec![1, 2, 3],
                 },
                 Capability::RouteRefresh,
@@ -222,7 +252,7 @@ mod tests {
             decode_capabilities(&buf).unwrap(),
             vec![
                 Capability::Unknown {
-                    code: 69,
+                    code: 80,
                     value: vec![1, 2, 3]
                 },
                 Capability::RouteRefresh
@@ -280,6 +310,22 @@ mod tests {
         encode_capabilities(std::slice::from_ref(&bare), &mut buf);
         assert_eq!(buf, vec![64, 2, 0x00, 0x5a]);
         assert_eq!(decode_capabilities(&buf).unwrap(), vec![bare]);
+    }
+
+    /// RFC 7911 §2: the ADD-PATH capability triple (the N5B receive
+    /// foundation — the per-path NLRI decode stays §Deferred).
+    #[test]
+    fn add_path_capability_round_trips() {
+        let cap = Capability::AddPath {
+            afi: 1,
+            safi: 1,
+            send_receive: 3, // send+receive
+        };
+        let mut buf = Vec::new();
+        encode_capabilities(std::slice::from_ref(&cap), &mut buf);
+        assert_eq!(buf, vec![69, 4, 0x00, 0x01, 0x01, 0x03]);
+        assert_eq!(decode_capabilities(&buf).unwrap(), vec![cap]);
+        assert!(decode_capabilities(&[69, 3, 0x00, 0x01, 0x01]).is_err());
     }
 
     #[test]

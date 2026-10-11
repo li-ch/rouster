@@ -243,6 +243,23 @@ impl BgpOpen {
         })
     }
 
+    /// The peer's ADD-PATH (RFC 7911 §2) Send/Receive values by
+    /// family — 0 when the family is absent or the capability is not
+    /// offered. (1 = receive, 2 = send, 3 = both.)
+    pub fn add_path(&self, afi: u16, safi: u8) -> u8 {
+        self.capabilities
+            .iter()
+            .find_map(|c| match c {
+                Capability::AddPath {
+                    afi: a,
+                    safi: s,
+                    send_receive,
+                } if *a == afi && *s == safi => Some(*send_receive),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     /// True when the peer offered the given (AFI, SAFI) multiprotocol
     /// capability.
     pub fn supports_af(&self, afi: u16, safi: u8) -> bool {
