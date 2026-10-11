@@ -251,6 +251,16 @@ impl Packet {
         self.encode_body(&mut buf);
         let len = buf.len() as u16;
         buf[2..4].copy_from_slice(&len.to_be_bytes());
+        if self.header.au_type == 2 {
+            // RFC 2328 D.4.3 step 2: in cryptographic-auth mode "the
+            // checksum field is not calculated; it is set to zero" —
+            // the appended MAC is the integrity check; the caller
+            // appends the trailer (auth::encode_for_wire).
+            buf[12] = 0;
+            buf[13] = 0;
+            let _ = &mut hdr;
+            return buf;
+        }
         // Checksum region: bytes [0..16) then [24..), auth excluded,
         // checksum field zeroed during computation (§A.3.1).
         let mut region = buf[..16].to_vec();
@@ -351,6 +361,53 @@ impl Packet {
             });
         }
         Ok(Self { header, body })
+    }
+
+    /// Decode a cryptographic-auth packet (AuType 2, RFC 2328
+    /// D.5.3): the OSPF packet proper runs to `header.length`, the
+    /// appended digest trailer follows (RFC 5709 §3.1: not counted
+    /// in the OSPF packet's own Length field, but included in the
+    /// IP Length field). The checksum is NOT verified (D.4.3(2)
+    /// leaves it 0); MAC verification is the caller's D.5.3(3).
+    /// Returns the packet and the trailer bytes.
+    pub fn decode_crypto(buf: &[u8]) -> Result<(Self, Vec<u8>), OspfError> {
+        let mut r = Reader::new(buf);
+        let header = PacketHeader::decode(&mut r)?;
+        if header.au_type != 2 {
+            return Err(OspfError::Config(format!(
+                "decode_crypto on AuType {au}",
+                au = header.au_type
+            )));
+        }
+        if header.length as usize > buf.len() {
+            return Err(OspfError::BadLength {
+                field: "packet length",
+                declared: header.length as usize,
+                actual: buf.len(),
+            });
+        }
+        let trailer = buf[header.length as usize..].to_vec();
+        let body_buf = &buf[..header.length as usize];
+        let mut br = Reader::new(body_buf);
+        // Walk the 24-byte header fields.
+        for _ in 0..6 {
+            let _ = br.u32();
+        }
+        let body = match header.packet_type {
+            1 => PacketBody::Hello(Self::decode_hello(&mut br)?),
+            2 => PacketBody::DbDescription(Self::decode_dbd(&mut br)?),
+            3 => PacketBody::LsRequest(Self::decode_lsr(&mut br)?),
+            4 => PacketBody::LsUpdate(Self::decode_lsu(&mut br, body_buf)?),
+            5 => PacketBody::LsAck(Self::decode_lsack(&mut br)?),
+            other => return Err(OspfError::BadPacketType(other)),
+        };
+        if !br.is_empty() {
+            return Err(OspfError::Trailing {
+                field: "packet body",
+                count: br.remaining(),
+            });
+        }
+        Ok((Self { header, body }, trailer))
     }
 
     fn decode_hello(r: &mut Reader<'_>) -> Result<Hello, OspfError> {

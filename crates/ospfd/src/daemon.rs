@@ -72,6 +72,12 @@ pub struct Interface {
     pub neighbors: HashMap<RouterId, Conversation>,
     /// Next hello deadline (monotonic seconds).
     hello_deadline: u64,
+    /// Appendix D.3/D.4.3 step 5: the interface's ONE send-side
+    /// cryptographic sequence counter, shared by the daemon's own
+    /// packets (Hellos, floods) and every conversation on the
+    /// interface — strictly increasing across the interface's whole
+    /// packet stream.
+    auth_tx_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Interface {
@@ -83,6 +89,8 @@ impl Interface {
             // follows the area's ExternalRoutingCapability (§10.5's
             // agreement rule extends to the DD options check).
             options: area_options(kind),
+            auth: self.cfg.auth.clone(),
+            auth_seq: self.auth_tx_seq.clone(),
         }
     }
 
@@ -108,6 +116,19 @@ fn area_options(kind: AreaKind) -> Options {
         // RFC 3101 §2.1: E clear in NSSAs, N set in Hellos/DBDs.
         AreaKind::Nssa { .. } => Options(Options::NP),
         AreaKind::Stub | AreaKind::StubNoSummary => Options(0),
+    }
+}
+
+/// Take the next sequence from an interface's shared crypto counter
+/// (only in crypto mode — Null/Simple stamp nothing).
+fn next_crypto_seq(
+    counter: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    auth: &crate::auth::AuthConfig,
+) -> u32 {
+    use std::sync::atomic::Ordering;
+    match auth {
+        crate::auth::AuthConfig::HmacSha256 { .. } => counter.fetch_add(1, Ordering::Relaxed) + 1,
+        _ => 0,
     }
 }
 
@@ -325,6 +346,7 @@ impl Ospfd {
                     claims: HashMap::new(),
                     neighbors: HashMap::new(),
                     hello_deadline: 0,
+                    auth_tx_seq: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 });
             }
         }
@@ -399,8 +421,21 @@ impl Ospfd {
         }
     }
 
+    #[cfg(test)]
     fn packet(&self, area: u32, body: PacketBody) -> Packet {
         make_packet(self.router_id, area, body)
+    }
+
+    /// `packet` with the target interface's auth stamped (Appendix
+    /// D): the AuType/Authentication header fields, the crypto
+    /// sequence bumped per send (D.4.3 step 5).
+    fn packet_for(&mut self, iface_idx: usize, area: u32, body: PacketBody) -> Packet {
+        let mut p = make_packet(self.router_id, area, body);
+        let auth = self.interfaces[iface_idx].cfg.auth.clone();
+        let seq = next_crypto_seq(&self.interfaces[iface_idx].auth_tx_seq, &auth);
+        p.header.au_type = auth.au_type();
+        p.header.authentication = auth.auth_field(seq);
+        p
     }
 
     /// Interface advertisement snapshot for one area (§12.4.1's
@@ -1137,7 +1172,8 @@ impl Ospfd {
                     // §13.3: one multicast LSU on the broadcast
                     // network; every Full neighbor is on the
                     // retransmission list.
-                    let packet = self.packet(
+                    let packet = self.packet_for(
+                        idx,
                         area,
                         PacketBody::LsUpdate(LsUpdate {
                             lsas: vec![lsa.clone()],
@@ -1155,7 +1191,8 @@ impl Ospfd {
                 }
                 _ => {
                     for ip in ips {
-                        let packet = self.packet(
+                        let packet = self.packet_for(
+                            idx,
                             area,
                             PacketBody::LsUpdate(LsUpdate {
                                 lsas: vec![lsa.clone()],
@@ -1172,14 +1209,103 @@ impl Ospfd {
         }
     }
 
+    /// Appendix D.5: authenticate one received packet against the
+    /// receiving interface's configured mode, then hand back the
+    /// decoded packet. Failure discards the packet silently — §8.2's
+    /// processing never starts, so no neighbor FSM event fires (the
+    /// ONLY neighbor-state effect of sustained failure is the
+    /// Inactivity Timer's eventual Down).
+    fn authenticate(&mut self, iface_idx: usize, received: &Received) -> Result<Packet, String> {
+        let auth = self.interfaces[iface_idx].cfg.auth.clone();
+        match &auth {
+            crate::auth::AuthConfig::None => {
+                // D.5 preamble: "the packet's AuType must match the
+                // receiving interface's".
+                let p = Packet::decode(&received.payload).map_err(|e| format!("decode: {e}"))?;
+                if p.header.au_type != 0 {
+                    return Err("AuType mismatch (0 expected)".into());
+                }
+                Ok(p)
+            }
+            crate::auth::AuthConfig::Simple { password } => {
+                // D.5.2: (1) the normal checksum (decode verified
+                // it), (2) the Authentication field must equal the
+                // configured password.
+                let p = Packet::decode(&received.payload).map_err(|e| format!("decode: {e}"))?;
+                if p.header.au_type != 1 || p.header.authentication != u64::from_be_bytes(*password)
+                {
+                    return Err("simple password mismatch (D.5.2 step 2)".into());
+                }
+                Ok(p)
+            }
+            crate::auth::AuthConfig::HmacSha256 { key_id, key } => {
+                // D.5.3, in the RFC's order.
+                if key.is_empty() {
+                    return Err("no crypto key configured".into());
+                }
+                let (p, trailer) =
+                    Packet::decode_crypto(&received.payload).map_err(|e| format!("decode: {e}"))?;
+                // (1) Key lookup by Key ID on this interface.
+                let data = crate::auth::CryptoAuthData::from_u64(p.header.authentication);
+                if data.key_id != *key_id {
+                    return Err(format!(
+                        "Key ID {} not configured on this interface",
+                        data.key_id
+                    ));
+                }
+                // (2) The per-neighbor sequence: "discard if the
+                // packet's sequence number is less than the value
+                // recorded in the neighbor data structure" (equal
+                // passes — retransmissions).
+                let peer = p.header.router_id;
+                let recorded = self.interfaces[iface_idx]
+                    .neighbors
+                    .get(&peer)
+                    .map(|c| c.rx_crypto_seq)
+                    .unwrap_or(0);
+                if data.seq < recorded {
+                    return Err(format!(
+                        "crypto sequence {} < recorded {recorded} (D.5.3 step 2)",
+                        data.seq
+                    ));
+                }
+                // (3) The digest: MAC over packet ‖ Apad (RFC 5709
+                // §3.3), compared against the trailer.
+                if trailer.len() != 32 {
+                    return Err(format!(
+                        "trailer length {} (Auth Data Len says {})",
+                        trailer.len(),
+                        data.data_len
+                    ));
+                }
+                let packet_bytes = &received.payload[..received.payload.len() - 32];
+                let mac = crate::auth::packet_mac(packet_bytes, key);
+                if mac[..] != trailer[..] {
+                    return Err("HMAC-SHA-256 digest mismatch (D.5.3 step 3)".into());
+                }
+                // Accept: record the sequence (D.3) when the
+                // neighbor structure exists.
+                if let Some(c) = self.interfaces[iface_idx].neighbors.get_mut(&peer) {
+                    c.rx_crypto_seq = data.seq;
+                }
+                Ok(p)
+            }
+        }
+    }
+
     /// Process one inbound datagram (already demultiplexed to its
     /// interface by the run loop's on-link test).
     pub fn on_packet(&mut self, iface_idx: usize, received: &Received, now: u64) -> Vec<WireOut> {
         let mut out = Vec::new();
-        let packet = match Packet::decode(&received.payload) {
+        // Appendix D.5: authenticate before ANY further processing
+        // ("processing of the received packet, as described in
+        // Section 8.2, continues only if the packet is
+        // authenticated") — a failed packet is silently discarded:
+        // no neighbor events, no LSAs, nothing.
+        let packet = match self.authenticate(iface_idx, received) {
             Ok(p) => p,
             Err(e) => {
-                debug!(error = %e, src = %received.src, "ospfd: packet decode failed");
+                debug!(error = %e, src = %received.src, "ospfd: packet failed authentication (App D.5)");
                 return out;
             }
         };
@@ -1441,6 +1567,13 @@ impl Ospfd {
             }
         }
         if report.adjacency_down {
+            // Appendix D.3: the neighbor's cryptographic sequence
+            // number "is reset to zero" on the transition to Down.
+            if let Some(peer_id) = peer {
+                if let Some(conv) = self.interfaces[iface_idx].neighbors.get_mut(&peer_id) {
+                    conv.rx_crypto_seq = 0;
+                }
+            }
             if let Some(a) = self.areas.get_mut(&area) {
                 a.router_lsa_dirty = true;
             }
@@ -2439,7 +2572,10 @@ impl Ospfd {
                     .get(&iface.area)
                     .map(|a| a.kind)
                     .unwrap_or(AreaKind::Normal);
-                let packet = make_hello(router_id, iface.area, iface, kind);
+                let seq = next_crypto_seq(&iface.auth_tx_seq, &iface.cfg.auth);
+                let mut packet = make_hello(router_id, iface.area, iface, kind);
+                packet.header.au_type = iface.cfg.auth.au_type();
+                packet.header.authentication = iface.cfg.auth.auth_field(seq);
                 out.push(WireOut {
                     iface: idx,
                     to: WireTo::Multicast,
@@ -2501,6 +2637,9 @@ impl Ospfd {
         // inside this pass).
         let syncing = self.any_syncing();
         let area_ids: Vec<u32> = self.areas.keys().copied().collect();
+        // §14 MaxAge refloods and §12.4 refresh floods, collected
+        // under the per-area borrow and put on the wire after it.
+        let mut pending_maxage_floods: Vec<(u32, Vec<Lsa>)> = Vec::new();
         for area in area_ids {
             let Some(state) = self.areas.get_mut(&area) else {
                 continue;
@@ -2559,23 +2698,7 @@ impl Ospfd {
                     .iter()
                     .filter_map(|k| state.lsdb.get(k).map(|e| e.lsa.clone()))
                     .collect();
-                if !lsas.is_empty() {
-                    let packet = make_packet(
-                        self.router_id,
-                        area,
-                        PacketBody::LsUpdate(LsUpdate { lsas }),
-                    );
-                    for idx in 0..self.interfaces.len() {
-                        if self.interfaces[idx].area != area {
-                            continue;
-                        }
-                        out.push(WireOut {
-                            iface: idx,
-                            to: WireTo::Multicast,
-                            packet: packet.clone(),
-                        });
-                    }
-                }
+                pending_maxage_floods.push((area, lsas));
             }
             let flushable = state.lsdb.flush_ready(syncing);
             let mut spf_needed = false;
@@ -2594,6 +2717,28 @@ impl Ospfd {
             // §12.4 refresh floods, now past the area borrow.
             for (lsa, scope) in pending_refresh_floods.drain(..) {
                 self.flood_own(&lsa, scope, now, out);
+            }
+        }
+        // §14 MaxAge refloods on the wire (auth-stamped per
+        // interface).
+        for (area, lsas) in pending_maxage_floods.drain(..) {
+            if lsas.is_empty() {
+                continue;
+            }
+            for idx in 0..self.interfaces.len() {
+                if self.interfaces[idx].area != area {
+                    continue;
+                }
+                let packet = self.packet_for(
+                    idx,
+                    area,
+                    PacketBody::LsUpdate(LsUpdate { lsas: lsas.clone() }),
+                );
+                out.push(WireOut {
+                    iface: idx,
+                    to: WireTo::Multicast,
+                    packet,
+                });
             }
         }
         // Deferred originations (MinLSInterval retries): every
@@ -2864,7 +3009,10 @@ async fn flush_wire(sockets: &[Arc<OspfRawSocket>], core: &Ospfd, out: Vec<WireO
         let Some(sock) = sockets.get(wire.iface) else {
             continue;
         };
-        let bytes = wire.packet.encode();
+        // Appendix D: crypto mode appends the digest trailer at the
+        // wire boundary (RFC 2328 D.3 / RFC 5709 §3.3).
+        let bytes =
+            crate::auth::encode_for_wire(&wire.packet, &core.interfaces[wire.iface].cfg.auth);
         let result = match wire.to {
             WireTo::Multicast => sock.send_multicast(&bytes).await,
             WireTo::AllDRouters => sock.send_multicast_drouters(&bytes).await,
@@ -2940,7 +3088,7 @@ mod tests {
     fn pump(from: &mut Ospfd, to: &mut Ospfd, out: Vec<WireOut>, now: u64) -> Vec<WireOut> {
         let mut replies = Vec::new();
         for (_, packet) in bodies(&out) {
-            let payload = packet.encode();
+            let payload = crate::auth::encode_for_wire(&packet, &from.interfaces[0].cfg.auth);
             let idx = 0;
             replies.extend(to.on_packet(
                 idx,
@@ -3359,13 +3507,14 @@ mod tests {
             return;
         }
         let from_addr = cores[from].interfaces[0].addr;
+        let from_auth = cores[from].interfaces[0].cfg.auth.clone();
         // The on-link destinations: multicast reaches every core,
         // unicast only the addressed neighbor (§A.1).
         let targets: Vec<usize> = (0..cores.len())
             .filter(|i| *i != from && !dead.contains(i))
             .collect();
         for (dst, packet) in bodies(outs) {
-            let payload = packet.encode();
+            let payload = crate::auth::encode_for_wire(&packet, &from_auth);
             for i in &targets {
                 let i = *i;
                 {
@@ -3636,7 +3785,8 @@ mod tests {
     ) {
         for w in outs {
             let src = cores[from].interfaces[w.iface].addr;
-            let payload = w.packet.encode();
+            let payload =
+                crate::auth::encode_for_wire(&w.packet, &cores[from].interfaces[w.iface].cfg.auth);
             let pkt_area = w.packet.header.area_id;
             let dst = match w.to {
                 WireTo::Unicast(d) => Some(d),
@@ -4707,6 +4857,279 @@ mod tests {
             panic!()
         };
         assert_eq!(sm.metric, 1, "default-cost");
+    }
+
+    // ---- authentication (Appendix D / RFC 5709, N3 M3) -----------
+
+    /// A core with simple-password auth on its interface.
+    fn simple_auth_core(router_id: &str, addr: &str, password: &str) -> Ospfd {
+        let text = format!(
+            "router ospf\n router-id {router_id}\n area 0.0.0.0\n  interface eth0\n   address {addr}/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n   authentication-key {password}\n"
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    fn hmac_core(router_id: &str, addr: &str, key_id: u8, key: &str) -> Ospfd {
+        let text = format!(
+            "router ospf\n router-id {router_id}\n area 0.0.0.0\n  interface eth0\n   address {addr}/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n   authentication message-digest\n   message-digest-key {key_id} hmac-sha-256 {key}\n"
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// D.5.2: the simple password guards adjacency formation. A
+    /// mismatched Hello is silently discarded — no neighbor forms,
+    /// no neighbor FSM event ever fires; an established adjacency
+    /// dies through the Inactivity Timer (the Down transition), the
+    /// only neighbor-state effect auth failure is allowed to have.
+    #[test]
+    fn simple_password_matches_form_adjacency_and_mismatches_do_not() {
+        // Matching passwords: Full adjacency through the signed wire.
+        let mut a = simple_auth_core("10.255.1.1", "10.77.0.1", "s3cret");
+        let mut b = simple_auth_core("10.255.2.1", "10.77.0.2", "s3cret");
+        let now = run_to_full(&mut a, &mut b, 0);
+        assert!(a
+            .neighbor_states()
+            .iter()
+            .any(|(_, _, s)| *s == NeighborState::Full));
+        // The packets on the wire carry AuType 1 + the padded field
+        // (a tick past the hello deadline).
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        a.tick(now + 10, &mut out, &mut zap);
+        assert!(out.iter().any(|w| {
+            w.packet.header.au_type == 1
+                && w.packet.header.authentication == u64::from_be_bytes(*b"s3cret\0\0")
+        }));
+
+        // A MISMATCHED peer never forms a neighbor: its Hellos are
+        // discarded before §10.5 processing (App D.5).
+        let c = simple_auth_core("10.255.3.1", "10.77.0.3", "wrongpw");
+        // One mismatched hello, properly checksummed (AuType 1 +
+        // the wrong 64-bit password): discarded before §10.5, no
+        // neighbor forms (D.5.2).
+        let mut hello = make_hello(c.router_id, 0, &c.interfaces[0], AreaKind::Normal);
+        hello.header.au_type = 1;
+        hello.header.authentication = u64::from_be_bytes(*b"wrongpw\0");
+        let payload = hello.encode();
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: c.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 2,
+        );
+        assert!(replies.is_empty());
+        assert!(
+            !a.neighbor_states()
+                .iter()
+                .any(|(_, rid, _)| *rid == c.router_id),
+            "no neighbor forms under a password mismatch (D.5.2)"
+        );
+
+        // The established adjacency under a password change: B stops
+        // authenticating correctly (forged wrong-password Hellos keep
+        // arriving); within RouterDeadInterval A's Inactivity Timer
+        // fires — the neighbor goes Down, the auth-only effect.
+        let peer_id = b.router_id;
+        for t in 1..=6u64 {
+            let mut hello = make_hello(b.router_id, 0, &b.interfaces[0], AreaKind::Normal);
+            hello.header.au_type = 1;
+            hello.header.authentication = u64::from_be_bytes(*b"wrongpw\0");
+            // Re-encode under the right checksum convention: build
+            // via the packet codec (checksum computed in simple mode
+            // over the auth-excluded region).
+            let payload = hello.encode();
+            a.on_packet(
+                0,
+                &crate::transport::Received {
+                    src: b.interfaces[0].addr,
+                    dst: crate::packet::ALL_SPF_ROUTERS,
+                    payload,
+                },
+                now + t,
+            );
+        }
+        // Quiet ticks past RouterDeadInterval (4 s).
+        for t in 2..=8u64 {
+            let mut oa = Vec::new();
+            let mut zap2 = Vec::new();
+            a.tick(now + t, &mut oa, &mut zap2);
+        }
+        let state = a
+            .neighbor_states()
+            .iter()
+            .find(|(_, rid, _)| *rid == peer_id)
+            .map(|(_, _, s)| *s);
+        assert_eq!(
+            state,
+            Some(NeighborState::Down),
+            "the mismatched adjacency dies via the Inactivity Timer (Down)"
+        );
+    }
+
+    /// D.5.3 end to end: HMAC-SHA-256 signed packets form and keep a
+    /// Full adjacency; tampered digests and replayed (older)
+    /// sequences are discarded; the Down transition resets the
+    /// recorded sequence (D.3).
+    #[test]
+    fn hmac_crypto_signs_rejects_tampering_and_replay() {
+        let mut a = hmac_core("10.255.1.1", "10.77.0.1", 1, "ospfkey");
+        let mut b = hmac_core("10.255.2.1", "10.77.0.2", 1, "ospfkey");
+        let now = run_to_full(&mut a, &mut b, 0);
+        assert!(a
+            .neighbor_states()
+            .iter()
+            .any(|(_, _, s)| *s == NeighborState::Full));
+
+        // A tampered payload fails the digest (D.5.3 step 3): flip
+        // one body byte inside a signed hello.
+        let hello = make_hello(b.router_id, 0, &b.interfaces[0], AreaKind::Normal);
+        let seq = 900u32; // any non-decreasing value
+        let mut signed = {
+            let mut p = hello.clone();
+            p.header.au_type = 2;
+            p.header.authentication = crate::auth::CryptoAuthData {
+                key_id: 1,
+                data_len: 32,
+                seq,
+            }
+            .to_u64();
+            p.encode() // leaves the checksum 0 (au_type 2)
+        };
+        let mac = crate::auth::packet_mac(&signed, b"ospfkey");
+        signed.extend_from_slice(&mac);
+        let mut tampered = signed.clone();
+        let last = tampered.len() - 5;
+        tampered[last] ^= 0x01;
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload: tampered,
+            },
+            now + 1,
+        );
+        assert!(replies.is_empty(), "tampered packet discarded");
+        // The clean signed packet passes and records the sequence.
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload: signed,
+            },
+            now + 2,
+        );
+        // A Hello needs no reply obligation; acceptance shows in the
+        // recorded sequence below (and the neighbor stays up).
+        assert!(replies.is_empty());
+        assert_eq!(
+            a.interfaces[0]
+                .neighbors
+                .get(&b.router_id)
+                .map(|c| c.rx_crypto_seq),
+            Some(900),
+            "the accepted sequence is recorded (D.3)"
+        );
+
+        // Replay: an OLDER sequence is discarded even with a valid
+        // MAC (D.5.3 step 2 fires before the digest).
+        let older = {
+            let mut p = hello;
+            p.header.au_type = 2;
+            p.header.authentication = crate::auth::CryptoAuthData {
+                key_id: 1,
+                data_len: 32,
+                seq: 899,
+            }
+            .to_u64();
+            let mut buf = p.encode();
+            let mac = crate::auth::packet_mac(&buf, b"ospfkey");
+            buf.extend_from_slice(&mac);
+            buf
+        };
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload: older,
+            },
+            now + 3,
+        );
+        assert!(
+            replies.is_empty(),
+            "replayed older sequence discarded (D.5.3 step 2)"
+        );
+        assert_eq!(
+            a.interfaces[0]
+                .neighbors
+                .get(&b.router_id)
+                .map(|c| c.rx_crypto_seq),
+            Some(900),
+            "the recorded sequence did not regress"
+        );
+
+        // A wrong Key ID is discarded before any digest work.
+        let wrong_id = {
+            let mut p = make_hello(b.router_id, 0, &b.interfaces[0], AreaKind::Normal);
+            p.header.au_type = 2;
+            p.header.authentication = crate::auth::CryptoAuthData {
+                key_id: 7,
+                data_len: 32,
+                seq: 901,
+            }
+            .to_u64();
+            let mut buf = p.encode();
+            let mac = crate::auth::packet_mac(&buf, b"ospfkey");
+            buf.extend_from_slice(&mac);
+            buf
+        };
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload: wrong_id,
+            },
+            now + 4,
+        );
+        assert!(
+            replies.is_empty(),
+            "unknown Key ID discarded (D.5.3 step 1)"
+        );
+    }
+
+    /// The wire conventions (D.3/D.4.3): the trailer sits past the
+    /// OSPF length, the checksum is 0, and decode_crypto splits it
+    /// back off.
+    #[test]
+    fn crypto_wire_conventions_hold() {
+        let mut a = hmac_core("10.255.1.1", "10.77.0.1", 1, "ospfkey");
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        a.tick(0, &mut out, &mut zap);
+        let bytes =
+            crate::auth::encode_for_wire(&out[0].packet.clone(), &a.interfaces[0].cfg.auth.clone());
+        let length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(
+            length,
+            bytes.len() - 32,
+            "the OSPF length excludes the 32-byte trailer (D.3)"
+        );
+        assert_eq!(
+            &bytes[12..14],
+            &[0, 0],
+            "checksum zero in crypto mode (D.4.3 step 2)"
+        );
+        let (packet, trailer) = Packet::decode_crypto(&bytes).unwrap();
+        assert_eq!(trailer.len(), 32);
+        assert_eq!(packet.header.au_type, 2);
+        // The plain decoder rejects the trailer (strict framing).
+        assert!(Packet::decode(&bytes).is_err());
     }
 
     #[test]

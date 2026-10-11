@@ -28,6 +28,7 @@
 //! calculation (§16.2-§16.4) are §Deferred (anchors in the stream
 //! report).
 
+pub mod auth;
 pub mod checksum;
 pub mod config;
 pub mod daemon;

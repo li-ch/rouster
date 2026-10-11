@@ -36,6 +36,11 @@ pub struct ConversationParams {
     pub mtu: u16,
     /// Our Hello/DD options byte (E-bit for a normal area).
     pub options: Options,
+    /// The interface's authentication mode (Appendix D): the header
+    /// fields every conversation packet carries.
+    pub auth: crate::auth::AuthConfig,
+    /// The interface's shared crypto sequence counter (D.4.3 step 5).
+    pub auth_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Default for ConversationParams {
@@ -44,6 +49,8 @@ impl Default for ConversationParams {
             rxmt_interval: 5,
             mtu: 1500,
             options: Options(Options::E),
+            auth: crate::auth::AuthConfig::None,
+            auth_seq: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 }
@@ -100,6 +107,12 @@ pub struct Conversation {
     own_router_id: RouterId,
     area_id: u32,
     params: ConversationParams,
+    /// D.3's cryptographic sequence numbers: our send counter
+    /// (non-decreasing, bumped per packet) and the highest sequence
+    /// accepted from the neighbor (reset to zero when the neighbor
+    /// transitions to Down).
+    pub tx_crypto_seq: u32,
+    pub rx_crypto_seq: u32,
 }
 
 impl Conversation {
@@ -127,6 +140,8 @@ impl Conversation {
             own_router_id,
             area_id,
             params,
+            tx_crypto_seq: 0,
+            rx_crypto_seq: 0,
         }
     }
 
@@ -134,7 +149,19 @@ impl Conversation {
         self.fsm.state
     }
 
-    fn packet(&self, body: PacketBody) -> Packet {
+    fn packet(&mut self, body: PacketBody) -> Packet {
+        // Appendix D: stamp the interface's auth mode. Crypto mode
+        // takes the next value from the interface's shared counter
+        // (D.4.3 step 5) — Hellos and floods use the same one.
+        use std::sync::atomic::Ordering;
+        let seq = match &self.params.auth {
+            crate::auth::AuthConfig::HmacSha256 { .. } => {
+                self.params.auth_seq.fetch_add(1, Ordering::Relaxed) + 1
+            }
+            _ => 0,
+        };
+        let (au_type, authentication) =
+            (self.params.auth.au_type(), self.params.auth.auth_field(seq));
         Packet {
             header: PacketHeader {
                 version: 2,
@@ -143,14 +170,14 @@ impl Conversation {
                 router_id: self.own_router_id,
                 area_id: self.area_id,
                 checksum: 0,
-                au_type: 0,
-                authentication: 0,
+                au_type,
+                authentication,
             },
             body,
         }
     }
 
-    fn send(&self, body: PacketBody) -> Send {
+    fn send(&mut self, body: PacketBody) -> Send {
         Send {
             to: self.ip,
             packet: self.packet(body),

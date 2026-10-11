@@ -315,6 +315,55 @@ fork it. The concrete seams, documented where they bite:
   refresh re-originates every self-originated LSA (summaries and
   externals used to age to MaxAge silently).
 
+## Authentication (2026-10-11, the N3 M3 slice — Appendix D + RFC 5709)
+
+- **Three modes per interface** (`auth.rs`): Null (D.1), simple
+  password (D.2 — `authentication-key <1-8 chars>`, null-padded to
+  the 64-bit field per D.4.2 step 3), and cryptographic
+  HMAC-SHA-256 (D.3/D.4.3 with RFC 5709 §3.3's digest —
+  `authentication message-digest` +
+  `message-digest-key <id> hmac-sha-256 <key>`). FRR 10.2's
+  `message-digest-key` only accepts `md5`; its HMAC-SHA-256 rides
+  the key-chain path (frr-10.2 `lib/keychain.c`'s algo table:
+  internal-crypto builds resolve `md5` + `hmac-sha-256` only) — our
+  single-directive grammar is a disclosed deviation. Keyed-MD5 (the
+  legacy D.4.3(6) digest) is §Deferred.
+- **Verification order** (D.5, implemented in
+  `Ospfd::authenticate`): authentication precedes ALL §8.2
+  processing; a failed packet is silently discarded — no neighbor
+  event fires, so the ONLY neighbor-state effect of sustained
+  failure is the Inactivity Timer's Down transition (tested in
+  exactly that shape). Simple mode: checksum (D.5.2 step 1, the
+  codec's existing auth-excluded checksum) then field equality
+  (step 2). Crypto mode (D.5.3): Key-ID lookup, then the per-neighbor
+  sequence check ("less than the recorded value" discards; equal
+  passes for retransmissions), then the digest; the accepted
+  sequence is recorded (D.3) and reset on the neighbor's Down
+  transition.
+- **The Figure-18 field** (D.3): `CryptoAuthData` views the 64 bits
+  as zero octets + Key ID + Auth Data Len + sequence. In crypto mode
+  the packet checksum stays 0 (D.4.3 step 2 — `Packet::encode`
+  branches on AuType; `Packet::decode_crypto` skips the checksum,
+  splits the appended trailer at `header.length`, and hands the
+  trailer to the caller for MAC verification). The MAC input is
+  packet ‖ Apad (RFC 5709 §3.3: `0x878FE1F3` × 8).
+- **One sequence counter per interface** (D.4.3 step 5's
+  non-decreasing rule): the daemon's Hellos/floods and every
+  conversation share an atomic counter — the first cut had two
+  counters and the DBD stream legitimately ran "backwards" against
+  the hello stream (caught by the daemon-level sign/verify test).
+- **The digest primitives are hand-rolled pure safe Rust**
+  (`sha256`/`hmac_sha256` in `auth.rs`) — verified against FIPS
+  180-4 and RFC 4231 test-case vectors — because the standing fence
+  admits no new dependencies. Swapping to the `sha2`/`hmac` crates
+  is an owner decision (recorded); the module boundary is drawn so
+  the swap is one file, and so OSPFv3's RFC 7166 trailer can reuse
+  the MAC/Apad/replay skeleton (the 64-bit descriptor view is the
+  only v2-specific part).
+- **No live FRR auth interop leg yet** (disclosed): the wire
+  conventions are RFC/ADD-A2-pinned and vector-tested; an
+  FRR-10.2.2 key-chain HMAC-SHA-256 leg is the natural next interop.
+
 ## §Deferred (updated day-3 anchors)
 
 - §16.3 (transit areas' summary-LSAs — only meaningful with virtual

@@ -141,6 +141,9 @@ pub struct InterfaceConfig {
     pub network_type: NetworkType,
     /// Interface MTU (DD's MTU field).
     pub mtu: u16,
+    /// Packet authentication (Appendix D): None / simple password /
+    /// HMAC-SHA-256 cryptographic.
+    pub auth: crate::auth::AuthConfig,
 }
 
 impl InterfaceConfig {
@@ -156,6 +159,7 @@ impl InterfaceConfig {
             address: None,
             network_type: NetworkType::Broadcast,
             mtu: 1500,
+            auth: crate::auth::AuthConfig::None,
         }
     }
 }
@@ -434,7 +438,8 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                         cfg.networks.push((net, len, u32::from(area)));
                     }
                     "cost" | "hello-interval" | "dead-interval" | "priority" | "address"
-                    | "network-type" | "mtu" => {
+                    | "network-type" | "mtu" | "authentication-key" | "authentication"
+                    | "message-digest-key" => {
                         // Interface parameter inside the LAST interface
                         // stanza of the LAST area; BTreeMap order cannot
                         // express "last", so we require the parameter to
@@ -473,6 +478,77 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                             "expected: network-type <broadcast|point-to-point>",
                                         ))
                                     }
+                                };
+                            }
+                            "authentication-key" => {
+                                // FRR's `ip ospf authentication-key
+                                // AUTH_KEY` (≤8 chars, null-padded
+                                // to the 64-bit field — D.4.2 step 3).
+                                let raw = words.get(1).copied().unwrap_or("");
+                                let bytes = raw.as_bytes();
+                                if bytes.is_empty() || bytes.len() > 8 {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: authentication-key <1-8 chars>",
+                                    ));
+                                }
+                                let mut pw = [0u8; 8];
+                                pw[..bytes.len()].copy_from_slice(bytes);
+                                iface.auth = crate::auth::AuthConfig::Simple { password: pw };
+                            }
+                            "authentication" => {
+                                // FRR's `ip ospf authentication
+                                // message-digest` (the plain
+                                // `authentication` form is the
+                                // area-level default; per-interface we
+                                // only carry the override).
+                                if words.len() != 2 || words[1] != "message-digest" {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: authentication message-digest",
+                                    ));
+                                }
+                                // Enables AuType 2 once a key exists;
+                                // a missing key errors at daemon
+                                // construction (the key may parse
+                                // later in the stanza).
+                                if iface.auth == crate::auth::AuthConfig::None {
+                                    iface.auth = crate::auth::AuthConfig::HmacSha256 {
+                                        key_id: 0,
+                                        key: Vec::new(),
+                                    };
+                                }
+                            }
+                            "message-digest-key" => {
+                                // FRR's message-digest-key carries
+                                // only `md5`; we expose the RFC 5709
+                                // MUST-level digest explicitly
+                                // (grammar deviation, disclosed).
+                                let id: u8 =
+                                    words.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| {
+                                        parse_error(
+                                            line_no,
+                                            "expected: message-digest-key <id 1-255>",
+                                        )
+                                    })?;
+                                if id == 0 {
+                                    return Err(parse_error(line_no, "key id must be 1-255"));
+                                }
+                                if words.get(2).copied() != Some("hmac-sha-256") {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: message-digest-key <id> hmac-sha-256 <key>",
+                                    ));
+                                }
+                                let Some(key) = words.get(3) else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: message-digest-key <id> hmac-sha-256 <key>",
+                                    ));
+                                };
+                                iface.auth = crate::auth::AuthConfig::HmacSha256 {
+                                    key_id: id,
+                                    key: key.as_bytes().to_vec(),
                                 };
                             }
                             "mtu" | "cost" | "hello-interval" | "dead-interval" | "priority" => {
@@ -742,6 +818,49 @@ router ospf
         // role presupposes a non-backbone area).
         let err = parse("router ospf\n area 0.0.0.0 nssa\n").unwrap_err();
         assert!(err.to_string().contains("backbone"), "{err}");
+    }
+
+    #[test]
+    fn auth_directives_parse() {
+        // The simple password (FRR's `ip ospf authentication-key`).
+        let cfg =
+            parse("router ospf\n area 0.0.0.0\n  interface eth0\n   authentication-key s3cret\n")
+                .unwrap();
+        assert_eq!(
+            cfg.areas[0].interfaces["eth0"].auth,
+            crate::auth::AuthConfig::Simple {
+                password: *b"s3cret\0\0"
+            },
+            "null-padded to the 64-bit field (D.4.2 step 3)"
+        );
+        // The crypto form: authentication message-digest + the key.
+        let cfg = parse(
+            "router ospf\n area 0.0.0.0\n  interface eth0\n   authentication message-digest\n   message-digest-key 3 hmac-sha-256 ospfkey\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.areas[0].interfaces["eth0"].auth,
+            crate::auth::AuthConfig::HmacSha256 {
+                key_id: 3,
+                key: b"ospfkey".to_vec()
+            }
+        );
+        // Strictness: >8-char password, bad key id, wrong algorithm
+        // keyword — all carry line numbers.
+        let err = parse(
+            "router ospf\n area 0.0.0.0\n  interface eth0\n   authentication-key ninechars\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("line 4"), "{err}");
+        let err = parse(
+            "router ospf\n area 0.0.0.0\n  interface eth0\n   message-digest-key 0 hmac-sha-256 k\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("line 4"), "{err}");
+        let err =
+            parse("router ospf\n area 0.0.0.0\n  interface eth0\n   message-digest-key 1 md5 k\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("line 4"), "{err}");
     }
 
     #[test]
