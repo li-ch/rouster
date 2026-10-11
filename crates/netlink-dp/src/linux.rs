@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use common::{
     Dataplane, DataplaneError, DataplaneEvent, IpPrefix, Ipv4Prefix, Ipv6Prefix,
     NeighbourCacheInfo, NeighbourEntry, NeighbourProtocol, Nexthop, RouteEntry, RouteProtocol,
-    SavMonitorCounts, SavProgram,
+    SavMonitorCounts, SavProgram, SavProgramOp,
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
@@ -68,6 +68,18 @@ pub struct NetlinkDataplane {
     /// applied value). Interior-mutable so the `&self` trait methods
     /// can update it; never held across an await.
     sav_applied: Mutex<BTreeMap<u32, (String, u8, u8)>>,
+    /// The nft backend's counter-units map (op, valid unit, invalid
+    /// unit) of the last program THIS HANDLE installed — the per-op
+    /// attribution [`Dataplane::sav_monitor_per_op`] reads counters
+    /// back through. `None` until the first install (and after clear):
+    /// per-op attribution is install-scoped by design, because the
+    /// kernel counter NAMES are minted at install time from the
+    /// then-current interface names — only the installing process
+    /// holds the mapping that explains them. savd always installs
+    /// before reading (its evaluate installs, then counts), so the
+    /// daemon flow never sees `None`; a handle that never installed
+    /// answers `Unsupported` rather than guessing.
+    sav_nft_counters: Mutex<Option<Vec<(SavProgramOp, String, String)>>>,
     /// Which enforcement surface the SAV trait ops route to (default
     /// rp_filter — the long-landed behavior).
     sav_backend: SavBackend,
@@ -98,6 +110,7 @@ impl NetlinkDataplane {
                 handle,
                 messages,
                 sav_applied: Mutex::new(BTreeMap::new()),
+                sav_nft_counters: Mutex::new(None),
                 sav_backend: SavBackend::default(),
             },
             connection,
@@ -812,6 +825,40 @@ impl Dataplane for NetlinkDataplane {
         }
     }
 
+    /// Per-op monitor counters (N6B): the nft backend joins its
+    /// install-time counter-units map with the same `nft list counters`
+    /// read the aggregate uses — one row per placed op, its two named
+    /// counters' packets. Attribution is install-scoped (the counter
+    /// names are minted at install time): a handle that never installed
+    /// — or cleared — answers `Unsupported` rather than guessing at
+    /// units it cannot explain; savd installs before reading, so its
+    /// flow always answers. The rp_filter surface keeps its
+    /// pre-registered `Unsupported` (no per-rule counters at all).
+    async fn sav_monitor_per_op(
+        &self,
+    ) -> Result<Vec<(SavProgramOp, SavMonitorCounts)>, DataplaneError> {
+        match self.sav_backend {
+            SavBackend::RpFilter => Err(DataplaneError::Unsupported(
+                "rp_filter backend has no per-rule kernel counters; per-op counting runs in the \
+                 sav layer (route-lookup simulation)",
+            )),
+            SavBackend::Nft => {
+                let units = self.sav_nft_counters.lock().unwrap().clone();
+                let Some(units) = units else {
+                    return Err(DataplaneError::Unsupported(
+                        "nft backend has no installed program on this handle to attribute \
+                         counters to (install first; counter names are minted at install time)",
+                    ));
+                };
+                let out = run_nft(&["list", "counters"])?;
+                let packets = sav_nft::parse_counter_packets(&out, sav_nft::NFT_TABLE);
+                let rows = sav_nft::attribute_counts(&units, &packets);
+                debug!(rows = rows.len(), "sav nft per-op monitor counters read");
+                Ok(rows)
+            }
+        }
+    }
+
     /// Remove every installed SAV rule on the configured backend: the
     /// sysctl side restores each interface's pre-SAV rp_filter value;
     /// the nft side destroys the wholly-owned table (a single command —
@@ -981,6 +1028,14 @@ impl NetlinkDataplane {
             warn!(op = ?op, reason, "sav op not placed in the nft ruleset");
         }
 
+        // The per-op attribution map is remembered from the generation
+        // itself — BEFORE the churn guard — so an identical replay (no
+        // table rewrite, counters preserved) refreshes the same map and
+        // `sav_monitor_per_op` keeps answering. An empty program owns
+        // no counters: the map is Some(empty), which reads back as
+        // zero rows (no table, nothing attributed).
+        *self.sav_nft_counters.lock().unwrap() = Some(rs.counters.clone());
+
         // Churn guard (file is the truth; presence cross-checked
         // against the kernel so an externally destroyed table is
         // reinstalled, never skipped over).
@@ -1040,6 +1095,10 @@ impl NetlinkDataplane {
         run_nft(&["destroy", "table", sav_nft::NFT_FAMILY, sav_nft::NFT_TABLE])?;
         remove_run_file(NFT_RULESET_PATH);
         remove_run_file(NFT_STATE_PATH);
+        // No table, nothing to attribute: back to the never-installed
+        // answer (Unsupported) — an empty install is the Some(empty)
+        // shape that honestly reads zero rows instead.
+        *self.sav_nft_counters.lock().unwrap() = None;
         info!("sav nft table destroyed");
         Ok(())
     }

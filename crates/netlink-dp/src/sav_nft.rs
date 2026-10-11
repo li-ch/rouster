@@ -53,8 +53,10 @@
 //! from `nft list counters` output; `unknown` stays 0 (packets no rule
 //! judged never enter a rouster chain — nothing counts them, by
 //! construction). Aggregate counts feed
-//! [`crate::Dataplane::sav_monitor_counts`]; the per-counter map is the
-//! per-rule surface the status layer can ride later.
+//! [`crate::Dataplane::sav_monitor_counts`]; the per-op rows
+//! ([`NftRuleset::counters`] + [`attribute_counts`]) feed
+//! [`crate::Dataplane::sav_monitor_per_op`] — the per-rule counter
+//! surface the daemon's status rides (GSC §4 "count", kernel-sourced).
 //!
 //! Determinism: the same program + ifindex→name map always generates a
 //! byte-identical file (program ops arrive normalized; interface
@@ -91,6 +93,18 @@ pub struct NftRuleset {
     /// One `(ifindex, name, action)` per per-interface chain, in
     /// ifindex order — the applied-state marker's content.
     pub interfaces: Vec<(u32, String, SavEnforce)>,
+    /// The per-op counter attribution map (N6B): one `(op, valid-unit,
+    /// invalid-unit)` per PLACED op, in emission order (interfaces by
+    /// ifindex, then router-scale ops in rule order) — the units the
+    /// ruleset names its `v_`/`i_` counters after, paired with the op
+    /// whose verdicts they count. [`attribute_counts`] joins this map
+    /// with `nft list counters` output into the per-op monitor rows
+    /// ([`crate::Dataplane::sav_monitor_per_op`]). An IBB op's valid
+    /// unit is a DEAD counter (its chain has no terminal rule, so no
+    /// rule ever references it) — carried anyway so the map is total
+    /// and the row's `valid` stays an honest 0. Ops in `ignored` have
+    /// no rules and appear here not at all.
+    pub counters: Vec<(SavProgramOp, String, String)>,
     /// Ops no rule could place (unreachable duplicates, or a blocklist
     /// under a decisive allowlist), with reasons — logged as warnings
     /// by the backend, never silently swallowed (same contract as the
@@ -122,19 +136,16 @@ pub fn ruleset(
     // in canonical order is the one the reference pipeline consults
     // (`evaluate` uses `find`); a later same-kind op for the same
     // interface is unreachable and lands in `ignored`, disclosed.
-    let mut iba: BTreeMap<u32, (&[IpPrefix], SavEnforce)> = BTreeMap::new();
-    let mut ibb: BTreeMap<u32, (&[IpPrefix], SavEnforce)> = BTreeMap::new();
+    // The maps keep whole ops so `counters` below can pair units with
+    // the op identity that placed them.
+    let mut iba: BTreeMap<u32, &SavProgramOp> = BTreeMap::new();
+    let mut ibb: BTreeMap<u32, &SavProgramOp> = BTreeMap::new();
     let mut router_scale: Vec<&SavProgramOp> = Vec::new();
     let mut ignored: Vec<(SavProgramOp, &'static str)> = Vec::new();
 
     for op in program.ops() {
         match op {
-            SavProgramOp::IfaceAllow {
-                ifindex,
-                prefixes,
-                action,
-                ..
-            } => {
+            SavProgramOp::IfaceAllow { ifindex, .. } => {
                 if iba.contains_key(ifindex) {
                     ignored.push((
                         op.clone(),
@@ -142,14 +153,10 @@ pub fn ruleset(
                          decisive (reference pipeline step 2); this one is unreachable",
                     ));
                 } else {
-                    iba.insert(*ifindex, (prefixes.as_slice(), *action));
+                    iba.insert(*ifindex, op);
                 }
             }
-            SavProgramOp::IfaceBlock {
-                ifindex,
-                prefixes,
-                action,
-            } => {
+            SavProgramOp::IfaceBlock { ifindex, .. } => {
                 if ibb.contains_key(ifindex) {
                     ignored.push((
                         op.clone(),
@@ -158,7 +165,7 @@ pub fn ruleset(
                          unreachable",
                     ));
                 } else {
-                    ibb.insert(*ifindex, (prefixes.as_slice(), *action));
+                    ibb.insert(*ifindex, op);
                 }
             }
             SavProgramOp::PrefixAllow { .. } | SavProgramOp::PrefixBlock { .. } => {
@@ -170,14 +177,10 @@ pub fn ruleset(
     // IBA is decisive: a blocklist on an IBA-covered interface never
     // runs (step 3 is only reached when step 2 did not decide).
     let mut ifindexes: BTreeSet<u32> = iba.keys().copied().collect();
-    for (&ifindex, &(prefixes, action)) in &ibb {
+    for (&ifindex, op) in &ibb {
         if iba.contains_key(&ifindex) {
             ignored.push((
-                SavProgramOp::IfaceBlock {
-                    ifindex,
-                    prefixes: prefixes.to_vec(),
-                    action,
-                },
+                (*op).clone(),
                 "interface allowlist (IBA) is decisive for this interface (reference pipeline \
                  step 2 short-circuits step 3); the blocklist is unreachable",
             ));
@@ -215,11 +218,13 @@ pub fn ruleset(
     router_scale.sort_by_key(|op| (prefix_family_rank(op), std::cmp::Reverse(prefix_len(op))));
 
     let mut interfaces = Vec::new();
+    let mut counters: Vec<(SavProgramOp, String, String)> = Vec::new();
     let mut text = String::new();
     if ifindexes.is_empty() && router_scale.is_empty() {
         return Ok(NftRuleset {
             text,
             interfaces,
+            counters,
             ignored,
         });
     }
@@ -237,7 +242,10 @@ pub fn ruleset(
     text.push_str(" {\n");
 
     // Sets: allow/block, v4/v6, per interface in ifindex order.
-    for (&ifindex, &(prefixes, _)) in &iba {
+    for (&ifindex, op) in &iba {
+        let SavProgramOp::IfaceAllow { prefixes, .. } = op else {
+            unreachable!("iba holds allow ops");
+        };
         emit_set(
             &mut text,
             &set_name('a', '4', ifindex, &resolved),
@@ -251,10 +259,13 @@ pub fn ruleset(
             v6(prefixes),
         );
     }
-    for (&ifindex, &(prefixes, _)) in &ibb {
+    for (&ifindex, op) in &ibb {
         if iba.contains_key(&ifindex) {
             continue; // unreachable under the decisive allowlist
         }
+        let SavProgramOp::IfaceBlock { prefixes, .. } = op else {
+            unreachable!("ibb holds block ops");
+        };
         emit_set(
             &mut text,
             &set_name('b', '4', ifindex, &resolved),
@@ -270,22 +281,24 @@ pub fn ruleset(
     }
 
     // Counters: v/i per interface chain, then v/i per router-scale op.
+    // Every declared unit is recorded against the op whose verdicts it
+    // counts — the attribution map `sav_monitor_per_op` reads back.
     for &ifindex in &ifindexes {
         let name = &resolved[&ifindex];
-        emit_counter(&mut text, &unit_name('v', ifindex, name));
-        emit_counter(&mut text, &unit_name('i', ifindex, name));
-        interfaces.push((
-            ifindex,
-            name.clone(),
-            iba.get(&ifindex)
-                .or_else(|| ibb.get(&ifindex))
-                .map(|&(_, action)| action)
-                .expect("ifindexes come from the op maps"),
-        ));
+        let (v_unit, i_unit) = (unit_name('v', ifindex, name), unit_name('i', ifindex, name));
+        emit_counter(&mut text, &v_unit);
+        emit_counter(&mut text, &i_unit);
+        let op = iba
+            .get(&ifindex)
+            .or_else(|| ibb.get(&ifindex))
+            .expect("ifindexes come from the op maps");
+        interfaces.push((ifindex, name.clone(), action_of(op)));
+        counters.push(((**op).clone(), v_unit, i_unit));
     }
-    for idx in 0..router_scale.len() {
+    for (idx, op) in router_scale.iter().enumerate() {
         emit_counter(&mut text, &format!("v_rs{idx}"));
         emit_counter(&mut text, &format!("i_rs{idx}"));
+        counters.push(((*op).clone(), format!("v_rs{idx}"), format!("i_rs{idx}")));
     }
 
     // Base chain: dispatch per-interface chains, then router-scale.
@@ -313,7 +326,13 @@ pub fn ruleset(
             &mut text,
             &format!("    chain {} {{", chain_name(ifindex, name)),
         );
-        if let Some(&(prefixes, action)) = iba.get(&ifindex) {
+        if let Some(op) = iba.get(&ifindex) {
+            let SavProgramOp::IfaceAllow {
+                prefixes, action, ..
+            } = op
+            else {
+                unreachable!("iba holds allow ops");
+            };
             // IBA: decisive. Set matches accept (valid); the terminal
             // rule decides everything else (invalid) — drop, or count
             // and accept under monitor.
@@ -342,13 +361,19 @@ pub fn ruleset(
                 &format!(
                     r#"        counter name "{}" {}"#,
                     unit_name('i', ifindex, name),
-                    verdict_of(action)
+                    verdict_of(*action)
                 ),
             );
-        } else if let Some(&(prefixes, action)) = ibb.get(&ifindex) {
+        } else if let Some(op) = ibb.get(&ifindex) {
+            let SavProgramOp::IfaceBlock {
+                prefixes, action, ..
+            } = op
+            else {
+                unreachable!("ibb holds block ops");
+            };
             // IBB: a match is decided-invalid (terminal); a non-match
             // falls through to the router-scale chain — no terminal.
-            let verdict = verdict_of(action);
+            let verdict = verdict_of(*action);
             if !v4(prefixes).is_empty() {
                 line(
                     &mut text,
@@ -425,8 +450,19 @@ pub fn ruleset(
     Ok(NftRuleset {
         text,
         interfaces,
+        counters,
         ignored,
     })
+}
+
+/// The enforcement action of a placed op (interface- or router-scale).
+fn action_of(op: &SavProgramOp) -> SavEnforce {
+    match op {
+        SavProgramOp::IfaceAllow { action, .. }
+        | SavProgramOp::IfaceBlock { action, .. }
+        | SavProgramOp::PrefixAllow { action, .. }
+        | SavProgramOp::PrefixBlock { action, .. } => *action,
+    }
 }
 
 /// Aggregate `nft list counters` output into the monitor counts: the
@@ -484,6 +520,38 @@ pub fn aggregate_counts(packets: &BTreeMap<String, u64>) -> SavMonitorCounts {
         }
     }
     counts
+}
+
+/// Join the ruleset's counter-units map ([`NftRuleset::counters`])
+/// with a parsed `nft list counters` packet map into the per-op
+/// monitor rows ([`crate::Dataplane::sav_monitor_per_op`]): each op
+/// pairs with its two named counters' packets — the `v_` unit is its
+/// valid bucket, the `i_` unit its invalid bucket; `unknown` stays 0
+/// (packets no rule judged never enter a rouster chain, by
+/// construction). Rows return in the program's canonical op order
+/// (deterministic for consumers); a unit missing from the packet map
+/// reads 0, never errors — a counter absent from the listing counted
+/// nothing. The rows sum to [`aggregate_counts`] over the same packet
+/// map: every unit the ruleset declares appears in exactly one row.
+pub fn attribute_counts(
+    counters: &[(SavProgramOp, String, String)],
+    packets: &BTreeMap<String, u64>,
+) -> Vec<(SavProgramOp, SavMonitorCounts)> {
+    let mut rows: Vec<(SavProgramOp, SavMonitorCounts)> = counters
+        .iter()
+        .map(|(op, valid_unit, invalid_unit)| {
+            (
+                op.clone(),
+                SavMonitorCounts {
+                    valid: packets.get(valid_unit).copied().unwrap_or(0),
+                    invalid: packets.get(invalid_unit).copied().unwrap_or(0),
+                    unknown: 0,
+                },
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
 }
 
 /// The terminal verdict an action maps to: drop enforces the deny,
@@ -974,6 +1042,184 @@ garbage
         let packets = parse_counter_packets("", NFT_TABLE);
         assert!(packets.is_empty());
         assert_eq!(aggregate_counts(&packets), SavMonitorCounts::default());
+        // The per-op join over the same emptiness: rows exist (the ops
+        // are placed) but every bucket reads an honest 0.
+        let rows = attribute_counts(
+            &[(
+                allow(4, &["10.0.0.0/8"], SavEnforce::Monitor),
+                "v_x_4".into(),
+                "i_x_4".into(),
+            )],
+            &packets,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, SavMonitorCounts::default());
+    }
+
+    /// The counters map (N6B) pairs every PLACED op with its two
+    /// units, in emission order: interface ops by ifindex with their
+    /// name-addressable units, router-scale ops in rule order (longest
+    /// prefix first) with their positional rs units. Ignored
+    /// (unreachable) ops appear not at all.
+    #[test]
+    fn counters_map_pairs_placed_ops_with_their_units() {
+        let iba_op = allow(2, &["192.0.2.0/24"], SavEnforce::Drop);
+        let pba = SavProgramOp::PrefixAllow {
+            prefix: p("203.0.113.0/24"),
+            ifindexes: vec![2, 3],
+            action: SavEnforce::Drop,
+        };
+        let pbb = SavProgramOp::PrefixBlock {
+            prefix: p("203.0.113.128/25"),
+            ifindexes: vec![3],
+            action: SavEnforce::Monitor,
+        };
+        let program = SavProgram::from_ops([
+            iba_op.clone(),
+            pbb.clone(),
+            pba.clone(),
+            // Unreachable: a second allow on ifindex 2 and a blocklist
+            // under the decisive allowlist.
+            allow(2, &["198.51.100.0/24"], SavEnforce::Monitor),
+            SavProgramOp::IfaceBlock {
+                ifindex: 2,
+                prefixes: vec![p("10.0.0.0/8")],
+                action: SavEnforce::Drop,
+            },
+        ]);
+        let rs = ruleset(&program, &names(&[(2, "eth0"), (3, "eth1")])).unwrap();
+        assert_eq!(rs.ignored.len(), 2, "the unreachable pair");
+        let units_of = |op: &SavProgramOp| -> (String, String) {
+            rs.counters
+                .iter()
+                .find(|(o, _, _)| o == op)
+                .map(|(_, v, i)| (v.clone(), i.clone()))
+                .unwrap_or_else(|| panic!("op {op} missing from the counters map"))
+        };
+        // Interface op: name-addressable units.
+        assert_eq!(units_of(&iba_op), ("v_eth0_2".into(), "i_eth0_2".into()));
+        // Router-scale: positional, in RULE order (the /25 PBB sorts
+        // before the /24 PBA — longest covering prefix first).
+        assert_eq!(units_of(&pbb), ("v_rs0".into(), "i_rs0".into()));
+        assert_eq!(units_of(&pba), ("v_rs1".into(), "i_rs1".into()));
+        assert_eq!(rs.counters.len(), 3, "only placed ops");
+        // The declared units exist in the file (map and text agree).
+        for (_, v, i) in &rs.counters {
+            assert!(rs.text.contains(&format!("counter {v} {{")), "unit {v}");
+            assert!(rs.text.contains(&format!("counter {i} {{")), "unit {i}");
+        }
+    }
+
+    /// An IBB-only interface carries a DEAD valid unit (no terminal
+    /// rule references it) — the map stays total so the row's valid
+    /// bucket is an honest 0, and the invalid unit is the match rule's.
+    #[test]
+    fn ibb_op_carries_a_dead_valid_unit() {
+        let program = SavProgram::from_ops([SavProgramOp::IfaceBlock {
+            ifindex: 2,
+            prefixes: vec![p("192.0.2.0/24")],
+            action: SavEnforce::Drop,
+        }]);
+        let rs = ruleset(&program, &names(&[(2, "eth0")])).unwrap();
+        assert_eq!(rs.counters.len(), 1);
+        let (op, v, i) = &rs.counters[0];
+        assert!(matches!(op, SavProgramOp::IfaceBlock { .. }));
+        assert_eq!((v.as_str(), i.as_str()), ("v_eth0_2", "i_eth0_2"));
+        // Only the invalid unit is referenced by a rule.
+        assert!(rs.text.contains(&format!(r#"counter name "{i}""#)));
+        assert!(!rs.text.contains(&format!(r#"counter name "{v}""#)));
+    }
+
+    /// The per-op join over real listing text: each op's row reads its
+    /// own two counters, rows come back in canonical op order, and the
+    /// rows sum EXACTLY to the aggregate over the same listing (every
+    /// declared unit appears in exactly one row — the property that
+    /// lets the daemon derive its aggregate line from the per-op read).
+    #[test]
+    fn attribute_counts_rows_read_their_own_counters_and_sum_to_the_aggregate() {
+        let program = SavProgram::from_ops([
+            allow(4, &["198.51.100.0/24"], SavEnforce::Monitor),
+            allow(6, &[], SavEnforce::Monitor),
+            SavProgramOp::PrefixBlock {
+                prefix: p("203.0.113.0/24"),
+                ifindexes: vec![6],
+                action: SavEnforce::Monitor,
+            },
+        ]);
+        let rs = ruleset(&program, &names(&[(4, "vethlegit"), (6, "vethspoof")])).unwrap();
+        let listing = "table inet rouster_sav {
+\tcounter i_vethspoof_6 {
+\t\tpackets 12 bytes 1008
+\t}
+\tcounter v_vethlegit_4 {
+\t\tpackets 3 bytes 252
+\t}
+\tcounter i_vethlegit_4 {
+\t\tpackets 1 bytes 84
+\t}
+\tcounter v_rs0 {
+\t\tpackets 2 bytes 168
+\t}
+\tcounter i_rs0 {
+\t\tpackets 5 bytes 420
+\t}
+\tcounter v_vethspoof_6 {
+\t\tpackets 0 bytes 0
+\t}
+}
+";
+        let packets = parse_counter_packets(listing, NFT_TABLE);
+        let rows = attribute_counts(&rs.counters, &packets);
+        assert_eq!(rows.len(), 3);
+        // Canonical op order (SavProgram::from_ops order): the two
+        // interface allows by ifindex, then the router-scale op.
+        let shapes: Vec<String> = rows.iter().map(|(op, _)| op.to_string()).collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "allow if#4 [198.51.100.0/24] strict monitor",
+                "allow if#6 [] strict monitor",
+                "block 203.0.113.0/24 if [6] monitor",
+            ]
+        );
+        assert_eq!(
+            rows[0].1,
+            SavMonitorCounts {
+                invalid: 1,
+                valid: 3,
+                unknown: 0
+            },
+            "vethlegit's own two units"
+        );
+        assert_eq!(
+            rows[1].1,
+            SavMonitorCounts {
+                invalid: 12,
+                valid: 0,
+                unknown: 0
+            },
+            "the deny-all's invalid unit; its v_ unit counted 0"
+        );
+        assert_eq!(
+            rows[2].1,
+            SavMonitorCounts {
+                invalid: 5,
+                valid: 2,
+                unknown: 0
+            },
+            "the PBB pair units, positional rs0"
+        );
+        // The sum property: rows sum to the aggregate over the same
+        // listing, bucket for bucket.
+        let sum = rows
+            .iter()
+            .fold(SavMonitorCounts::default(), |mut acc, (_, c)| {
+                acc.invalid += c.invalid;
+                acc.valid += c.valid;
+                acc.unknown += c.unknown;
+                acc
+            });
+        assert_eq!(sum, aggregate_counts(&packets));
     }
 
     /// v6 allowlists ride the same table: a v6 set under ip6 matching
