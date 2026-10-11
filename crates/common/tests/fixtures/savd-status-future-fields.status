@@ -1,0 +1,6 @@
+savd 2.0.0 pid 51234 uptime 3600s
+config mode EFP-uRPF action monitor poll 5s interfaces 2 bindings 1 ttl-window 90s
+installed 1 rules
+rule allow if#2 [198.51.100.0/24] strict monitor expires-in 120s
+agent session 3 peers 1
+monitor source dataplane invalid=1 valid=2 unknown=3 window 60s

@@ -1,0 +1,6 @@
+bfdd 0.0.0 pid 4711
+peers 3
+session peer 192.0.2.2 state Up diag 0 local-discr 1 remote-discr 7 detection-time 900ms tx-interval 300ms
+session peer 192.0.2.3 state Up diag 0 local-discr 2 remote-discr 8 detection-time 900ms tx-interval 300ms
+session peer 2001:db8::2 state Down diag 1 local-discr 3 remote-discr 0 detection-time 900ms tx-interval 300ms
+  last-transition Up -> Down (Control Detection Time Expired (1), timeout while Up (RFC 5880 6.8.8))

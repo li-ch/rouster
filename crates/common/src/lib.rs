@@ -8,6 +8,7 @@ pub mod neighbour;
 pub mod nexthop;
 pub mod prefix;
 pub mod route;
+pub mod rundir;
 
 pub use dataplane::{
     Dataplane, DataplaneError, DataplaneEvent, LinkFlags, SavEnforce, SavMonitorCounts, SavProgram,

@@ -1,0 +1,17 @@
+rousterd 0.0.0 pid 4242
+router-id 198.51.100.1
+interfaces 4
+interface lo ifindex 1 up flags UP|LOOPBACK|RUNNING vrf -
+  address 127.0.0.1/8
+interface eth0 ifindex 2 up flags UP|BROADCAST|RUNNING|MULTICAST vrf -
+  address 192.0.2.1/24
+  address 2001:db8::1/64
+interface vrf-blue ifindex 5 up flags UP|BROADCAST|RUNNING|MULTICAST vrf - vrf-table 1001
+interface eth1 ifindex 6 up flags UP|BROADCAST|RUNNING|MULTICAST vrf vrf-blue
+  address 198.51.100.1/24
+neighbours 2
+neighbour 192.0.2.10 ifindex 2 state INCOMPLETE lladdr -
+neighbour 198.51.100.9 ifindex 6 state REACHABLE lladdr 02:00:00:00:00:11
+tables 2
+table 254 routes 1 prefixes 1 connected 3 kernel 1 vrf -
+table 1001 routes 0 prefixes 0 connected 1 kernel 1 vrf vrf-blue

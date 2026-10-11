@@ -1,0 +1,5 @@
+bfdd 2.0.0 pid 51234 uptime 3600s
+peers 1 echo-mode
+session peer 192.0.2.2 state AdminDown diag 2 local-discr 9 remote-discr 7 detection-time 900ms tx-interval 300ms echo-interval 300ms
+  last-transition Up -> AdminDown (Local system admin down)
+agent session 3 peers 1

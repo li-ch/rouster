@@ -1,0 +1,4 @@
+savd 0.0.0 pid 4711
+config mode loose-uRPF action monitor poll 10s interfaces 0 bindings 0
+installed 0 rules (never evaluated)
+monitor source simulation invalid=0 valid=0 unknown=0
