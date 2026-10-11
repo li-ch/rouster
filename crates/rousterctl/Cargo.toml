@@ -5,7 +5,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# v1 is deliberately std-only: every answer comes from files a Rouster
-# daemon already publishes in the run dir — no IPC, no parser crates.
-# Adding a dependency here is an owner decision, not a patch detail.
+# v1 is deliberately free of EXTERNAL dependencies: every answer
+# comes from files a Rouster daemon already publishes in the run
+# dir — no IPC, no parser crates. The one dependency is a
+# pre-existing workspace member: common::rundir, the N8-consolidated
+# run-dir status reader (std-only, no lock changes). Adding anything
+# else here is an owner decision, not a patch detail.
 [dependencies]
+common.workspace = true

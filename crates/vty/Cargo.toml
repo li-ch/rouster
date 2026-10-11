@@ -6,6 +6,10 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The run-dir status reader (N8 consolidation): a pre-existing
+# workspace member, std-only — no new external crates, no new lock
+# entries beyond this package's own dependency edges.
+common.workspace = true
 # io-util ( AsyncReadExt/AsyncWriteExt for the line discipline) is
 # added here on top of the workspace's feature set — same crate,
 # same lock entry, no workspace-file change.

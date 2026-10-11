@@ -1,9 +1,7 @@
-//! Tolerant parsing of `rousterd.status` — the S3/W1-c conventions
-//! applied to the main daemon's dump (crates/rousterd/src/status.rs
-//! writes it; the format contract is docs/operator-surfaces.md
-//! §2.3). The third run-dir publisher, re-implemented in-crate per
-//! the W1-c deviation (edge adapters stay decoupled; consolidation
-//! is an owner decision recorded in docs/protocols/vty.md).
+//! `rousterd.status` parsing — the vty view over the ONE run-dir
+//! reader (`common::rundir`, the N8 consolidation; the format
+//! contract is docs/operator-surfaces.md §2.3; the writer is
+//! `crates/rousterd/src/status.rs`):
 //!
 //! ```text
 //! rousterd 0.0.0 pid 4242
@@ -17,48 +15,18 @@
 //! table 254 routes 1 prefixes 1 connected 3 kernel 1 vrf -
 //! ```
 //!
-//! Tolerance contract: unknown *lines* are counted and dropped;
-//! known *keywords* are picked out wherever they sit, so added fields
-//! ride along harmlessly; indented `address` lines attach to the
-//! interface above them; a value position never swallows another
-//! keyword; a malformed number leaves its field unset. Parsing never
-//! fails.
+//! The shared reader owns the tolerance contract (unknown *lines*
+//! counted and dropped; known *keywords* picked out wherever they
+//! sit; a value position never swallows another keyword; indented
+//! `address` lines attach to the interface above them; a malformed
+//! number leaves its field unset; parsing never fails). [`RibStatus`]
+//! is this crate's projection of the reader's result: the rows the
+//! vty renders, without the count claims rousterctl carries.
 
-use std::net::IpAddr;
+pub use common::rundir::{IfaceLine, NeighLine, TableLine};
 
-/// One `interface` line plus its `address` children.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IfaceLine {
-    pub name: Option<String>,
-    pub ifindex: Option<u32>,
-    pub up: Option<bool>,
-    pub flags: Option<String>,
-    pub vrf: Option<String>,
-    pub vrf_table: Option<u32>,
-    pub addresses: Vec<String>,
-}
-
-/// One `neighbour` line.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NeighLine {
-    pub ip: Option<IpAddr>,
-    pub ifindex: Option<u32>,
-    pub state: Option<String>,
-    pub lladdr: Option<String>,
-}
-
-/// One `table` line.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TableLine {
-    pub id: Option<u32>,
-    pub routes: Option<u64>,
-    pub prefixes: Option<u64>,
-    pub connected: Option<u64>,
-    pub kernel: Option<u64>,
-    pub vrf: Option<String>,
-}
-
-/// A parsed `rousterd.status`.
+/// The vty projection of a parsed `rousterd.status`: the rows, the
+/// header facts, and the unrecognized-line count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RibStatus {
     pub version: Option<String>,
@@ -73,251 +41,42 @@ pub struct RibStatus {
 impl RibStatus {
     /// Parses a status file's content. Never fails.
     pub fn parse(text: &str) -> RibStatus {
-        let mut parsed = RibStatus::default();
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r').trim_end();
-            if line.is_empty() {
-                continue;
-            }
-            // Indented lines are children of the interface above.
-            if line.starts_with(' ') || line.starts_with('\t') {
-                let body = line.trim();
-                if let Some(address) = body.strip_prefix("address ") {
-                    if let Some(iface) = parsed.interfaces.last_mut() {
-                        iface.addresses.push(address.trim().to_string());
-                        continue;
-                    }
-                }
-                parsed.unknown_lines += 1;
-                continue;
-            }
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            match tokens[0] {
-                "rousterd" => parse_header(&mut parsed, &tokens),
-                "router-id" => {
-                    if let Some(value) = tokens.get(1) {
-                        if value.parse::<IpAddr>().is_ok() {
-                            parsed.router_id = Some(value.to_string());
-                        }
-                    }
-                }
-                "interface" => {
-                    let mut iface = IfaceLine::default();
-                    parse_iface_body(&mut iface, &tokens[1..]);
-                    if iface.name.is_some() || iface.ifindex.is_some() {
-                        parsed.interfaces.push(iface);
-                    } else {
-                        parsed.unknown_lines += 1;
-                    }
-                }
-                "neighbour" => {
-                    let mut neigh = NeighLine::default();
-                    parse_neigh_body(&mut neigh, &tokens[1..]);
-                    if neigh.ip.is_some() || neigh.ifindex.is_some() {
-                        parsed.neighbours.push(neigh);
-                    } else {
-                        parsed.unknown_lines += 1;
-                    }
-                }
-                "table" => {
-                    let mut table = TableLine {
-                        id: tokens.get(1).and_then(|t| t.parse().ok()),
-                        ..TableLine::default()
-                    };
-                    parse_table_body(&mut table, &tokens[2..]);
-                    if table.id.is_some() {
-                        parsed.tables.push(table);
-                    } else {
-                        parsed.unknown_lines += 1;
-                    }
-                }
-                // Count lines (`interfaces N`, ...) are known but
-                // informational — the renderers trust the rows they
-                // parsed, so these are dropped without counting.
-                "interfaces" | "neighbours" | "tables" => {}
-                _ => parsed.unknown_lines += 1,
-            }
-        }
-        parsed
+        common::rundir::parse_rousterd(text).into()
     }
 
-    /// The interfaces the `name` filter selects (all when `None`).
+    /// The interfaces a `name` filter selects (all when `None`).
     pub fn interfaces_matching(&self, name: Option<&str>) -> Vec<&IfaceLine> {
-        self.interfaces
-            .iter()
-            .filter(|iface| name.is_none_or(|want| iface.name.as_deref() == Some(want)))
-            .collect()
+        common::rundir::interfaces_matching(&self.interfaces, name)
     }
 
     /// The neighbours the `filter` selects (all when `None`): a bare
     /// address or a CIDR prefix, either family.
     pub fn neighbours_matching(&self, filter: Option<&str>) -> Vec<&NeighLine> {
-        let filter = filter.and_then(parse_filter);
-        self.neighbours
-            .iter()
-            .filter(|neigh| match (&filter, neigh.ip) {
-                (Some(filter), Some(ip)) => filter.contains(ip),
-                _ => true,
-            })
-            .collect()
+        common::rundir::neighbours_matching(&self.neighbours, filter)
     }
 }
 
-/// Header line: `rousterd <version> pid <pid>`, keyword-picked.
-fn parse_header(parsed: &mut RibStatus, tokens: &[&str]) {
-    if let Some(version) = tokens.get(1) {
-        if *version != "pid" {
-            parsed.version = Some(version.to_string());
+impl From<common::rundir::RousterdStatus> for RibStatus {
+    fn from(parsed: common::rundir::RousterdStatus) -> RibStatus {
+        // The count claims are rousterctl's; the vty renderers trust
+        // the rows they parsed.
+        RibStatus {
+            version: parsed.version,
+            pid: parsed.pid,
+            router_id: parsed.router_id,
+            interfaces: parsed.interfaces,
+            neighbours: parsed.neighbours,
+            tables: parsed.tables,
+            unknown_lines: parsed.unknown_lines,
         }
     }
-    if let Some(position) = tokens.iter().position(|token| *token == "pid") {
-        if let Some(value) = tokens.get(position + 1) {
-            parsed.pid = value.parse().ok();
-        }
-    }
-}
-
-/// Keywords of the `interface` line: a value position never swallows
-/// one of these.
-const IFACE_KEYWORDS: [&str; 6] = ["ifindex", "up", "down", "flags", "vrf", "vrf-table"];
-
-fn parse_iface_body(iface: &mut IfaceLine, tokens: &[&str]) {
-    if let Some(name) = tokens.first() {
-        iface.name = Some(name.to_string());
-    }
-    for (index, token) in tokens.iter().enumerate().skip(1) {
-        match *token {
-            "up" => iface.up = Some(true),
-            "down" => iface.up = Some(false),
-            "ifindex" | "vrf-table" => {
-                if let Some(value) = value_of(tokens, index, &IFACE_KEYWORDS) {
-                    let number = value.parse().ok();
-                    match *token {
-                        "ifindex" => iface.ifindex = number,
-                        _ => iface.vrf_table = number,
-                    }
-                }
-            }
-            "flags" => {
-                if let Some(value) = value_of(tokens, index, &IFACE_KEYWORDS) {
-                    iface.flags = Some(value.to_string());
-                }
-            }
-            "vrf" => {
-                if let Some(value) = value_of(tokens, index, &IFACE_KEYWORDS) {
-                    iface.vrf = Some(value.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-const NEIGH_KEYWORDS: [&str; 3] = ["ifindex", "state", "lladdr"];
-
-fn parse_neigh_body(neigh: &mut NeighLine, tokens: &[&str]) {
-    if let Some(ip) = tokens.first() {
-        neigh.ip = ip.parse().ok();
-    }
-    for (index, token) in tokens.iter().enumerate().skip(1) {
-        let Some(value) = value_of(tokens, index, &NEIGH_KEYWORDS) else {
-            continue;
-        };
-        match *token {
-            "ifindex" => neigh.ifindex = value.parse().ok(),
-            "state" => neigh.state = Some(value.to_string()),
-            "lladdr" => neigh.lladdr = Some(value.to_string()),
-            _ => {}
-        }
-    }
-}
-
-const TABLE_KEYWORDS: [&str; 5] = ["routes", "prefixes", "connected", "kernel", "vrf"];
-
-fn parse_table_body(table: &mut TableLine, tokens: &[&str]) {
-    for (index, token) in tokens.iter().enumerate() {
-        let Some(value) = value_of(tokens, index, &TABLE_KEYWORDS) else {
-            continue;
-        };
-        let number = value.parse().ok();
-        match *token {
-            "routes" => table.routes = number,
-            "prefixes" => table.prefixes = number,
-            "connected" => table.connected = number,
-            "kernel" => table.kernel = number,
-            "vrf" => table.vrf = Some(value.to_string()),
-            _ => {}
-        }
-    }
-}
-
-/// The token after `index`, when it exists and is not itself a
-/// keyword.
-fn value_of<'a>(tokens: &'a [&'a str], index: usize, keywords: &[&str]) -> Option<&'a str> {
-    let value = tokens.get(index + 1)?;
-    (!keywords.contains(value)).then_some(*value)
-}
-
-/// A parsed neighbour filter (see [`RibStatus::neighbours_matching`]).
-struct Filter {
-    base: u128,
-    width: u32,
-    family_v4: bool,
-}
-
-impl Filter {
-    fn contains(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) if self.family_v4 => {
-                in_window(u32::from(v4) as u128, self.base, self.width.min(32), 32)
-            }
-            IpAddr::V6(v6) if !self.family_v4 => {
-                in_window(u128::from(v6), self.base, self.width.min(128), 128)
-            }
-            _ => false,
-        }
-    }
-}
-
-fn in_window(addr: u128, base: u128, width: u32, family_len: u32) -> bool {
-    let shift = family_len - width;
-    (addr >> shift) == (base >> shift)
-}
-
-fn parse_filter(text: &str) -> Option<Filter> {
-    let (addr_text, len_text) = match text.split_once('/') {
-        Some((addr, len)) => (addr, Some(len)),
-        None => (text, None),
-    };
-    if let Ok(v4) = addr_text.parse::<std::net::Ipv4Addr>() {
-        let width = match len_text {
-            Some(len) => len.parse::<u32>().ok().filter(|l| *l <= 32)?,
-            None => 32,
-        };
-        return Some(Filter {
-            base: u32::from(v4) as u128,
-            width,
-            family_v4: true,
-        });
-    }
-    if let Ok(v6) = addr_text.parse::<std::net::Ipv6Addr>() {
-        let width = match len_text {
-            Some(len) => len.parse::<u32>().ok().filter(|l| *l <= 128)?,
-            None => 128,
-        };
-        return Some(Filter {
-            base: u128::from(v6),
-            width,
-            family_v4: false,
-        });
-    }
-    None
 }
 
 /// Does this token satisfy the vty's address-or-prefix parameter kind?
-/// (Either family, bare or CIDR — the grammar's validator.)
+/// (Either family, bare or CIDR — the grammar's validator, shared
+/// with the reader's filter machinery.)
 pub fn accepts_addr_or_prefix(token: &str) -> bool {
-    parse_filter(token).is_some()
+    common::rundir::accepts_addr_or_prefix(token)
 }
 
 #[cfg(test)]

@@ -11,14 +11,30 @@
 //! monitor source simulation invalid=0 valid=0 unknown=0
 //! ```
 //!
-//! Tolerance contract (the daemon's format may grow): unknown lines
-//! are counted and dropped; known keywords are picked out wherever
-//! they sit on their line, so added fields ride along harmlessly; a
-//! `rule` line matching no known shape is kept verbatim as a
-//! [`RuleLine::Raw`] so no operator data is lost. Parsing never
+//! Tolerance contract (the daemon's format may grow; owned by the
+//! ONE shared reader, `common::rundir` — the N8 consolidation):
+//! unknown lines are counted and dropped; known keywords are picked
+//! out wherever they sit on their line, so added fields ride along
+//! harmlessly; a `rule` line matching no known shape is kept verbatim
+//! as a [`RuleLine::Raw`] so no operator data is lost. Parsing never
 //! fails — whatever is recognized is reported.
+//!
+//! This module is rousterctl's projection: the reader's typed result
+//! mapped onto the CLI's [`RuleLine`] shape, plus the terminal and
+//! JSON renderers.
+
+use common::rundir;
 
 use crate::liveness::PidState;
+
+/// The `config` line's recognized keywords (the reader's
+/// [`common::rundir::SavConfig`], under the name this crate's public
+/// surface has always used).
+pub use common::rundir::SavConfig as ConfigLine;
+
+/// The `monitor` line's counters (the reader's
+/// [`common::rundir::SavMonitor`], ditto).
+pub use common::rundir::SavMonitor as MonitorLine;
 
 /// One `rule` line: the four op shapes savd renders today, plus the
 /// verbatim fallback for shapes this version does not know.
@@ -112,36 +128,6 @@ impl RuleLine {
     }
 }
 
-/// The `config` line's recognized keywords; unrecognized ones are
-/// ignored (the format may grow).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConfigLine {
-    /// e.g. `strict-uRPF`.
-    pub mode: Option<String>,
-    /// e.g. `monitor`.
-    pub action: Option<String>,
-    /// The `poll Ns` cadence.
-    pub poll_secs: Option<u64>,
-    /// The configured interface stanza count.
-    pub interfaces: Option<u64>,
-    /// The configured binding line count.
-    pub bindings: Option<u64>,
-}
-
-/// The `monitor` line's counters; each is individually optional so a
-/// malformed one does not erase its siblings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MonitorLine {
-    /// `simulation` or `dataplane`.
-    pub source: Option<String>,
-    /// Sources judged invalid.
-    pub invalid: Option<u64>,
-    /// Sources judged valid.
-    pub valid: Option<u64>,
-    /// Sources no rule judged.
-    pub unknown: Option<u64>,
-}
-
 /// A parsed `savd.status`: everything this version recognized.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavStatus {
@@ -164,29 +150,11 @@ pub struct SavStatus {
 }
 
 impl SavStatus {
-    /// Parses a status file's content. Never fails: unrecognized or
-    /// malformed pieces simply do not populate their fields.
+    /// Parses a status file's content (the shared reader, mapped).
+    /// Never fails: unrecognized or malformed pieces simply do not
+    /// populate their fields.
     pub fn parse(text: &str) -> SavStatus {
-        let mut parsed = SavStatus::default();
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r').trim_end();
-            if line.is_empty() {
-                continue;
-            }
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            match tokens[0] {
-                "savd" => parse_header(&mut parsed, &tokens),
-                "config" => parse_config(&mut parsed.config, &tokens),
-                "installed" => parse_installed(&mut parsed, &tokens),
-                "rule" => {
-                    let raw = line.strip_prefix("rule ").unwrap_or(line);
-                    parsed.rules.push(parse_rule(raw));
-                }
-                "monitor" => parse_monitor(&mut parsed.monitor, &tokens),
-                _ => parsed.unknown_lines += 1,
-            }
-        }
-        parsed
+        rundir::parse_savd(text).into()
     }
 
     /// Renders the status for a terminal: aligned rule table, config,
@@ -353,157 +321,67 @@ impl SavStatus {
     }
 }
 
-/// Header line: `savd <version> pid <pid>` — both pieces are picked
-/// out by keyword so future header fields cannot hide them.
-fn parse_header(parsed: &mut SavStatus, tokens: &[&str]) {
-    if let Some(version) = tokens.get(1) {
-        if *version != "pid" {
-            parsed.version = Some(version.to_string());
-        }
-    }
-    if let Some(position) = tokens.iter().position(|token| *token == "pid") {
-        if let Some(value) = tokens.get(position + 1) {
-            parsed.pid = value.parse().ok();
-        }
-    }
-}
-
-/// Config line: keyword/value pairs scanned wherever they sit, so
-/// reordered or newly added keywords ride along harmlessly.
-fn parse_config(config: &mut ConfigLine, tokens: &[&str]) {
-    for (index, token) in tokens.iter().enumerate().skip(1) {
-        let Some(value) = tokens.get(index + 1) else {
-            break;
-        };
-        match *token {
-            "mode" => config.mode = Some(value.to_string()),
-            "action" => config.action = Some(value.to_string()),
-            "poll" => config.poll_secs = value.strip_suffix('s').unwrap_or(value).parse().ok(),
-            "interfaces" => config.interfaces = value.parse().ok(),
-            "bindings" => config.bindings = value.parse().ok(),
-            _ => {}
+/// The reader's result mapped onto the CLI's shapes. The rule
+/// polarity split is total: the reader's `Iface`/`Prefix` variants
+/// only ever carry `allow`/`block` (anything else degraded to `Raw`
+/// at parse time), and the allow shape always carries its urpf hint.
+impl From<rundir::SavStatus> for SavStatus {
+    fn from(parsed: rundir::SavStatus) -> SavStatus {
+        SavStatus {
+            version: parsed.version,
+            pid: parsed.pid,
+            config: parsed.config,
+            evaluated: parsed.evaluated,
+            installed_claim: parsed.installed_claim,
+            rules: parsed.rules.into_iter().map(RuleLine::from).collect(),
+            monitor: parsed.monitor,
+            unknown_lines: parsed.unknown_lines,
         }
     }
 }
 
-/// Installed line: `installed <N> rules` (optionally `(never
-/// evaluated)`). A count we cannot read makes the line unrecognized.
-fn parse_installed(parsed: &mut SavStatus, tokens: &[&str]) {
-    let never = tokens.contains(&"(never");
-    match tokens.get(1).and_then(|token| token.parse::<u64>().ok()) {
-        Some(count) => {
-            parsed.installed_claim = Some(count);
-            parsed.evaluated = Some(!never);
-        }
-        None if never => parsed.evaluated = Some(false),
-        None => parsed.unknown_lines += 1,
-    }
-}
-
-/// Monitor line: `monitor source <s> invalid=<n> valid=<n>
-/// unknown=<n>`, keyword-scanned so added counters are ignored.
-fn parse_monitor(monitor: &mut MonitorLine, tokens: &[&str]) {
-    for (index, token) in tokens.iter().enumerate().skip(1) {
-        if *token == "source" {
-            if let Some(value) = tokens.get(index + 1) {
-                monitor.source = Some(value.to_string());
-            }
-            continue;
-        }
-        if let Some((key, value)) = token.split_once('=') {
-            let number = value.parse().ok();
-            match key {
-                "invalid" => monitor.invalid = number,
-                "valid" => monitor.valid = number,
-                "unknown" => monitor.unknown = number,
-                _ => {}
-            }
-        }
-    }
-}
-
-/// One rule body (after `rule `): the four shapes savd renders today,
-/// falling back to [`RuleLine::Raw`] for anything else.
-fn parse_rule(raw: &str) -> RuleLine {
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-    let Some(&polarity) = tokens.first() else {
-        return RuleLine::Raw(raw.to_string());
-    };
-    // Interface scale: `allow if#N [prefixes] (urpf) action`.
-    if let Some(second) = tokens.get(1) {
-        if let Some(index_text) = second.strip_prefix("if#") {
-            let Some(ifindex) = index_text.parse::<u32>().ok() else {
-                return RuleLine::Raw(raw.to_string());
-            };
-            let Some((prefixes, tail)) = bracket_set(&tokens[2..]) else {
-                return RuleLine::Raw(raw.to_string());
-            };
-            return match (polarity, tail.as_slice()) {
-                ("allow", [urpf, action]) => RuleLine::IfaceAllow {
+impl From<rundir::SavRule> for RuleLine {
+    fn from(rule: rundir::SavRule) -> RuleLine {
+        match rule {
+            rundir::SavRule::Iface {
+                polarity,
+                ifindex,
+                prefixes,
+                urpf,
+                action,
+            } => match polarity.as_str() {
+                "allow" => RuleLine::IfaceAllow {
                     ifindex,
                     prefixes,
-                    urpf: (*urpf).to_string(),
-                    action: (*action).to_string(),
+                    urpf: urpf.unwrap_or_default(),
+                    action,
                 },
-                ("block", [action]) => RuleLine::IfaceBlock {
+                _ => RuleLine::IfaceBlock {
                     ifindex,
                     prefixes,
-                    action: (*action).to_string(),
+                    action,
                 },
-                _ => RuleLine::Raw(raw.to_string()),
-            };
+            },
+            rundir::SavRule::Prefix {
+                polarity,
+                prefix,
+                ifindexes,
+                action,
+            } => match polarity.as_str() {
+                "allow" => RuleLine::PrefixAllow {
+                    prefix,
+                    ifindexes,
+                    action,
+                },
+                _ => RuleLine::PrefixBlock {
+                    prefix,
+                    ifindexes,
+                    action,
+                },
+            },
+            rundir::SavRule::Raw(text) => RuleLine::Raw(text),
         }
     }
-    // Router scale: `allow PREFIX if [ifindexes] action`.
-    if tokens.get(2) == Some(&"if") {
-        let prefix = tokens[1].to_string();
-        let Some((members, tail)) = bracket_set(&tokens[3..]) else {
-            return RuleLine::Raw(raw.to_string());
-        };
-        let ifindexes: Option<Vec<u32>> = members.iter().map(|m| m.parse().ok()).collect();
-        let Some(ifindexes) = ifindexes else {
-            return RuleLine::Raw(raw.to_string());
-        };
-        return match (polarity, tail.as_slice()) {
-            ("allow", [action]) => RuleLine::PrefixAllow {
-                prefix,
-                ifindexes,
-                action: (*action).to_string(),
-            },
-            ("block", [action]) => RuleLine::PrefixBlock {
-                prefix,
-                ifindexes,
-                action: (*action).to_string(),
-            },
-            _ => RuleLine::Raw(raw.to_string()),
-        };
-    }
-    RuleLine::Raw(raw.to_string())
-}
-
-/// Splits a token slice at its bracketed `[...]` set: the set's
-/// members and the tokens after the closing `]`. `None` when the
-/// slice does not start at `[` or the set never closes.
-fn bracket_set<'a>(tokens: &'a [&'a str]) -> Option<(Vec<String>, Vec<&'a str>)> {
-    let first = tokens.first()?;
-    if !first.starts_with('[') {
-        return None;
-    }
-    let mut end = 0;
-    while end < tokens.len() && !tokens[end].ends_with(']') {
-        end += 1;
-    }
-    if end == tokens.len() {
-        return None;
-    }
-    let inner = tokens[..=end].join(" ");
-    let inner = inner.trim_start_matches('[').trim_end_matches(']');
-    let members = inner
-        .split(", ")
-        .filter(|member| !member.is_empty())
-        .map(|member| member.to_string())
-        .collect();
-    Some((members, tokens[end + 1..].to_vec()))
 }
 
 /// The aligned rule table (two-space gutters; `-` marks a cell the

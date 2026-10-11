@@ -7,9 +7,10 @@
 //! an IPC protocol; if a future surface needs one, that is an owner
 //! decision.
 //!
-//! Layout: [`args`] parses the command line, [`status`] parses and
-//! re-renders `savd.status` while [`rousterd`] parses and renders
-//! `rousterd.status` (tolerantly — the daemons' formats may grow),
+//! Layout: [`args`] parses the command line, [`status`] renders
+//! `savd.status` while [`rousterd`] renders `rousterd.status` (both
+//! parsed by the ONE shared tolerant reader, `common::rundir` — the
+//! N8 consolidation; the daemons' formats may grow),
 //! [`liveness`] answers "is that pid alive", and [`run`] wires them
 //! into the operator-facing exit codes.
 

@@ -331,6 +331,14 @@ pub fn parse_savd(text: &str) -> SavStatus {
     )
 }
 
+impl SavStatus {
+    /// Parses a status file's content (the method form of
+    /// [`parse_savd`]). Never fails.
+    pub fn parse(text: &str) -> SavStatus {
+        parse_savd(text)
+    }
+}
+
 fn h_savd_header(state: &mut SavStatus, tokens: &[&str], _line: &str) -> bool {
     let (version, pid) = daemon_header(tokens);
     state.version = version;
@@ -538,6 +546,14 @@ pub fn parse_bfdd(text: &str) -> BfdStatus {
     )
 }
 
+impl BfdStatus {
+    /// Parses a status file's content (the method form of
+    /// [`parse_bfdd`]). Never fails.
+    pub fn parse(text: &str) -> BfdStatus {
+        parse_bfdd(text)
+    }
+}
+
 fn h_bfdd_header(state: &mut BfdStatus, tokens: &[&str], _line: &str) -> bool {
     let (version, pid) = daemon_header(tokens);
     state.version = version;
@@ -685,6 +701,25 @@ pub fn parse_rousterd(text: &str) -> RousterdStatus {
             entries: ROUSTERD_TABLE,
         },
     )
+}
+
+impl RousterdStatus {
+    /// Parses a status file's content (the method form of
+    /// [`parse_rousterd`]). Never fails.
+    pub fn parse(text: &str) -> RousterdStatus {
+        parse_rousterd(text)
+    }
+
+    /// The interfaces a `name` filter selects (all when `None`).
+    pub fn interfaces_matching(&self, name: Option<&str>) -> Vec<&IfaceLine> {
+        interfaces_matching(&self.interfaces, name)
+    }
+
+    /// The neighbours a `filter` selects (all when `None`): a bare
+    /// address or a CIDR prefix, either family.
+    pub fn neighbours_matching(&self, filter: Option<&str>) -> Vec<&NeighLine> {
+        neighbours_matching(&self.neighbours, filter)
+    }
 }
 
 fn h_rousterd_header(state: &mut RousterdStatus, tokens: &[&str], _line: &str) -> bool {

@@ -17,9 +17,10 @@
 //! v1 command table per mode; [`config`] is the parse-only session
 //! config tree (the quarantine-B7 observed frr.conf grammar subset,
 //! echoed by `show running-config`); [`savparse`]/[`bfdparse`]/
-//! [`ribparse`]/[`liveness`] re-read the run dir tolerantly (the
-//! rousterctl S3 conventions, kept in-crate so the two edge crates
-//! stay decoupled); [`render`] renders the `show` outputs;
+//! [`ribparse`]/[`liveness`] read the run dir through the ONE shared
+//! reader (`common::rundir`, the N8 consolidation — the first two
+//! are re-exports, the third is this crate's claim-less projection);
+//! [`render`] renders the `show` outputs;
 //! [`protocol`] pins the wire framing; [`server`]/[`client`] are the
 //! TCP halves; the `vtyd` binary wires config file, flags, and
 //! signals.
