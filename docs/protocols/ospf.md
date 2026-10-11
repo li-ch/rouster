@@ -261,14 +261,71 @@ fork it. The concrete seams, documented where they bite:
   said "none are originated yet" — stale since M4); a newer
   echoed self-summary is re-adopted, not flushed.
 
+## NSSA (2026-10-11, the N3 M2 slice — RFC 3101)
+
+- **`area <id> nssa [no-summary] [default-information-originate]`**
+  + `default-cost` reuse (metric of the area default). The
+  `default-information-originate` FRR knob is accepted for grammar
+  compatibility but is a no-op in behavior: RFC 3101 §2.4's "NSSA
+  border routers **must** originate an LSA for the default
+  destination into all their directly attached NSSAs" is implemented
+  unconditionally; FRR 10.2.2 conditions it on the NHT import check
+  (A23's `z5e` probe — `ospf_abr_nssa_type7_defaults` fires off the
+  NEXTHOP_UPDATE answer; our zedge has no NHT registration yet, so
+  the RFC form landed and the FRR difference is recorded here).
+- **The type-7 LSA** (`LsaType::NSSA`, header type 7): the body is
+  the AS-external shape (RFC 3101 Appendix C) — one `LsaBody::
+  AsExternal` serving both wire types; the P-bit rides the header
+  Options' N/P position (`Options::NP`).
+- **N-bit agreement** (RFC 3101 §2.1): NSSA Hellos/DBD Options carry
+  N set + E clear; §10.5 processing additionally verifies the N-bit
+  matches the area type and rejects E&N both set.
+- **Flooding scope** (§2.3): type-7s are area-scoped like types 1/2
+  — admitted only in their NSSA, discarded in normal/stub areas;
+  type-5s are still never flooded into an NSSA.
+- **Origination** (§2.4): a redistributed route becomes a type-7 in
+  every attached NSSA alongside the type-5 in the normal areas. The
+  P-bit follows the RFC's both-forms rule — set for an NSSA-internal
+  ASBR (with FA = the router's own NSSA interface address; P-set
+  demands non-zero FA per §2.3), clear for a border router that also
+  originates the type-5.
+- **The border defaults** (§2.4/§2.7): plain NSSA → type-7 default
+  (P clear, metric = default-cost); totally-NSSA (`no-summary`) →
+  type-3 default (§2.7's protection against diverting intra-AS
+  traffic out a type-7 default). Summaries (type-3s) are imported
+  into plain NSSAs; type-4s never are.
+- **§2.5 route calculation**: the type-7s of every attached NSSA are
+  examined alongside the type-5s — the ASBR/forwarding-address
+  lookups restricted to intra-area paths through the originating
+  NSSA ([NSSA] paragraphs verbatim), the border-router skip rules
+  for type-7 defaults, and §2.5 step (6)(e)'s preference ladder
+  (type-7-P-set > type-5 > type-7-P-clear, higher Router ID last).
+- **§3.2 translation**: the border router translates every
+  translatable type-7 (P set + non-zero FA) into a type-5 — same
+  network/mask/metric/FA/tag, advertising router = the translator,
+  flooded into the normal areas; flushed when the source stops being
+  translatable. v1 scope, disclosed: NSSATranslatorRole is
+  effectively Always (no Candidate election, no Nt bit, no
+  TranslatorStabilityInterval — single-ABR lab shape), no Type-7
+  address ranges, the type-7 default never translates, and §3.2's
+  LS-ID remapping on type-5 collisions is absent.
+- **Riding fixes**: the daemon now floods summary originations and
+  flushes on the real wire path (N2 built them into a dropped local
+  vector — only RxmtInterval retransmits delivered them), and §12.4
+  refresh re-originates every self-originated LSA (summaries and
+  externals used to age to MaxAge silently).
+
 ## §Deferred (updated day-3 anchors)
 
 - §16.3 (transit areas' summary-LSAs — only meaningful with virtual
   links, which set TransitCapability); incremental SPF (§16.5/§16.6);
-  virtual links (§15); NSSA areas (RFC 3101 — the area-kind plumbing
-  is in, type-7 is not); authentication
+  virtual links (§15); authentication
   (Appendix D); graceful restart (RFC 3623); DNA honoring; OSPFv3
   bodies (the ladder's codecs-only scope).
+- NSSA remainder: translator election (Nt bit, Candidate role,
+  TranslatorStabilityInterval — RFC 3101 §3.1), Type-7 address
+  ranges, §3.2 LS-ID remapping, the Appendix E P-bit-default
+  install technique, keyed-MD5 (AuType 2 legacy digest).
 - `area range` configuration — §12.4.3's address-range
   coalescing/DoNotAdvertise (the per-network default is implemented);
   §16.2 step (3)'s own-active-range check rides with it.

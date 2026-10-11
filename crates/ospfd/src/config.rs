@@ -94,12 +94,29 @@ pub enum AreaKind {
     /// LSAs (types 3/4) are not admitted either — the default is the
     /// only inter-area route.
     StubNoSummary,
+    /// `area <id> nssa` (RFC 3101): no type-5s, but type-7 externals
+    /// live in the area and the ABR translates the P-set ones into
+    /// type-5s for the transit topology.
+    Nssa {
+        no_summary: bool,
+        /// FRR's `nssa default-information-originate` — accepted for
+        /// grammar compatibility; the RFC-mandatory border default
+        /// (§2.4/§2.7) is originated either way (see docs).
+        default_information_originate: bool,
+    },
 }
 
 impl AreaKind {
-    /// §3.6/§10.5: ExternalRoutingCapability is false in stub areas.
+    /// §3.6/§10.5: ExternalRoutingCapability is false in stub areas
+    /// and in NSSAs (RFC 3101 §2.1: interfaces in an NSSA neither
+    /// send nor receive type-5s).
     pub fn external_capable(self) -> bool {
         matches!(self, AreaKind::Normal)
+    }
+
+    /// Type-7s may be originated/flooded (NSSA only, RFC 3101 §2.3).
+    pub fn nssa(self) -> bool {
+        matches!(self, AreaKind::Nssa { .. })
     }
 }
 
@@ -140,6 +157,28 @@ impl InterfaceConfig {
             network_type: NetworkType::Broadcast,
             mtu: 1500,
         }
+    }
+}
+
+/// Merge a re-declared area kind with the existing one (the nssa
+/// flags OR together — FRR accepts `area X nssa` then
+/// `area X nssa no-summary` as refinements).
+fn merge_area_kind(old: AreaKind, new: AreaKind) -> AreaKind {
+    match (old, new) {
+        (
+            AreaKind::Nssa {
+                no_summary: a,
+                default_information_originate: b,
+            },
+            AreaKind::Nssa {
+                no_summary: c,
+                default_information_originate: d,
+            },
+        ) => AreaKind::Nssa {
+            no_summary: a || c,
+            default_information_originate: b || d,
+        },
+        (_, n) => n,
     }
 }
 
@@ -248,6 +287,26 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                             [] => None,
                             ["stub"] => Some(AreaKind::Stub),
                             ["stub", "no-summary"] => Some(AreaKind::StubNoSummary),
+                            ["nssa"] => Some(AreaKind::Nssa {
+                                no_summary: false,
+                                default_information_originate: false,
+                            }),
+                            ["nssa", "no-summary"] => Some(AreaKind::Nssa {
+                                no_summary: true,
+                                default_information_originate: false,
+                            }),
+                            ["nssa", "default-information-originate"] => {
+                                Some(AreaKind::Nssa {
+                                    no_summary: false,
+                                    default_information_originate: true,
+                                })
+                            }
+                            ["nssa", "no-summary", "default-information-originate"] => {
+                                Some(AreaKind::Nssa {
+                                    no_summary: true,
+                                    default_information_originate: true,
+                                })
+                            }
                             ["default-cost", n] => {
                                 let cost = n.parse().ok().filter(|v| *v <= 0x00ff_ffff).ok_or_else(
                                     || {
@@ -287,7 +346,9 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                 ));
                             }
                             match cfg.areas.iter_mut().find(|a| a.id == raw) {
-                                Some(existing) => existing.kind = set,
+                                Some(existing) => {
+                                    existing.kind = merge_area_kind(existing.kind, set)
+                                }
                                 None => cfg.areas.push(AreaConfig {
                                     id: raw,
                                     kind: set,
@@ -639,6 +700,51 @@ router ospf
     }
 
     #[test]
+    fn nssa_area_config_parses() {
+        let cfg = parse("router ospf\n area 0.0.0.1 nssa\n").unwrap();
+        assert_eq!(
+            cfg.areas[0].kind,
+            AreaKind::Nssa {
+                no_summary: false,
+                default_information_originate: false
+            }
+        );
+        // The FRR knob forms.
+        let cfg = parse("router ospf\n area 0.0.0.1 nssa default-information-originate\n").unwrap();
+        assert!(matches!(
+            cfg.areas[0].kind,
+            AreaKind::Nssa {
+                default_information_originate: true,
+                ..
+            }
+        ));
+        let cfg =
+            parse("router ospf\n area 0.0.0.1 nssa no-summary default-information-originate\n")
+                .unwrap();
+        assert!(matches!(
+            cfg.areas[0].kind,
+            AreaKind::Nssa {
+                no_summary: true,
+                default_information_originate: true
+            }
+        ));
+        // Reopen merges the flags (FRR refinements).
+        let cfg =
+            parse("router ospf\n area 0.0.0.1 nssa\n area 0.0.0.1 nssa no-summary\n").unwrap();
+        assert!(matches!(
+            cfg.areas[0].kind,
+            AreaKind::Nssa {
+                no_summary: true,
+                ..
+            }
+        ));
+        // The backbone cannot be an NSSA (RFC 3101 §3.1's transit
+        // role presupposes a non-backbone area).
+        let err = parse("router ospf\n area 0.0.0.0 nssa\n").unwrap_err();
+        assert!(err.to_string().contains("backbone"), "{err}");
+    }
+
+    #[test]
     fn stub_area_config_is_strict() {
         // §3.6: the backbone cannot be a stub area.
         let err = parse("router ospf\n area 0.0.0.0 stub\n").unwrap_err();
@@ -648,7 +754,7 @@ router ospf
         let err = parse("router ospf\n area 0.0.0.0\n area 0.0.0.0 stub no-summary\n").unwrap_err();
         assert!(err.to_string().contains("backbone"), "{err}");
         // Unknown area parameter carries the line number.
-        let err = parse("router ospf\n area 0.0.0.1 nssa\n").unwrap_err();
+        let err = parse("router ospf\n area 0.0.0.1 frob\n").unwrap_err();
         assert!(err.to_string().contains("line 2"), "{err}");
         // Out-of-range default-cost.
         let err = parse("router ospf\n area 0.0.0.1 default-cost 16777216\n").unwrap_err();

@@ -535,6 +535,21 @@ pub fn process_hello(
             "E-bit mismatch with area external routing capability".into(),
         ));
     }
+    // RFC 3101 §2.1: the N-bit must match too ("a mismatch in the
+    // options causes processing of the received Hello packet to stop
+    // and the packet to be dropped"), and E and N may never both be
+    // set ("If the N-bit is set in the options field, the E-bit must
+    // be clear").
+    if hello.options.np_bit() != own.n_capable {
+        return Err(OspfError::Neighbor(
+            "N-bit mismatch with the area's NSSA capability (RFC 3101 §2.1)".into(),
+        ));
+    }
+    if hello.options.np_bit() && hello.options.e_bit() {
+        return Err(OspfError::Neighbor(
+            "both E and N bits set (RFC 3101 §2.1)".into(),
+        ));
+    }
     let _ = packet_router_id;
     // Every Hello fires HelloReceived; then the 2-way check.
     let mut events = vec![NeighborEvent::HelloReceived];
@@ -555,6 +570,8 @@ pub struct HelloParams {
     pub router_dead_interval: u32,
     /// Area ExternalRoutingCapability (E-bit).
     pub e_capable: bool,
+    /// Area NSSA capability (the Hello N-bit, RFC 3101 §2.1).
+    pub n_capable: bool,
     /// Point-to-point / virtual link: mask ignored on receive.
     pub p2p: bool,
 }
@@ -572,6 +589,11 @@ pub enum AreaAdmission {
     /// `area <id> stub no-summary`: no type-5s and no type-3/4s (FRR's
     /// totally stubby extension).
     StubNoSummary,
+    /// `area <id> nssa` (RFC 3101 §2.1): no type-5s, type-7s flood
+    /// within the NSSA like types 1/2 (§2.3).
+    Nssa,
+    /// `area <id> nssa no-summary` (FRR's totally-NSSA).
+    NssaNoSummary,
 }
 
 impl AreaAdmission {
@@ -580,9 +602,15 @@ impl AreaAdmission {
     /// receiver-side form discards it on arrival.
     pub fn admits(self, ls_type: crate::lsa::LsaType) -> bool {
         match self {
-            AreaAdmission::Normal => true,
-            AreaAdmission::Stub => ls_type != crate::lsa::LsaType::AS_EXTERNAL,
-            AreaAdmission::StubNoSummary => !matches!(
+            AreaAdmission::Normal => {
+                // RFC 3101 §2.3: type-7s are only flooded within
+                // their originating NSSA.
+                ls_type != crate::lsa::LsaType::NSSA
+            }
+            AreaAdmission::Stub | AreaAdmission::Nssa => {
+                ls_type != crate::lsa::LsaType::AS_EXTERNAL
+            }
+            AreaAdmission::StubNoSummary | AreaAdmission::NssaNoSummary => !matches!(
                 ls_type,
                 crate::lsa::LsaType::AS_EXTERNAL
                     | crate::lsa::LsaType::SUMMARY_NETWORK
@@ -713,6 +741,7 @@ mod tests {
             hello_interval: 10,
             router_dead_interval: 40,
             e_capable: true,
+            n_capable: false,
             p2p: true,
         }
     }

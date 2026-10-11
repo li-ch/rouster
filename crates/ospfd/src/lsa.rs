@@ -110,9 +110,13 @@ impl LsaType {
     /// Type 4: summary-LSA for an AS boundary router.
     pub const SUMMARY_ASBR: Self = Self(4);
     pub const AS_EXTERNAL: Self = Self(5);
+    /// Type 7: NSSA external (RFC 3101 §2.3) — the body is the
+    /// AS-external shape; the header's Options N/P bit position
+    /// carries the P-bit.
+    pub const NSSA: Self = Self(7);
 
     pub fn is_known_v2(self) -> bool {
-        matches!(self.0, 1..=5)
+        matches!(self.0, 1..=5 | 7)
     }
 
     pub fn name(self) -> &'static str {
@@ -122,6 +126,7 @@ impl LsaType {
             3 => "summary(network)",
             4 => "summary(ASBR)",
             5 => "AS-external",
+            7 => "NSSA-external",
             _ => "unknown",
         }
     }
@@ -571,6 +576,10 @@ impl Lsa {
             LsaType::SUMMARY_NETWORK => Self::decode_summary(r, false),
             LsaType::SUMMARY_ASBR => Self::decode_summary(r, true),
             LsaType::AS_EXTERNAL => Self::decode_external(r),
+            // RFC 3101 Appendix C: the type-7 body is identical to
+            // the AS-external shape (mask, E+metric, forwarding
+            // address, tag).
+            LsaType::NSSA => Self::decode_external(r),
             other => Err(OspfError::BadLsType(other.0)),
         }
     }

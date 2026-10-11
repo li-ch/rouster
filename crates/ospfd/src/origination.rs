@@ -205,6 +205,46 @@ pub fn build_summary_lsa(
     }
 }
 
+/// Build the type-7 NSSA-external-LSA for one external route
+/// imported into an NSSA (RFC 3101 §2.3/§2.4): the type-5 body shape
+/// with the header type 7, the P-bit in the header Options' N/P
+/// position, and the forwarding address the caller selected
+/// (§2.4's FA rules: a P-set LSA must carry a non-zero FA).
+pub fn build_nssa_lsa(
+    own: RouterId,
+    network: Ipv4Addr,
+    mask: Ipv4Addr,
+    metric: u32,
+    type2: bool,
+    forwarding_address: Ipv4Addr,
+    p_bit: bool,
+) -> Lsa {
+    let mut options = Options(0);
+    if p_bit {
+        options.0 |= Options::NP;
+    }
+    Lsa {
+        header: LsaHeader {
+            ls_age: 0,
+            options,
+            ls_type: LsaType::NSSA,
+            link_state_id: LinkStateId(u32::from(network)),
+            adv_router: own,
+            seq: 0,
+            checksum: 0,
+            length: 0,
+        },
+        body: LsaBody::AsExternal(AsExternalLsa {
+            mask,
+            e_bit: type2,
+            metric,
+            forwarding_address,
+            external_route_tag: 0,
+            tos: vec![],
+        }),
+    }
+}
+
 /// Build the AS-external-LSA for one redistributed route (§12.4.3).
 /// Type-2 (E-bit) with FRR's default metric 20; forwarding address
 /// 0.0.0.0 (the ASBR itself — §12.4.3's default when no dedicated
@@ -303,6 +343,44 @@ mod tests {
             panic!()
         };
         assert!(body.links.is_empty());
+    }
+
+    #[test]
+    fn type_seven_round_trips_with_p_bit_and_fa() {
+        // RFC 3101 Appendix C: the type-7 body is the type-5 shape;
+        // the P-bit rides the header Options' N/P position.
+        let lsa = crate::origination::build_nssa_lsa(
+            rid("1.1.1.1"),
+            ip("192.0.2.0"),
+            ip("255.255.255.0"),
+            20,
+            true,
+            ip("10.0.0.1"),
+            true,
+        );
+        assert_eq!(lsa.header.ls_type, crate::lsa::LsaType::NSSA);
+        assert!(lsa.header.options.np_bit(), "P-bit set");
+        let back = Lsa::decode(&lsa.encode()).unwrap();
+        assert_eq!(back.header.ls_type, crate::lsa::LsaType::NSSA);
+        assert!(back.header.options.np_bit(), "P-bit survives the codec");
+        let crate::lsa::LsaBody::AsExternal(ext) = &back.body else {
+            panic!("type-7 body decodes to the external shape")
+        };
+        assert_eq!(ext.forwarding_address, ip("10.0.0.1"));
+        assert_eq!(ext.mask, ip("255.255.255.0"));
+        assert!(ext.e_bit);
+        assert_eq!(ext.metric, 20);
+        // P clear form.
+        let lsa = crate::origination::build_nssa_lsa(
+            rid("1.1.1.1"),
+            ip("192.0.2.0"),
+            ip("255.255.255.0"),
+            20,
+            true,
+            ip("0.0.0.0"),
+            false,
+        );
+        assert!(!lsa.header.options.np_bit());
     }
 
     #[test]
