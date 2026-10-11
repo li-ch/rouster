@@ -136,6 +136,23 @@ enum SeqState {
     NeedsFlush { pending: u32 },
 }
 
+/// §13.4's outcome for one received self-originated LSA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readopt {
+    /// The received instance is newer than anything we originated:
+    /// tracking advanced one past it — re-originate.
+    Advanced,
+    /// At/below our own tracking (§13's steps 7/8 territory).
+    Stale,
+    /// The received instance sits at MaxSequenceNumber: flush before
+    /// the sequence restarts (§12.1.6) — prematurely age the stored
+    /// copy (§14.1).
+    NeedsFlush,
+    /// Not an LSA we originate (anymore) — the caller's §13.4 flush
+    /// policy decides (no route / no longer DR / Router ID changed).
+    NotOurs,
+}
+
 /// The typed link state database for one area (plus the global
 /// AS-external scope — v1 keeps one store; areas are §Deferred).
 #[derive(Debug, Default)]
@@ -372,6 +389,61 @@ impl Lsdb {
         let entry = self.map.get_mut(key)?;
         entry.lsa.header.ls_age = (entry.lsa.header.ls_age & crate::lsa::DO_NOT_AGE) | MAX_AGE;
         Some(entry.lsa.clone())
+    }
+
+    /// §13.4's re-adoption: a received instance of a self-originated
+    /// LSA is "newer than the last instance that the router actually
+    /// originated" (a pre-restart instance a peer still holds) — the
+    /// router must then advance its sequence tracking "one past the
+    /// received LS sequence number" so the next origination is the
+    /// newest in the domain.
+    ///
+    /// Returns `true` when the tracking advanced (the caller then
+    /// re-originates). Older/equal instances return `false` (§13's
+    /// steps 7/8 already answer them). A received instance at
+    /// MaxSequenceNumber cannot be advanced past (§12.1.6): the
+    /// tracking moves to the flush-before-restart state instead, and
+    /// the caller should prematurely age its stored copy (§14.1).
+    pub fn readopt_self_originated(&mut self, received: &Lsa) -> Readopt {
+        let key = received.key();
+        let Some(SeqState::Ready { next }) = self.self_seq.get(&key) else {
+            // Not ours to originate (anymore): nothing to adopt —
+            // the flush decision is the caller's policy.
+            return Readopt::NotOurs;
+        };
+        let recv = received.header.seq as i32;
+        let ours = *next as i32;
+        if recv < ours {
+            return Readopt::Stale;
+        }
+        if received.header.seq == crate::lsa::MAX_SEQUENCE_NUMBER {
+            // §12.1.6: nothing exists past MaxSequenceNumber — the
+            // old instance must be flushed before the sequence
+            // restarts at InitialSequenceNumber.
+            self.self_seq.insert(
+                key,
+                SeqState::NeedsFlush {
+                    pending: crate::lsa::MAX_SEQUENCE_NUMBER,
+                },
+            );
+            return Readopt::NeedsFlush;
+        }
+        self.self_seq.insert(
+            key,
+            SeqState::Ready {
+                next: received.header.seq + 1,
+            },
+        );
+        Readopt::Advanced
+    }
+
+    /// The next sequence number the LSDB would stamp for `key`
+    /// (operator surface / tests; `None` when never originated).
+    pub fn next_seq_for(&self, key: &LsaKey) -> Option<i32> {
+        match self.self_seq.get(key) {
+            Some(SeqState::Ready { next }) => Some(*next as i32),
+            _ => None,
+        }
     }
 
     /// Mark/unmark an LSA as sitting on a retransmission list (§14
@@ -854,5 +926,96 @@ mod tests {
             let best = best.unwrap();
             assert_eq!(newer_than(&stored, &best), Which::Identical);
         }
+    }
+
+    // ---- §13.4 re-adoption ----------------------------------------
+
+    fn originated_db(seq: u32) -> Lsdb {
+        // One self-originated instance at `seq` (as Lsdb::originate
+        // would have stamped it), tracking `seq + 1` next.
+        let mut db = Lsdb::new();
+        let mut lsa = normalize_local(&router_lsa(seq, 0, 10));
+        lsa.header.seq = seq;
+        let _ = db.install(lsa, false, 0);
+        // The self-seq tracking originate() maintains.
+        db.self_seq
+            .insert(router_lsa(0, 0, 0).key(), SeqState::Ready { next: seq + 1 });
+        db
+    }
+
+    #[test]
+    fn readopt_advances_one_past_a_newer_received_instance() {
+        // §13.4: "the router must then advance the LSA's LS sequence
+        // number one past the received LS sequence number" — a peer
+        // still holding our pre-restart instance (seq 0x80000005)
+        // while we restarted at InitialSequenceNumber.
+        let mut db = originated_db(INITIAL_SEQUENCE_NUMBER);
+        let received = normalize_local(&router_lsa(0x8000_0005, 0, 10));
+        assert_eq!(db.readopt_self_originated(&received), Readopt::Advanced);
+        assert_eq!(
+            db.next_seq_for(&received.key()),
+            Some(0x8000_0006u32 as i32),
+            "the next origination is one past the received instance"
+        );
+        // The re-origination that follows is accepted (MinLSInterval
+        // aside — inject time past it).
+        let mut fresh = router_lsa(0, 0, 10);
+        fresh.header.seq = 0xdead_beef; // overwritten by originate
+        let outcome = db.originate(normalize_local(&fresh), 10).unwrap();
+        assert!(matches!(outcome, InstallOutcome::Installed { .. }));
+        assert_eq!(
+            db.get(&received.key()).unwrap().lsa.header.seq,
+            0x8000_0006,
+            "the re-originated instance carries the advanced sequence"
+        );
+    }
+
+    #[test]
+    fn readopt_is_a_noop_on_stale_or_equal_instances() {
+        // Our tracking is at 0x80000006: the peer echoing our current
+        // instance (0x80000005) or an older one changes nothing.
+        let mut db = originated_db(0x8000_0005);
+        for seq in [0x8000_0001, 0x8000_0004, 0x8000_0005] {
+            let received = normalize_local(&router_lsa(seq, 0, 10));
+            assert_eq!(db.readopt_self_originated(&received), Readopt::Stale);
+            assert_eq!(
+                db.next_seq_for(&received.key()),
+                Some(0x8000_0006u32 as i32)
+            );
+        }
+    }
+
+    #[test]
+    fn readopt_at_max_sequence_number_takes_the_flush_path() {
+        // §13.4 meets §12.1.6: nothing exists past MaxSequenceNumber,
+        // so the tracking moves to flush-before-restart.
+        let mut db = originated_db(0x7fff_fffd);
+        let received = normalize_local(&router_lsa(MAX_SEQUENCE_NUMBER, 0, 10));
+        assert_eq!(db.readopt_self_originated(&received), Readopt::NeedsFlush);
+        // Originating is refused while the old instance is stored
+        // (the rollover guard); premature aging plus the §14 removal
+        // (the daemon's flush_ready loop) unlock the restart.
+        let mut fresh = router_lsa(0, 0, 10);
+        fresh.header.seq = 0;
+        assert!(db.originate(normalize_local(&fresh), 10).is_err());
+        assert!(db.premature_age(&received.key()).is_some());
+        db.remove(&received.key());
+        let outcome = db.originate(normalize_local(&fresh), 10).unwrap();
+        assert!(matches!(outcome, InstallOutcome::Installed { .. }));
+        assert_eq!(
+            db.get(&received.key()).unwrap().lsa.header.seq,
+            INITIAL_SEQUENCE_NUMBER,
+            "the sequence restarted at InitialSequenceNumber"
+        );
+    }
+
+    #[test]
+    fn readopt_reports_not_ours_for_foreign_lsas() {
+        // An LSA we do not originate (e.g. a summary we no longer
+        // advertise, or a network-LSA after losing DR) — the §13.4
+        // flush decision belongs to the caller's policy.
+        let mut db = Lsdb::new();
+        let foreign = normalize_local(&router_lsa(0x8000_0009, 0, 10));
+        assert_eq!(db.readopt_self_originated(&foreign), Readopt::NotOurs);
     }
 }

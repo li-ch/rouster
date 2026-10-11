@@ -35,7 +35,7 @@ use crate::config::{InterfaceConfig, NetworkType, OspfdConfig};
 use crate::exchange::{Conversation, ConversationParams, ConversationReport, Send};
 use crate::iface::InterfaceFsm;
 use crate::lsa::{Lsa, LsaKey, LsaType, Options, RouterId};
-use crate::lsdb::Lsdb;
+use crate::lsdb::{Lsdb, Readopt};
 use crate::neighbor::process_hello;
 use crate::neighbor::{HelloParams, NeighborEvent, NeighborState};
 use crate::origination::{build_external_lsa, build_router_lsa, InterfaceAdv};
@@ -306,6 +306,101 @@ impl Ospfd {
         }
     }
 
+    /// §13.4: whether the router currently wishes to originate the
+    /// LSA named by `key`. The "no longer wishes" cases drive the
+    /// flush: no advertisable route (externals), no longer DR for
+    /// the network (network-LSAs), and the Router-ID-changed shape
+    /// is handled by `is_our_network` below.
+    fn wants_to_originate(&self, key: &LsaKey) -> bool {
+        match key.ls_type {
+            // Our router-LSA: always (the router exists).
+            LsaType::ROUTER => true,
+            // §13.4 case 2: the network-LSA only while we are its DR.
+            LsaType::NETWORK => self.interfaces.iter().any(|i| {
+                u32::from(i.addr) == key.link_state_id.0
+                    && i.fsm.state == crate::iface::InterfaceState::Dr
+            }),
+            // §13.4 case 1: only while the redistributed route exists.
+            LsaType::AS_EXTERNAL => self.externals.values().any(|k| k == key),
+            // Summary-LSAs: the §12.4.3 set (inter-area, M4); none
+            // are originated yet, so any received self-summary is
+            // flushed.
+            _ => false,
+        }
+    }
+
+    /// §13.4's reception of self-originated LSAs, run after the LSU's
+    /// flooding install: by then the store holds the received
+    /// instance whenever it won §13.1, so this sees exactly the
+    /// adopted state. Two detections (§13.4): Advertising Router ==
+    /// our ID, or a network-LSA whose Link State ID is one of our
+    /// interface addresses.
+    fn after_self_originated(&mut self, lsas: &[Lsa], now: u64, out: &mut Vec<WireOut>) {
+        for lsa in lsas {
+            let is_self = lsa.header.adv_router == self.router_id;
+            let is_our_network = lsa.header.ls_type == LsaType::NETWORK
+                && self
+                    .interfaces
+                    .iter()
+                    .any(|i| u32::from(i.addr) == lsa.header.link_state_id.0);
+            if !is_self && !is_our_network {
+                continue;
+            }
+            let key = lsa.key();
+            // Only an instance that actually became our stored copy
+            // (won §13.1) triggers the special action; older echoes
+            // were answered by §13's steps 7/8, MaxAge ones are
+            // already flushing.
+            let Some(stored) = self.lsdb.get(&key) else {
+                continue;
+            };
+            if stored.lsa.header.seq != lsa.header.seq || stored.lsa.header.is_max_age() {
+                continue;
+            }
+            let stored = stored.lsa.clone();
+            if self.wants_to_originate(&key) {
+                match self.lsdb.readopt_self_originated(lsa) {
+                    Readopt::Advanced => {
+                        info!(key = ?key, "ospfd: adopting newer self-originated LSA (§13.4)");
+                        // Re-originate past it on the next tick
+                        // (MinLSInterval retries included).
+                        match key.ls_type {
+                            LsaType::ROUTER => self.router_lsa_dirty = true,
+                            LsaType::AS_EXTERNAL => {
+                                if let crate::lsa::LsaBody::AsExternal(ext) = &stored.body {
+                                    let prefix = Ipv4Prefix::new(
+                                        stored.header.link_state_id.to_ipv4(),
+                                        u32::from(ext.mask).count_ones() as u8,
+                                    )
+                                    .expect("external mask");
+                                    self.originate_external(prefix, ext.metric, now, out);
+                                }
+                            }
+                            // The network-LSA re-origination joins with
+                            // the broadcast-network daemon (§12.4.2).
+                            _ => {}
+                        }
+                    }
+                    Readopt::NeedsFlush => {
+                        // §12.1.6 met §13.4: prematurely age our copy
+                        // (§14.1) so the sequence can restart.
+                        if let Some(maxage) = self.lsdb.premature_age(&key) {
+                            self.flood_own(&maxage, now, out);
+                        }
+                    }
+                    Readopt::Stale | Readopt::NotOurs => {}
+                }
+            } else {
+                // §13.4's flush list: increment the received LSA's
+                // age to MaxAge and reflood (§14.1).
+                if let Some(maxage) = self.lsdb.premature_age(&key) {
+                    info!(key = ?key, "ospfd: flushing unwanted self-originated LSA (§13.4)");
+                    self.flood_own(&maxage, now, out);
+                }
+            }
+        }
+    }
+
     /// Flood one self-originated LSA to every Full neighbor (v1: the
     /// p2p unicast shape; §13.3's retransmission lists armed).
     fn flood_own(&mut self, lsa: &Lsa, now: u64, out: &mut Vec<WireOut>) {
@@ -444,13 +539,17 @@ impl Ospfd {
                     debug!(src = %received.src, "ospfd: conversation packet from unknown neighbor");
                     return out;
                 };
+                let mut received_lsas: Option<Vec<Lsa>> = None;
                 let (sends, report) = match &packet.body {
                     PacketBody::DbDescription(dd) => {
                         conv.handle_dbd(dd, peer, iface.cfg.mtu, &mut self.lsdb, now)
                     }
                     PacketBody::LsRequest(lsr) => conv.handle_lsr(lsr, &mut self.lsdb, now),
                     PacketBody::LsUpdate(lsu) => {
-                        conv.handle_lsu(&lsu.lsas, &mut self.lsdb, now, syncing)
+                        let (sends, report) =
+                            conv.handle_lsu(&lsu.lsas, &mut self.lsdb, now, syncing);
+                        received_lsas = Some(lsu.lsas.clone());
+                        (sends, report)
                     }
                     PacketBody::LsAck(ack) => {
                         conv.handle_lsack(&ack.headers);
@@ -459,6 +558,11 @@ impl Ospfd {
                     PacketBody::Hello(_) => unreachable!(),
                 };
                 out.extend(sends_into(iface_idx, sends));
+                // §13.4's self-originated reception, after the
+                // flooding install (see the method note).
+                if let Some(lsas) = received_lsas {
+                    self.after_self_originated(&lsas, now, &mut out);
+                }
                 self.after_report(iface_idx, &report, now);
             }
         }
@@ -1146,5 +1250,199 @@ mod tests {
             ext_routes.iter().any(|p| p == "198.51.100.0/24"),
             "B installed the redistributed external route: {ext_routes:?}"
         );
+    }
+
+    /// Run two cores (already constructed) to mutual Full adjacency.
+    /// Returns the clock at settlement.
+    fn run_to_full(a: &mut Ospfd, b: &mut Ospfd, mut now: u64) -> u64 {
+        let mut queue: Vec<(bool, Vec<WireOut>)> = Vec::new();
+        let mut zap: Vec<crate::zedge::ZedgeCommand> = Vec::new();
+        let mut oa = Vec::new();
+        let mut ob = Vec::new();
+        a.tick(now, &mut oa, &mut zap);
+        b.tick(now, &mut ob, &mut zap);
+        if !oa.is_empty() {
+            queue.push((true, oa));
+        }
+        if !ob.is_empty() {
+            queue.push((false, ob));
+        }
+        let full = |c: &Ospfd| {
+            c.neighbor_states()
+                .iter()
+                .any(|(_, _, s)| *s == NeighborState::Full)
+        };
+        let mut iterations = 0;
+        while !(full(a) && full(b)) && iterations < 300 {
+            iterations += 1;
+            while !queue.is_empty() {
+                let (from_a, sends) = queue.remove(0);
+                let replies = if from_a {
+                    pump(a, b, sends, now)
+                } else {
+                    pump(b, a, sends, now)
+                };
+                if !replies.is_empty() {
+                    queue.push((!from_a, replies));
+                }
+            }
+            now += 1;
+            let mut oa = Vec::new();
+            let mut ob = Vec::new();
+            a.tick(now, &mut oa, &mut zap);
+            b.tick(now, &mut ob, &mut zap);
+            if !oa.is_empty() {
+                queue.push((true, oa));
+            }
+            if !ob.is_empty() {
+                queue.push((false, ob));
+            }
+        }
+        assert!(iterations < 300, "adjacency never settled");
+        assert!(full(a) && full(b));
+        // Drain any residual exchange traffic.
+        while !queue.is_empty() {
+            let (from_a, sends) = queue.remove(0);
+            let replies = if from_a {
+                pump(a, b, sends, now)
+            } else {
+                pump(b, a, sends, now)
+            };
+            if !replies.is_empty() {
+                queue.push((!from_a, replies));
+            }
+        }
+        now
+    }
+
+    #[test]
+    fn restart_adopts_a_newer_self_originated_router_lsa_back() {
+        // §13.4's restart case (the W2-e §Deferred repro): B holds
+        // A's router-LSA at seq S when A restarts. A's fresh instance
+        // (InitialSequenceNumber) is OLDER; without the re-adoption A
+        // sticks at the stale instance forever. With it, A adopts the
+        // received instance, re-originates at S+1, and B accepts.
+        let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+        let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+        let now = run_to_full(&mut a, &mut b, 0);
+
+        // B's stored copy of A's router-LSA — the pre-restart
+        // instance A will be handed back.
+        let key = crate::lsa::LsaKey {
+            ls_type: crate::lsa::LsaType::ROUTER,
+            link_state_id: crate::lsa::LinkStateId(ip("10.255.1.1").into()),
+            adv_router: RouterId::from_ipv4(ip("10.255.1.1")),
+        };
+        let pre_restart = b.lsdb.get(&key).unwrap().lsa.clone();
+        let seq = pre_restart.header.seq;
+        assert!(
+            seq > crate::lsa::INITIAL_SEQUENCE_NUMBER,
+            "multiple originations happened"
+        );
+
+        // A restarts: a fresh core with the same Router ID. Its first
+        // router-LSA is at InitialSequenceNumber — older than the
+        // instance B holds.
+        let mut a2 = core_for("10.255.1.1", "eth0", "10.77.0.1");
+        let mut zap = Vec::new();
+        let mut oa = Vec::new();
+        a2.tick(now, &mut oa, &mut zap);
+        assert_eq!(
+            a2.lsdb.get(&key).unwrap().lsa.header.seq,
+            crate::lsa::INITIAL_SEQUENCE_NUMBER
+        );
+        // The re-established adjacency delivers B's copy through the
+        // normal DBD/LSR exchange (B's is newer than a2's).
+        let now2 = run_to_full(&mut a2, &mut b, now);
+
+        // §13.4 fired: the tracking advanced one past the received
+        // instance, and the re-origination (MinLSInterval past a2's
+        // first, hence the quiet ticks) consumed it — the stored
+        // instance carries S+1 (asserted below, after the drain).
+        assert!(
+            a2.lsdb.next_seq_for(&key).unwrap() > seq as i32,
+            "tracking advanced past the received instance"
+        );
+        let mut a2_seq = a2.lsdb.get(&key).unwrap().lsa.header.seq;
+        let mut settled = now2;
+        for _ in 0..12 {
+            if a2_seq == seq + 1 {
+                break;
+            }
+            settled += 1;
+            let mut oa = Vec::new();
+            let mut ob = Vec::new();
+            a2.tick(settled, &mut oa, &mut zap);
+            b.tick(settled, &mut ob, &mut zap);
+            for (from_a, sends) in [(true, oa), (false, ob)] {
+                let replies = if from_a {
+                    pump(&mut a2, &mut b, sends, settled)
+                } else {
+                    pump(&mut b, &mut a2, sends, settled)
+                };
+                if !replies.is_empty() {
+                    let _ = pump(&mut a2, &mut b, replies, settled);
+                }
+            }
+            a2_seq = a2.lsdb.get(&key).unwrap().lsa.header.seq;
+        }
+        assert_eq!(
+            a2.lsdb.get(&key).unwrap().lsa.header.seq,
+            seq + 1,
+            "the re-originated instance is one past the adopted one (§13.4)"
+        );
+        // B accepted it (§13.1: S+1 beats S).
+        assert_eq!(b.lsdb.get(&key).unwrap().lsa.header.seq, seq + 1);
+    }
+
+    #[test]
+    fn unwanted_self_originated_external_is_flushed() {
+        // §13.4's "no longer wishes to originate" flush: a peer echoes
+        // an AS-external LSA under our Router ID that is not in our
+        // redistributed set — it must be prematurely aged (§14.1) and
+        // the MaxAge instance reflooded, not adopted.
+        let mut a = core_for("10.255.1.1", "eth0", "10.77.0.1");
+        let mut b = core_for("10.255.2.1", "eth0", "10.77.0.2");
+        let now = run_to_full(&mut a, &mut b, 0);
+
+        // Hand A an LSU from B carrying "our" external LSA at a
+        // sequence well past anything A originated.
+        let foreign = crate::origination::build_external_lsa(
+            a.router_id,
+            ip("198.51.100.0"),
+            ip("255.255.255.0"),
+            20,
+            true,
+        );
+        let key = foreign.key();
+        let mut foreign = foreign.with_computed_header();
+        foreign.header.seq = crate::lsa::INITIAL_SEQUENCE_NUMBER + 40;
+        foreign = foreign.with_computed_header();
+        // The packet must carry B's Router ID (A drops packets it
+        // originates, §A.3.1's self-check).
+        let payload = b
+            .packet(PacketBody::LsUpdate(LsUpdate {
+                lsas: vec![foreign.clone()],
+            }))
+            .encode();
+        let out = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 1,
+        );
+        // The flush reflood went out and the stored copy is MaxAge.
+        assert!(
+            out.iter()
+                .any(|w| matches!(w.packet.body, PacketBody::LsUpdate(_))),
+            "the MaxAge instance is reflooded (§14.1)"
+        );
+        let stored = a.lsdb.get(&key).unwrap();
+        assert!(stored.lsa.header.is_max_age(), "flushed, not adopted");
+        // The re-adoption did NOT advance any tracking (no want).
+        assert!(!a.externals.values().any(|k| *k == key));
     }
 }
