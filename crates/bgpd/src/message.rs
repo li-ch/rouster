@@ -11,11 +11,9 @@
 
 use std::net::Ipv4Addr;
 
-use common::IpPrefix;
-
 use crate::attr::{
-    decode_attributes_with, decode_prefix, encode_attributes, encode_prefix, AsPath, Origin,
-    PathAttribute, UpdateHandling, UpdateReport,
+    decode_attributes_with, decode_nlri, encode_attributes, encode_nlri, AddPathCtx, AsPath, Nlri,
+    Origin, PathAttribute, UpdateHandling, UpdateReport,
 };
 use crate::capability::{decode_capabilities, encode_capabilities, Capability};
 use crate::error::{self, BgpError, BgpResult};
@@ -61,11 +59,21 @@ impl BgpMessage {
     }
 
     /// Full encoded frame (header + body), RFC-capped at 4096 octets.
+    /// Classic NLRI encoding; `encode_with` carries the ADD-PATH
+    /// direction (RFC 7911 §3).
     pub fn encode(&self, asn4: bool) -> BgpResult<Vec<u8>> {
+        self.encode_with(asn4, AddPathCtx::default())
+    }
+
+    /// [`Self::encode`] with the negotiated ADD-PATH direction: an
+    /// UPDATE's NLRI uses the extended encoding only where directed —
+    /// a nonzero Path Identifier outside it is refused by the codec
+    /// (RFC 7911 §5's send-side MUST), never silently flattened.
+    pub fn encode_with(&self, asn4: bool, addpath: AddPathCtx) -> BgpResult<Vec<u8>> {
         let mut body = Vec::new();
         match self {
             Self::Open(open) => open.encode(&mut body),
-            Self::Update(update) => update.encode(&mut body, asn4)?,
+            Self::Update(update) => update.encode(&mut body, asn4, addpath)?,
             Self::Notification(n) => n.encode(&mut body),
             Self::Keepalive => {}
             Self::RouteRefresh(rr) => rr.encode(&mut body),
@@ -85,19 +93,31 @@ impl BgpMessage {
     }
 
     /// Decodes one frame (header + body; `buf` must be exactly one
-    /// message — the session layer frames first).
+    /// message — the session layer frames first). Classic NLRI
+    /// encoding; `decode_with_handling` carries the ADD-PATH
+    /// direction (RFC 7911 §3).
     pub fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
-        Self::decode_with_handling(buf, asn4, UpdateHandling::StrictRfc4271).map(|(m, _)| m)
+        Self::decode_with_handling(
+            buf,
+            asn4,
+            UpdateHandling::StrictRfc4271,
+            AddPathCtx::default(),
+        )
+        .map(|(m, _)| m)
     }
 
-    /// [`Self::decode`] with RFC 7606 UPDATE error handling: a
-    /// malformed-but-salvageable UPDATE decodes to itself plus the
-    /// handling report (discarded attributes, treat-as-withdraw);
-    /// errors that keep the session reset still return `Err`.
+    /// [`Self::decode`] with RFC 7606 UPDATE error handling and the
+    /// negotiated ADD-PATH direction: extended NLRI (the 4-octet Path
+    /// Identifier per prefix, RFC 7911 §3) decodes only for the
+    /// families that negotiated it. A malformed-but-salvageable
+    /// UPDATE decodes to itself plus the handling report (discarded
+    /// attributes, treat-as-withdraw); errors that keep the session
+    /// reset still return `Err`.
     pub fn decode_with_handling(
         buf: &[u8],
         asn4: bool,
         handling: UpdateHandling,
+        addpath: AddPathCtx,
     ) -> BgpResult<(Self, UpdateReport)> {
         let mut r = Reader::new(buf);
         let marker = r.take(16).ok_or_else(|| BgpError::local("short header"))?;
@@ -149,7 +169,8 @@ impl BgpMessage {
         Ok(match msg_type {
             message_type::OPEN => (Self::Open(BgpOpen::decode(body)?), UpdateReport::default()),
             message_type::UPDATE => {
-                let (update, report) = BgpUpdate::decode_with_handling(body, asn4, handling)?;
+                let (update, report) =
+                    BgpUpdate::decode_with_handling(body, asn4, handling, addpath)?;
                 (Self::Update(update), report)
             }
             message_type::NOTIFICATION => (
@@ -243,20 +264,28 @@ impl BgpOpen {
         })
     }
 
-    /// The peer's ADD-PATH (RFC 7911 §2) Send/Receive values by
+    /// The peer's ADD-PATH (RFC 7911 §4) Send/Receive value for one
     /// family — 0 when the family is absent or the capability is not
-    /// offered. (1 = receive, 2 = send, 3 = both.)
+    /// offered. (1 = receive, 2 = send, 3 = both.) Per §4, a Send/
+    /// Receive value outside 1..=3 makes the *whole capability*
+    /// "treated as not understood and ignored": every family then
+    /// reads 0, not just the offending tuple.
     pub fn add_path(&self, afi: u16, safi: u8) -> u8 {
-        self.capabilities
+        let Some(tuples) = self.capabilities.iter().find_map(|c| match c {
+            Capability::AddPath(tuples) => Some(tuples),
+            _ => None,
+        }) else {
+            return 0;
+        };
+        // The §4 ignore rule keys on the capability as a unit: any
+        // invalid tuple voids the whole offer.
+        if tuples.iter().any(|t| !t.send_receive_valid()) {
+            return 0;
+        }
+        tuples
             .iter()
-            .find_map(|c| match c {
-                Capability::AddPath {
-                    afi: a,
-                    safi: s,
-                    send_receive,
-                } if *a == afi && *s == safi => Some(*send_receive),
-                _ => None,
-            })
+            .find(|t| t.afi == afi && t.safi == safi)
+            .map(|t| t.send_receive)
             .unwrap_or(0)
     }
 
@@ -429,12 +458,14 @@ fn append_param(caps: &mut Vec<Capability>, param_type: u8, value: &[u8]) -> Bgp
 
 /// An UPDATE message (RFC 4271 §4.3): withdrawn routes, path
 /// attributes, and NLRI. Multiprotocol routes ride MP_REACH/MP_UNREACH
-/// attributes instead of the top-level fields (RFC 4760).
+/// attributes instead of the top-level fields (RFC 4760). Each NLRI
+/// entry carries its ADD-PATH Path Identifier when the family
+/// negotiated one (RFC 7911 §3) — 0 for the classic encoding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BgpUpdate {
-    pub withdrawn: Vec<IpPrefix>,
+    pub withdrawn: Vec<Nlri>,
     pub attrs: Vec<PathAttribute>,
-    pub nlri: Vec<IpPrefix>,
+    pub nlri: Vec<Nlri>,
 }
 
 impl BgpUpdate {
@@ -463,8 +494,9 @@ impl BgpUpdate {
     }
 
     /// The prefixes this UPDATE announces, family-merged: top-level
-    /// NLRI (v4) plus any MP_REACH NLRI.
-    pub fn announced(&self) -> Vec<IpPrefix> {
+    /// NLRI (v4) plus any MP_REACH NLRI. Path IDs ride along
+    /// (RFC 7911): a withdrawal's key is the (prefix, path-id) pair.
+    pub fn announced(&self) -> Vec<Nlri> {
         let mut out = self.nlri.clone();
         for attr in &self.attrs {
             if let PathAttribute::MpReach(mp) = attr {
@@ -475,8 +507,8 @@ impl BgpUpdate {
     }
 
     /// The prefixes this UPDATE withdraws: top-level (v4) plus
-    /// MP_UNREACH.
-    pub fn withdrawn_all(&self) -> Vec<IpPrefix> {
+    /// MP_UNREACH, with their path IDs.
+    pub fn withdrawn_all(&self) -> Vec<Nlri> {
         let mut out = self.withdrawn.clone();
         for attr in &self.attrs {
             if let PathAttribute::MpUnreach(mp) = attr {
@@ -512,10 +544,15 @@ impl BgpUpdate {
         Ok(())
     }
 
-    pub(crate) fn encode(&self, out: &mut Vec<u8>, asn4: bool) -> BgpResult<()> {
+    pub(crate) fn encode(
+        &self,
+        out: &mut Vec<u8>,
+        asn4: bool,
+        addpath: AddPathCtx,
+    ) -> BgpResult<()> {
         let mut withdrawn = Vec::new();
-        for prefix in &self.withdrawn {
-            encode_prefix(&mut withdrawn, *prefix);
+        for nlri in &self.withdrawn {
+            encode_nlri(&mut withdrawn, nlri, addpath.v4)?;
         }
         if withdrawn.len() > u16::MAX as usize {
             return Err(BgpError::local("withdrawn routes exceed 65535 octets"));
@@ -524,34 +561,44 @@ impl BgpUpdate {
         out.extend_from_slice(&withdrawn);
 
         let mut attrs = Vec::new();
-        encode_attributes(&self.attrs, &mut attrs, asn4)?;
+        encode_attributes(&self.attrs, &mut attrs, asn4, addpath)?;
         if attrs.len() > u16::MAX as usize {
             return Err(BgpError::local("path attributes exceed 65535 octets"));
         }
         put_u16(out, attrs.len() as u16);
         out.extend_from_slice(&attrs);
 
-        for prefix in &self.nlri {
-            encode_prefix(out, *prefix);
+        for nlri in &self.nlri {
+            encode_nlri(out, nlri, addpath.v4)?;
         }
         Ok(())
     }
 
-    /// Strict [`Self::decode_with_handling`] (the tests' RFC 4271
-    /// expectations keep the session-reset shape).
+    /// Strict [`Self::decode_with_handling`] under the classic
+    /// encoding (the tests' RFC 4271 expectations keep the
+    /// session-reset shape).
     #[cfg(test)]
     fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
-        Self::decode_with_handling(buf, asn4, UpdateHandling::StrictRfc4271).map(|(u, _)| u)
+        Self::decode_with_handling(
+            buf,
+            asn4,
+            UpdateHandling::StrictRfc4271,
+            AddPathCtx::default(),
+        )
+        .map(|(u, _)| u)
     }
 
     /// [`Self::decode`] with RFC 7606 handling for the attribute
-    /// block (the withdrawn/NLRI framing rules are un-revised: a
-    /// message-level overrun stays Malformed Attribute List and NLRI
-    /// errors stay Invalid Network Field, both session resets).
+    /// block and the negotiated ADD-PATH direction for the v4
+    /// top-level fields (the withdrawn/NLRI framing rules are
+    /// un-revised: a message-level overrun stays Malformed Attribute
+    /// List and NLRI errors stay Invalid Network Field, both session
+    /// resets).
     pub(crate) fn decode_with_handling(
         buf: &[u8],
         asn4: bool,
         handling: UpdateHandling,
+        addpath: AddPathCtx,
     ) -> BgpResult<(Self, UpdateReport)> {
         let mut r = Reader::new(buf);
         let withdrawn_len = r
@@ -570,7 +617,7 @@ impl BgpUpdate {
         let mut wr = Reader::new(withdrawn_bytes);
         let mut withdrawn = Vec::new();
         while !wr.is_empty() {
-            withdrawn.push(decode_prefix(&mut wr, false)?);
+            withdrawn.push(decode_nlri(&mut wr, false, addpath.v4)?);
         }
 
         let attr_len = r
@@ -584,11 +631,11 @@ impl BgpUpdate {
                 "total path attribute length overruns UPDATE (§6.3)",
             )
         })?;
-        let decoded = decode_attributes_with(attr_bytes, asn4, handling)?;
+        let decoded = decode_attributes_with(attr_bytes, asn4, handling, addpath)?;
 
         let mut nlri = Vec::new();
         while !r.is_empty() {
-            nlri.push(decode_prefix(&mut r, false)?);
+            nlri.push(decode_nlri(&mut r, false, addpath.v4)?);
         }
 
         Ok((
@@ -1065,6 +1112,212 @@ mod tests {
         );
         assert_eq!(update.announced().len(), 2);
         assert_eq!(update.withdrawn_all().len(), 2);
+    }
+
+    /// RFC 7911 §3 golden: an UPDATE whose NLRI and withdrawn fields
+    /// carry the extended encoding — the 4-octet Path Identifier
+    /// before each prefix. Path ID 1, 203.0.113.0/24 is
+    /// `00000001 18 cb0071` on the wire, the RFC's own example shape.
+    #[test]
+    fn update_add_path_golden_bytes() {
+        let ctx = AddPathCtx {
+            v4: true,
+            v6: false,
+        };
+        let update = BgpUpdate {
+            withdrawn: vec![Nlri {
+                prefix: "198.51.100.0/24".parse().unwrap(),
+                path_id: 0x0102_0304,
+            }],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65002])),
+                PathAttribute::NextHop(id(2)),
+            ],
+            nlri: vec![Nlri {
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                path_id: 1,
+            }],
+        };
+        let frame = BgpMessage::Update(update.clone())
+            .encode_with(false, ctx)
+            .unwrap();
+        // frame = 19 header + 2+8 withdrawn + 2+18 attrs + 8 NLRI
+        // (4 id + 1 length + 3 address octets) = 57 (0x39).
+        let expected = unhex(
+            "ffffffffffffffffffffffffffffffff 0039 02 \
+             0008 01020304 18 c63364 \
+             0012 \
+             40 01 01 00 \
+             40 02 04 02 01 fdea \
+             40 03 04 0a000002 \
+             00000001 18 cb0071",
+        );
+        assert_eq!(frame, expected);
+        let (back, _) =
+            BgpMessage::decode_with_handling(&frame, false, UpdateHandling::StrictRfc4271, ctx)
+                .unwrap();
+        assert_eq!(back, BgpMessage::Update(update));
+        // Mixed path IDs on one prefix coexist as separate entries —
+        // the §5 replacement key.
+        let update = BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65002])),
+                PathAttribute::NextHop(id(2)),
+            ],
+            nlri: vec![
+                Nlri {
+                    prefix: "203.0.113.0/24".parse().unwrap(),
+                    path_id: 1,
+                },
+                Nlri {
+                    prefix: "203.0.113.0/24".parse().unwrap(),
+                    path_id: 2,
+                },
+            ],
+        };
+        let frame = BgpMessage::Update(update.clone())
+            .encode_with(false, ctx)
+            .unwrap();
+        let (back, _) =
+            BgpMessage::decode_with_handling(&frame, false, UpdateHandling::StrictRfc4271, ctx)
+                .unwrap();
+        assert_eq!(back, BgpMessage::Update(update));
+    }
+
+    /// RFC 7911 §3 applies wherever the session's NLRI encoding is
+    /// used: MP_REACH and MP_UNREACH prefix lists for v6 under the
+    /// negotiated (2,1) direction.
+    #[test]
+    fn update_add_path_mp_v6_round_trip() {
+        let ctx = AddPathCtx {
+            v4: false,
+            v6: true,
+        };
+        let update = BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::MpUnreach(MpUnreach {
+                    afi: 2,
+                    safi: 1,
+                    withdrawn: vec![Nlri {
+                        prefix: "2001:db8::/32".parse().unwrap(),
+                        path_id: 9,
+                    }],
+                }),
+                PathAttribute::MpReach(MpReach {
+                    afi: 2,
+                    safi: 1,
+                    next_hop: crate::attr::MpNextHop::V6 {
+                        global: "2001:db8::1".parse().unwrap(),
+                        link_local: None,
+                    },
+                    nlri: vec![
+                        Nlri {
+                            prefix: "2001:db8:aa::/48".parse().unwrap(),
+                            path_id: 1,
+                        },
+                        Nlri {
+                            prefix: "2001:db8:aa::/48".parse().unwrap(),
+                            path_id: 0xdead_beef,
+                        },
+                    ],
+                }),
+            ],
+            nlri: vec![],
+        };
+        let frame = BgpMessage::Update(update.clone())
+            .encode_with(true, ctx)
+            .unwrap();
+        let (back, _) =
+            BgpMessage::decode_with_handling(&frame, true, UpdateHandling::StrictRfc4271, ctx)
+                .unwrap();
+        assert_eq!(back, BgpMessage::Update(update.clone()));
+        // The v4 top-level fields stay classic under a v6-only
+        // negotiation: family-scoped, not session-global.
+        assert!(!ctx.for_family(1, 1));
+        // And a v4 classic NLRI in the same message decodes with
+        // path_id 0 (classic key) even under this ctx.
+        let mixed = BgpUpdate {
+            withdrawn: vec![],
+            attrs: update.attrs.clone(),
+            nlri: vec![Nlri::from(
+                "203.0.113.0/24".parse::<common::IpPrefix>().unwrap(),
+            )],
+        };
+        let frame = BgpMessage::Update(mixed.clone())
+            .encode_with(true, ctx)
+            .unwrap();
+        let (back, _) =
+            BgpMessage::decode_with_handling(&frame, true, UpdateHandling::StrictRfc4271, ctx)
+                .unwrap();
+        assert_eq!(back, BgpMessage::Update(mixed));
+    }
+
+    /// The /0 hazard, pinned (RFC 7911's only defense is the
+    /// capability gate): extended NLRI decoded under a CLASSIC
+    /// context reads the path ID's top octet as the prefix length —
+    /// path IDs 1..255 read as 0, i.e. 0.0.0.0/0 — and the decode
+    /// must NOT silently succeed with a poisoned default route. These
+    /// exact bytes error (the trailing garbage trips the length
+    /// validation); the gate itself (never decoding extended without
+    /// the negotiation) is what makes the aligned-poison case
+    /// unreachable in operation — capability trust, no heuristic.
+    #[test]
+    fn add_path_zero_hazard_classic_context_is_loud() {
+        // Extended encoding of (path 1, 203.0.113.0/24):
+        // 00 00 00 01 | 18 | cb 00 71 — classic eyes see length 0,
+        // 0, 0, then 1 (a /1 needing 1 octet = 0x18), then 0xcb = 203
+        // > 32 → INVALID_NETWORK_FIELD.
+        let body = unhex("0000 0000 00000001 18 cb0071");
+        let err = BgpUpdate::decode(&body, false).unwrap_err();
+        assert_eq!(
+            err.notification,
+            Some((3, error::update_subcode::INVALID_NETWORK_FIELD))
+        );
+    }
+
+    /// The mirror mis-gate: CLASSIC bytes under an extended context
+    /// read the first 4 prefix octets as the path ID — loud here too
+    /// (the /24 runs out of octets for its length byte).
+    #[test]
+    fn classic_nlri_under_add_path_ctx_is_loud() {
+        let ctx = AddPathCtx { v4: true, v6: true };
+        let body = unhex("0000 0000 18 cb0071");
+        let err = BgpUpdate::decode_with_handling(&body, false, UpdateHandling::StrictRfc4271, ctx)
+            .unwrap_err();
+        assert_eq!(
+            err.notification,
+            Some((3, error::update_subcode::INVALID_NETWORK_FIELD))
+        );
+    }
+
+    /// RFC 7911 §5's send-side MUST, enforced at the codec: a nonzero
+    /// Path Identifier is never emitted under the classic encoding —
+    /// refused loudly, not silently flattened to a corrupt frame.
+    #[test]
+    fn path_id_refused_without_negotiated_ctx() {
+        let update = BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65002])),
+                PathAttribute::NextHop(id(2)),
+            ],
+            nlri: vec![Nlri {
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                path_id: 7,
+            }],
+        };
+        assert!(BgpMessage::Update(update.clone()).encode(false).is_err());
+        // With the direction negotiated, the same message encodes.
+        let ctx = AddPathCtx {
+            v4: true,
+            v6: false,
+        };
+        assert!(BgpMessage::Update(update).encode_with(false, ctx).is_ok());
     }
 
     /// RFC 4724 §3 End-of-RIB markers: the v4-unicast one is the bare

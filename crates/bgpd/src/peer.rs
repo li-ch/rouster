@@ -24,9 +24,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::attr::{
-    AsPath, MpNextHop, MpReach, Origin, PathAttribute, UpdateHandling, UpdateReport,
+    AddPathCtx, AsPath, MpNextHop, MpReach, Nlri, Origin, PathAttribute, UpdateHandling,
+    UpdateReport,
 };
-use crate::capability::Capability;
+use crate::capability::{AddPathFamily, Capability};
 use crate::error::{self, BgpError, BgpResult};
 use crate::fsm::{Action, Event, Fsm, SessionConfig, State};
 use crate::message::{
@@ -43,10 +44,12 @@ pub struct PeerInfo {
 }
 
 /// Adj-RIB-In sink: everything a received UPDATE does to the RIB.
-/// M4's Loc-RIB implements this; tests record calls.
+/// M4's Loc-RIB implements this; tests record calls. Withdrawals
+/// carry the (prefix, path-id) pairs (RFC 7911 §5: the replacement
+/// key) — classic sessions use path-id 0.
 pub trait RouteSink: Send {
     fn announce(&mut self, peer: &PeerInfo, update: &BgpUpdate);
-    fn withdraw(&mut self, peer: &PeerInfo, prefixes: &[IpPrefix]);
+    fn withdraw(&mut self, peer: &PeerInfo, prefixes: &[Nlri]);
     /// "Deletes all routes associated with this connection" (the
     /// Established teardown rows).
     fn clear_peer(&mut self, peer: &PeerInfo);
@@ -88,7 +91,7 @@ pub trait RouteSink: Send {
 pub struct NullSink;
 impl RouteSink for NullSink {
     fn announce(&mut self, _: &PeerInfo, _: &BgpUpdate) {}
-    fn withdraw(&mut self, _: &PeerInfo, _: &[IpPrefix]) {}
+    fn withdraw(&mut self, _: &PeerInfo, _: &[Nlri]) {}
     fn clear_peer(&mut self, _: &PeerInfo) {}
 }
 
@@ -105,7 +108,7 @@ impl<T: RouteSink> RouteSink for SharedSink<T> {
     fn announce(&mut self, peer: &PeerInfo, update: &BgpUpdate) {
         self.0.lock().unwrap().announce(peer, update);
     }
-    fn withdraw(&mut self, peer: &PeerInfo, prefixes: &[IpPrefix]) {
+    fn withdraw(&mut self, peer: &PeerInfo, prefixes: &[Nlri]) {
         self.0.lock().unwrap().withdraw(peer, prefixes);
     }
     fn clear_peer(&mut self, peer: &PeerInfo) {
@@ -149,10 +152,12 @@ pub trait OutRib: Send + Sync {
 }
 
 /// A sink that records what arrived (tests + the in-process speaker).
+/// Keyed by (prefix, path-id) so ADD-PATH's sibling paths stay
+/// distinct (RFC 7911 §5).
 #[derive(Default)]
 pub struct RecordingSink {
-    pub announced: BTreeMap<IpPrefix, BgpUpdate>,
-    pub withdrawn: Vec<IpPrefix>,
+    pub announced: BTreeMap<Nlri, BgpUpdate>,
+    pub withdrawn: Vec<Nlri>,
     pub cleared: usize,
     /// RFC 4724 hooks: retain-stale calls, flush-stale calls, and the
     /// End-of-RIB (afi, safi) pairs.
@@ -163,11 +168,11 @@ pub struct RecordingSink {
 
 impl RouteSink for RecordingSink {
     fn announce(&mut self, _peer: &PeerInfo, update: &BgpUpdate) {
-        for prefix in update.announced() {
-            self.announced.insert(prefix, update.clone());
+        for nlri in update.announced() {
+            self.announced.insert(nlri, update.clone());
         }
     }
-    fn withdraw(&mut self, _peer: &PeerInfo, prefixes: &[IpPrefix]) {
+    fn withdraw(&mut self, _peer: &PeerInfo, prefixes: &[Nlri]) {
         self.withdrawn.extend_from_slice(prefixes);
     }
     fn clear_peer(&mut self, _peer: &PeerInfo) {
@@ -304,7 +309,7 @@ where
         out_rib: Option<Arc<dyn OutRib>>,
         mrai: Duration,
     ) -> Self {
-        let advertise = vec![
+        let mut advertise = vec![
             Capability::Multiprotocol { afi: 1, safi: 1 },
             Capability::Multiprotocol { afi: 2, safi: 1 },
             Capability::RouteRefresh,
@@ -312,6 +317,28 @@ where
                 asn: local.local_as,
             },
         ];
+        // RFC 7911 §4 (receive side): one capability instance, one
+        // Send/Receive-1 tuple per locally rx-enabled family. Never
+        // advertised by default (classic encoding); S/R 2/3 is the
+        // §Deferred send side.
+        let add_path_tuples = [
+            (local.add_path_rx_v4).then_some(AddPathFamily {
+                afi: 1,
+                safi: 1,
+                send_receive: 1,
+            }),
+            (local.add_path_rx_v6).then_some(AddPathFamily {
+                afi: 2,
+                safi: 1,
+                send_receive: 1,
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !add_path_tuples.is_empty() {
+            advertise.push(Capability::AddPath(add_path_tuples));
+        }
         let now = tokio::time::Instant::now();
         Self {
             io,
@@ -421,6 +448,23 @@ where
         }
     }
 
+    /// The ADD-PATH direction inbound UPDATEs decode under: extended
+    /// NLRI (RFC 7911 §3) only per the §5 negotiation — locally
+    /// configured rx AND the peer offered to send (S/R 2/3) for the
+    /// family. Everything else decodes classic; extended bytes under
+    /// a classic gate mis-parse (the path ID's top octet reads as a
+    /// prefix length — the /0 hazard), which is exactly why the gate
+    /// is the negotiated fact, not a wire guess.
+    fn current_add_path_ctx(&self) -> AddPathCtx {
+        match self.fsm.negotiated() {
+            Some(n) => AddPathCtx {
+                v4: n.add_path_rx_v4,
+                v6: n.add_path_rx_v6,
+            },
+            None => AddPathCtx::default(),
+        }
+    }
+
     /// Override the clock (tests).
     pub fn set_clock(&mut self, now: fn() -> Instant) {
         self.now = now;
@@ -471,8 +515,9 @@ where
             }
             let asn4 = self.fsm.negotiated().is_none_or(|n| n.asn4);
             let handling = self.current_update_handling();
+            let add_path = self.current_add_path_ctx();
             tokio::select! {
-                read = read_frame_with(&mut self.io, asn4, handling) => {
+                read = read_frame_with(&mut self.io, asn4, handling, add_path) => {
                     match read {
                         Ok(Ok((message, report))) => {
                             if let Some(end) = self.on_message(message, report, sink).await {
@@ -711,10 +756,10 @@ where
                     #[cfg(feature = "experimental-savnet")]
                     if let Some(agent) = &self.agent {
                         let source = sav::agent::SavEventSource::Bgp(self.sav_peer());
-                        for prefix in &gone {
+                        for nlri in &gone {
                             agent.on_event(sav::agent::SavAgentEvent::RouteWithdrawn {
                                 source: source.clone(),
-                                prefix: *prefix,
+                                prefix: nlri.prefix,
                             });
                         }
                     }
@@ -753,21 +798,23 @@ where
                 // Adj-RIB-In granularity — every announced/withdrawn
                 // prefix at the same point the RIB sink learns it
                 // (pre-best-path, the RFC 8704 §3.1 candidate space).
+                // ADD-PATH siblings report per prefix (the SAV view
+                // is prefix-shaped; path IDs are BGP-internal).
                 #[cfg(feature = "experimental-savnet")]
                 if let Some(agent) = &self.agent {
                     let source = sav::agent::SavEventSource::Bgp(self.sav_peer());
                     let nexthop = bgp_next_hop(&update);
-                    for prefix in update.announced() {
+                    for nlri in update.announced() {
                         agent.on_event(sav::agent::SavAgentEvent::RouteInstalled {
                             source: source.clone(),
-                            prefix,
+                            prefix: nlri.prefix,
                             nexthop,
                         });
                     }
-                    for prefix in &withdrawn {
+                    for nlri in &withdrawn {
                         agent.on_event(sav::agent::SavAgentEvent::RouteWithdrawn {
                             source: source.clone(),
-                            prefix: *prefix,
+                            prefix: nlri.prefix,
                         });
                     }
                 }
@@ -1008,18 +1055,26 @@ pub async fn read_frame<IO: AsyncRead + Unpin>(
     io: &mut IO,
     asn4: bool,
 ) -> io::Result<BgpResult<BgpMessage>> {
-    read_frame_with(io, asn4, UpdateHandling::StrictRfc4271)
-        .await
-        .map(|r| r.map(|(m, _)| m))
+    read_frame_with(
+        io,
+        asn4,
+        UpdateHandling::StrictRfc4271,
+        AddPathCtx::default(),
+    )
+    .await
+    .map(|r| r.map(|(m, _)| m))
 }
 
 /// [`read_frame`] with selectable UPDATE error handling: an RFC 7606
 /// mode returns salvageable UPDATEs together with their handling
-/// report instead of an error.
+/// report instead of an error. `add_path` carries the negotiated
+/// ADD-PATH direction (RFC 7911 §3): extended NLRI decodes only where
+/// both sides negotiated it.
 pub async fn read_frame_with<IO: AsyncRead + Unpin>(
     io: &mut IO,
     asn4: bool,
     handling: UpdateHandling,
+    add_path: AddPathCtx,
 ) -> io::Result<BgpResult<(BgpMessage, UpdateReport)>> {
     let mut header = [0u8; BGP_HEADER_LEN as usize];
     io.read_exact(&mut header).await?;
@@ -1042,7 +1097,9 @@ pub async fn read_frame_with<IO: AsyncRead + Unpin>(
     io.read_exact(&mut body).await?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
-    Ok(BgpMessage::decode_with_handling(&frame, asn4, handling))
+    Ok(BgpMessage::decode_with_handling(
+        &frame, asn4, handling, add_path,
+    ))
 }
 
 /// The v1 Adj-RIB-Out source: the `network` lines from the config,
@@ -1105,7 +1162,7 @@ pub fn originated_update(
                 PathAttribute::AsPath(path),
                 PathAttribute::NextHop(nh),
             ],
-            nlri: vec![IpPrefix::V4(p)],
+            nlri: vec![Nlri::from(IpPrefix::V4(p))],
         },
         (IpPrefix::V6(p), IpAddr::V6(nh)) => BgpUpdate {
             withdrawn: vec![],
@@ -1119,7 +1176,7 @@ pub fn originated_update(
                         global: nh,
                         link_local: None,
                     },
-                    nlri: vec![IpPrefix::V6(p)],
+                    nlri: vec![Nlri::from(IpPrefix::V6(p))],
                 }),
             ],
             nlri: vec![],
@@ -1134,7 +1191,7 @@ pub fn originated_update(
                 // shape in practice (kept total for the type system).
                 PathAttribute::NextHop(Ipv4Addr::UNSPECIFIED),
             ],
-            nlri: vec![IpPrefix::V4(p)],
+            nlri: vec![Nlri::from(IpPrefix::V4(p))],
         },
         (IpPrefix::V6(p), IpAddr::V4(nh)) => BgpUpdate {
             withdrawn: vec![],
@@ -1145,7 +1202,7 @@ pub fn originated_update(
                     afi: 2,
                     safi: 1,
                     next_hop: MpNextHop::V4(nh),
-                    nlri: vec![IpPrefix::V6(p)],
+                    nlri: vec![Nlri::from(IpPrefix::V6(p))],
                 }),
             ],
             nlri: vec![],
@@ -1154,14 +1211,15 @@ pub fn originated_update(
 }
 
 /// Builds the UPDATE that withdraws `prefixes` (v4 in the NLRI field,
-/// v6 via MP_UNREACH, per RFC 4760 §4).
+/// v6 via MP_UNREACH, per RFC 4760 §4). Classic withdrawals — path
+/// id 0 (locally originated routes have no ADD-PATH identity).
 pub fn withdrawal_update(prefixes: &[IpPrefix]) -> BgpUpdate {
     let mut update = BgpUpdate::default();
     let mut v6 = Vec::new();
     for prefix in prefixes {
         match prefix {
-            IpPrefix::V4(_) => update.nlri.push(*prefix),
-            IpPrefix::V6(_) => v6.push(*prefix),
+            IpPrefix::V4(_) => update.nlri.push(Nlri::from(*prefix)),
+            IpPrefix::V6(_) => v6.push(Nlri::from(*prefix)),
         }
     }
     if !v6.is_empty() {
@@ -1690,6 +1748,116 @@ mod tests {
         );
         let end = driver.await.unwrap();
         assert!(matches!(end, SessionEnd::Notified(3, _)));
+    }
+
+    // ---- RFC 7911 ADD-PATH receive (N5B) -----------------------------
+
+    /// The receive path end to end over the duplex pair: with
+    /// `addpath rx` configured our OPEN advertises S/R 1; the peer's
+    /// S/R 2 turns the effective direction on (§5's MUSTs); extended
+    /// NLRI — two paths of one prefix — lands keyed (prefix,
+    /// path-id); a per-path withdrawal carries exactly its id.
+    #[tokio::test]
+    async fn add_path_session_receives_extended_updates() {
+        let (ours, theirs) = duplex(8192);
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_rx_v4 = true;
+        let mut sess = PeerSession::new(
+            ours,
+            config,
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            None,
+            Duration::ZERO,
+        );
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        let mut peer = MalformedPeer {
+            io: theirs,
+            sink: sink.clone(),
+        };
+
+        // Our OPEN must carry the ADD-PATH capability, S/R 1 for v4.
+        let frame = read_bytes(&mut peer.io).await;
+        let our_open = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Open(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            our_open.capabilities.iter().any(|c| matches!(c,
+                Capability::AddPath(tuples)
+                    if tuples == &vec![AddPathFamily { afi: 1, safi: 1, send_receive: 1 }])),
+            "S/R 1 advertised once rx is configured: {:?}",
+            our_open.capabilities
+        );
+
+        // The peer offers to SEND (S/R 2) — the direction that lets a
+        // receive-configured speaker decode extended NLRI.
+        let mine = BgpOpen::new(
+            65001,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![Capability::AddPath(vec![AddPathFamily {
+                afi: 1,
+                safi: 1,
+                send_receive: 2,
+            }])],
+        );
+        write_bytes(&mut peer.io, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let frame = read_bytes(&mut peer.io).await;
+        assert_eq!(frame[18], message_type::KEEPALIVE);
+        write_bytes(&mut peer.io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        // Extended UPDATE: two sibling paths of one prefix.
+        let ctx = crate::attr::AddPathCtx {
+            v4: true,
+            v6: false,
+        };
+        let prefix: common::IpPrefix = "203.0.113.0/24".parse().unwrap();
+        let update = BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+            ],
+            nlri: vec![Nlri { prefix, path_id: 1 }, Nlri { prefix, path_id: 2 }],
+        };
+        let frame = BgpMessage::Update(update).encode_with(true, ctx).unwrap();
+        write_bytes(&mut peer.io, &frame).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        {
+            let sink = peer.sink.0.lock().unwrap();
+            assert!(
+                sink.announced.contains_key(&Nlri { prefix, path_id: 1 }),
+                "path 1 recorded: {:?}",
+                sink.announced.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                sink.announced.contains_key(&Nlri { prefix, path_id: 2 }),
+                "path 2 recorded as a sibling, not a replacement"
+            );
+        }
+
+        // Per-path withdrawal: only path 1 leaves.
+        let withdraw = BgpUpdate {
+            withdrawn: vec![Nlri { prefix, path_id: 1 }],
+            ..Default::default()
+        };
+        let frame = BgpMessage::Update(withdraw).encode_with(true, ctx).unwrap();
+        write_bytes(&mut peer.io, &frame).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        {
+            let sink = peer.sink.0.lock().unwrap();
+            assert_eq!(sink.withdrawn, vec![Nlri { prefix, path_id: 1 }]);
+        }
+        assert!(!driver.is_finished());
+        driver.abort();
     }
 
     /// A malformed AGGREGATOR (length 3) is attribute-discard only:

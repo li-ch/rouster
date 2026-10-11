@@ -31,7 +31,7 @@ use std::sync::Arc;
 use common::{IpPrefix, Nexthop, NexthopGroup, RouteEntry, RouteProtocol};
 use tracing::info;
 
-use crate::attr::{attr_type, AsPath, AsSegment, Origin, PathAttribute};
+use crate::attr::{attr_type, AsPath, AsSegment, Nlri, Origin, PathAttribute};
 use crate::message::BgpUpdate;
 use crate::peer::{PeerInfo, RouteSink};
 
@@ -67,10 +67,16 @@ pub struct Route {
     /// re-establishment without the R bit, or the restart timer); a
     /// re-advertised prefix simply replaces its stale entry.
     pub stale: bool,
+    /// RFC 7911 §2/§5: the Path Identifier this path arrived under
+    /// (ADD-PATH receive). 0 = the classic no-ADD-PATH key. Sibling
+    /// paths of one prefix from one peer differ here and only here;
+    /// the value is the peer's local matter — opaque, never assumed
+    /// stable across its restart (§5's GR caution).
+    pub path_id: u32,
 }
 
 impl Route {
-    /// The plain-route constructor (no RPKI state).
+    /// The plain-route constructor (no RPKI state, classic path id 0).
     pub fn new(
         prefix: IpPrefix,
         attrs: Vec<PathAttribute>,
@@ -86,6 +92,7 @@ impl Route {
             aspa: None,
             rs_client: false,
             stale: false,
+            path_id: 0,
         }
     }
 }
@@ -100,6 +107,7 @@ impl PartialEq for Route {
             && self.rov == other.rov
             && self.aspa == other.aspa
             && self.rs_client == other.rs_client
+            && self.path_id == other.path_id
     }
 }
 
@@ -318,8 +326,12 @@ pub struct BestChange {
 /// the session's OutRib plays).
 pub struct LocRib {
     local_as: u32,
-    /// peer address → (prefix → route)
-    adj_in: BTreeMap<IpAddr, BTreeMap<IpPrefix, Route>>,
+    /// peer address → ((prefix, path-id) → route). The key widens the
+    /// RFC 4271 implicit-replacement key by the ADD-PATH Path
+    /// Identifier (RFC 7911 §5: a new advertisement replaces only the
+    /// same (prefix, path-id); a *different* id from the same peer
+    /// coexists as a sibling path). Classic sessions live under id 0.
+    adj_in: BTreeMap<IpAddr, BTreeMap<Nlri, Route>>,
     best: BTreeMap<IpPrefix, Route>,
     /// The Phase 1 import policy (§9.2.1): typed filter + RPKI/OTC
     /// validation in W2-d; accept-all by default.
@@ -358,33 +370,38 @@ impl LocRib {
     }
 
     /// Adj-RIB-In update from one peer's UPDATE (announce side). Each
-    /// carried prefix runs the import policy (§9.2.1 Phase 1) before
-    /// entering the Adj-RIB-In: rejected prefixes never become
-    /// decision candidates; accepted ones may carry mutated
-    /// attributes.
+    /// carried path (prefix + its ADD-PATH identifier, RFC 7911 §3)
+    /// runs the import policy (§9.2.1 Phase 1) before entering the
+    /// Adj-RIB-In: rejected paths never become decision candidates;
+    /// accepted ones may carry mutated attributes.
     pub fn announce(&mut self, peer: &PeerInfo, update: &BgpUpdate) {
         let rib = self.adj_in.entry(peer.address).or_default();
         let internal = peer.remote_as == self.local_as;
         let rs_client = self.rs_clients.contains(&peer.address);
-        for prefix in update.announced() {
-            let mut route = Route::new(prefix, update.attrs.clone(), *peer, internal);
+        for nlri in update.announced() {
+            let mut route = Route::new(nlri.prefix, update.attrs.clone(), *peer, internal);
             route.rs_client = rs_client;
+            route.path_id = nlri.path_id;
             match self.import.import(route) {
                 Some(route) => {
-                    rib.insert(prefix, route);
+                    rib.insert(nlri, route);
                 }
                 None => {
-                    info!(peer = %peer.address, %prefix, "bgpd: route rejected by import policy");
+                    info!(peer = %peer.address, prefix = %nlri.prefix,
+                        path_id = nlri.path_id, "bgpd: route rejected by import policy");
                 }
             }
         }
     }
 
-    /// Adj-RIB-In withdrawals.
-    pub fn withdraw(&mut self, peer: &PeerInfo, prefixes: &[IpPrefix]) {
+    /// Adj-RIB-In withdrawals, keyed (prefix, path-id): RFC 7911 §5 —
+    /// removing one path of a prefix leaves its siblings; a key never
+    /// seen is "silently ignore" (the §5 SHOULD — a `BTreeMap::remove`
+    /// on an absent key is exactly that).
+    pub fn withdraw(&mut self, peer: &PeerInfo, nlris: &[Nlri]) {
         if let Some(rib) = self.adj_in.get_mut(&peer.address) {
-            for prefix in prefixes {
-                rib.remove(prefix);
+            for nlri in nlris {
+                rib.remove(nlri);
             }
         }
     }
@@ -465,6 +482,10 @@ impl LocRib {
 
     /// Re-run the decision process over every known prefix; returns
     /// the best-path changes (for export and re-advertisement).
+    /// ADD-PATH (RFC 7911 §5): every sibling path of a prefix is a
+    /// candidate — "the procedures for adding, deleting, and
+    /// advertising routes are unchanged" apart from the widened key —
+    /// and the Loc-RIB still elects exactly one best per prefix.
     pub fn recompute(&mut self) -> Vec<BestChange> {
         // Union of the candidates' prefixes and the current best
         // table: a prefix whose every candidate vanished must still
@@ -472,9 +493,8 @@ impl LocRib {
         let mut prefixes: Vec<IpPrefix> = self
             .adj_in
             .values()
-            .flat_map(|rib| rib.keys())
-            .chain(self.best.keys())
-            .copied()
+            .flat_map(|rib| rib.values().map(|r| r.prefix))
+            .chain(self.best.keys().copied())
             .collect();
         prefixes.sort();
         prefixes.dedup();
@@ -483,7 +503,8 @@ impl LocRib {
             let candidates: Vec<Route> = self
                 .adj_in
                 .values()
-                .filter_map(|rib| rib.get(&prefix).cloned())
+                .flat_map(|rib| rib.values().filter(|r| r.prefix == prefix))
+                .cloned()
                 .collect();
             let new_best = best_path(&candidates).cloned();
             let old_best = self.best.get(&prefix).cloned();
@@ -543,9 +564,9 @@ impl RouteSink for RibSink {
         self.changes.extend(rib.recompute());
     }
 
-    fn withdraw(&mut self, peer: &PeerInfo, prefixes: &[IpPrefix]) {
+    fn withdraw(&mut self, peer: &PeerInfo, nlris: &[Nlri]) {
         let mut rib = self.rib.lock().unwrap();
-        rib.withdraw(peer, prefixes);
+        rib.withdraw(peer, nlris);
         self.changes.extend(rib.recompute());
     }
 
@@ -645,7 +666,7 @@ impl crate::peer::OutRib for LocRibOut {
             .networks
             .advertisements(afi, safi, next_hop, to_peer, internal)
         {
-            let Some(prefix) = update.announced().first().copied() else {
+            let Some(prefix) = update.announced().first().map(|n| n.prefix) else {
                 updates.push(update);
                 continue;
             };
@@ -738,7 +759,12 @@ impl crate::peer::OutRib for LocRibOut {
                 updates.push(BgpUpdate {
                     withdrawn: vec![],
                     attrs,
-                    nlri: vec![exported.prefix],
+                    // Classic path id 0: re-advertised routes get OUR
+                    // encoding (RFC 7911 §2 — a re-advertiser "MUST
+                    // generate its own Path Identifier" — that send
+                    // side, with its per-peer allocator, is §Deferred;
+                    // v1 advertises the single best path per prefix).
+                    nlri: vec![Nlri::from(exported.prefix)],
                 });
             }
         }
@@ -1046,6 +1072,106 @@ mod tests {
         rib.announce(&p, &u);
         rib.recompute();
         assert!(rib.recompute().is_empty(), "no change, no event");
+    }
+
+    // ---- RFC 7911 ADD-PATH receive semantics (N5B) ------------------
+
+    fn path_update(prefix: &str, path_id: u32, med: Option<u32>) -> BgpUpdate {
+        BgpUpdate {
+            attrs: base_attrs(vec![65001], med),
+            nlri: vec![Nlri {
+                prefix: prefix.parse().unwrap(),
+                path_id,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn path_nlri(prefix: &str, path_id: u32) -> Nlri {
+        Nlri {
+            prefix: prefix.parse().unwrap(),
+            path_id,
+        }
+    }
+
+    /// RFC 7911 §5: the replacement key widens to (prefix, path-id) —
+    /// sibling paths from ONE peer coexist (no implicit replacement),
+    /// a re-advertisement of the same key replaces, and a per-path
+    /// withdrawal leaves the sibling alone.
+    #[test]
+    fn add_path_siblings_coexist_and_replace_by_key() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        rib.announce(&p, &path_update("203.0.113.0/24", 1, None));
+        rib.announce(&p, &path_update("203.0.113.0/24", 2, None));
+        assert_eq!(rib.route_count(), 2, "two sibling paths coexist");
+        rib.recompute();
+        assert_eq!(rib.best_routes().count(), 1, "one best per prefix");
+
+        // Same (prefix, path-id): replaces, not a third entry — and
+        // the replacement's new attributes surface as a best-path
+        // event (the winner is still path 1, raised by LOCAL_PREF).
+        let mut better = path_update("203.0.113.0/24", 1, None);
+        better.attrs.push(PathAttribute::LocalPref(200));
+        rib.announce(&p, &better);
+        assert_eq!(rib.route_count(), 2);
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 1, "the best route's attrs changed");
+        assert_eq!(changes[0].best.as_ref().unwrap().path_id, 1);
+
+        // Withdrawing path 1 leaves path 2.
+        rib.withdraw(&p, &[path_nlri("203.0.113.0/24", 1)]);
+        assert_eq!(rib.route_count(), 1);
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 1, "the best may flip to the sibling");
+        assert_eq!(changes[0].best.as_ref().unwrap().path_id, 2);
+    }
+
+    /// §5's SHOULD: "withdraw a prefix with a Path Identifier not seen
+    /// before → silently ignore" — an unseen key is a no-op (and a
+    /// CLASSIC withdrawal of a prefix stored only under path ids hits
+    /// the same rule: key (prefix, 0) was never announced).
+    #[test]
+    fn add_path_withdraw_unseen_key_silently_ignored() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        rib.announce(&p, &path_update("203.0.113.0/24", 5, None));
+        rib.recompute();
+        rib.withdraw(&p, &[path_nlri("203.0.113.0/24", 99)]);
+        assert_eq!(rib.route_count(), 1, "unseen path id ignored");
+        rib.withdraw(&p, &[path_nlri("203.0.113.0/24", 0)]);
+        assert_eq!(rib.route_count(), 1, "classic key never announced");
+        assert!(rib.recompute().is_empty(), "no best-path effect");
+        // The real key still withdraws cleanly.
+        rib.withdraw(&p, &[path_nlri("203.0.113.0/24", 5)]);
+        assert_eq!(rib.route_count(), 0);
+        assert!(rib.recompute()[0].best.is_none());
+    }
+
+    /// §5: "the procedures ... are otherwise unchanged" — sibling
+    /// paths are ordinary decision candidates; best_path picks by the
+    /// §9.1.2.2 ladder (MED here), the Loc-RIB keeps exactly one best
+    /// per prefix, and per-path withdrawal can flip it.
+    #[test]
+    fn add_path_siblings_are_decision_candidates() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        rib.announce(&p, &path_update("203.0.113.0/24", 1, Some(200)));
+        rib.announce(&p, &path_update("203.0.113.0/24", 2, Some(10)));
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].best.as_ref().unwrap().path_id, 2, "lower MED");
+        // Losing the winner flips the best to the sibling.
+        rib.withdraw(&p, &[path_nlri("203.0.113.0/24", 2)]);
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].best.as_ref().unwrap().path_id, 1);
+        // Sibling paths from two peers mix into one candidate set.
+        let q = peer("192.0.2.2", 65002, 2);
+        rib.announce(&q, &path_update("203.0.113.0/24", 7, Some(500)));
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 0, "existing best (MED 200) still wins");
+        assert_eq!(rib.route_count(), 2);
     }
 
     #[test]

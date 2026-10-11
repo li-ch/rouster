@@ -169,6 +169,49 @@ announced to that peer are not modified"). v1 semantics:
   presence + R bit coarsely), the RFC 8542 long-lived stale timers,
   BFD-triggered early flush.
 
+### ADD-PATH receive (N5B, RFC 7911)
+
+- **Scope: receive-only, both unicast families.** `neighbor X addpath
+  rx` (off by default, BIRD-shaped — FRR's receive side is default-on
+  with `disable-addpath-rx`; ours is opt-in) advertises capability 69
+  with Send/Receive 1 for v4+v6 in ONE instance (§4's single-instance
+  MUST — the capability model carries a tuple list). The knob parses
+  nothing else: `addpath tx`/`both` are startup errors naming the
+  §Deferred send side, never silently-dead knobs.
+- **Negotiation (§5's MUSTs)**: `Negotiated.add_path_rx_v4/v6` is
+  the effective receive direction — locally configured rx AND the
+  peer offered S/R 2 or 3 for the family. A Send/Receive value
+  outside 1..=3 makes the whole capability "treated as not
+  understood and ignored" (§4) — every family reads 0 then, not just
+  the offending tuple.
+- **Extended NLRI (§3)**: when (and only when) the direction is on,
+  every NLRI field of that family — top-level NLRI and withdrawn for
+  v4, MP_REACH/MP_UNREACH lists for v6 — decodes and encodes as
+  `Path Identifier (4) | Length (1) | Prefix`. The context is a
+  session fact threaded like `asn4` (`AddPathCtx`), never a wire
+  fact. The codec refuses a nonzero path id under the classic gate
+  (§5's send-side MUST, loud local error — never silently flattened).
+- **The /0 hazard, pinned**: extended bytes under a classic gate read
+  the path ID's top octet as the prefix length — ids 1..255 decode as
+  `0.0.0.0/0` with trailing garbage. Posture is **capability trust**:
+  the negotiation gate is the correctness mechanism (both tests that
+  mis-gated decode error loudly with INVALID_NETWORK_FIELD; the
+  aligned-poison case is unreachable in operation because the decode
+  context comes from the OPENs, not the bytes). No defensive
+  heuristic — legitimate default routes would not survive one.
+- **Storage (§5)**: Adj-RIB-In is keyed (peer, prefix, path-id) —
+  sibling paths from one peer coexist, the same key replaces, a
+  withdrawal of an unseen key is silently ignored (§5 SHOULD), and
+  the decision process is otherwise unchanged: every sibling is an
+  ordinary §9.1 candidate, the Loc-RIB still elects exactly one best
+  per prefix, zebra sees no difference. Path IDs are the peer's
+  local, opaque matter (§2) — never assumed stable across its
+  restart (the §5 GR caution).
+- Interop: `scripts/test-bgp-addpath-interop.sh` — a real FRR 10.2.2
+  hub (`addpath-tx-best-selected 2`, two leaf ASes announcing the
+  same prefix) sends two paths; asserted on our side: two distinct
+  path ids logged, session clean, exactly one kernel route.
+
 ### RPKI (W2-d)
 
 - **ROV** (RFC 6811 §2): validity computed at import from the VRP
@@ -210,6 +253,7 @@ router bgp 65000
  neighbor 192.0.2.9 update-error-handling rfc7606   # default | strict-rfc4271 (N5)
  neighbor 192.0.2.9 route-server        # RS client, transparent reflection (N5)
  neighbor 192.0.2.9 graceful-restart 120  # sending-side capability 1..=4095 (N5)
+ neighbor 192.0.2.9 addpath rx           # RFC 7911 receive, default off (N5B)
  network 203.0.113.0/24
  import INBOUND                         # names a route-map (below)
  export OUTBOUND
@@ -260,11 +304,15 @@ graceful restart: the restarting-speaker machinery (forwarding-state
 preservation, R bit on our restart, selection deferral), per-family
 F-bit granularity, RFC 8542 long-lived stale, BFD early flush ·
 route next-hop resolution (v1: single-hop peers only) · v6 listener
-side · ADD-PATH (RFC 7911): capability 69 codec + per-family
-Send/Receive negotiation landed (N5B foundation, `Negotiated.add_path_v4/v6`);
-the per-path NLRI decode (4-octet Path Identifier before each prefix)
-and Adj-RIB-In storage keyed by (peer, path-id, prefix) are the next
-slice · interface up/down mirror tracking.
+side · ADD-PATH (RFC 7911) send side: the per-peer path-ID allocator
+(FRR-style monotonic counter is a convention, not an RFC MUST — §2
+requires only per-neighbor uniqueness and own-ID regeneration on
+re-advertisement), the selection modes (all-paths /
+best-per-AS / best-selected N, FRR's knob semantics), the
+"SHOULD include the best path" rule, per-family knob granularity,
+and the pre-RFC PATHS-LIMIT / dynamic-capability IDR drafts
+(explicitly out) — the receive side (capability, extended-NLRI codec,
+keyed Adj-RIB-In) landed (N5B) · interface up/down mirror tracking.
 
 The `experimental-savnet` hook LANDED (2026-10-11) behind the flag,
 in-process only: `peer.rs` `on_message`'s UPDATE arm reports

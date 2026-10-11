@@ -277,7 +277,7 @@ pub struct MpReach {
     pub afi: u16,
     pub safi: u8,
     pub next_hop: MpNextHop,
-    pub nlri: Vec<IpPrefix>,
+    pub nlri: Vec<Nlri>,
 }
 
 /// MP_UNREACH_NLRI (attribute 15, RFC 4760 §4).
@@ -285,7 +285,7 @@ pub struct MpReach {
 pub struct MpUnreach {
     pub afi: u16,
     pub safi: u8,
-    pub withdrawn: Vec<IpPrefix>,
+    pub withdrawn: Vec<Nlri>,
 }
 
 /// One path attribute, typed for the ones v1 understands.
@@ -362,7 +362,10 @@ impl PathAttribute {
         }
     }
 
-    fn encode_value(&self, out: &mut Vec<u8>, asn4: bool) {
+    /// Encodes the attribute value. `addpath` carries the negotiated
+    /// ADD-PATH direction for the MP fields' family (RFC 7911 §3) —
+    /// the classic encoding when off.
+    fn encode_value(&self, out: &mut Vec<u8>, asn4: bool, addpath: AddPathCtx) -> BgpResult<()> {
         match self {
             Self::Origin(o) => out.push(o.as_u8()),
             Self::AsPath(p) => p.encode(out, asn4),
@@ -395,19 +398,20 @@ impl PathAttribute {
                 out.push(nh_len as u8);
                 out.extend_from_slice(&nh);
                 out.push(0); // Reserved: MUST be 0 (RFC 4760 §3)
-                for prefix in &mp.nlri {
-                    encode_prefix(out, *prefix);
+                for nlri in &mp.nlri {
+                    encode_nlri(out, nlri, addpath.for_family(mp.afi, mp.safi))?;
                 }
             }
             Self::MpUnreach(mp) => {
                 put_u16(out, mp.afi);
                 out.push(mp.safi);
-                for prefix in &mp.withdrawn {
-                    encode_prefix(out, *prefix);
+                for nlri in &mp.withdrawn {
+                    encode_nlri(out, nlri, addpath.for_family(mp.afi, mp.safi))?;
                 }
             }
             Self::Unknown { value, .. } => out.extend_from_slice(value),
         }
+        Ok(())
     }
 }
 
@@ -475,6 +479,111 @@ pub fn decode_prefix(r: &mut Reader<'_>, v6: bool) -> BgpResult<IpPrefix> {
 
 fn prefix_bytes(len: u8) -> usize {
     (len as usize).div_ceil(8)
+}
+
+/// One NLRI entry: a prefix plus, under ADD-PATH (RFC 7911 §3), the
+/// 4-octet Path Identifier that precedes it on the wire. `path_id`
+/// is 0 for the classic encoding — the no-ADD-PATH key — and an
+/// opaque, per-neighbor, locally assigned number otherwise (§2: a
+/// receiver "should not assume that the identifier carries any
+/// particular semantics"; a re-advertiser MUST generate its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct Nlri {
+    pub prefix: IpPrefix,
+    pub path_id: u32,
+}
+
+impl From<IpPrefix> for Nlri {
+    fn from(prefix: IpPrefix) -> Self {
+        Self { prefix, path_id: 0 }
+    }
+}
+
+impl std::fmt::Display for Nlri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.path_id != 0 {
+            write!(f, "path {} {}", self.path_id, self.prefix)
+        } else {
+            write!(f, "{}", self.prefix)
+        }
+    }
+}
+
+impl std::str::FromStr for Nlri {
+    type Err = common::PrefixError;
+    /// Parses the prefix form (path_id 0) — the shape tests and show
+    /// output use; ADD-PATH IDs arrive on the wire, never in text.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<IpPrefix>().map(Self::from)
+    }
+}
+
+/// Which families this session decodes/encodes with the ADD-PATH
+/// extended NLRI (RFC 7911 §3): the negotiated per-`<AFI, SAFI>`
+/// direction, a session fact like `asn4` — never a wire fact. Off by
+/// default (the RFC 4271 classic encoding); v1 fills it only from the
+/// *receive* negotiation (send side §Deferred).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AddPathCtx {
+    /// Extended encoding active for (AFI 1, SAFI 1) — the top-level
+    /// NLRI and withdrawn-routes fields.
+    pub v4: bool,
+    /// Extended encoding active for (AFI 2, SAFI 1) — the MP fields.
+    pub v6: bool,
+}
+
+impl AddPathCtx {
+    /// The context for one family's fields (unknown families never
+    /// negotiate ADD-PATH in v1).
+    pub fn for_family(self, afi: u16, safi: u8) -> bool {
+        match (afi, safi) {
+            (1, 1) => self.v4,
+            (2, 1) => self.v6,
+            _ => false,
+        }
+    }
+}
+
+/// [`encode_prefix`] with the optional ADD-PATH Path Identifier
+/// prepended (RFC 7911 §3: `Path Identifier (4) | Length (1) |
+/// Prefix`). `path_id: false` keeps the classic encoding. A nonzero
+/// Path Identifier under the classic gate is REFUSED, not silently
+/// flattened: RFC 7911 §5's MUST is that extended NLRI leaves only
+/// toward a peer that negotiated it (mis-gating here would corrupt
+/// the peer's NLRI parse — the /0 hazard in reverse).
+pub fn encode_nlri(out: &mut Vec<u8>, nlri: &Nlri, path_id: bool) -> BgpResult<()> {
+    if nlri.path_id != 0 && !path_id {
+        return Err(BgpError::local(format!(
+            "NLRI path id {} encoded without negotiated ADD-PATH (RFC 7911 §5)",
+            nlri.path_id
+        )));
+    }
+    if path_id {
+        out.extend_from_slice(&nlri.path_id.to_be_bytes());
+    }
+    encode_prefix(out, nlri.prefix);
+    Ok(())
+}
+
+/// [`decode_prefix`] under the ADD-PATH extended encoding: reads the
+/// 4-octet Path Identifier before the prefix (RFC 7911 §3).
+pub fn decode_nlri(r: &mut Reader<'_>, v6: bool, path_id: bool) -> BgpResult<Nlri> {
+    if path_id {
+        let bytes = r.take(4).ok_or_else(|| {
+            BgpError::notify(
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::INVALID_NETWORK_FIELD,
+                "truncated ADD-PATH path identifier (RFC 7911 §3)",
+            )
+        })?;
+        let id = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Ok(Nlri {
+            prefix: decode_prefix(r, v6)?,
+            path_id: id,
+        })
+    } else {
+        Ok(Nlri::from(decode_prefix(r, v6)?))
+    }
 }
 
 /// How malformed UPDATE content is handled: the RFC 4271 §6.3
@@ -609,20 +718,27 @@ pub struct AttrDecode {
 
 /// Decodes a whole attribute list (the `Path Attributes` field of an
 /// UPDATE). Duplicate well-known attributes are a Malformed Attribute
-/// List (§6.3, subcode 1).
+/// List (§6.3, subcode 1). Classic NLRI encoding (no ADD-PATH).
 pub fn decode_attributes(buf: &[u8], asn4: bool) -> BgpResult<Vec<PathAttribute>> {
     // The strict entry: every error propagates as the NOTIFICATION
     // the §6 handling rules prescribe.
-    decode_attributes_with(buf, asn4, UpdateHandling::StrictRfc4271).map(|out| out.attrs)
+    decode_attributes_with(
+        buf,
+        asn4,
+        UpdateHandling::StrictRfc4271,
+        AddPathCtx::default(),
+    )
+    .map(|out| out.attrs)
 }
 
-/// [`decode_attributes`] with selectable error handling: RFC 7606
-/// mode discards/treats-as-withdraws per the §7 table instead of
-/// resetting the session.
+/// [`decode_attributes`] with selectable error handling and the
+/// negotiated ADD-PATH direction for the MP fields' families
+/// (RFC 7911 §3): extended NLRI decodes only where negotiated.
 pub fn decode_attributes_with(
     buf: &[u8],
     asn4: bool,
     handling: UpdateHandling,
+    addpath: AddPathCtx,
 ) -> BgpResult<AttrDecode> {
     let lenient = handling.is_rfc7606();
     let internal = matches!(handling, UpdateHandling::Rfc7606 { internal: true });
@@ -731,7 +847,7 @@ pub fn decode_attributes_with(
             seen.push(attr_type);
         }
 
-        match decode_one(attr_type, flags, value, asn4) {
+        match decode_one(attr_type, flags, value, asn4, addpath) {
             Ok(attr) => out.attrs.push(attr),
             Err(err) => {
                 let (_, subcode) = err
@@ -788,7 +904,13 @@ fn length_error(attr_type: u8, expected: usize, got: usize) -> BgpError {
     )
 }
 
-fn decode_one(attr_type: u8, flags: u8, value: &[u8], asn4: bool) -> BgpResult<PathAttribute> {
+fn decode_one(
+    attr_type: u8,
+    flags: u8,
+    value: &[u8],
+    asn4: bool,
+    addpath: AddPathCtx,
+) -> BgpResult<PathAttribute> {
     match attr_type {
         attr_type::ORIGIN => {
             if flags & !attr_flag::EXTENDED_LENGTH != WELL_KNOWN_FLAGS {
@@ -937,9 +1059,10 @@ fn decode_one(attr_type: u8, flags: u8, value: &[u8], asn4: bool) -> BgpResult<P
             r.take(1)
                 .ok_or_else(|| mp_malformed("truncated MP_REACH reserved octet"))?;
             let v6 = afi == 2;
+            let extended = addpath.for_family(afi, safi);
             let mut nlri = Vec::new();
             while !r.is_empty() {
-                nlri.push(decode_prefix(&mut r, v6)?);
+                nlri.push(decode_nlri(&mut r, v6, extended)?);
             }
             Ok(PathAttribute::MpReach(MpReach {
                 afi,
@@ -960,9 +1083,10 @@ fn decode_one(attr_type: u8, flags: u8, value: &[u8], asn4: bool) -> BgpResult<P
                 .u8()
                 .ok_or_else(|| mp_malformed("truncated MP_UNREACH SAFI"))?;
             let v6 = afi == 2;
+            let extended = addpath.for_family(afi, safi);
             let mut withdrawn = Vec::new();
             while !r.is_empty() {
-                withdrawn.push(decode_prefix(&mut r, v6)?);
+                withdrawn.push(decode_nlri(&mut r, v6, extended)?);
             }
             Ok(PathAttribute::MpUnreach(MpUnreach {
                 afi,
@@ -1035,11 +1159,17 @@ fn valid_next_hop(addr: Ipv4Addr) -> bool {
 
 /// Encodes the full attribute list. Well-known/typed attributes carry
 /// their §4.3 flags; unknown ones carry their received flags with the
-/// partial bit forced.
-pub fn encode_attributes(attrs: &[PathAttribute], out: &mut Vec<u8>, asn4: bool) -> BgpResult<()> {
+/// partial bit forced. `addpath` gates the MP fields' NLRI encoding
+/// (RFC 7911 §3).
+pub fn encode_attributes(
+    attrs: &[PathAttribute],
+    out: &mut Vec<u8>,
+    asn4: bool,
+    addpath: AddPathCtx,
+) -> BgpResult<()> {
     for attr in attrs {
         let mut value = Vec::new();
-        attr.encode_value(&mut value, asn4);
+        attr.encode_value(&mut value, asn4, addpath)?;
         let mut flags = match attr.expected_flags() {
             Some(f) => f,
             None => {
@@ -1074,7 +1204,7 @@ mod tests {
 
     fn attrs_bytes(attrs: &[PathAttribute], asn4: bool) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_attributes(attrs, &mut out, asn4).unwrap();
+        encode_attributes(attrs, &mut out, asn4, AddPathCtx::default()).unwrap();
         out
     }
 
@@ -1145,7 +1275,7 @@ mod tests {
                 global: "2001:db8::1".parse().unwrap(),
                 link_local: Some("fe80::1".parse().unwrap()),
             },
-            nlri: vec![p4("2001:db8:1::/48")],
+            nlri: vec![p4("2001:db8:1::/48").into()],
         })];
         let bytes = attrs_bytes(&attrs, true);
         // 16+16 next hop, reserved 0, then /48 = 6 bytes NLRI
@@ -1153,7 +1283,7 @@ mod tests {
         assert_eq!(decoded, attrs);
         if let PathAttribute::MpReach(mp) = &decoded[0] {
             assert_eq!(bytes.len(), 4 + 2 + 1 + 1 + 32 + 1 + 6);
-            assert_eq!(mp.nlri, vec![p4("2001:db8:1::/48")]);
+            assert_eq!(mp.nlri, vec![p4("2001:db8:1::/48").into()]);
         } else {
             panic!("mp reach lost");
         }
@@ -1480,7 +1610,13 @@ mod tests {
     }
 
     fn lenient(bytes: &[u8], internal: bool) -> AttrDecode {
-        decode_attributes_with(bytes, false, UpdateHandling::Rfc7606 { internal }).unwrap()
+        decode_attributes_with(
+            bytes,
+            false,
+            UpdateHandling::Rfc7606 { internal },
+            AddPathCtx::default(),
+        )
+        .unwrap()
     }
 
     /// §7: COMMUNITIES/MED/ORIGIN malformations withdraw the routes
@@ -1582,8 +1718,13 @@ mod tests {
             false,
         );
         mp.extend_from_slice(&mp.clone());
-        let err = decode_attributes_with(&mp, false, UpdateHandling::Rfc7606 { internal: false })
-            .unwrap_err();
+        let err = decode_attributes_with(
+            &mp,
+            false,
+            UpdateHandling::Rfc7606 { internal: false },
+            AddPathCtx::default(),
+        )
+        .unwrap_err();
         assert_eq!(
             err.notification,
             Some((3, error::update_subcode::MALFORMED_ATTRIBUTE_LIST))
@@ -1608,6 +1749,7 @@ mod tests {
             &[0x40, 99, 2, 0xAA, 0xBB],
             false,
             UpdateHandling::Rfc7606 { internal: false },
+            AddPathCtx::default(),
         )
         .unwrap_err();
         assert_eq!(
@@ -1620,6 +1762,7 @@ mod tests {
             &[0x80, 14, 7, 0x00, 0x02, 0x01, 16, 1, 2, 3, 4],
             true,
             UpdateHandling::Rfc7606 { internal: false },
+            AddPathCtx::default(),
         )
         .unwrap_err();
         assert_eq!(
@@ -1669,7 +1812,7 @@ mod tests {
                         global: "2001:db8::1".parse().unwrap(),
                         link_local: None,
                     },
-                    nlri: vec![p4(&format!("2001:db8:{round:x}::/64"))],
+                    nlri: vec![p4(&format!("2001:db8:{round:x}::/64")).into()],
                 }));
             }
             let bytes = attrs_bytes(&attrs, asn4);

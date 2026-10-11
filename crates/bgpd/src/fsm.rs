@@ -133,6 +133,13 @@ pub struct SessionConfig {
     /// Whether we advertise the 4-octet capability (always true in
     /// this daemon — the field exists so negotiation logic is visible).
     pub local_four_octet: bool,
+    /// Locally configured ADD-PATH receive per unicast family
+    /// (RFC 7911, `neighbor X addpath rx`): we then advertise
+    /// Send/Receive 1 for that family. Off by default — the classic
+    /// NLRI encoding. (Send side §Deferred: no S/R 2/3 is ever
+    /// advertised in v1.)
+    pub add_path_rx_v4: bool,
+    pub add_path_rx_v6: bool,
 }
 
 impl SessionConfig {
@@ -142,6 +149,8 @@ impl SessionConfig {
             local_id,
             hold_time,
             local_four_octet: true,
+            add_path_rx_v4: false,
+            add_path_rx_v6: false,
         }
     }
 }
@@ -164,10 +173,17 @@ pub struct Negotiated {
     /// rules on (§4.1).
     pub graceful_restart: Option<GracefulRestartInfo>,
     /// The peer's ADD-PATH Send/Receive value per unicast family
-    /// (RFC 7911 §2; 0 = off). The per-path NLRI decode keys off
-    /// these — §Deferred (N5B landed the capability + negotiation).
+    /// (RFC 7911 §4; 0 = off, and 0 when any tuple carries an invalid
+    /// value — the §4 whole-capability ignore).
     pub add_path_v4: u8,
     pub add_path_v6: u8,
+    /// Effective ADD-PATH *receive* direction per family — the §5
+    /// MUST: true only when we advertised Send/Receive 1 (locally
+    /// configured rx) AND the peer advertised 2 or 3 (willing to
+    /// send). Only then may inbound NLRI for the family use the
+    /// extended encoding (the 4-octet Path Identifier, §3).
+    pub add_path_rx_v4: bool,
+    pub add_path_rx_v6: bool,
 }
 
 /// The RFC 4724 §3 facts a receiving speaker needs from the peer's
@@ -397,6 +413,13 @@ impl Fsm {
                     graceful_restart: open.graceful_restart(),
                     add_path_v4: open.add_path(1, 1),
                     add_path_v6: open.add_path(2, 1),
+                    // RFC 7911 §5's receive MUST: we receive multiple
+                    // paths only when we offered S/R 1 and the peer
+                    // offered S/R 2/3 for the family.
+                    add_path_rx_v4: self.config.add_path_rx_v4
+                        && matches!(open.add_path(1, 1), 2 | 3),
+                    add_path_rx_v6: self.config.add_path_rx_v6
+                        && matches!(open.add_path(2, 1), 2 | 3),
                 };
                 let zero_hold = negotiated.hold_time == 0;
                 self.negotiated = Some(negotiated);
@@ -895,7 +918,7 @@ mod tests {
         assert_eq!(f.negotiated().unwrap().graceful_restart, None);
     }
 
-    /// RFC 7911 §2: the ADD-PATH Send/Receive values land per family
+    /// RFC 7911 §4: the ADD-PATH Send/Receive values land per family
     /// (N5B foundation).
     #[test]
     fn negotiation_records_add_path_per_family() {
@@ -906,11 +929,11 @@ mod tests {
             "10.9.9.9".parse().unwrap(),
             vec![
                 crate::capability::Capability::Multiprotocol { afi: 1, safi: 1 },
-                crate::capability::Capability::AddPath {
+                crate::capability::Capability::AddPath(vec![crate::capability::AddPathFamily {
                     afi: 1,
                     safi: 1,
                     send_receive: 3, // both
-                },
+                }]),
             ],
         );
         f.fire(Event::Start { passive: false });
@@ -918,7 +941,64 @@ mod tests {
         f.fire(Event::BgpOpen(open));
         let n = f.negotiated().unwrap();
         assert_eq!(n.add_path_v4, 3);
-        assert_eq!(n.add_path_v6, 0, "no v6 triple advertised");
+        assert_eq!(n.add_path_v6, 0, "no v6 tuple advertised");
+    }
+
+    /// RFC 7911 §5's two direction MUSTs, as the effective-receive
+    /// matrix: we receive multiple paths only when locally configured
+    /// rx AND the peer offered Send/Receive 2 or 3 for the family.
+    /// Everything else stays the classic encoding.
+    #[test]
+    fn add_path_effective_rx_matrix() {
+        let open_with = |v4: u8, v6: u8| {
+            let mut tuples = Vec::new();
+            if v4 != 0 {
+                tuples.push(crate::capability::AddPathFamily {
+                    afi: 1,
+                    safi: 1,
+                    send_receive: v4,
+                });
+            }
+            if v6 != 0 {
+                tuples.push(crate::capability::AddPathFamily {
+                    afi: 2,
+                    safi: 1,
+                    send_receive: v6,
+                });
+            }
+            let caps = if tuples.is_empty() {
+                vec![]
+            } else {
+                vec![crate::capability::Capability::AddPath(tuples)]
+            };
+            BgpOpen::new(65001, 90, "10.9.9.9".parse().unwrap(), caps)
+        };
+        let negotiate = |local_rx: bool, peer_v4: u8| {
+            let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+            config.add_path_rx_v4 = local_rx;
+            let mut f = Fsm::new(config);
+            f.fire(Event::Start { passive: false });
+            f.fire(Event::TcpConnectionConfirmed);
+            f.fire(Event::BgpOpen(open_with(peer_v4, 0)));
+            f.negotiated().unwrap().add_path_rx_v4
+        };
+        // local off: nothing the peer says turns extended rx on.
+        for peer in [0u8, 1, 2, 3] {
+            assert!(!negotiate(false, peer), "local-rx off, peer {peer}");
+        }
+        // local on: only a peer willing to send (2 or 3) does.
+        assert!(!negotiate(true, 0), "peer silent");
+        assert!(!negotiate(true, 1), "peer receive-only");
+        assert!(negotiate(true, 2), "peer send");
+        assert!(negotiate(true, 3), "peer both");
+        // v6 independently: peer offers only v4 → v6 stays classic.
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_rx_v6 = true;
+        let mut f = Fsm::new(config);
+        f.fire(Event::Start { passive: false });
+        f.fire(Event::TcpConnectionConfirmed);
+        f.fire(Event::BgpOpen(open_with(2, 0)));
+        assert!(!f.negotiated().unwrap().add_path_rx_v6);
     }
 
     /// Session-identity facts: iBGP detection and AS_TRANS peers.

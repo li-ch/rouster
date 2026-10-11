@@ -21,6 +21,22 @@ pub mod capability_code {
     pub const ADD_PATH: u8 = 69;
 }
 
+/// One `<AFI, SAFI, Send/Receive>` tuple of the ADD-PATH capability
+/// (RFC 7911 §4). Send/Receive: 1 = receive, 2 = send, 3 = both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddPathFamily {
+    pub afi: u16,
+    pub safi: u8,
+    pub send_receive: u8,
+}
+
+impl AddPathFamily {
+    /// The §4-valid Send/Receive values (1 receive, 2 send, 3 both).
+    pub fn send_receive_valid(self) -> bool {
+        matches!(self.send_receive, 1..=3)
+    }
+}
+
 /// One advertised capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
@@ -40,13 +56,15 @@ pub enum Capability {
         restart_time: u16,
         families: Vec<(u16, u8, bool)>,
     },
-    /// Code 69 (RFC 7911 §2): `<AFI(2), SAFI(1), Send/Receive(1)>` per
-    /// triple — 1 = willing to receive, 2 = willing to send, 3 = both.
-    AddPath {
-        afi: u16,
-        safi: u8,
-        send_receive: u8,
-    },
+    /// Code 69 (RFC 7911 §4): one or more `<AFI(2), SAFI(1),
+    /// Send/Receive(1)>` tuples in a **single instance** (the RFC's
+    /// MUST: multi-family speakers merge into one capability).
+    /// Send/Receive: 1 = willing to receive, 2 = willing to send,
+    /// 3 = both. A value outside 1..=3 makes the *whole capability*
+    /// "treated as not understood and ignored" (§4, a SHOULD) — the
+    /// codec keeps it; consumers ([`crate::message::BgpOpen::add_path`])
+    /// ignore it.
+    AddPath(Vec<AddPathFamily>),
     /// Unrecognized code: value kept verbatim for logging.
     Unknown { code: u8, value: Vec<u8> },
 }
@@ -85,14 +103,14 @@ impl Capability {
                     out.push((*forwarding as u8) << 7);
                 }
             }
-            Self::AddPath {
-                afi,
-                safi,
-                send_receive,
-            } => {
-                out.extend_from_slice(&afi.to_be_bytes());
-                out.push(*safi);
-                out.push(*send_receive);
+            Self::AddPath(tuples) => {
+                // One instance, every tuple inline (RFC 7911 §4 MUST:
+                // multi-family support rides a single capability).
+                for t in tuples {
+                    out.extend_from_slice(&t.afi.to_be_bytes());
+                    out.push(t.safi);
+                    out.push(t.send_receive);
+                }
             }
             Self::Unknown { value, .. } => out.extend_from_slice(value),
         }
@@ -146,15 +164,31 @@ pub fn decode_capabilities(buf: &[u8]) -> BgpResult<Vec<Capability>> {
                 }
             }
             capability_code::ADD_PATH => {
-                if value.len() == 4 {
-                    Capability::AddPath {
-                        afi: u16::from_be_bytes([value[0], value[1]]),
-                        safi: value[2],
-                        send_receive: value[3],
-                    }
-                } else {
-                    return Err(BgpError::local("add-path capability not 4 bytes"));
+                // RFC 7911 §4: "one or more tuples", each 4 octets —
+                // any other length is malformed (module precedent for
+                // known codes: error, not ignore). An invalid
+                // Send/Receive *value* is NOT malformed: §4 says the
+                // capability is then treated as not understood and
+                // ignored — a consumer-side decision, so the codec
+                // keeps the tuple and [`AddPathFamily::send_receive_valid`]
+                // answers it.
+                if value.is_empty() || !value.len().is_multiple_of(4) {
+                    return Err(BgpError::local(
+                        "add-path capability length not 4n (RFC 7911 §4)",
+                    ));
                 }
+                Capability::AddPath(
+                    value
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| AddPathFamily {
+                            afi: u16::from_be_bytes([c[0], c[1]]),
+                            safi: c[2],
+                            send_receive: c[3],
+                        })
+                        .collect(),
+                )
             }
             capability_code::GRACEFUL_RESTART => {
                 // 2 restart octets + 4-octet family triples (RFC 4724
@@ -312,20 +346,69 @@ mod tests {
         assert_eq!(decode_capabilities(&buf).unwrap(), vec![bare]);
     }
 
-    /// RFC 7911 §2: the ADD-PATH capability triple (the N5B receive
-    /// foundation — the per-path NLRI decode stays §Deferred).
+    /// RFC 7911 §4: the ADD-PATH capability tuples. One family rides
+    /// one 4-octet tuple; the Send/Receive values are 1/2/3.
     #[test]
     fn add_path_capability_round_trips() {
-        let cap = Capability::AddPath {
+        let cap = Capability::AddPath(vec![AddPathFamily {
             afi: 1,
             safi: 1,
             send_receive: 3, // send+receive
-        };
+        }]);
         let mut buf = Vec::new();
         encode_capabilities(std::slice::from_ref(&cap), &mut buf);
         assert_eq!(buf, vec![69, 4, 0x00, 0x01, 0x01, 0x03]);
         assert_eq!(decode_capabilities(&buf).unwrap(), vec![cap]);
         assert!(decode_capabilities(&[69, 3, 0x00, 0x01, 0x01]).is_err());
+    }
+
+    /// RFC 7911 §4's single-instance MUST: multiple families merge
+    /// into ONE capability of 4n octets (not repeated instances).
+    /// The codec round-trips the merged shape; repeated instances also
+    /// decode (both are legal wire input for a decoder — the MUST
+    /// binds the sender).
+    #[test]
+    fn add_path_capability_multi_family_single_instance() {
+        let cap = Capability::AddPath(vec![
+            AddPathFamily {
+                afi: 1,
+                safi: 1,
+                send_receive: 1,
+            },
+            AddPathFamily {
+                afi: 2,
+                safi: 1,
+                send_receive: 3,
+            },
+        ]);
+        let mut buf = Vec::new();
+        encode_capabilities(std::slice::from_ref(&cap), &mut buf);
+        assert_eq!(
+            buf,
+            vec![69, 8, 0x00, 0x01, 0x01, 0x01, 0x00, 0x02, 0x01, 0x03]
+        );
+        assert_eq!(decode_capabilities(&buf).unwrap(), vec![cap]);
+    }
+
+    /// §4: a value length that is not 4n (or empty) is malformed;
+    /// an invalid Send/Receive value is NOT — the tuples decode and
+    /// the ignore-the-capability rule is a consumer concern.
+    #[test]
+    fn add_path_capability_lengths_and_invalid_sr() {
+        // Not 4n.
+        assert!(decode_capabilities(&[69, 5, 0, 1, 1, 1, 2]).is_err());
+        // Empty.
+        assert!(decode_capabilities(&[69, 0]).is_err());
+        // S/R 0 and 4: decodes (kept for the consumer to ignore).
+        let caps = decode_capabilities(&[69, 8, 0, 1, 1, 0, 0, 1, 1, 4]).unwrap();
+        match &caps[0] {
+            Capability::AddPath(tuples) => {
+                assert_eq!(tuples.len(), 2);
+                assert!(!tuples[0].send_receive_valid());
+                assert!(!tuples[1].send_receive_valid());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
