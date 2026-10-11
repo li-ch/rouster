@@ -67,6 +67,31 @@ fn show_sav_renders_todays_fixture_with_the_rule_table() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The per-op `count` lines (GSC §4 "count"): a backend-sourced
+/// status renders one line per judged op under the monitor line —
+/// the op body verbatim (provenance included), counters re-rendered
+/// from what was recognized. `show sav rules` stays table-only.
+#[test]
+fn show_sav_renders_the_per_op_count_lines() {
+    let dir = scratch("sav-counts");
+    publish(&dir, "savd-counts", &fixture("savd-status-counts.status"));
+    let text = show_sav(&dir, false);
+    assert!(text.contains("monitor  source dataplane"));
+    assert!(
+        text.contains(
+            "count  iba permit #2 [198.51.100.0/24] monitor (from fib)  invalid=1  valid=6  unknown=0"
+        ),
+        "the per-op rows render under the monitor line: {text}"
+    );
+    assert!(text.contains("count  pbb block 203.0.113.0/24 [6] monitor (from bgp)"));
+    let rules_only = show_sav(&dir, true);
+    assert!(
+        !rules_only.contains("count  "),
+        "rules-only stays table-only"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn show_sav_rules_prints_only_the_table() {
     let dir = scratch("sav-rules");

@@ -283,6 +283,23 @@ pub struct SavMonitor {
     pub unknown: Option<u64>,
 }
 
+/// One `count` line (GSC §4 "count", per-rule): the op body verbatim
+/// (savd renders it in its effective-op vocabulary — the daemon's to
+/// grow, this reader's to carry) plus the op's verdict-bucket
+/// counters, each individually optional so a malformed one does not
+/// erase its siblings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavCount {
+    /// The op rendering, verbatim between `count ` and the counters.
+    pub op: String,
+    /// Sources this op judged invalid (the spoof counter's per-op cut).
+    pub invalid: Option<u64>,
+    /// Sources this op judged valid.
+    pub valid: Option<u64>,
+    /// Sources this op left to no rule (simulation rows only).
+    pub unknown: Option<u64>,
+}
+
 /// A parsed `savd.status`: everything this reader recognized.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavStatus {
@@ -300,6 +317,9 @@ pub struct SavStatus {
     pub rules: Vec<SavRule>,
     /// The last evaluate's monitor counters.
     pub monitor: SavMonitor,
+    /// The per-op `count` lines, in file order (GSC §4 "count"; only
+    /// ops that judged something render).
+    pub counts: Vec<SavCount>,
     /// How many lines matched nothing this reader knows.
     pub unknown_lines: usize,
 }
@@ -317,6 +337,7 @@ const SAVD_TABLE: &[(&str, Handler<SavStatus>)] = &[
     ("installed", h_savd_installed),
     ("rule", h_savd_rule),
     ("monitor", h_savd_monitor),
+    ("count", h_savd_count),
 ];
 
 /// Parses `savd.status`. Never fails: unrecognized or malformed
@@ -414,6 +435,49 @@ fn h_savd_monitor(state: &mut SavStatus, tokens: &[&str], _line: &str) -> bool {
             }
         }
     }
+    true
+}
+
+/// Count line (GSC §4 "count", per-rule): `count <op-body>
+/// invalid=<n> valid=<n> unknown=<n>` — the counter tokens are picked
+/// out wherever they sit, the remaining tokens are the op body
+/// (verbatim — its vocabulary is the daemon's). A line with no
+/// readable counter token at all is not a count line (counted
+/// unknown); a malformed number leaves its bucket unset without
+/// failing the row.
+fn h_savd_count(state: &mut SavStatus, tokens: &[&str], _line: &str) -> bool {
+    let mut row = SavCount::default();
+    let mut body: Vec<&str> = Vec::new();
+    let mut recognized = false;
+    for token in tokens.iter().skip(1) {
+        if let Some((key, value)) = token.split_once('=') {
+            let number = value.parse().ok();
+            match key {
+                "invalid" => {
+                    row.invalid = number;
+                    recognized = true;
+                    continue;
+                }
+                "valid" => {
+                    row.valid = number;
+                    recognized = true;
+                    continue;
+                }
+                "unknown" => {
+                    row.unknown = number;
+                    recognized = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        body.push(token);
+    }
+    if !recognized {
+        return false;
+    }
+    row.op = body.join(" ");
+    state.counts.push(row);
     true
 }
 
@@ -1090,6 +1154,54 @@ monitor source dataplane invalid=1 valid=2 unknown=3 window 60s
         // Through policy honest).
         let parsed = parse_savd("savd 0.0.0 pid 1\n  installed 2 rules\n  wat\n");
         assert_eq!(parsed.installed_claim, Some(2));
+        assert_eq!(parsed.unknown_lines, 1);
+    }
+
+    /// Count lines (GSC §4 "count", per-rule): the counter tokens are
+    /// read wherever they sit, the rest is the op body verbatim —
+    /// provenance suffixes ride along, future counter tokens stay in
+    /// the body (lossless), a malformed number leaves its bucket unset
+    /// without failing the row, and a line with no readable counter at
+    /// all is not a count line.
+    #[test]
+    fn savd_count_lines_split_body_and_counters() {
+        let parsed = parse_savd(
+            "savd 0.0.0 pid 1\n\
+             count iba permit #2 [198.51.100.0/24] monitor (from fib) invalid=1 valid=6 unknown=0\n\
+             count pbb block 203.0.113.0/24 [6] monitor (from bgp) invalid=2 valid=0 unknown=0 window=60s\n\
+             count iba permit #3 [] monitor invalid=x valid=4\n\
+             count not really a count line\n",
+        );
+        assert_eq!(parsed.counts.len(), 3, "the counterless line is unknown");
+        assert_eq!(
+            parsed.counts[0],
+            SavCount {
+                op: "iba permit #2 [198.51.100.0/24] monitor (from fib)".to_string(),
+                invalid: Some(1),
+                valid: Some(6),
+                unknown: Some(0),
+            }
+        );
+        assert_eq!(
+            parsed.counts[1],
+            SavCount {
+                op: "pbb block 203.0.113.0/24 [6] monitor (from bgp) window=60s".to_string(),
+                invalid: Some(2),
+                valid: Some(0),
+                unknown: Some(0),
+            },
+            "an unknown future counter rides in the body, lossless"
+        );
+        assert_eq!(
+            parsed.counts[2],
+            SavCount {
+                op: "iba permit #3 [] monitor".to_string(),
+                invalid: None,
+                valid: Some(4),
+                unknown: None,
+            },
+            "malformed numbers leave their buckets unset, siblings survive"
+        );
         assert_eq!(parsed.unknown_lines, 1);
     }
 

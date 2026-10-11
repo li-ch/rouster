@@ -86,6 +86,39 @@ fn savd_never_evaluated_corpus_parses() {
     assert!(parsed.rules.is_empty());
 }
 
+/// The per-op `count` corpus (GSC §4 "count"): a backend-sourced
+/// status (nft, source dataplane) carries one count line per op that
+/// judged something — op bodies in the daemon's effective-op
+/// vocabulary with provenance, counters split out — and nothing in the
+/// file counts unknown.
+#[test]
+fn savd_counts_corpus_reads_the_per_op_rows() {
+    let parsed = parse_savd(&fixture("savd-status-counts.status"));
+    assert_eq!(parsed.monitor.source.as_deref(), Some("dataplane"));
+    assert_eq!(parsed.monitor.invalid, Some(16));
+    assert_eq!(parsed.monitor.valid, Some(6));
+    assert_eq!(parsed.counts.len(), 3);
+    assert_eq!(
+        parsed.counts[0].op,
+        "iba permit #2 [198.51.100.0/24] monitor (from fib)"
+    );
+    assert_eq!(parsed.counts[0].invalid, Some(1));
+    assert_eq!(parsed.counts[0].valid, Some(6));
+    assert_eq!(parsed.counts[0].unknown, Some(0));
+    assert_eq!(
+        parsed.counts[2].op,
+        "pbb block 203.0.113.0/24 [6] monitor (from bgp)"
+    );
+    assert_eq!(parsed.counts[2].invalid, Some(2));
+    // The per-op rows sum to the monitor line's aggregate (the rows
+    // ARE the backend view the aggregate line summarizes).
+    let invalid: u64 = parsed.counts.iter().filter_map(|c| c.invalid).sum();
+    let valid: u64 = parsed.counts.iter().filter_map(|c| c.valid).sum();
+    assert_eq!(invalid, 16);
+    assert_eq!(valid, 6);
+    assert_eq!(parsed.unknown_lines, 0);
+}
+
 // -------------------------------------------------------------- bfdd
 
 #[test]

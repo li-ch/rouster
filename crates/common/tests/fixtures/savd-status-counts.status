@@ -1,0 +1,10 @@
+savd 0.0.0 pid 4242
+config mode strict-uRPF action monitor poll 5s interfaces 2 bindings 0 collision ignore hysteresis 3s backend nft
+installed 3 rules
+rule allow if#2 [198.51.100.0/24] strict monitor
+rule allow if#3 [] strict monitor
+rule block 203.0.113.0/24 if [6] monitor
+monitor source dataplane invalid=16 valid=6 unknown=0
+count iba permit #2 [198.51.100.0/24] monitor (from fib) invalid=1 valid=6 unknown=0
+count iba permit #3 [] monitor invalid=13 valid=0 unknown=0
+count pbb block 203.0.113.0/24 [6] monitor (from bgp) invalid=2 valid=0 unknown=0

@@ -25,10 +25,16 @@ two landed surfaces, selected by savd.conf's `backend <rp_filter|nft>`
   actions as named kernel counters (`sav_monitor_counts` answers from
   them — the dataplane-first path), drop actions as enforced denies.
   Enforcement lives only in the table: the sysctl surface is never
-  touched and clear is a single `destroy table`. Evidence:
-  `scripts/test-sav-nft.sh` (spoof-differential vs the rp_filter
-  baseline, same topology; both scripts' readouts recorded under the
-  stage's quarantine).
+  touched and clear is a single `destroy table`. Since N6B the
+  counters also answer PER OP (`sav_monitor_per_op` joins the
+  install-time counter-units map with `nft list counters`): savd's
+  status `count` lines (GSC §4 "count") render the kernel-sourced
+  rows, and the simulation tallies are the fallback view only.
+  Attribution is install-scoped (counter names are minted at install
+  time; savd installs before reading, so its flow always answers).
+  Evidence: `scripts/test-sav-nft.sh` (spoof-differential vs the
+  rp_filter baseline, same topology; both scripts' readouts recorded
+  under the stage's quarantine).
 
 The verdict semantics are backend-independent: the nft ruleset's
 interpreted decisions are pinned equal to the reference pipeline

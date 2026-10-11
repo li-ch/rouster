@@ -6,7 +6,7 @@ use std::process::Command as Spawn;
 
 use rousterctl::args::{self, Command};
 use rousterctl::liveness::{pid_state, PidState};
-use rousterctl::status::{ConfigLine, MonitorLine, RuleLine, SavStatus};
+use rousterctl::status::{ConfigLine, CountLine, MonitorLine, RuleLine, SavStatus};
 
 fn fixture(name: &str) -> String {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -324,6 +324,39 @@ fn json_render_escapes_and_nulls() {
         "Raw rules stay machine-visible"
     );
     assert!(json.contains("\"unknown_lines\":1"));
+}
+
+/// The per-op `count` lines (GSC §4 "count", backend-sourced when the
+/// nft backend answers): parse into the counts rows (op bodies
+/// verbatim with provenance, counters split), render in the terminal
+/// view under the monitor line, and ride in the JSON as an array.
+#[test]
+fn per_op_count_lines_parse_and_render() {
+    let st = parse_fixture("savd-status-counts.status");
+    assert_eq!(st.monitor.source.as_deref(), Some("dataplane"));
+    assert_eq!(st.counts.len(), 3);
+    assert_eq!(
+        st.counts[0],
+        CountLine {
+            op: "iba permit #2 [198.51.100.0/24] monitor (from fib)".into(),
+            invalid: Some(1),
+            valid: Some(6),
+            unknown: Some(0),
+        }
+    );
+    assert_eq!(st.unknown_lines, 0);
+    let terminal = st.render_terminal(PidState::Running);
+    assert!(
+        terminal.contains(
+            "count  iba permit #2 [198.51.100.0/24] monitor (from fib)  invalid=1  valid=6  unknown=0"
+        ),
+        "the per-op cut renders under the monitor line: {terminal}"
+    );
+    let json = st.render_json(PidState::Running);
+    assert!(json.contains("\"counts\":["));
+    assert!(json.contains(
+        "\"op\":\"iba permit #2 [198.51.100.0/24] monitor (from fib)\",\"invalid\":1,\"valid\":6,\"unknown\":0"
+    ));
 }
 
 // ----------------------------------------------------------------- args

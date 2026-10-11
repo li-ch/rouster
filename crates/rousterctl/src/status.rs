@@ -9,6 +9,7 @@
 //! installed 2 rules
 //! rule allow if#2 [198.51.100.0/24] strict monitor
 //! monitor source simulation invalid=0 valid=0 unknown=0
+//! count iba permit #2 [198.51.100.0/24] monitor invalid=0 valid=3 unknown=0
 //! ```
 //!
 //! Tolerance contract (the daemon's format may grow; owned by the
@@ -35,6 +36,10 @@ pub use common::rundir::SavConfig as ConfigLine;
 /// The `monitor` line's counters (the reader's
 /// [`common::rundir::SavMonitor`], ditto).
 pub use common::rundir::SavMonitor as MonitorLine;
+
+/// One per-op `count` line (the reader's
+/// [`common::rundir::SavCount`], ditto — GSC §4 "count").
+pub use common::rundir::SavCount as CountLine;
 
 /// One `rule` line: the four op shapes savd renders today, plus the
 /// verbatim fallback for shapes this version does not know.
@@ -145,6 +150,9 @@ pub struct SavStatus {
     pub rules: Vec<RuleLine>,
     /// The last evaluate's monitor counters.
     pub monitor: MonitorLine,
+    /// The per-op `count` lines, in file order (GSC §4 "count"; only
+    /// ops that judged something render).
+    pub counts: Vec<CountLine>,
     /// How many lines matched nothing this version knows.
     pub unknown_lines: usize,
 }
@@ -220,6 +228,24 @@ impl SavStatus {
             out.push_str(&format!("  unknown={unknown}"));
         }
         out.push('\n');
+
+        // The per-op cut of the same view (GSC §4 "count"): one line
+        // per op that judged something, the op rendered as the file
+        // carries it.
+        for count in &self.counts {
+            out.push_str("count");
+            out.push_str(&format!("  {}", count.op));
+            if let Some(invalid) = count.invalid {
+                out.push_str(&format!("  invalid={invalid}"));
+            }
+            if let Some(valid) = count.valid {
+                out.push_str(&format!("  valid={valid}"));
+            }
+            if let Some(unknown) = count.unknown {
+                out.push_str(&format!("  unknown={unknown}"));
+            }
+            out.push('\n');
+        }
 
         if self.unknown_lines > 0 {
             out.push_str(&format!(
@@ -305,8 +331,21 @@ impl SavStatus {
                 ),
             })
             .collect();
+        let counts: Vec<String> = self
+            .counts
+            .iter()
+            .map(|count| {
+                format!(
+                    "{{\"op\":{},\"invalid\":{},\"valid\":{},\"unknown\":{}}}",
+                    json_string(&count.op),
+                    json_opt_u64(count.invalid),
+                    json_opt_u64(count.valid),
+                    json_opt_u64(count.unknown),
+                )
+            })
+            .collect();
         format!(
-            "{{\"daemon\":\"savd\",\"version\":{},\"pid\":{},\"pid_state\":\"{state}\",\"config\":{config},\"evaluated\":{},\"installed_rules\":{},\"rules\":[{}],\"monitor\":{{\"source\":{},\"invalid\":{},\"valid\":{},\"unknown\":{}}},\"unknown_lines\":{}}}",
+            "{{\"daemon\":\"savd\",\"version\":{},\"pid\":{},\"pid_state\":\"{state}\",\"config\":{config},\"evaluated\":{},\"installed_rules\":{},\"rules\":[{}],\"monitor\":{{\"source\":{},\"invalid\":{},\"valid\":{},\"unknown\":{}}},\"counts\":[{}],\"unknown_lines\":{}}}",
             json_opt_string(self.version.as_deref()),
             json_opt_u32(self.pid),
             json_bool(self.evaluated),
@@ -316,6 +355,7 @@ impl SavStatus {
             json_opt_u64(self.monitor.invalid),
             json_opt_u64(self.monitor.valid),
             json_opt_u64(self.monitor.unknown),
+            counts.join(","),
             self.unknown_lines,
         )
     }
@@ -335,6 +375,7 @@ impl From<rundir::SavStatus> for SavStatus {
             installed_claim: parsed.installed_claim,
             rules: parsed.rules.into_iter().map(RuleLine::from).collect(),
             monitor: parsed.monitor,
+            counts: parsed.counts,
             unknown_lines: parsed.unknown_lines,
         }
     }

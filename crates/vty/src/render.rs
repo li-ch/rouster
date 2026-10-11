@@ -75,6 +75,22 @@ pub fn show_sav(run_dir: &Path, rules_only: bool) -> Vec<String> {
     if !rules_only {
         out.push(String::new());
         out.push(render_sav_monitor(&parsed));
+        // The per-op cut of the same view (GSC §4 "count"): one line
+        // per op that judged something, the op rendered as the file
+        // carries it.
+        for count in &parsed.counts {
+            let mut line = format!("count  {}", count.op);
+            if let Some(invalid) = count.invalid {
+                line.push_str(&format!("  invalid={invalid}"));
+            }
+            if let Some(valid) = count.valid {
+                line.push_str(&format!("  valid={valid}"));
+            }
+            if let Some(unknown) = count.unknown {
+                line.push_str(&format!("  unknown={unknown}"));
+            }
+            out.push(line);
+        }
         if parsed.unknown_lines > 0 {
             out.push(format!(
                 "({} unrecognized line{} — the daemon's format is newer than this vty)",

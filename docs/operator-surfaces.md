@@ -108,7 +108,18 @@ rule block if#7 [192.0.2.0/26] drop                  (IBB)
 rule allow 2001:db8:1::/48 if [2, 3] monitor         (PBA)
 rule block 192.0.2.128/25 if [7, 9] monitor          (PBB)
 monitor source simulation invalid=0 valid=0 unknown=0
+count iba permit #2 [198.51.100.0/24] monitor (from fib) invalid=1 valid=6 unknown=0
 ```
+
+The `count` lines are the GSC §4 "count" per-op cut of the `monitor`
+aggregate: one line per op that has judged anything, the op rendered
+in the daemon's effective-op vocabulary (provenance suffix included
+when the contributing rules agreed on an origin). Their numbers are
+kernel-sourced when the enforcement backend answers per-op counter
+reads (`backend nft` — the `monitor` line's `source` says `dataplane`
+and the rows sum to it); otherwise they are the sav layer's
+route-lookup simulation tallies. Only ops that judged something
+render (zero rows are noise).
 
 **Tolerance contract** (the format is savd's to grow; rousterctl
 adapts, not the reverse): unknown *lines* are counted and dropped;
