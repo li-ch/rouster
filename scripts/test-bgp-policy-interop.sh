@@ -336,7 +336,12 @@ sleep 2
 # post-malformation announce) is there.
 docker exec "$R2" sh -c "ip route show proto bgp" | grep -q "$CRAFT_NET_A" \
     && fail "$CRAFT_NET_A still installed despite treat-as-withdraw"
-wait_in "$R2" "$CRAFT_NET_B installed (session survived)" 15 \
+# The zebra-programming proof (fast), then the kernel table (rousterd's
+# reconcile programs on a several-second cadence — give it room; the
+# crafted peer holds the session ~26 s).
+wait_in "$R2" "rousterd programmed $CRAFT_NET_B" 15 \
+    "grep 'zapi: route add' $ROUSTERD_LOG | grep -q '$CRAFT_NET_B'"
+wait_in "$R2" "$CRAFT_NET_B installed (session survived)" 30 \
     "ip route show proto bgp | grep -q '$CRAFT_NET_B'"
 docker exec "$R2" sh -c "grep 'sending NOTIFICATION' $OUR_BGPD_LOG | grep -q '$GW_IP'" \
     && fail "the malformed UPDATE reset the session (RFC 7606 violated)"
