@@ -14,6 +14,7 @@
 //!  neighbor 192.0.2.9 timers 10 30
 //!  neighbor 192.0.2.9 mrai 0
 //!  neighbor 192.0.2.9 role peer
+//!  neighbor 192.0.2.9 update-error-handling rfc7606
 //!  network 203.0.113.0/24
 //!  network 2001:db8:1::/48
 //!  import IN
@@ -114,6 +115,47 @@ pub enum AspaMode {
     Enforce,
 }
 
+/// Per-neighbor UPDATE error handling (N5): `rfc7606` is the modern
+/// default (attribute discard / treat-as-withdraw per RFC 7606 §7);
+/// `strict-rfc4271` restores the RFC 4271 §6.3 session-reset
+/// behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpdateErrorHandling {
+    #[default]
+    Rfc7606,
+    StrictRfc4271,
+}
+
+impl UpdateErrorHandling {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rfc7606" => Some(Self::Rfc7606),
+            "strict-rfc4271" => Some(Self::StrictRfc4271),
+            _ => None,
+        }
+    }
+
+    /// The decoder-level mode; `internal` refines RFC 7606 §7's
+    /// LOCAL_PREF row (the session type is negotiated, so the wire
+    /// value is chosen at decode time).
+    pub fn handling(self, internal: bool) -> crate::attr::UpdateHandling {
+        match self {
+            Self::Rfc7606 => crate::attr::UpdateHandling::Rfc7606 { internal },
+            Self::StrictRfc4271 => crate::attr::UpdateHandling::StrictRfc4271,
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateErrorHandling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Rfc7606 => "rfc7606",
+            Self::StrictRfc4271 => "strict-rfc4271",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Per-neighbor configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborConfig {
@@ -127,6 +169,9 @@ pub struct NeighborConfig {
     /// RFC 9234 §4 role toward this neighbor (drives OTC and the
     /// ASPA verify procedure selection).
     pub role: Option<Role>,
+    /// UPDATE error handling: `rfc7606` (default) or
+    /// `strict-rfc4271` (N5, RFC 7606).
+    pub update_handling: UpdateErrorHandling,
 }
 
 /// The whole daemon config.
@@ -387,6 +432,7 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                             timers: None,
                             mrai: 0,
                             role: None,
+                            update_handling: UpdateErrorHandling::default(),
                         });
                         if neighbor.remote_as != asn {
                             return Err(err(
@@ -441,6 +487,18 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                         })?;
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
                         neighbor.role = Some(role);
+                    }
+                    ["update-error-handling", mode] => {
+                        let handling = UpdateErrorHandling::parse(mode).ok_or_else(|| {
+                            err(
+                                line_no,
+                                format!(
+                                    "update-error-handling expects rfc7606|strict-rfc4271, got `{mode}`"
+                                ),
+                            )
+                        })?;
+                        let neighbor = require_neighbor(&mut config, addr, line_no)?;
+                        neighbor.update_handling = handling;
                     }
                     _ => {
                         return Err(err(
@@ -730,5 +788,43 @@ ip prefix-list CUST seq 5 permit 203.0.113.0/24
         let e = parse_config("router bgp 65000\nbgp router-id 10.0.0.1\nset local-preference 5\n")
             .unwrap_err();
         assert!(e.to_string().contains("unknown directive"), "{e}");
+    }
+
+    // ---- N5: RFC 7606 error-handling knob --------------------------
+
+    #[test]
+    fn update_error_handling_defaults_to_rfc7606_and_parses_both() {
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].update_handling,
+            UpdateErrorHandling::Rfc7606,
+            "the modern default (RFC 7606)"
+        );
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 update-error-handling strict-rfc4271\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].update_handling,
+            UpdateErrorHandling::StrictRfc4271
+        );
+        let e = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 update-error-handling lax\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("rfc7606|strict-rfc4271"), "{e}");
+        // The decoder-level mapping (the LOCAL_PREF row's `internal`
+        // refinement is chosen at decode time).
+        assert!(matches!(
+            UpdateErrorHandling::Rfc7606.handling(true),
+            crate::attr::UpdateHandling::Rfc7606 { internal: true }
+        ));
+        assert!(matches!(
+            UpdateErrorHandling::StrictRfc4271.handling(true),
+            crate::attr::UpdateHandling::StrictRfc4271
+        ));
     }
 }

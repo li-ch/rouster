@@ -14,8 +14,8 @@ use std::net::Ipv4Addr;
 use common::IpPrefix;
 
 use crate::attr::{
-    decode_attributes, decode_prefix, encode_attributes, encode_prefix, AsPath, Origin,
-    PathAttribute,
+    decode_attributes_with, decode_prefix, encode_attributes, encode_prefix, AsPath, Origin,
+    PathAttribute, UpdateHandling, UpdateReport,
 };
 use crate::capability::{decode_capabilities, encode_capabilities, Capability};
 use crate::error::{self, BgpError, BgpResult};
@@ -87,6 +87,18 @@ impl BgpMessage {
     /// Decodes one frame (header + body; `buf` must be exactly one
     /// message — the session layer frames first).
     pub fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
+        Self::decode_with_handling(buf, asn4, UpdateHandling::StrictRfc4271).map(|(m, _)| m)
+    }
+
+    /// [`Self::decode`] with RFC 7606 UPDATE error handling: a
+    /// malformed-but-salvageable UPDATE decodes to itself plus the
+    /// handling report (discarded attributes, treat-as-withdraw);
+    /// errors that keep the session reset still return `Err`.
+    pub fn decode_with_handling(
+        buf: &[u8],
+        asn4: bool,
+        handling: UpdateHandling,
+    ) -> BgpResult<(Self, UpdateReport)> {
         let mut r = Reader::new(buf);
         let marker = r.take(16).ok_or_else(|| BgpError::local("short header"))?;
         if marker != BGP_MARKER {
@@ -135,13 +147,22 @@ impl BgpMessage {
             ));
         }
         Ok(match msg_type {
-            message_type::OPEN => Self::Open(BgpOpen::decode(body)?),
-            message_type::UPDATE => Self::Update(BgpUpdate::decode(body, asn4)?),
-            message_type::NOTIFICATION => Self::Notification(BgpNotification::decode(body)?),
+            message_type::OPEN => (Self::Open(BgpOpen::decode(body)?), UpdateReport::default()),
+            message_type::UPDATE => {
+                let (update, report) = BgpUpdate::decode_with_handling(body, asn4, handling)?;
+                (Self::Update(update), report)
+            }
+            message_type::NOTIFICATION => (
+                Self::Notification(BgpNotification::decode(body)?),
+                UpdateReport::default(),
+            ),
             // §4.4: a KEEPALIVE is exactly the 19-octet header (the
             // type-minimum check above rejected any data octets).
-            message_type::KEEPALIVE => Self::Keepalive,
-            _ => Self::RouteRefresh(BgpRouteRefresh::decode(body)?),
+            message_type::KEEPALIVE => (Self::Keepalive, UpdateReport::default()),
+            _ => (
+                Self::RouteRefresh(BgpRouteRefresh::decode(body)?),
+                UpdateReport::default(),
+            ),
         })
     }
 }
@@ -482,7 +503,22 @@ impl BgpUpdate {
         Ok(())
     }
 
-    pub(crate) fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
+    /// Strict [`Self::decode_with_handling`] (the tests' RFC 4271
+    /// expectations keep the session-reset shape).
+    #[cfg(test)]
+    fn decode(buf: &[u8], asn4: bool) -> BgpResult<Self> {
+        Self::decode_with_handling(buf, asn4, UpdateHandling::StrictRfc4271).map(|(u, _)| u)
+    }
+
+    /// [`Self::decode`] with RFC 7606 handling for the attribute
+    /// block (the withdrawn/NLRI framing rules are un-revised: a
+    /// message-level overrun stays Malformed Attribute List and NLRI
+    /// errors stay Invalid Network Field, both session resets).
+    pub(crate) fn decode_with_handling(
+        buf: &[u8],
+        asn4: bool,
+        handling: UpdateHandling,
+    ) -> BgpResult<(Self, UpdateReport)> {
         let mut r = Reader::new(buf);
         let withdrawn_len = r
             .u16()
@@ -514,18 +550,56 @@ impl BgpUpdate {
                 "total path attribute length overruns UPDATE (§6.3)",
             )
         })?;
-        let attrs = decode_attributes(attr_bytes, asn4)?;
+        let decoded = decode_attributes_with(attr_bytes, asn4, handling)?;
 
         let mut nlri = Vec::new();
         while !r.is_empty() {
             nlri.push(decode_prefix(&mut r, false)?);
         }
 
-        Ok(Self {
-            withdrawn,
-            attrs,
-            nlri,
-        })
+        Ok((
+            Self {
+                withdrawn,
+                attrs: decoded.attrs,
+                nlri,
+            },
+            decoded.report,
+        ))
+    }
+
+    /// True when this UPDATE is an End-of-RIB marker (RFC 4724 §3): no
+    /// reachable NLRI and no withdrawn routes — the bare minimum
+    /// UPDATE for IPv4 unicast, or an MP_UNREACH carrying no routes
+    /// for a multiprotocol family (returns that family).
+    pub fn end_of_rib(&self) -> Option<Option<(u16, u8)>> {
+        if !self.withdrawn.is_empty() || !self.nlri.is_empty() || self.announced().is_empty() {
+            return None;
+        }
+        match self.attrs.as_slice() {
+            [] => Some(None), // the v4-unicast marker
+            [PathAttribute::MpUnreach(mp)] if mp.withdrawn.is_empty() => {
+                Some(Some((mp.afi, mp.safi)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Builds the End-of-RIB marker for one family (RFC 4724 §3): the
+    /// minimum-length UPDATE for v4 unicast; an UPDATE carrying only
+    /// an empty MP_UNREACH for multiprotocol families.
+    pub fn end_of_rib_marker(afi: u16, safi: u8) -> Self {
+        if afi == 1 && safi == 1 {
+            Self::default()
+        } else {
+            Self {
+                attrs: vec![PathAttribute::MpUnreach(crate::attr::MpUnreach {
+                    afi,
+                    safi,
+                    withdrawn: Vec::new(),
+                })],
+                ..Default::default()
+            }
+        }
     }
 }
 

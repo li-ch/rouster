@@ -23,7 +23,9 @@ use common::IpPrefix;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{info, warn};
 
-use crate::attr::{AsPath, MpNextHop, MpReach, Origin, PathAttribute};
+use crate::attr::{
+    AsPath, MpNextHop, MpReach, Origin, PathAttribute, UpdateHandling, UpdateReport,
+};
 use crate::capability::Capability;
 use crate::error::{self, BgpError, BgpResult};
 use crate::fsm::{Action, Event, Fsm, SessionConfig, State};
@@ -205,6 +207,9 @@ pub struct PeerSession<IO> {
     mrai: Duration,
     next_advertisement: Option<Instant>,
     now: fn() -> Instant,
+    /// UPDATE error handling for this session (RFC 7606 by default;
+    /// strict-RFC-4271 is the per-neighbor compatibility knob).
+    update_handling: UpdateHandling,
     end: Option<SessionEnd>,
     /// Daemon-side observability (None in tests).
     shared: Option<Arc<SessionShared>>,
@@ -259,6 +264,7 @@ where
             mrai,
             next_advertisement: None,
             now: Instant::now,
+            update_handling: UpdateHandling::default(),
             end: None,
             shared: None,
             #[cfg(feature = "experimental-savnet")]
@@ -312,6 +318,26 @@ where
         self
     }
 
+    /// Set the UPDATE error-handling mode (RFC 7606 default;
+    /// `strict-rfc4271` per neighbor for the RFC 4271 session-reset
+    /// behavior).
+    pub fn with_update_handling(mut self, handling: UpdateHandling) -> Self {
+        self.update_handling = handling;
+        self
+    }
+
+    /// The handling in force for the current stream position: the
+    /// configured mode, with RFC 7606's `internal` refinement from
+    /// the negotiated session type (the LOCAL_PREF §7 row).
+    fn current_update_handling(&self) -> UpdateHandling {
+        match self.update_handling {
+            UpdateHandling::Rfc7606 { .. } => UpdateHandling::Rfc7606 {
+                internal: self.fsm.negotiated().is_some_and(|n| n.internal),
+            },
+            strict => strict,
+        }
+    }
+
     /// Override the clock (tests).
     pub fn set_clock(&mut self, now: fn() -> Instant) {
         self.now = now;
@@ -361,11 +387,12 @@ where
                     .unwrap_or(SessionEnd::Transport("session closed".into()));
             }
             let asn4 = self.fsm.negotiated().is_none_or(|n| n.asn4);
+            let handling = self.current_update_handling();
             tokio::select! {
-                read = read_frame(&mut self.io, asn4) => {
+                read = read_frame_with(&mut self.io, asn4, handling) => {
                     match read {
-                        Ok(Ok(message)) => {
-                            if let Some(end) = self.on_message(message, sink).await {
+                        Ok(Ok((message, report))) => {
+                            if let Some(end) = self.on_message(message, report, sink).await {
                                 return end;
                             }
                         }
@@ -375,7 +402,9 @@ where
                             let event = match bgp_err.notification {
                                 Some((1, sub)) => Event::BgpHeaderErr(1, sub),
                                 Some((2, sub)) => Event::BgpOpenMsgErr(2, sub),
-                                _ => Event::UpdateMsgErr(3, 1),
+                                // §6.3: the prescribed subcode rides the
+                                // NOTIFICATION (previously flattened to 1).
+                                other => Event::UpdateMsgErr(3, other.map(|(_, s)| s).unwrap_or(1)),
                             };
                             warn!(?bgp_err, peer = %self.peer.address, "bgpd: malformed message");
                             if let Some(end) = self.step(event, sink).await {
@@ -505,6 +534,7 @@ where
     async fn on_message<S: RouteSink>(
         &mut self,
         message: BgpMessage,
+        report: UpdateReport,
         sink: &mut S,
     ) -> Option<SessionEnd> {
         match message {
@@ -531,7 +561,49 @@ where
             BgpMessage::Update(update) => {
                 if let Err(err) = update.validate_well_known() {
                     let (code, sub) = err.notification.unwrap_or((3, 1));
+                    // RFC 7606 §7: a missing well-known mandatory
+                    // attribute is treat-as-withdraw, not a session
+                    // reset ("missing well-known mandatory attributes
+                    // require treat-as-withdraw").
+                    if self.update_handling.is_rfc7606() {
+                        let gone = update.announced();
+                        if !gone.is_empty() {
+                            warn!(peer = %self.peer.address, missing = sub,
+                                "bgpd: UPDATE missing well-known attribute, routes withdrawn (RFC 7606 §7)");
+                            sink.withdraw(&self.peer, &gone);
+                        }
+                        return self.step(Event::UpdateMsg, sink).await;
+                    }
                     return self.step(Event::UpdateMsgErr(code, sub), sink).await;
+                }
+                if report.treat_as_withdraw {
+                    // RFC 7606 §2: "treat the UPDATE ... as though all
+                    // contained routes had been withdrawn" — the
+                    // announced prefixes leave the Adj-RIB-In, the
+                    // explicit withdrawals still apply, and the
+                    // session itself is unaffected.
+                    let mut gone = update.announced();
+                    gone.extend(update.withdrawn_all());
+                    warn!(peer = %self.peer.address,
+                        attrs = ?report.discarded.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                        "bgpd: malformed UPDATE treated as withdrawal (RFC 7606)");
+                    #[cfg(feature = "experimental-savnet")]
+                    if let Some(agent) = &self.agent {
+                        let source = sav::agent::SavEventSource::Bgp(self.sav_peer());
+                        for prefix in &gone {
+                            agent.on_event(sav::agent::SavAgentEvent::RouteWithdrawn {
+                                source: source.clone(),
+                                prefix: *prefix,
+                            });
+                        }
+                    }
+                    sink.withdraw(&self.peer, &gone);
+                    return self.step(Event::UpdateMsg, sink).await;
+                }
+                if !report.discarded.is_empty() {
+                    warn!(peer = %self.peer.address,
+                        attrs = ?report.discarded,
+                        "bgpd: malformed attributes discarded, UPDATE processed (RFC 7606 §2)");
                 }
                 // §9.5: discard UPDATEs whose AS_PATH carries our own
                 // AS (loop); the connection itself is unaffected.
@@ -784,11 +856,25 @@ where
 /// Reads one complete BGP frame: 19-octet header, then the body the
 /// header's length field prescribes (bounded by the §4.1 maximum).
 /// The header is checked before the body read so a bogus length never
-/// drives the reader into the stream.
+/// drives the reader into the stream. Strict UPDATE error handling
+/// (see [`read_frame_with`]).
 pub async fn read_frame<IO: AsyncRead + Unpin>(
     io: &mut IO,
     asn4: bool,
 ) -> io::Result<BgpResult<BgpMessage>> {
+    read_frame_with(io, asn4, UpdateHandling::StrictRfc4271)
+        .await
+        .map(|r| r.map(|(m, _)| m))
+}
+
+/// [`read_frame`] with selectable UPDATE error handling: an RFC 7606
+/// mode returns salvageable UPDATEs together with their handling
+/// report instead of an error.
+pub async fn read_frame_with<IO: AsyncRead + Unpin>(
+    io: &mut IO,
+    asn4: bool,
+    handling: UpdateHandling,
+) -> io::Result<BgpResult<(BgpMessage, UpdateReport)>> {
     let mut header = [0u8; BGP_HEADER_LEN as usize];
     io.read_exact(&mut header).await?;
     if header[..16] != BGP_MARKER {
@@ -810,7 +896,7 @@ pub async fn read_frame<IO: AsyncRead + Unpin>(
     io.read_exact(&mut body).await?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
-    Ok(BgpMessage::decode(&frame, asn4))
+    Ok(BgpMessage::decode_with_handling(&frame, asn4, handling))
 }
 
 /// The v1 Adj-RIB-Out source: the `network` lines from the config,
@@ -1293,6 +1379,215 @@ mod tests {
             update.attrs.last(),
             Some(PathAttribute::MpUnreach(_))
         ));
+    }
+
+    // ---- RFC 7606 revised error handling at the session (N5 M1) ---
+
+    /// A duplex helper: drive one session, hand the test side raw
+    /// frame bytes, record the sink.
+    struct MalformedPeer {
+        io: tokio::io::DuplexStream,
+        sink: SharedSink<RecordingSink>,
+    }
+
+    async fn established_session() -> (MalformedPeer, tokio::task::JoinHandle<SessionEnd>) {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        let mut peer = MalformedPeer { io: theirs, sink };
+        peer.handshake(65000).await;
+        (peer, driver)
+    }
+
+    impl MalformedPeer {
+        /// OPEN (as 65001) answered to our OPEN, then KEEPALIVE.
+        async fn handshake(&mut self, _expect_as: u32) {
+            let frame = read_bytes(&mut self.io).await;
+            let _ = BgpMessage::decode(&frame, true).unwrap();
+            let mine = BgpOpen::new(65001, 30, "10.9.9.9".parse().unwrap(), vec![]);
+            write_bytes(&mut self.io, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+            let frame = read_bytes(&mut self.io).await;
+            assert_eq!(frame[18], message_type::KEEPALIVE);
+            write_bytes(&mut self.io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+        }
+
+        /// Pre-advertise a good route so the withdrawal is observable.
+        async fn advertise(&mut self, prefix: &str) {
+            let update = BgpMessage::Update(BgpUpdate {
+                withdrawn: vec![],
+                attrs: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::sequence([65001])),
+                    PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+                ],
+                nlri: vec![prefix.parse().unwrap()],
+            })
+            .encode(true)
+            .unwrap();
+            write_bytes(&mut self.io, &update).await;
+        }
+
+        async fn raw(&mut self, body: &[u8]) {
+            let mut frame = vec![0xff; 16];
+            put_len(&mut frame, 19 + body.len() as u16);
+            frame.push(message_type::UPDATE);
+            frame.extend_from_slice(body);
+            write_bytes(&mut self.io, &frame).await;
+        }
+
+        /// Read until a NOTIFICATION arrives (None on EOF first).
+        async fn expect_alive_after_keepalive(
+            &mut self,
+            driver: &tokio::task::JoinHandle<SessionEnd>,
+        ) {
+            write_bytes(&mut self.io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+            // The session must process the KEEPALIVE after the
+            // malformed UPDATE: give it a moment, then confirm the
+            // driver is still running (not returned).
+            for _ in 0..50 {
+                if driver.is_finished() {
+                    panic!("session died after a treat-as-withdraw UPDATE");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    fn put_len(frame: &mut Vec<u8>, len: u16) {
+        frame.push((len >> 8) as u8);
+        frame.push((len & 0xff) as u8);
+    }
+
+    /// An UPDATE whose ORIGIN attribute is malformed (length 2):
+    /// RFC 7606 §7 treats it as a withdrawal of the NLRI it carries —
+    /// the session survives and answers the next KEEPALIVE.
+    #[tokio::test]
+    async fn malformed_update_treated_as_withdraw_session_survives() {
+        let (mut peer, driver) = established_session().await;
+        peer.advertise("203.0.113.0/24").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        {
+            let sink = peer.sink.0.lock().unwrap();
+            assert!(sink
+                .announced
+                .contains_key(&"203.0.113.0/24".parse().unwrap()));
+        }
+        // A re-announcement of the same prefix with a malformed
+        // ORIGIN (length 2): RFC 7606 §2 treats the contained routes
+        // (the NLRI below) as withdrawn.
+        let body: Vec<u8> = [
+            0x00, 0x00, // withdrawn len
+            0x00, 0x15, // attr len: ORIGIN(5) + AS_PATH(9) + NEXT_HOP(7)
+            0x40, 0x01, 0x02, 0x00, 0x00, // ORIGIN len 2 (malformed)
+            0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH 65001 (4-octet)
+            0x40, 0x03, 0x04, 192, 0, 2, 9, // NEXT_HOP
+            //
+            24, 203, 0, 113, // NLRI 203.0.113.0/24
+        ]
+        .to_vec();
+        peer.raw(&body).await;
+        peer.expect_alive_after_keepalive(&driver).await;
+        let sink = peer.sink.0.lock().unwrap();
+        assert!(
+            sink.withdrawn.contains(&"203.0.113.0/24".parse().unwrap()),
+            "the announced route was withdrawn (RFC 7606 §2)"
+        );
+        assert_eq!(sink.cleared, 0, "no teardown: the session lives");
+        driver.abort();
+    }
+
+    /// The same malformed UPDATE under `strict-rfc4271`: NOTIFICATION
+    /// (3, 5 Attribute Length Error) and session teardown.
+    #[tokio::test]
+    async fn strict_mode_still_resets_the_session() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None)
+            .with_update_handling(crate::attr::UpdateHandling::StrictRfc4271);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        let mut peer = MalformedPeer {
+            io: theirs,
+            sink: sink.clone(),
+        };
+        peer.handshake(65000).await;
+        let body: Vec<u8> = [
+            0x00, 0x00, 0x00, 0x0c, // attr len: ORIGIN(5) + NEXT_HOP(7)
+            0x40, 0x01, 0x02, 0x00, 0x00, // ORIGIN len 2 (malformed)
+            0x40, 0x03, 0x04, 192, 0, 2, 9, // NEXT_HOP
+        ]
+        .to_vec();
+        peer.raw(&body).await;
+        let frame = read_bytes(&mut peer.io).await;
+        assert_eq!(frame[18], message_type::NOTIFICATION);
+        let notification = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Notification(n) => n,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(notification.code, 3);
+        assert_eq!(
+            notification.subcode,
+            error::update_subcode::ATTRIBUTE_LENGTH_ERROR
+        );
+        let end = driver.await.unwrap();
+        assert!(matches!(end, SessionEnd::Notified(3, _)));
+    }
+
+    /// A malformed AGGREGATOR (length 3) is attribute-discard only:
+    /// the route lands in the sink, no withdrawal, session alive.
+    #[tokio::test]
+    async fn discarded_attribute_keeps_the_route() {
+        let (mut peer, driver) = established_session().await;
+        let body: Vec<u8> = [
+            0x00, 0x00, // withdrawn len
+            0x00, 0x1a, // attr len 26: ORIGIN+AS_PATH+NEXT_HOP+AGGREGATOR
+            0x40, 0x01, 0x01, 0x00, // ORIGIN IGP
+            0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, // AS_PATH 65001
+            0x40, 0x03, 0x04, 192, 0, 2, 9, // NEXT_HOP
+            0xC0, 0x07, 0x03, 0x01, 0x02, 0x03, // AGGREGATOR len 3 (malformed)
+            //
+            24, 203, 0, 113, // NLRI 203.0.113.0/24
+        ]
+        .to_vec();
+        peer.raw(&body).await;
+        peer.expect_alive_after_keepalive(&driver).await;
+        let sink = peer.sink.0.lock().unwrap();
+        assert!(
+            sink.announced
+                .contains_key(&"203.0.113.0/24".parse().unwrap()),
+            "the route itself is kept (RFC 7606 §2 attribute discard)"
+        );
+        assert!(sink.withdrawn.is_empty());
+        driver.abort();
+    }
+
+    /// RFC 7606 §7: an UPDATE whose NLRI lacks NEXT_HOP (missing
+    /// well-known mandatory) withdraws the routes instead of
+    /// resetting the session (the strict mode still notifies).
+    #[tokio::test]
+    async fn missing_well_known_withdraws_under_7606() {
+        let (mut peer, driver) = established_session().await;
+        peer.advertise("198.51.100.0/24").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // NLRI present, ORIGIN + AS_PATH only (no NEXT_HOP).
+        let body: Vec<u8> = [
+            0x00, 0x00, 0x00, 0x0d, // attr len 13: ORIGIN(4)+AS_PATH(9)
+            0x40, 0x01, 0x01, 0x00, //
+            0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfd, 0xe9, //
+            24, 198, 51, 100, // NLRI 198.51.100.0/24
+        ]
+        .to_vec();
+        peer.raw(&body).await;
+        peer.expect_alive_after_keepalive(&driver).await;
+        let sink = peer.sink.0.lock().unwrap();
+        assert!(
+            sink.withdrawn.contains(&"198.51.100.0/24".parse().unwrap()),
+            "missing NEXT_HOP treats the NLRI as withdrawn (RFC 7606 §7)"
+        );
+        assert_eq!(sink.cleared, 0);
+        driver.abort();
     }
 
     // --- SAVNET agent hooks (experimental-savnet only) ---

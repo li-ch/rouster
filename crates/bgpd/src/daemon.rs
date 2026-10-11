@@ -519,6 +519,10 @@ where
         bgp_id: None,
     };
     let session_config = session_config_for(&config, &neighbor);
+    // RFC 7606 §7's LOCAL_PREF row keys on the session type; the
+    // session refines `internal` from the negotiated OPEN, so the
+    // config side only carries the mode.
+    let internal = neighbor.remote_as == config.local_as;
     let mut session = PeerSession::new(
         io,
         session_config,
@@ -527,7 +531,8 @@ where
         Some(ctx.out_rib),
         Duration::from_secs(neighbor.mrai),
     )
-    .with_shared(shared);
+    .with_shared(shared)
+    .with_update_handling(neighbor.update_handling.handling(internal));
     let mut sink = ctx.sink;
     let end = session
         .run_with_signals(&mut sink, session_stop, refresh)
@@ -677,6 +682,7 @@ mod tests {
             timers: Some((10, 30)),
             mrai: 0,
             role: None,
+            update_handling: Default::default(),
         };
         assert_eq!(session_config_for(&config, &neighbor).hold_time, 30);
         neighbor.timers = None;
