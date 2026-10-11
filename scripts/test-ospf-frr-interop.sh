@@ -39,11 +39,21 @@
 # NET_RAW); self-cleaning; quarantine (absolute path) under
 # away/2026-10-11/weekend/quarantine/ospf/ on success AND failure.
 #
+# ADD-C2 dynamic-address mode (ROUSTER_OSPF_DYNAMIC_ADDRESS=1): r2's
+# ospfd.conf carries NO `address` line — the zapi interface dump
+# (ifdump) supplies eth0's live address/link-state from rousterd's
+# netlink mirror — and an extra machine check pins that the address
+# indeed came from the dump log line before the adjacency checks run.
+# Default (unset/0) is the pinned static-address path, unchanged.
+#
 #   scripts/test-ospf-frr-interop.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# ADD-C2: 1 = no static address on r2's interface stanza (dump-fed).
+DYNAMIC=${ROUSTER_OSPF_DYNAMIC_ADDRESS:-0}
 
 R1=ospf-frr-r1
 R2=ospf-rouster-r2
@@ -166,21 +176,43 @@ wait_in "$R1" "r1 ospfd vty socket" 30 "test -S /var/run/frr/ospfd.vty"
 echo "==> r2: mgmtd + staticd (FRR) + OUR ospfd against rousterd"
 docker exec "$R2" sh -c "/usr/lib/frr/mgmtd -d -z $ZAPI_SOCK --log file:$MGMTD_LOG --log-level debug"
 docker exec "$R2" sh -c "/usr/lib/frr/staticd -d -z $ZAPI_SOCK --log file:$STATICD_LOG --log-level debug"
-docker exec "$R2" sh -c "printf '%s\n' \
-  'zapi socket $ZAPI_SOCK' \
-  'router ospf' \
-  ' router-id $OUR_RID' \
-  ' area 0.0.0.0' \
-  '  interface eth0' \
-  '   address $R2_IP/$R2_LEN' \
-  '   network-type point-to-point' \
-  '   hello-interval 2' \
-  '   dead-interval 8' \
-  ' redistribute static' \
-  > /etc/rouster-ospfd.conf"
+if [ "$DYNAMIC" = 1 ]; then
+    # ADD-C2: NO address line — the zapi interface dump feeds it
+    # (rousterd's netlink mirror already holds eth0's live address).
+    docker exec "$R2" sh -c "printf '%s\n' \
+      'zapi socket $ZAPI_SOCK' \
+      'router ospf' \
+      ' router-id $OUR_RID' \
+      ' area 0.0.0.0' \
+      '  interface eth0' \
+      '   network-type point-to-point' \
+      '   hello-interval 2' \
+      '   dead-interval 8' \
+      ' redistribute static' \
+      > /etc/rouster-ospfd.conf"
+else
+    docker exec "$R2" sh -c "printf '%s\n' \
+      'zapi socket $ZAPI_SOCK' \
+      'router ospf' \
+      ' router-id $OUR_RID' \
+      ' area 0.0.0.0' \
+      '  interface eth0' \
+      '   address $R2_IP/$R2_LEN' \
+      '   network-type point-to-point' \
+      '   hello-interval 2' \
+      '   dead-interval 8' \
+      ' redistribute static' \
+      > /etc/rouster-ospfd.conf"
+fi
 docker exec "$R2" sh -c "cat /etc/rouster-ospfd.conf"
 docker exec -d "$R2" sh -c "NO_COLOR=1 rouster-ospfd --config /etc/rouster-ospfd.conf > $OUR_OSPFD_LOG 2>&1"
 wait_in "$R2" "our ospfd is up" 10 "pidof rouster-ospfd"
+if [ "$DYNAMIC" = 1 ]; then
+    echo "==> DYNAMIC-ADDRESS (ADD-C2): eth0's address came from the dump"
+    wait_in "$R2" "our ospfd took eth0's address from the dump" 15 \
+        "grep -q 'address from the zapi interface dump' $OUR_OSPFD_LOG"
+    docker exec "$R2" sh -c "grep 'interface config merged' $OUR_OSPFD_LOG" || true
+fi
 
 echo "==> FRR side config (vtysh -b, retried past the zebra-view race)"
 docker exec "$R1" sh -c "printf '%s\n' \
