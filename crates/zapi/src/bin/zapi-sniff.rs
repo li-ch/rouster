@@ -24,13 +24,20 @@
 //!
 //! With `--respond-iface <NAME:IFINDEX:ADDR/PLEN>` it answers the empty-body
 //! INTERFACE_ADD (0) registration with one interface dump + one address
-//! frame for the named interface — bgpd refuses to arm SINGLE-HOP BFD
-//! (treats every NHT-unresolved neighbor as multihop-without-local,
-//! `_bfd_sess_valid` rejects; W1-b live finding) until zebra has told it
-//! about interfaces, so the single-hop BFD_DEST_REGISTER pin needs this.
+//! frame for the named interface, advertising the interface's HOST
+//! address (the connected-route form real zebra pushes). bgpd arms
+//! single-hop BFD at config-apply with NO interface or NHT knowledge at
+//! all (M1 wire pin: the apply-time REGISTER fires against a bare
+//! masquerade; classification is `PEER_IS_MULTIHOP` — same-AS ⇒ iBGP ⇒
+//! multihop — not an NHT property; the W1-b "NHT-unresolved neighbors
+//! are treated as multihop" reading was a misdiagnosis of a same-AS
+//! config). What the interface dump IS load-bearing for: bgpd's
+//! session-establish path (`bgp_zebra_nexthop_set` →
+//! `if_lookup_by_ipv4_exact`) and therefore the ifname/local-address
+//! UPDATE (29) a real EBGP session triggers.
 //! With `--respond-nht` it answers every ZEBRA_NEXTHOP_REGISTER (21) with a
 //! resolved NEXTHOP_UPDATE over a connected route through that interface —
-//! the same NHT-resolution trigger from the other half.
+//! what lets bgpd's connect logic pass the ebgp connected check.
 //!
 //! Dependency-free by design: std + tokio + the crate's own header codec.
 //! Usage: zapi-sniff --socket /var/run/frr/zserv.api --log /tmp/cap.log
@@ -132,8 +139,8 @@ fn log_line(sink: &LogSink, line: &str) {
 }
 
 /// The synthetic interface the `--respond-iface` mode advertises: a name,
-/// an ifindex, and one address whose connected prefix is what bgpd's
-/// `if_lookup_by_ipv4` walks to decide single-hop.
+/// an ifindex, and one address (host form) whose connected route bgpd's
+/// `if_lookup_by_ipv4_exact` matches on session-establish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FakeIface {
     name: String,
@@ -571,21 +578,19 @@ const ZEBRA_INTERFACE_ACTIVE: u64 = 0x1;
 /// frame plus one INTERFACE_ADDRESS_ADD for the synthetic interface.
 /// SPEC bodies (the pinned doc's source-verified zebra→client layouts).
 fn iface_reply(iface: &FakeIface) -> Result<Vec<Vec<u8>>, String> {
-    // The network address of the configured prefix (the host bits must
-    // not leak into a "connected route" advertisement).
+    // The interface's own HOST address at the configured prefix length —
+    // the form real zebra's INTERFACE_ADDRESS_ADD carries (a connected
+    // route derived from the interface address), and the form bgpd's
+    // `if_lookup_by_ipv4_exact` matches on session-establish
+    // (`bgp_zebra_nexthop_set`): masking the host bits to the network
+    // address makes every exact lookup miss and the BGP session can
+    // never come up (found live in the M1 single-hop pin run).
     let prefix: common::IpPrefix = match iface.addr {
         std::net::IpAddr::V4(a) => {
-            let plen = u32::from(iface.plen);
-            if plen > 32 {
-                return Err(format!("bad v4 prefix length /{plen}"));
+            if iface.plen > 32 {
+                return Err(format!("bad v4 prefix length /{}", iface.plen));
             }
-            let mask = if plen == 0 {
-                0
-            } else {
-                u32::MAX << (32 - plen)
-            };
-            let net = u32::from_be_bytes(a.octets()) & mask;
-            format!("{}/{plen}", std::net::Ipv4Addr::from(net.to_be_bytes()))
+            format!("{a}/{}", iface.plen)
                 .parse()
                 .map_err(|e: common::PrefixError| e.to_string())?
         }
@@ -699,8 +704,8 @@ mod tests {
                 assert_eq!(a.ifindex, 2);
                 assert_eq!(
                     a.address.to_string(),
-                    "192.168.0.0/16",
-                    "network address (host bits masked off)"
+                    "192.168.215.2/16",
+                    "the interface's HOST address (real zebra's form; the masked network form makes bgpd's exact lookup miss)"
                 );
             }
             other => panic!("not an InterfaceAddressAdd: {other:?}"),

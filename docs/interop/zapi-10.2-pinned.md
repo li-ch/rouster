@@ -81,9 +81,9 @@ against the frr-10.2.2 source (`lib/zclient.h` fetched by Z2), holes marked
 | 24 | ZEBRA_INTERFACE_NBR_ADDRESS_ADD | B | |
 | 25 | ZEBRA_INTERFACE_NBR_ADDRESS_DELETE | B | |
 | 26 | ZEBRA_INTERFACE_BFD_DEST_UPDATE | B, **E** | **W1-b-fix**: zebra→client BFD state push, body PINNED by wire capture in three states (DOWN/UP/DOWN) — see the W1-b addendum |
-| 27 | ZEBRA_BFD_DEST_REGISTER | B, **E** | **W1-b-fix**: bgpd multihop frame pinned; single-hop pinned by Phase B acceptance |
-| 28 | ZEBRA_BFD_DEST_DEREGISTER | B, SRC | **W1-b**: no daemon observed sending one; body source-pinned (same layout); zebra sends no reply |
-| 29 | ZEBRA_BFD_DEST_UPDATE | B, **E** | **W1-b-fix**: bgpd re-install frame pinned (byte-identical to its REGISTER body); as zebra→client never observed (26 is the push) |
+| 27 | ZEBRA_BFD_DEST_REGISTER | B, **E** | **W1-b-fix**: bgpd multihop frame pinned; **M1N**: single-hop bgpd-emitted frames pinned in both forms (apply-time wildcard + established ifname/src — see the M1N addendum) |
+| 28 | ZEBRA_BFD_DEST_DEREGISTER | B, SRC, **E** | **M1N-fix**: wire-captured at last — bgpd emits 28 on the establish address-change re-arm AND on `no neighbor ... bfd` (byte-identical body to its register); zebra sends no reply |
+| 29 | ZEBRA_BFD_DEST_UPDATE | B, **E** | **W1-b-fix**: bgpd re-install frame pinned (byte-identical to its REGISTER body); **M1N**: single-hop ifname form captured (same-address re-fire); as zebra→client never observed (26 is the push) |
 | 30 | ZEBRA_BFD_DEST_REPLAY | B, **E** | **W1-b-fix**: bfdd sends it at connect with body = pid u32, AND on every session transition with body = pid + the 26-tuple (Phase C) |
 | 31 | ZEBRA_REDISTRIBUTE_ROUTE_ADD | B | zebra→client |
 | 32 | ZEBRA_REDISTRIBUTE_ROUTE_DEL | B | zebra→client |
@@ -704,12 +704,12 @@ body = 00000052 0002 c6336409 0000012c 0000012c 03 01 0002 c0a8d704 ff 00 00 00
 
 Layout cross-verified against `zclient_bfd_command` (frr-10.2.2
 `lib/bfd.c`, HAVE_BFDD>0 variant — every field, in order, big-endian).
-The single-hop form differs only in mhop=0, src=0.0.0.0, hops=1, and
-ifnamelen>0 + name when the client knows the egress interface — the
-encoder branch is source-read; the single-hop frame is pinned by
-ACCEPTANCE in Phase B (the probe's 30-byte single-hop register created
-a live session), not by a bgpd-emitted capture (see deviations below).
-The timers are MILLISECONDS on the wire (300 = 300 ms).
+The single-hop form was W1-b-pinned by ACCEPTANCE only (the Phase B
+probe's register created a live session); the M1N addendum below pins
+the bgpd-EMITTED single-hop frames byte-for-byte — identical
+shape/order, only the mhop/src/hops/ifname field VALUES differ (the
+HAVE_BFDD>0 encoder always sends the source family+address, both
+hops modes). The timers are MILLISECONDS on the wire (300 = 300 ms).
 
 ### ZEBRA_BFD_DEST_REPLAY (30) — bfdd→zebra — E, both forms
 
@@ -781,9 +781,10 @@ Pinned behaviors:
 3. **DEREGISTER (28) draws no reply** — the probe's mid-window
    deregister (source-shaped body, byte-same layout as the register)
    produced zero frames back in the 12 s remainder of its window. 28
-   stays E-absent: no FRR daemon was observed SENDING one in any
-   capture window (the `no neighbor ... bfd` vtysh toggle never emitted
-   one — bgpd appears to keep the session armed); the body layout is
+   stayed E-absent through W1-b (no FRR daemon was observed SENDING one
+   in those windows; the `no neighbor ... bfd` toggle never emitted one
+   because the W1-b neighbor's session had never installed — see the
+   M1N addendum for the captured frames and why); the body layout is
    source-pinned (`zclient_bfd_command` sends the identical tail for
    all three commands).
 
@@ -794,15 +795,104 @@ Pinned behaviors:
   configured or a learned `su_local`); without it bgpd logs
   `_bfd_sess_valid: multi hop but no local address provided` and sends
   nothing.
-- Against a masquerade zebra, bgpd classified even an on-link neighbor
-  (`neighbor <bridge-gw> bfd`) as multi-hop until NHT resolved — with
-  interface dumps (`--respond-iface`) AND NHT answers
-  (`--respond-nht`), plus `bgp router-id` set, bgpd still showed
-  `BFD: Type: multi hop` for the on-link neighbor in-window; the
-  bgpd-emitted single-hop REGISTER frame therefore remains unpinned
-  (source-read + Phase B acceptance only — disclosed). bgpd without a
-  router-id refuses connections (`bgp_connect: BGP identifier is
-  missing`) but this does not block the REGISTER.
+- **M1N-fix**: W1-b read its missing on-link frame as "bgpd classifies
+  NHT-unresolved neighbors as multi hop" — a misdiagnosis. The real
+  mechanism (frr-10.2.2 `bgpd/bgp_bfd.h`): `PEER_IS_MULTIHOP(peer) =
+  (IBGP && !shared_network) || is_ebgp_multihop_configured(peer)`.
+  W1-b's on-link neighbor carried `remote-as 65000` under
+  `router bgp 65000` — same AS ⇒ iBGP ⇒ multihop ⇒ (no update-source)
+  invalid ⇒ nothing sent. Classification never consults NHT: the M1N
+  leg-1 REGISTER fires at config-apply against a masquerade that
+  answers NOTHING, a second before bgpd's own NEXTHOP_REGISTER.
+  (`bgp router-id` is still needed — bgpd without a router-id refuses
+  connections (`bgp_connect: BGP identifier is missing`) but this does
+  not block the REGISTER.)
+- The multihop W1-b frame's `hops = 0xff` (not the configured
+  `ebgp-multihop 5`): `peer_ebgp_multihop_set` is a NO-OP for iBGP
+  peers, and the same-AS neighbor WAS iBGP — so ttl stayed the iBGP
+  default 255. The multihop wire-shape pin stands; only the
+  config-effect reading is corrected (M1N, source-read +
+  `bgpd.c:peer_ebgp_multihop_set`).
+
+## M1N addendum (2026-10-11 night): the single-hop REGISTER family, bgpd-emitted
+
+Method: `scripts/test-bfd-singlehop-pin.sh` — the zapi-sniff masquerade
+plus a REAL bgpd 10.2.2, two legs. Leg 1: a BARE masquerade (HELLO +
+label-manager answers only — no interface dumps, no NHT answers) with
+an on-link EBGP neighbor (the docker bridge gateway, `remote-as 65001`
+under `router bgp 65000`); leg 2: the full masquerade (interface dump +
+NHT answers) with a REAL EBGP peer container (`remote-as 65001`, BGP
+session Established). Tag M1N = the 2026-10-11 night-round micro M1
+(the M1-fix further up is the 2026-10-10 BFD_CLIENT_REGISTER micro).
+
+### The apply-time single-hop REGISTER (27) — E, both legs
+
+Leg 1 (bare masquerade; dst = the bridge gateway; sent at
+config-apply, ~1 s BEFORE bgpd's own NEXTHOP_REGISTER, with zero
+interface/NHT exchange in the whole leg — single-hop arming needs
+neither):
+
+```text
+body(30) = 0000003c 0002 c0a8d701 0000012c 0000012c 03 00 0002 00000000 01 00 00 00
+          |         |    |         |         |        |  |  |    |         |  |  |  +-- profilelen u8 = 0
+          |         |    |         |         |        |  |  |    |         |  |  +-- cbit u8 = 0
+          |         |    |         |         |        |  |  |    |         |  +-- ifnamelen u8 = 0 (no egress if known yet)
+          |         |    |         |         |        |  |  |    |         +-- hops u8 = 1 (single hop)
+          |         |    |         |         |        |  |  |    +-- src = 0.0.0.0 (no local address known yet)
+          |         |    |         |         |        |  |  +-- family u16 = 2 (again — ALWAYS sent, both hop modes)
+          |         |    |         |         |        |  +-- mhop u8 = 0
+          |         |    |         |         |        +-- detection_multiplier u8 = 3
+          |         |    |         |         +-- min_tx u32 ms = 300
+          |         |    |         +-- min_rx u32 ms = 300
+          |         |    +-- dst = 192.168.215.1 (the gateway)
+          |         +-- family u16 = AF_INET
+          +-- pid u32 = 0x3c (bgpd's getpid())
+```
+
+Leg 2's apply-time frame (dst = the peer container, pid 0x79) is the
+same 30-byte form: `00000079 0002 c0a8d703 0000012c 0000012c 03 00
+0002 00000000 01 00 00 00`.
+
+### The established-session forms — E (the ifname/src delta)
+
+Once the EBGP session establishes, bgpd re-arms with the learned local
+address (`su_local`) and egress interface (`nexthop.ifp`): a
+DEREGISTER (28) carrying the OLD parameters followed by a REGISTER
+(27) carrying the new ones (`bfd_sess_set_ipv4_addrs` → remove-then-
+install; `_bfd_sess_send` picks REGISTER because the remove cleared
+`installed`). The new-parameters body — 34 bytes, the only wire delta
+beyond field values:
+
+```text
+body(34) = 00000079 0002 c0a8d703 0000012c 0000012c 03 00 0002 c0a8d702 01 04 65746830 00 00
+          |                                                        |  |  |         |  |  +-- profilelen u8 = 0
+          |                                                        |  |  |         |  +-- cbit u8 = 0
+          |                                                        |  |  |         +-- ifname = "eth0" (ifnamelen u8 = 4)
+          |                                                        |  |  +-- hops u8 = 1
+          |                                                        |  +-- src = 192.168.215.2 (the learned su_local)
+          |                                                        +-- mhop u8 = 0
+          +-- (pid/family/dst/timers/multiplier as above)
+```
+
+The lifecycle matrix captured on the wire (all bodies verbatim in the
+script's quarantine logs):
+
+| event | cmd | body |
+|---|---|---|
+| config apply (`neighbor X remote-as <≠local> + bfd`) | 27 | the 30-byte wildcard form |
+| session Established (address change) | 28 then 27 | OLD 30-byte form, then the 34-byte src+ifname form |
+| `no neighbor X bfd` (installed session) | 28 | the 34-byte form, byte-identical |
+| `neighbor X bfd` re-add | 27 | the 34-byte form, byte-identical |
+| `neighbor X bfd` re-fire, same addresses | 29 | the 34-byte form, byte-identical (the same-address re-install is the UPDATE; an address CHANGE is the 28+27 pair) |
+
+Codec verdict: **no delta to model.** The single-hop frames match the
+W1-b multihop layout field-for-field — only VALUES differ (mhop byte,
+hops 1, wildcard-or-learned src, ifnamelen>0 + name extends the tail).
+`ZapiBfdSessionCmd` decodes and re-encodes all captured bodies
+byte-identically; the M1N golden tests pin the apply-time and
+established bodies (`crates/zapi/src/message.rs`,
+`bfd_dest_register_single_hop_wire_pins_the_bgpd_frames`,
+`bfd_dest_rearm_cycle_pins_deregister_and_ifname_forms`).
 
 ## A5 addendum (2026-10-09): ROUTE_NOTIFY_OWNER (11) wire-captured
 

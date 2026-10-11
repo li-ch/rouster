@@ -172,16 +172,22 @@ guard); `docker kill` of the Rouster container leaves FRR at
 
 `bfdd --zapi <SOCKET>` (default off) connects to a rousterd (the
 savd shape) and speaks the wire-pinned BFD daemon protocol
-(`docs/interop/zapi-10.2-pinned.md`, W1-b addendum): the connect
-burst is HELLO (redist byte 0x1a) + the empty INTERFACE_ADD + the
-4-byte REPLAY that claims the daemon role; forwarded
-REGISTER/UPDATE/DEREGISTER (27/29/28) become dynamic sessions
-(timers, multihop and source address straight off the wire; an
-UPDATE restarts with the new parameters — the reload rule); every
+(`docs/interop/zapi-10.2-pinned.md`, W1-b addendum + M1N addendum):
+the connect burst is HELLO (redist byte 0x1a) + the empty
+INTERFACE_ADD + the 4-byte REPLAY that claims the daemon role;
+forwarded REGISTER/UPDATE/DEREGISTER (27/29/28) become dynamic
+sessions (timers, multihop and source address straight off the wire;
+an UPDATE restarts with the new parameters — the reload rule); every
 state transition is reported back as the 25-byte REPLAY form (pid +
 the 26 tuple: dst at host length, the lib/bfd.h status bitmask,
 wildcard src, ifindex 0). Reconnect re-sends the burst, so a
-restarted rousterd replays what it remembers.
+restarted rousterd replays what it remembers. The single-hop forms
+are wire-pinned too (M1N): bgpd arms single-hop at config-apply with
+the wildcard source and no interface, then re-registers with the
+learned source + egress ifname once the BGP session establishes
+(a DEREGISTER/REGISTER pair — an address change, not an UPDATE); the
+ifname is accepted by the edge but not socket-selective (single-hop
+demux is the shared 3784 listeners keyed on peer+multihop).
 
 `scripts/test-bfd-zapi.sh` (exit 0 twice): rousterd + rouster bfdd
 --zapi + a REAL FRR bgpd in one container, a real FRR bfdd as the
@@ -200,9 +206,13 @@ DOWN report in bgpd through the 26 fan-out.
   landed (`parse_cmsgs`/`received_hop_limit`, unit-tested); landing
   the kernel half needs the no-unsafe fence lifted (socket2 0.6.5
   has no safe cmsg read-back — deviation 1 above).
-- **bgpd-emitted single-hop REGISTER frame**: pinned only by source
-  + Phase B acceptance (bgpd classifies NHT-unresolved neighbors as
-  multihop; the pinned doc's W1-b addendum has the finding).
+- ~~bgpd-emitted single-hop REGISTER frame~~ — LANDED (M1, night of
+  2026-10-11): wire-pinned in both forms plus the DEREGISTER/UPDATE
+  lifecycle (`docs/interop/zapi-10.2-pinned.md`, M1N addendum); no
+  codec delta (field values only), golden tests on the captured bytes.
+  The finding also corrected W1-b's trigger story: single/multi-hop
+  classification is `PEER_IS_MULTIHOP` (same-AS ⇒ iBGP ⇒ multihop),
+  never NHT.
 - **Soft timer update on reload** (announce via §6.8.2 poll sequence
   instead of restarting the session; ~1 h at
   `crates/bfdd/src/daemon.rs` reload).

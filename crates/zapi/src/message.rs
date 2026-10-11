@@ -3016,6 +3016,79 @@ mod tests {
         assert_eq!(roundtrip(&msg), wire);
     }
 
+    /// M1 wire pins: the bgpd-EMITTED single-hop REGISTER bodies (real
+    /// FRR 10.2.2, apply-time). Leg 1 fired against a BARE masquerade
+    /// (no interface dumps, no NHT answers; the frame precedes bgpd's
+    /// own NEXTHOP_REGISTER by a second) — single-hop arming at config
+    /// apply needs neither. Identical shape to the multihop W1-b frame,
+    /// field values only: mhop 0, src wildcard, hops 1, ifnamelen 0.
+    #[test]
+    fn bfd_dest_register_single_hop_wire_pins_the_bgpd_frames() {
+        // Leg 1 (bare masquerade): dst = the bridge gateway.
+        let leg1 = hex("0000003c0002c0a8d7010000012c0000012c030000020000000001000000");
+        let msg = ZapiMessage::decode(27, &leg1).unwrap();
+        match &msg {
+            ZapiMessage::BfdDestRegister(cmd) => {
+                assert_eq!(cmd.pid, 0x3c);
+                assert_eq!(cmd.dst, "192.168.215.1".parse::<IpAddr>().unwrap());
+                assert!(!cmd.mhop, "single hop");
+                assert_eq!(cmd.src, "0.0.0.0".parse::<IpAddr>().unwrap());
+                assert_eq!(cmd.hops, 1);
+                assert_eq!(cmd.ifname, None);
+                assert_eq!(
+                    (cmd.min_rx_ms, cmd.min_tx_ms, cmd.detection_multiplier),
+                    (300, 300, 3)
+                );
+            }
+            other => panic!("not a register: {other:?}"),
+        }
+        assert_eq!(roundtrip(&msg), leg1);
+
+        // Leg 2 (full masquerade, real EBGP peer): the apply-time frame
+        // for the peer — same 30-byte single-hop form.
+        let leg2 = hex("000000790002c0a8d7030000012c0000012c030000020000000001000000");
+        let msg = ZapiMessage::decode(27, &leg2).unwrap();
+        let ZapiMessage::BfdDestRegister(cmd) = &msg else {
+            panic!("not a register");
+        };
+        assert_eq!(cmd.dst, "192.168.215.3".parse::<IpAddr>().unwrap());
+        assert!(!cmd.mhop && cmd.hops == 1 && cmd.ifname.is_none());
+        assert_eq!(roundtrip(&msg), leg2);
+    }
+
+    /// M1 wire pins: the ifname-carrying single-hop bodies bgpd emits
+    /// once the EBGP session established (learned local address +
+    /// egress interface) — the re-arm REGISTER, the `no neighbor ... bfd`
+    /// DEREGISTER (28 — first wire evidence for the command, previously
+    /// source-pinned only), and the same-address re-fire UPDATE (29).
+    /// All three carry the byte-identical 34-byte body: src real,
+    /// hops 1, ifnamelen 4 "eth0".
+    #[test]
+    fn bfd_dest_rearm_cycle_pins_deregister_and_ifname_forms() {
+        let body = hex("000000790002c0a8d7030000012c0000012c03000002c0a8d7020104657468300000");
+        let rearm = ZapiMessage::decode(27, &body).unwrap();
+        match &rearm {
+            ZapiMessage::BfdDestRegister(cmd) => {
+                assert!(!cmd.mhop, "single hop");
+                assert_eq!(cmd.src, "192.168.215.2".parse::<IpAddr>().unwrap());
+                assert_eq!(cmd.hops, 1);
+                assert_eq!(cmd.ifname.as_deref(), Some("eth0"));
+            }
+            other => panic!("not a register: {other:?}"),
+        }
+        assert_eq!(roundtrip(&rearm), body);
+
+        // `no neighbor ... bfd` DEREGISTER — byte-identical body (28).
+        let dereg = ZapiMessage::decode(28, &body).unwrap();
+        assert!(matches!(dereg, ZapiMessage::BfdDestDeregister(_)));
+        assert_eq!(roundtrip(&dereg), body);
+
+        // Same-address re-fire — the UPDATE (29), byte-identical body.
+        let upd = ZapiMessage::decode(29, &body).unwrap();
+        assert!(matches!(upd, ZapiMessage::BfdDestUpdate(_)));
+        assert_eq!(roundtrip(&upd), body);
+    }
+
     /// Single-hop with a known egress interface carries ifname (the
     /// encoder branch frr's `zclient_bfd_command` source-read shows);
     /// multihop suppresses it even when set (so an mhop cmd with ifname
