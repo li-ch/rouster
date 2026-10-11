@@ -228,11 +228,45 @@ fork it. The concrete seams, documented where they bite:
   the area-1 ASBR sits in FRR's asbr-summary table and FRR resolves
   the redistributed static through us into its kernel.
 
+## Stub areas (2026-10-11, the N3 M1 slice)
+
+- **`area <id> stub [no-summary]` + `area <id> default-cost <n>`**
+  land in the config grammar (FRR's area-parameter shape; parameter
+  lines may reopen a declared area; the backbone cannot be stub —
+  §3.6; default-cost defaults to 1, FRR parity). `redistribute
+  static` with no external-capable area attached is a configuration
+  error (§3.6: "AS boundary routers cannot be placed internal to stub
+  areas").
+- **The area kind threads everywhere E-capability matters**: our
+  Hellos and DBD Options carry E clear in stub areas; §10.5's E-bit
+  agreement check (landed Day 1) now enforces §3.6's "all routers
+  belonging to an area agree" on the wire — a stub-area core drops
+  E-set Hellos and no neighbor forms.
+- **Flooding admission** (§13 step 3 receive-side): `AreaAdmission`
+  (`neighbor.rs`) — type-5s are silently discarded in stub areas;
+  FRR's totally-stubby (`no-summary`) discards type-3/4s too.
+- **Type-5 scope**: origination picks the first external-capable
+  area as the type-5 master, and both the §7 mirroring and the §13
+  step-1f re-flood skip stub areas entirely — a stub area's LSDB
+  holds no type-5s and no type-4s.
+- **The ABR's stub duties** (§12.4.3.1/§C.2): into a stub area the
+  ABR originates ONLY the default summary-LSA (type-3, LS ID
+  0.0.0.0, mask 0.0.0.0, metric = the area's `default-cost`) —
+  no per-network type-3s beyond the plain-stub set, no type-4s
+  (§12.4.3's ASBR-destination rules make them meaningless without
+  type-5s), and the internal routers resolve 0.0.0.0/0 through §16.2
+  at cost BR-distance + default-cost.
+- **§13.4 fix riding along**: `wants_to_originate` now answers true
+  for summaries the fresh table still justifies (the N2 comment
+  said "none are originated yet" — stale since M4); a newer
+  echoed self-summary is re-adopted, not flushed.
+
 ## §Deferred (updated day-3 anchors)
 
 - §16.3 (transit areas' summary-LSAs — only meaningful with virtual
   links, which set TransitCapability); incremental SPF (§16.5/§16.6);
-  virtual links (§15); stub/NSSA areas (§3.6); authentication
+  virtual links (§15); NSSA areas (RFC 3101 — the area-kind plumbing
+  is in, type-7 is not); authentication
   (Appendix D); graceful restart (RFC 3623); DNA honoring; OSPFv3
   bodies (the ladder's codecs-only scope).
 - `area range` configuration — §12.4.3's address-range

@@ -19,7 +19,8 @@ use std::net::Ipv4Addr;
 use crate::lsa::{Lsa, LsaHeader, LsaKey, Options, RouterId};
 use crate::lsdb::{self, Lsdb};
 use crate::neighbor::{
-    flood_step, FloodAction, NeighborAction, NeighborEvent, NeighborFsm, NeighborState,
+    flood_step, AreaAdmission, FloodAction, NeighborAction, NeighborEvent, NeighborFsm,
+    NeighborState,
 };
 use crate::packet::{
     DbDescription, LsAck, LsRequest, LsRequestId, LsUpdate, Packet, PacketBody, PacketHeader,
@@ -445,6 +446,7 @@ impl Conversation {
         lsdb: &mut Lsdb,
         now: u64,
         other_adjacencies_syncing: bool,
+        admission: AreaAdmission,
     ) -> (Vec<Send>, ConversationReport) {
         let mut sends = Vec::new();
         let mut report = ConversationReport::default();
@@ -466,7 +468,7 @@ impl Conversation {
                 lsdb,
                 now,
                 other_adjacencies_syncing,
-                false, // normal area (stub is §Deferred)
+                admission,
                 had_request,
                 on_rxmt,
             );
@@ -689,7 +691,8 @@ mod tests {
                     out.append(&mut s);
                 }
                 PacketBody::LsUpdate(lsu) => {
-                    let (mut s, _) = to.handle_lsu(&lsu.lsas, lsdb, now, false);
+                    let (mut s, _) =
+                        to.handle_lsu(&lsu.lsas, lsdb, now, false, AreaAdmission::Normal);
                     out.append(&mut s);
                 }
                 PacketBody::LsAck(ack) => to.handle_lsack(&ack.headers),
@@ -952,7 +955,8 @@ mod tests {
         let mut lsa = lsa_for(rid("8.8.8.8"), 3);
         lsa.header.ls_age = crate::MAX_AGE;
         let lsa = lsa.with_computed_header();
-        let (sends, report) = c.handle_lsu(&[lsa], &mut Lsdb::new(), now, false);
+        let (sends, report) =
+            c.handle_lsu(&[lsa], &mut Lsdb::new(), now, false, AreaAdmission::Normal);
         assert!(report.changed.is_empty());
         assert!(matches!(sends[0].packet.body, PacketBody::LsAck(_)));
     }

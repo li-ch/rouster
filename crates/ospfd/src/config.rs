@@ -70,7 +70,37 @@ impl OspfdConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AreaConfig {
     pub id: u32,
+    pub kind: AreaKind,
+    /// `area <id> default-cost` (§C.2): the metric of the default
+    /// summary-LSA an ABR advertises into a stub area. FRR parity:
+    /// default 1.
+    pub default_cost: u32,
     pub interfaces: BTreeMap<String, InterfaceConfig>,
+}
+
+/// The area type (§3.6 stub areas; RFC 3101 NSSA lands with the same
+/// plumbing). The backbone cannot be a stub area (§3.6: "Virtual links
+/// cannot be configured through stub areas. In addition, AS boundary
+/// routers cannot be placed internal to stub areas." — and §6 ties
+/// stub areas to non-backbone transit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AreaKind {
+    #[default]
+    Normal,
+    /// `area <id> stub`: no AS-external-LSAs flooded in (§3.6); the
+    /// ABRs advertise a default summary-LSA (§12.4.3.1).
+    Stub,
+    /// `area <id> stub no-summary` (FRR's totally stubby): summary
+    /// LSAs (types 3/4) are not admitted either — the default is the
+    /// only inter-area route.
+    StubNoSummary,
+}
+
+impl AreaKind {
+    /// §3.6/§10.5: ExternalRoutingCapability is false in stub areas.
+    pub fn external_capable(self) -> bool {
+        matches!(self, AreaKind::Normal)
+    }
 }
 
 /// The network type (§C.3): p2p skips the DR election entirely.
@@ -201,18 +231,79 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                         }
                     }
                     "area" => {
-                        if words.len() != 2 {
+                        // area <id> [stub [no-summary]] · area <id>
+                        // default-cost <n> — the FRR grammar's area
+                        // parameters; parameter lines may reopen an
+                        // already-declared area (FRR's own files write
+                        // `area X stub` and `area X default-cost N`
+                        // separately).
+                        if words.len() < 2 {
                             return Err(parse_error(line_no, "expected: area <id>"));
                         }
                         let Some(area) = parse_ipv4(words[1]) else {
                             return Err(parse_error(line_no, "bad area id"));
                         };
                         let raw = u32::from(area);
+                        let kind = match words[2..] {
+                            [] => None,
+                            ["stub"] => Some(AreaKind::Stub),
+                            ["stub", "no-summary"] => Some(AreaKind::StubNoSummary),
+                            ["default-cost", n] => {
+                                let cost = n.parse().ok().filter(|v| *v <= 0x00ff_ffff).ok_or_else(
+                                    || {
+                                        parse_error(
+                                            line_no,
+                                            "expected: default-cost <0-16777215>",
+                                        )
+                                    },
+                                )?;
+                                if let Some(existing) =
+                                    cfg.areas.iter_mut().find(|a| a.id == raw)
+                                {
+                                    existing.default_cost = cost;
+                                } else {
+                                    cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Normal,
+                                        default_cost: cost,
+                                        interfaces: BTreeMap::new(),
+                                    });
+                                }
+                                continue;
+                            }
+                            _ => {
+                                return Err(parse_error(
+                                    line_no,
+                                    "expected: area <id> [stub [no-summary]] | area <id> default-cost <0-16777215>",
+                                ))
+                            }
+                        };
+                        if let Some(set) = kind {
+                            if raw == 0 {
+                                // §3.6: the backbone cannot be a stub area.
+                                return Err(parse_error(
+                                    line_no,
+                                    "the backbone (area 0.0.0.0) cannot be a stub area (§3.6)",
+                                ));
+                            }
+                            match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                Some(existing) => existing.kind = set,
+                                None => cfg.areas.push(AreaConfig {
+                                    id: raw,
+                                    kind: set,
+                                    default_cost: 1,
+                                    interfaces: BTreeMap::new(),
+                                }),
+                            }
+                            continue;
+                        }
                         if cfg.areas.iter().any(|a| a.id == raw) {
                             return Err(parse_error(line_no, "duplicate area stanza"));
                         }
                         cfg.areas.push(AreaConfig {
                             id: raw,
+                            kind: AreaKind::Normal,
+                            default_cost: 1,
                             interfaces: BTreeMap::new(),
                         });
                     }
@@ -510,5 +601,60 @@ router ospf
             cfg.areas[0].interfaces["eth0"].cost, 10,
             "default untouched"
         );
+    }
+
+    // ---- stub areas (§3.6/§C.2, N3 M1) --------------------------------
+
+    #[test]
+    fn stub_area_config_parses() {
+        // FRR's shape: the area kind on the area line, default-cost on
+        // its own line reopening the same area.
+        let cfg = parse(concat!(
+            "router ospf\n",
+            " router-id 10.255.2.1\n",
+            " area 0.0.0.0\n",
+            "  interface eth0\n",
+            "   address 10.10.0.1/30\n",
+            "   network-type point-to-point\n",
+            " area 0.0.0.1 stub\n",
+            "  interface eth1\n",
+            "   address 10.20.0.1/30\n",
+            "   network-type point-to-point\n",
+            " area 0.0.0.1 default-cost 25\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.areas.len(), 2);
+        assert_eq!(cfg.areas[1].kind, AreaKind::Stub);
+        assert_eq!(cfg.areas[1].default_cost, 25);
+        // The one-line no-summary form (FRR's totally stuby).
+        let cfg = parse("router ospf\n area 0.0.0.2 stub no-summary\n").unwrap();
+        assert_eq!(cfg.areas[0].kind, AreaKind::StubNoSummary);
+        // The separate-line form of no-summary merges too.
+        let cfg =
+            parse("router ospf\n area 0.0.0.2 stub\n area 0.0.0.2 stub no-summary\n").unwrap();
+        assert_eq!(cfg.areas[0].kind, AreaKind::StubNoSummary);
+        // default-cost defaults to 1 (FRR parity).
+        let cfg = parse("router ospf\n area 0.0.0.1 stub\n").unwrap();
+        assert_eq!(cfg.areas[0].default_cost, 1);
+    }
+
+    #[test]
+    fn stub_area_config_is_strict() {
+        // §3.6: the backbone cannot be a stub area.
+        let err = parse("router ospf\n area 0.0.0.0 stub\n").unwrap_err();
+        assert!(err.to_string().contains("backbone"), "{err}");
+        assert!(err.to_string().contains("line 2"), "{err}");
+        // ... in either form.
+        let err = parse("router ospf\n area 0.0.0.0\n area 0.0.0.0 stub no-summary\n").unwrap_err();
+        assert!(err.to_string().contains("backbone"), "{err}");
+        // Unknown area parameter carries the line number.
+        let err = parse("router ospf\n area 0.0.0.1 nssa\n").unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
+        // Out-of-range default-cost.
+        let err = parse("router ospf\n area 0.0.0.1 default-cost 16777216\n").unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
+        // A bare duplicate area line is still a duplicate.
+        let err = parse("router ospf\n area 0.0.0.1\n area 0.0.0.1\n").unwrap_err();
+        assert!(err.to_string().contains("duplicate area"), "{err}");
     }
 }

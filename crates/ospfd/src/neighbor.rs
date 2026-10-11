@@ -559,6 +559,39 @@ pub struct HelloParams {
     pub p2p: bool,
 }
 
+/// §13 steps 1-3 receive-side admission, derived from the area type:
+/// what LSA classes this area accepts. Stub areas discard
+/// AS-external-LSAs (§13 step 3); FRR's totally-stubby
+/// (`no-summary`) discards the summary LSAs too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AreaAdmission {
+    #[default]
+    Normal,
+    /// `area <id> stub`: no type-5s (§3.6/§13 step 3).
+    Stub,
+    /// `area <id> stub no-summary`: no type-5s and no type-3/4s (FRR's
+    /// totally stubby extension).
+    StubNoSummary,
+}
+
+impl AreaAdmission {
+    /// §13 step 3: "If the area is a stub area and the LSA is an
+    /// AS-external-LSA, then the LSA is not flooded further" — the
+    /// receiver-side form discards it on arrival.
+    pub fn admits(self, ls_type: crate::lsa::LsaType) -> bool {
+        match self {
+            AreaAdmission::Normal => true,
+            AreaAdmission::Stub => ls_type != crate::lsa::LsaType::AS_EXTERNAL,
+            AreaAdmission::StubNoSummary => !matches!(
+                ls_type,
+                crate::lsa::LsaType::AS_EXTERNAL
+                    | crate::lsa::LsaType::SUMMARY_NETWORK
+                    | crate::lsa::LsaType::SUMMARY_ASBR
+            ),
+        }
+    }
+}
+
 /// §13 flooding: what to do with one received LSA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloodAction {
@@ -583,15 +616,15 @@ pub enum FloodAction {
 }
 
 /// §13 steps for a single received LSA. `neighbor_syncing` carries
-/// whether any adjacency is in Exchange/Loading; `stub_area` the
-/// area's ExternalRoutingCapability; `on_request_list`/`on_rxmt_list`
+/// whether any adjacency is in Exchange/Loading; `admission` the
+/// area-type admission rules; `on_request_list`/`on_rxmt_list`
 /// mirror the neighbor lists (the caller owns them).
 pub fn flood_step(
     lsa_bytes: &[u8],
     lsdb: &mut Lsdb,
     now: u64,
     neighbor_syncing: bool,
-    stub_area: bool,
+    admission: AreaAdmission,
     on_request_list: bool,
     on_rxmt_list: bool,
 ) -> FloodAction {
@@ -604,8 +637,9 @@ pub fn flood_step(
     if !lsa.header.ls_type.is_known_v2() {
         return FloodAction::Discard { silent: true };
     }
-    // (3) AS-external into a stub area.
-    if lsa.header.ls_type.0 == 5 && stub_area {
+    // (3) Area-type admission: AS-external into a stub area (§3.6);
+    // summaries into a totally-stubby area (FRR's no-summary).
+    if !admission.admits(lsa.header.ls_type) {
         return FloodAction::Discard { silent: true };
     }
     // (4) MaxAge with no instance and nobody syncing: ack + discard.
@@ -1040,7 +1074,15 @@ mod tests {
         let mut bytes = lsa(INITIAL_SEQUENCE_NUMBER, 1).encode();
         bytes[25] ^= 0x80;
         assert_eq!(
-            flood_step(&bytes, &mut db(), 0, false, false, false, false),
+            flood_step(
+                &bytes,
+                &mut db(),
+                0,
+                false,
+                AreaAdmission::Normal,
+                false,
+                false
+            ),
             FloodAction::Discard { silent: true }
         );
         // (2) unknown LS type — encode a valid router LSA then swap
@@ -1051,7 +1093,15 @@ mod tests {
         bytes[3] = 7;
         // (checksum now invalid -> still a silent discard, same bucket)
         assert_eq!(
-            flood_step(&bytes, &mut db(), 0, false, false, false, false),
+            flood_step(
+                &bytes,
+                &mut db(),
+                0,
+                false,
+                AreaAdmission::Normal,
+                false,
+                false
+            ),
             FloodAction::Discard { silent: true }
         );
         // (3) type-5 into a stub area: discard.
@@ -1077,13 +1127,21 @@ mod tests {
         }
         .encode();
         assert_eq!(
-            flood_step(&ext, &mut db(), 0, false, true, false, false),
+            flood_step(&ext, &mut db(), 0, false, AreaAdmission::Stub, false, false),
             FloodAction::Discard { silent: true }
         );
         // (4) MaxAge, no instance, nobody syncing: ack and discard.
         let bytes = lsa(INITIAL_SEQUENCE_NUMBER, crate::MAX_AGE).encode();
         assert_eq!(
-            flood_step(&bytes, &mut db(), 0, false, false, false, false),
+            flood_step(
+                &bytes,
+                &mut db(),
+                0,
+                false,
+                AreaAdmission::Normal,
+                false,
+                false
+            ),
             FloodAction::AckAndDiscard
         );
     }
@@ -1093,18 +1151,42 @@ mod tests {
         let mut d = db();
         let bytes = lsa(INITIAL_SEQUENCE_NUMBER, 1).encode();
         assert_eq!(
-            flood_step(&bytes, &mut d, 100, false, false, false, false),
+            flood_step(
+                &bytes,
+                &mut d,
+                100,
+                false,
+                AreaAdmission::Normal,
+                false,
+                false
+            ),
             FloodAction::InstallAndFlood { changed: true }
         );
         // A newer instance within MinLSArrival: silent discard (5a).
         let newer = lsa(INITIAL_SEQUENCE_NUMBER + 1, 1).encode();
         assert_eq!(
-            flood_step(&newer, &mut d, 100, false, false, false, false),
+            flood_step(
+                &newer,
+                &mut d,
+                100,
+                false,
+                AreaAdmission::Normal,
+                false,
+                false
+            ),
             FloodAction::Discard { silent: true }
         );
         // After the window: installed; same body => not "changed".
         assert_eq!(
-            flood_step(&newer, &mut d, 200, false, false, false, false),
+            flood_step(
+                &newer,
+                &mut d,
+                200,
+                false,
+                AreaAdmission::Normal,
+                false,
+                false
+            ),
             FloodAction::InstallAndFlood { changed: false }
         );
     }
@@ -1114,23 +1196,55 @@ mod tests {
         let mut d = db();
         // Seed the database with seq N+1.
         let newer = lsa(INITIAL_SEQUENCE_NUMBER + 1, 1).encode();
-        flood_step(&newer, &mut d, 0, false, false, false, false);
+        flood_step(
+            &newer,
+            &mut d,
+            0,
+            false,
+            AreaAdmission::Normal,
+            false,
+            false,
+        );
         // The same instance (seq N+1) again: step 7 — implied ack
         // when it sits on our retransmission list.
         assert_eq!(
-            flood_step(&newer, &mut d, 10, false, false, false, true),
+            flood_step(
+                &newer,
+                &mut d,
+                10,
+                false,
+                AreaAdmission::Normal,
+                false,
+                true
+            ),
             FloodAction::SameInstance { on_rxmt_list: true }
         );
         // Step 6 fires FIRST for a request-listed LSA (§13 order):
         // even the same instance is a BadLSReq when the sender had
         // it on its request list.
         assert_eq!(
-            flood_step(&newer, &mut d, 10, false, false, true, false),
+            flood_step(
+                &newer,
+                &mut d,
+                10,
+                false,
+                AreaAdmission::Normal,
+                true,
+                false
+            ),
             FloodAction::BadLSReq
         );
         // (8) older instance (seq N): send the database copy back.
         let older = lsa(INITIAL_SEQUENCE_NUMBER, 1).encode();
-        match flood_step(&older, &mut d, 10, false, false, false, false) {
+        match flood_step(
+            &older,
+            &mut d,
+            10,
+            false,
+            AreaAdmission::Normal,
+            false,
+            false,
+        ) {
             FloodAction::SendDatabaseCopy(l) => {
                 assert_eq!(l.header.seq, INITIAL_SEQUENCE_NUMBER + 1)
             }

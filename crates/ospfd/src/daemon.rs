@@ -31,12 +31,12 @@ use common::{Ipv4Prefix, Nexthop, NexthopGroup, RouteEntry, RouteProtocol};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::config::{InterfaceConfig, NetworkType, OspfdConfig};
+use crate::config::{AreaKind, InterfaceConfig, NetworkType, OspfdConfig};
 use crate::exchange::{Conversation, ConversationParams, ConversationReport, Send};
 use crate::iface::InterfaceFsm;
 use crate::lsa::{Lsa, LsaKey, LsaType, Options, RouterId};
 use crate::lsdb::{Lsdb, Readopt};
-use crate::neighbor::process_hello;
+use crate::neighbor::{process_hello, AreaAdmission};
 use crate::neighbor::{HelloParams, NeighborEvent, NeighborState};
 use crate::origination::{build_external_lsa, build_router_lsa, InterfaceAdv};
 use crate::packet::{Hello, LsUpdate, Packet, PacketBody};
@@ -75,11 +75,14 @@ pub struct Interface {
 }
 
 impl Interface {
-    fn conversation_params(&self) -> ConversationParams {
+    fn conversation_params(&self, kind: AreaKind) -> ConversationParams {
         ConversationParams {
             rxmt_interval: 5,
             mtu: self.cfg.mtu,
-            options: Options(Options::E),
+            // §C.3: the Options the DBD exchange carries — the E-bit
+            // follows the area's ExternalRoutingCapability (§10.5's
+            // agreement rule extends to the DD options check).
+            options: area_options(kind),
         }
     }
 
@@ -97,22 +100,48 @@ impl Interface {
     }
 }
 
+/// The Options octet we advertise for an area: E set only in
+/// external-capable (normal) areas (§3.6/§10.5).
+fn area_options(kind: AreaKind) -> Options {
+    if kind.external_capable() {
+        Options(Options::E)
+    } else {
+        Options(0)
+    }
+}
+
+/// The receive-side admission class for an area kind (§13 steps 1-3).
+fn area_admission(kind: AreaKind) -> AreaAdmission {
+    match kind {
+        AreaKind::Normal => AreaAdmission::Normal,
+        AreaKind::Stub => AreaAdmission::Stub,
+        AreaKind::StubNoSummary => AreaAdmission::StubNoSummary,
+    }
+}
+
 /// Per-area protocol state: the §12.2 database plus the §12.4/§16
 /// bookkeeping that scopes to one area (router-LSA origination, the
 /// SPF throttle). AS-external LSAs are mirrored into every area's
 /// database (§7: "The list of AS-external-LSAs is also considered
-/// to be part of each area's link-state database").
+/// to be part of each area's link state database") — except stub
+/// areas, into which type-5s are not flooded at all (§3.6).
 pub struct AreaState {
     pub lsdb: Lsdb,
+    pub kind: crate::config::AreaKind,
+    /// `area <id> default-cost` — the metric of the default summary
+    /// into a stub area (§C.2).
+    pub default_cost: u32,
     spf_sched: SpfScheduler,
     spf_dirty: bool,
     router_lsa_dirty: bool,
 }
 
 impl AreaState {
-    fn new() -> Self {
+    fn new(kind: crate::config::AreaKind, default_cost: u32) -> Self {
         Self {
             lsdb: Lsdb::new(),
+            kind,
+            default_cost,
             spf_sched: SpfScheduler::new(0, 50, 5000),
             spf_dirty: false,
             router_lsa_dirty: true,
@@ -242,7 +271,7 @@ impl Ospfd {
         let mut interfaces = Vec::new();
         let mut areas = BTreeMap::new();
         for area in &cfg.areas {
-            areas.insert(area.id, AreaState::new());
+            areas.insert(area.id, AreaState::new(area.kind, area.default_cost));
             for (name, icfg) in &area.interfaces {
                 let Some((addr, mask)) = icfg.address else {
                     return Err(format!(
@@ -288,6 +317,15 @@ impl Ospfd {
         }
         if interfaces.is_empty() {
             return Err("no interfaces configured".into());
+        }
+        if cfg.redistribute_static && !areas.values().any(|a| a.kind.external_capable()) {
+            // §3.6: "AS boundary routers cannot be placed internal to
+            // stub areas" — `redistribute static` with no
+            // external-capable area attached is a configuration error.
+            return Err(
+                "redistribute static requires a non-stub area (§3.6: ASBRs cannot be internal to stub areas)"
+                    .into(),
+            );
         }
         Ok(Self {
             router_id: RouterId::from_ipv4(router_id),
@@ -646,7 +684,21 @@ impl Ospfd {
             true, // type-2 external (FRR's default)
         );
         let key = lsa.key();
-        let master = *self.areas.keys().next().unwrap_or(&0);
+        // §7/§3.6: type-5s live in the external-capable (normal)
+        // areas only — never originated or mirrored into stub areas.
+        let master = *self
+            .areas
+            .iter()
+            .find(|(_, a)| a.kind.external_capable())
+            .map(|(id, _)| id)
+            .unwrap_or(&0);
+        if !self
+            .areas
+            .get(&master)
+            .is_some_and(|a| a.kind.external_capable())
+        {
+            return;
+        }
         let Some(area_state) = self.areas.get_mut(&master) else {
             return;
         };
@@ -656,13 +708,15 @@ impl Ospfd {
                 let first = !self.asbr;
                 self.asbr = true;
                 let stored = area_state.lsdb.get(&key).map(|e| e.lsa.clone());
-                // Mirror the identical instance into every other area.
+                // Mirror the identical instance into every other
+                // external-capable area (§7; stub areas are skipped —
+                // §3.6: AS-external-LSAs are not flooded into them).
                 if let Some(lsa) = &stored {
                     for other in self
                         .areas
-                        .keys()
-                        .copied()
-                        .filter(|a| *a != master)
+                        .iter()
+                        .filter(|(id, a)| **id != master && a.kind.external_capable())
+                        .map(|(id, _)| *id)
                         .collect::<Vec<_>>()
                     {
                         if let Some(state) = self.areas.get_mut(&other) {
@@ -726,9 +780,12 @@ impl Ospfd {
             }),
             // §13.4 case 1: only while the redistributed route exists.
             LsaType::AS_EXTERNAL => self.externals.values().any(|k| k == key),
-            // Summary-LSAs: the §12.4.3 set (inter-area, M4); none
-            // are originated yet, so any received self-summary is
-            // flushed.
+            // §12.4.3's set: the summaries the fresh table last
+            // justified (the default-cost summary into a stub area
+            // included).
+            LsaType::SUMMARY_NETWORK | LsaType::SUMMARY_ASBR => {
+                self.summaries.contains_key(&(_area, *key))
+            }
             _ => false,
         }
     }
@@ -855,9 +912,9 @@ impl Ospfd {
             }
             let areas: Vec<u32> = self
                 .areas
-                .keys()
-                .copied()
-                .filter(|a| *a != arrival_area)
+                .iter()
+                .filter(|(a, state)| **a != arrival_area && state.kind.external_capable())
+                .map(|(a, _)| *a)
                 .collect();
             for area in areas {
                 let Some(state) = self.areas.get_mut(&area) else {
@@ -998,13 +1055,19 @@ impl Ospfd {
             }
         }
         let peer = packet.header.router_id;
+        let kind = self
+            .areas
+            .get(&self.interfaces[iface_idx].area)
+            .map(|a| a.kind)
+            .unwrap_or(AreaKind::Normal);
+        let admission = area_admission(kind);
         let hello_params = {
             let iface = &self.interfaces[iface_idx];
             HelloParams {
                 network_mask: iface.mask,
                 hello_interval: iface.cfg.hello_interval,
                 router_dead_interval: iface.cfg.dead_interval,
-                e_capable: true,
+                e_capable: kind.external_capable(),
                 p2p: iface.p2p,
             }
         };
@@ -1025,7 +1088,7 @@ impl Ospfd {
                 };
                 let dead = self.interfaces[iface_idx].cfg.dead_interval as u64;
                 let p2p = self.interfaces[iface_idx].p2p;
-                let params = self.interfaces[iface_idx].conversation_params();
+                let params = self.interfaces[iface_idx].conversation_params(kind);
                 // §9.2's bidirectionality before this hello (the
                 // neighbor FSM state prior to the events below).
                 let was_2way = self.interfaces[iface_idx]
@@ -1160,7 +1223,8 @@ impl Ospfd {
                     PacketBody::DbDescription(dd) => conv.handle_dbd(dd, peer, mtu, lsdb, now),
                     PacketBody::LsRequest(lsr) => conv.handle_lsr(lsr, lsdb, now),
                     PacketBody::LsUpdate(lsu) => {
-                        let (sends, report) = conv.handle_lsu(&lsu.lsas, lsdb, now, syncing);
+                        let (sends, report) =
+                            conv.handle_lsu(&lsu.lsas, lsdb, now, syncing, admission);
                         received_lsas = Some(lsu.lsas.clone());
                         (sends, report)
                     }
@@ -1607,6 +1671,24 @@ impl Ospfd {
         let mut desired: BTreeMap<(u32, LsaKey), u32> = BTreeMap::new();
         let area_ids: Vec<u32> = self.areas.keys().copied().collect();
         for area_a in &area_ids {
+            let Some(target) = self.areas.get(area_a) else {
+                continue;
+            };
+            if !target.kind.external_capable() {
+                // §3.6/§12.4.3.1: into a stub area the ABR advertises
+                // ONLY the default summary-LSA (metric = the area's
+                // default-cost) — no per-network type-3s in the
+                // no-summary (totally stubby) form, no type-4s (ASBR
+                // locations are meaningless without type-5s), no
+                // type-5s at all.
+                let key = LsaKey {
+                    ls_type: LsaType::SUMMARY_NETWORK,
+                    link_state_id: crate::lsa::LinkStateId(0),
+                    adv_router: self.router_id,
+                };
+                desired.insert((*area_a, key), target.default_cost);
+                continue;
+            }
             for path in ribs.values() {
                 // §12.4.3's gating, in the RFC's order:
                 // - Destination Type network (yes — ribs holds
@@ -1707,7 +1789,10 @@ impl Ospfd {
             // (the prefix's own length); type 4 carries mask 0
             // (§A.4.4) and names the ASBR by its Router ID.
             let type4 = key.ls_type == LsaType::SUMMARY_ASBR;
-            let mask = if type4 {
+            let mask = if type4 || key.link_state_id.0 == 0 {
+                // Type-4 names the ASBR by Router ID (mask 0); the
+                // default summary (LS ID 0.0.0.0) carries mask
+                // 0.0.0.0 (§12.4.3.1/§A.4.4).
                 Ipv4Addr::UNSPECIFIED
             } else {
                 match ribs
@@ -1792,7 +1877,12 @@ impl Ospfd {
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
             if now >= iface.hello_deadline {
                 iface.hello_deadline = now + iface.cfg.hello_interval as u64;
-                let packet = make_hello(router_id, iface.area, iface);
+                let kind = self
+                    .areas
+                    .get(&iface.area)
+                    .map(|a| a.kind)
+                    .unwrap_or(AreaKind::Normal);
+                let packet = make_hello(router_id, iface.area, iface, kind);
                 out.push(WireOut {
                     iface: idx,
                     to: WireTo::Multicast,
@@ -1988,7 +2078,7 @@ fn make_packet(router_id: RouterId, area_id: u32, body: PacketBody) -> Packet {
     }
 }
 
-fn make_hello(router_id: RouterId, area_id: u32, iface: &Interface) -> Packet {
+fn make_hello(router_id: RouterId, area_id: u32, iface: &Interface, kind: AreaKind) -> Packet {
     let body = PacketBody::Hello(Hello {
         // §C.3: the mask of the attached network; 0.0.0.0 is the
         // convention on p2p (ignored by receivers anyway).
@@ -1998,7 +2088,9 @@ fn make_hello(router_id: RouterId, area_id: u32, iface: &Interface) -> Packet {
             iface.mask
         },
         hello_interval: iface.cfg.hello_interval,
-        options: Options(Options::E),
+        // §10.5/§3.6: the E-bit agrees with the area's
+        // ExternalRoutingCapability — clear in stub areas.
+        options: area_options(kind),
         router_priority: iface.cfg.priority,
         router_dead_interval: iface.cfg.dead_interval,
         // §A.3.2: our DR/BDR claims — the interface's elected values
@@ -3353,6 +3445,276 @@ mod tests {
             cores[b].areas.get(&0).unwrap().lsdb.contains(&ext_key),
             "the type-5 lives in B's area-0 database (§7 mirroring)"
         );
+        let _ = now2;
+    }
+
+    // ---- stub areas (§3.6/§C.2, N3 M1) --------------------------------
+
+    /// A stub-area core with fast p2p timers.
+    fn stub_core(router_id: &str, addr: &str, no_summary: bool) -> Ospfd {
+        let text = format!(
+            "router ospf\n router-id {router_id}\n area 0.0.0.1 stub{}\n  interface eth1\n   address {addr}/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n",
+            if no_summary { " no-summary" } else { "" }
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// §3.6's agreement rule (§9.5/§10.5): every router in the area
+    /// agrees on stub-ness via the Hello E-bit. Our stub-area Hellos
+    /// carry E clear; a Hello with E set is rejected (the packet is
+    /// discarded, no neighbor forms), E clear is accepted.
+    #[test]
+    fn stub_area_hello_e_bit_agreement() {
+        let mut a = stub_core("10.255.9.1", "10.99.0.1", false);
+        // Our own Hellos out of a stub area: E clear (§C.2).
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        a.tick(0, &mut out, &mut zap);
+        let hello = out
+            .iter()
+            .find(|w| matches!(w.packet.body, PacketBody::Hello(_)))
+            .expect("hello sent");
+        match &hello.packet.body {
+            PacketBody::Hello(h) => {
+                assert!(!h.options.e_bit(), "stub-area Hello carries E clear");
+            }
+            _ => unreachable!(),
+        }
+        // A forged peer Hello with E set: rejected (§10.5's E-bit
+        // mismatch with ExternalRoutingCapability).
+        let peer = core_for("10.255.8.1", "eth0", "10.99.0.2");
+        let hello = Hello {
+            network_mask: Ipv4Addr::UNSPECIFIED,
+            hello_interval: 1,
+            options: Options(Options::E),
+            router_priority: 1,
+            router_dead_interval: 4,
+            designated_router: Ipv4Addr::UNSPECIFIED,
+            backup_designated_router: Ipv4Addr::UNSPECIFIED,
+            neighbors: vec![],
+        };
+        let payload = peer.packet(1, PacketBody::Hello(hello.clone())).encode();
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: ip("10.99.0.2"),
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            1,
+        );
+        assert!(replies.is_empty(), "no answer to the mismatched Hello");
+        assert!(
+            a.neighbor_states().is_empty(),
+            "no neighbor forms under an E-bit mismatch (§3.6 agreement)"
+        );
+        // The same Hello with E clear: the neighbor forms (Init).
+        let mut ok = hello.clone();
+        ok.options = Options(0);
+        let payload = peer.packet(1, PacketBody::Hello(ok)).encode();
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: ip("10.99.0.2"),
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            2,
+        );
+        assert!(
+            !a.neighbor_states().is_empty(),
+            "E-clear Hello accepted in the stub area"
+        );
+    }
+
+    /// §13 step 3 at the daemon boundary: a type-5 arriving on a stub
+    /// adjacency is silently discarded; FRR's no-summary discards the
+    /// summaries too.
+    #[test]
+    fn stub_area_boundary_admission() {
+        let mk = |no_summary: bool| {
+            (
+                stub_core("10.255.9.1", "10.99.0.1", no_summary),
+                stub_core("10.255.9.2", "10.99.0.2", no_summary),
+            )
+        };
+        // Plain stub: type-5 discarded, type-3 admitted.
+        let (mut a, mut b) = mk(false);
+        let now = run_to_full(&mut a, &mut b, 0);
+        let ext = crate::origination::build_external_lsa(
+            b.router_id,
+            ip("198.51.100.0"),
+            ip("255.255.255.0"),
+            20,
+            true,
+        )
+        .with_computed_header();
+        let sum = crate::origination::build_summary_lsa(
+            b.router_id,
+            false,
+            ip("203.0.113.0"),
+            ip("255.255.255.0"),
+            10,
+        )
+        .with_computed_header();
+        let payload = b
+            .packet(
+                1,
+                PacketBody::LsUpdate(LsUpdate {
+                    lsas: vec![ext.clone(), sum.clone()],
+                }),
+            )
+            .encode();
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 1,
+        );
+        assert!(
+            !lsdb_of(&a).contains(&ext.key()),
+            "type-5 not admitted into a stub area (§13 step 3)"
+        );
+        assert!(
+            lsdb_of(&a).contains(&sum.key()),
+            "type-3 admitted into a plain stub area"
+        );
+        // Totally stubby: the type-3 is discarded too (FRR no-summary).
+        let (mut a, mut b) = mk(true);
+        let now = run_to_full(&mut a, &mut b, 0);
+        let payload = b
+            .packet(
+                1,
+                PacketBody::LsUpdate(LsUpdate {
+                    lsas: vec![sum.clone()],
+                }),
+            )
+            .encode();
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+            },
+            now + 1,
+        );
+        assert!(
+            !lsdb_of(&a).contains(&sum.key()),
+            "type-3 not admitted into a totally stubby area (no-summary)"
+        );
+    }
+
+    /// The ABR's stub duties (§3.6/§12.4.3.1/§C.2): advertise the
+    /// default summary (default-cost metric) and nothing else into the
+    /// stub area; type-5s from the ASBR never reach it; the internal
+    /// router routes the default through the ABR.
+    #[test]
+    fn abr_advertises_stub_default_and_shields_externals() {
+        let abr_text = concat!(
+            "router ospf\n",
+            " router-id 10.255.2.1\n",
+            " area 0.0.0.0\n",
+            "  interface eth0\n",
+            "   address 10.10.0.1/30\n",
+            "   network-type point-to-point\n",
+            "   hello-interval 1\n",
+            "   dead-interval 4\n",
+            " area 0.0.0.1 stub\n",
+            "  interface eth1\n",
+            "   address 10.20.0.1/30\n",
+            "   network-type point-to-point\n",
+            "   hello-interval 1\n",
+            "   dead-interval 4\n",
+            " area 0.0.0.1 default-cost 25\n",
+        );
+        let mut cores = vec![
+            Ospfd::new(&parse_config(abr_text).unwrap()).unwrap(),
+            area0_core(),
+            stub_core("10.255.3.1", "10.20.0.2", false),
+        ];
+        let (a, _b, c) = (0, 1, 2);
+        let now = run_multi(&mut cores, 0, 8);
+
+        // The stub default summary: type-3, LS ID 0.0.0.0, mask
+        // 0.0.0.0, metric = default-cost 25 (§12.4.3.1), present in
+        // the internal router's database.
+        let default_key = LsaKey {
+            ls_type: LsaType::SUMMARY_NETWORK,
+            link_state_id: crate::lsa::LinkStateId(0),
+            adv_router: cores[a].router_id,
+        };
+        let entry = cores[c]
+            .areas
+            .get(&1)
+            .unwrap()
+            .lsdb
+            .get(&default_key)
+            .expect("the stub default summary (§12.4.3.1)");
+        let crate::lsa::LsaBody::Summary(body) = &entry.lsa.body else {
+            panic!()
+        };
+        assert_eq!(body.metric, 25, "metric = the area's default-cost");
+        assert_eq!(body.mask, Ipv4Addr::UNSPECIFIED, "default mask 0.0.0.0");
+
+        // The internal router routes the default through the ABR:
+        // §16.2 cost = BR distance (10, the p2p link) + the summary
+        // metric (the default-cost 25).
+        let def = cores[c].routes.get("0.0.0.0/0").expect("the default route");
+        assert_eq!(def.metric, 35);
+        assert!(def
+            .nexthops
+            .hops()
+            .iter()
+            .any(|(nh, _)| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.20.0.1"))));
+
+        // The ASBR's external never enters the stub area (§3.6): not
+        // in the internal router's database, not even in the ABR's
+        // own stub-area database (mirroring skips it), and no type-4s
+        // for the ASBR anywhere in the stub.
+        let mut out: Vec<WireOut> = Vec::new();
+        cores[_b].on_redistribute_add(
+            crate::zedge::RedistributedRoute {
+                prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 24).unwrap()),
+                metric: 20,
+            },
+            now + 1,
+            &mut out,
+        );
+        deliver_multi(&mut cores, _b, &out, now + 1, &mut Vec::new());
+        let now2 = run_multi(&mut cores, now + 2, 10);
+        let ext_key = LsaKey {
+            ls_type: LsaType::AS_EXTERNAL,
+            link_state_id: crate::lsa::LinkStateId(u32::from(ip("203.0.113.0"))),
+            adv_router: cores[_b].router_id,
+        };
+        assert!(
+            !cores[c].areas.get(&1).unwrap().lsdb.contains(&ext_key),
+            "no type-5 in the internal stub router's database (§3.6)"
+        );
+        assert!(
+            !cores[a].areas.get(&1).unwrap().lsdb.contains(&ext_key),
+            "the ABR never mirrors type-5s into its stub area (§7 + §3.6)"
+        );
+        let any_t4 = cores[c]
+            .areas
+            .get(&1)
+            .unwrap()
+            .lsdb
+            .all()
+            .any(|e| e.lsa.header.ls_type == LsaType::SUMMARY_ASBR);
+        assert!(!any_t4, "no type-4 summaries in the stub area");
+        let any_t5 = cores[c]
+            .areas
+            .get(&1)
+            .unwrap()
+            .lsdb
+            .all()
+            .any(|e| e.lsa.header.ls_type == LsaType::AS_EXTERNAL);
+        assert!(!any_t5, "no type-5s anywhere in the stub LSDB");
         let _ = now2;
     }
 
