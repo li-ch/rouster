@@ -235,6 +235,7 @@ proptest! {
 /// Independent FRR-semantics interpreter over the parsed document.
 fn oracle_interpret(
     prefix_lists: &std::collections::BTreeMap<String, policy::sets::PrefixList>,
+    access_lists: &std::collections::BTreeMap<String, policy::sets::AccessList>,
     as_lists: &std::collections::BTreeMap<String, policy::sets::AsPathAccessList>,
     comm_lists: &std::collections::BTreeMap<String, policy::sets::CommunityAccessList>,
     entries: &[RmEntry],
@@ -252,6 +253,14 @@ fn oracle_interpret(
                     .and_then(|l| l.first_match(&route.prefix))
                     == Some(PrefixListVerdict::Permit)
             }),
+            // The generator does not emit access-list matches; the arm
+            // keeps this interpreter total over the AST regardless.
+            RmMatch::AccessList { name, .. } => {
+                access_lists
+                    .get(name)
+                    .and_then(|l| l.first_match(&route.prefix))
+                    == Some(PrefixListVerdict::Permit)
+            }
             RmMatch::AsPath(n) => route
                 .bgp()
                 .map(|b| as_lists.get(n).and_then(|l| l.first_match(&b.as_path)) == Some(true))
@@ -471,7 +480,14 @@ proptest! {
 
         // Independent interpreter over the same parsed document.
         let mut r2 = mk();
-        let v2 = oracle_interpret(&doc.prefix_lists, &doc.as_path_lists, &doc.community_lists, entries, &mut r2);
+        let v2 = oracle_interpret(
+            &doc.prefix_lists,
+            &doc.access_lists,
+            &doc.as_path_lists,
+            &doc.community_lists,
+            entries,
+            &mut r2,
+        );
 
         prop_assert_eq!(v1, v2, "verdict mismatch for config:\n{}", gen.text);
         prop_assert_eq!(r1, r2, "route state mismatch for config:\n{}", gen.text);

@@ -268,10 +268,11 @@ route-map INBOUND permit 10
 ip prefix-list CUST seq 5 permit 203.0.113.0/24
 ```
 
-Policy stanzas (`route-map`, `ip|ipv6 prefix-list`, `bgp as-path
-access-list`, `bgp community-list standard`) are extracted verbatim
-into a blank-padded fragment (file line numbers preserved) and
-compiled at startup by the W1-a grammar
+Policy stanzas (`route-map` including its `call` children,
+`access-list`, `ipv6 access-list`, `ip|ipv6 prefix-list`,
+`bgp as-path access-list`, `bgp community-list standard`) are
+extracted verbatim into a blank-padded fragment (file line numbers
+preserved) and compiled at startup by the W1-a grammar
 (`policy_engine::compile_named_policy`); unknown filter names and
 grammar errors are startup failures, never silent. The `vrp-file`
 grammar: `vrp <prefix> max <len> as <asn>` and

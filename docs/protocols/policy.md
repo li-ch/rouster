@@ -1,6 +1,8 @@
 # policy — the typed filter engine + FRR route-map import grammar
 
-Status: v1 landed 2026-10-11 (weekend program stream W1-a). Scope:
+Status: v1 landed 2026-10-11 (weekend program stream W1-a); extended
+the same night (micro M2) with `call`, zebra-style access-lists, and
+the `set comm-list NAME delete` token-order fix. Scope:
 `RouteView` (the generic route window), the BIRD-inspired typed filter
 language as a Rust API, sets-as-data with longest-match tags, the
 dependency-free FRR AS-path regex subset, the route-map
@@ -33,9 +35,9 @@ Primary prior art, cited per construct below:
 | Module | What |
 |---|---|
 | `route` | `RouteView` trait; policy-owned BGP attribute model: `AsPath`/`AsSegment`, `Community`/`WellKnownCommunity`, `ExtCommunity`, `BgpOrigin`, `BgpAttrs`, `OTC`; `RouteData` (owned mutable evaluation buffer) |
-| `sets` | `PrefixSet`/`PrefixPattern` (BIRD `{low,high}` semantics + longest-match tags), `PrefixList` (FRR ordered first-match), `AsSet` (interval representation), `CommunitySet`/`CommunityPattern` (BIRD pair-set style), `ExtCommunitySet`, `AsPathAccessList`, `CommunityAccessList` |
+| `sets` | `PrefixSet`/`PrefixPattern` (BIRD `{low,high}` semantics + longest-match tags), `PrefixList` (FRR ordered first-match), `AccessList` (FRR zebra-style ordered ACL, subnet-of default), `AsSet` (interval representation), `CommunitySet`/`CommunityPattern` (BIRD pair-set style), `ExtCommunitySet`, `AsPathAccessList`, `CommunityAccessList` |
 | `asregex` | FRR AS-path regex subset as an NFA position-set simulation (no regex crate; no catastrophic backtracking) |
-| `filter` | `Term` (match primitives + boolean combinators), `Action` (`accept`/`reject`/`set ...` + `Goto` control flow), `Rule`, `Filter`/`FilterBuilder` |
+| `filter` | `Term` (match primitives + boolean combinators), `Action` (`accept`/`reject`/`set ...` + `Goto`/`Call` control flow), `Rule`, `Filter`/`FilterBuilder` |
 | `routemap` | frr.conf policy stanzas → `PolicyDocument` AST → `compile_route_map` → typed `Filter` |
 
 ## 2. `RouteView` — the route window (M1)
@@ -121,6 +123,18 @@ deferred (§7).
   `le` only → ge = entry length.
 - `AsPathAccessList`: `bgp as-path access-list NAME [seq N]
   permit|deny REGEX`, first matching regex decides, no match → deny.
+- `AccessList`: zebra-style `access-list|ipv6 access-list NAME
+  [seq N] permit|deny (PREFIX [exact-match]|any)` (FRR 10.2
+  `lib/filter_cli.c`). Entries are seq-sorted (same seq replaces; a
+  seq-less entry gets max-existing + 5 — `acl_get_seq`, *not* the
+  prefix-list "next multiple of five") and the first covering entry
+  decides; no match → deny (`access_list_apply`). Coverage is
+  **subnet-of by default** — `filter_match_zebra` calls
+  `prefix_match(entry, route)` — with `exact-match` additionally
+  requiring equal prefix lengths. This is the *inverse* default of
+  `ip prefix-list` (exact unless `le`/`ge`): `access-list A permit
+  10.0.0.0/8` matches `10.1.0.0/16`, the prefix-list spelling does
+  not. `any` covers the whole family (`::/0` for the v6 twin).
 - `CommunityAccessList`: standard lists in **user-defined order**
   (FRR: "match will happen user defined order"); an entry matches when
   the route carries all its communities (an entry with no communities
@@ -155,6 +169,7 @@ default `Reject`; BIRD-style filters should terminate explicitly, per
 | `PrefixTagIn(id, tags)` | longest-match tag ∈ tags | Rouster (§3.1) |
 | `PrefixLen {min,max}` | prefix-length range | BIRD `.len` + §5.2 patterns |
 | `PrefixList(id)` | FRR ordered prefix-list scan (true iff first cover permits) | FRR Filtering |
+| `AccessList(id)` | FRR ordered zebra-style access-list scan, subnet-of default (true iff first cover permits) | FRR Filtering / `match ip address ACL` |
 | `PathMask(AsPathMask)` | BIRD mask `[= ... =]`: `As`, `Any` (`*`), `AnyOne` (`?`), `Range`, `Set`, `Repeat` (`2+`) | BIRD §5.2 bgpmask |
 | `PathRegex(AsRegex)` | FRR regex (`^ $ _ . * + ? \| [] {} ()`) | FRR BGP RegEx |
 | `PathIn(AsSetId)` | any path ASN in set | BIRD §5.3 |
@@ -169,12 +184,16 @@ default `Reject`; BIRD-style filters should terminate explicitly, per
 
 ### 4.2 Actions
 
-`Accept` (BIRD §5.6), `Reject`, `Goto(rule)` (FRR exit policy);
+`Accept` (BIRD §5.6), `Reject`, `Goto(rule)` (FRR exit policy),
+`Call(idx)` (FRR route-map `call NAME`: deny return finishes and
+denies, permit return proceeds with the remaining actions — FRR 10.2
+"Route Maps"; the index resolves into the owning filter's compiled
+call table, cycles rejected at compile time);
 `SetLocalPref`/`AdjustLocalPref`, `SetMed`/`AdjustMed`, `SetMetric`,
 `SetOrigin`, `SetOtc` (RFC 9234); `SetCommunities {list, Replace|Add}`
 (FRR `set community [additive]`; empty list + Replace = `none`);
 `RemoveCommunities(CommunitySet)` (BIRD `C.delete(P)`; FRR
-`set comm-list delete`); `PrependAsPath {asn, times}` (BIRD
+`set comm-list NAME delete`); `PrependAsPath {asn, times}` (BIRD
 `P.prepend(A)`; FRR `set as-path prepend`).
 
 ### 4.3 Purity and totality (disclosed deviation)
@@ -200,6 +219,7 @@ lines and `!` separators skipped):
 ```
 route-map NAME (permit|deny) SEQ
  [description ...]              # accepted, warning-ignored
+ match ip|ipv6 address ACCESS_LIST
  match ip|ipv6 address prefix-list NAME[,NAME...]
  match as-path NAME
  match community NAME[,NAME...] [exact-match|any]
@@ -208,12 +228,15 @@ route-map NAME (permit|deny) SEQ
  match source-protocol PROTO...            # static bgp ospf connected kernel rip isis local
  set local-preference VALUE|+VALUE|-VALUE
  set community COMM... [additive]|none
- set comm-list delete NAME
+ set comm-list NAME delete                 # FRR CLI order: NAME first, delete last
  set origin egp|igp|incomplete
  set metric VALUE|+VALUE|-VALUE
  set as-path prepend ASN...
+ call NAME                                 # after set actions; deny return denies
  continue [N]
  on-match next | on-match goto N
+access-list NAME [seq N] (permit|deny) (PREFIX [exact-match]|any)
+ipv6 access-list NAME [seq N] (permit|deny) (PREFIX [exact-match]|any)
 ip|ipv6 prefix-list NAME [seq N] (permit|deny) PREFIX [le E] [ge E]
 bgp as-path access-list NAME [seq N] (permit|deny) REGEX
 bgp community-list standard NAME [seq N] (permit|deny) COMM...
@@ -232,10 +255,16 @@ Compilation (`compile_route_map(&doc, name)`) follows the FRR "Route
 Maps" summary table:
 
 - **Match** (all clauses AND'd; empty = always) + **permit** → apply
-  sets, then exit policy (`None` → accept; `on-match next`/`continue` →
-  fall through; `continue N`/`on-match goto N` → jump to the first
-  entry with order ≥ N; target must exceed the current sequence —
-  "jumping to a previous entry is not permitted").
+  sets, then `call` (FRR 10.2 "Route Maps": "If it returns deny ...
+  the route is denied, regardless of the Matching Policy or the Exit
+  Policy"; the callee's implicit deny-all counts as a deny return;
+  a permit return proceeds), then exit policy (`None` → accept;
+  `on-match next`/`continue` → fall through; `continue N`/
+  `on-match goto N` → jump to the first entry with order ≥ N; target
+  must exceed the current sequence — "jumping to a previous entry is
+  not permitted"). `call NAME` targets must be defined route-maps and
+  acyclic — both are compile errors (Rouster's undefined-ref
+  convention; FRR instead looks the name up at apply time).
 - **Match + deny** → deny immediately; set clauses and exit policy on a
   matched deny entry are unreachable — surfaced as compile warnings.
 - **No match** → next entry. **Nothing matched** → implicit deny
@@ -256,6 +285,8 @@ Maps" summary table:
 | `route-map N permit SEQ` | `Rule { when: AND(clauses), then: [sets…, Accept] }` |
 | `route-map N deny SEQ` | `Rule { when: AND(clauses), then: [Reject] }` |
 | no clauses | `Term::True` ("always matches") |
+| `match ip address ACL` | `Term::AccessList(idx)` (zebra-style access-list) |
+| `match ipv6 address ACL` | same (AF separation via pattern coverage) |
 | `match ip address prefix-list X` | `Term::PrefixList(idx)` (+`Or` across names) |
 | `match ipv6 address prefix-list X` | same (AF separation via pattern coverage) |
 | `match as-path X` | `Term::PathList(idx)` |
@@ -267,10 +298,11 @@ Maps" summary table:
 | `set local-preference V / +V / -V` | `SetLocalPref(V)` / `AdjustLocalPref(±V)` |
 | `set community A B additive` | `SetCommunities {list, Add}` (without `additive`: `Replace`) |
 | `set community none` | `SetCommunities {[], Replace}` |
-| `set comm-list delete X` | `RemoveCommunities(union of X's entries)` |
+| `set comm-list X delete` | `RemoveCommunities(union of X's entries)` — FRR CLI order `NAME delete` (bgpd/bgp_routemap.c, 10.2) |
 | `set origin egp|igp|incomplete` | `SetOrigin(BgpOrigin::…)` |
 | `set metric V` | `SetMed(V)` / `AdjustMed(±V)` — "When used with BGP, set the BGP attribute MED" |
 | `set as-path prepend A B C` | `PrependAsPath` ×3, executed right-to-left (A ends leftmost) |
+| `call X` | `Action::Call(compiled X)` after the set actions; deny return → `Reject` |
 | `continue N` / `on-match goto N` | `Action::Goto(first rule with seq ≥ N)` |
 | `on-match next` / bare `continue` | fall-through (no terminal action) |
 | implicit deny-all | `Filter` default verdict `Reject` |
@@ -290,8 +322,11 @@ Maps" summary table:
    `PrefixPattern::covers_frr` (subnet-of-entry + `le`/`ge`, used by
    `PrefixList`). Conflating them was caught by the BIRD §5.2 doc
    example `3.0.0.0/8-` covering `0.0.0.0/0` — now a unit test.
-3. **Undefined references** (`match ... prefix-list UNDEFINED`) are
-   compile errors, not permit-all/no-match guesses.
+3. **Undefined references** (`match ... prefix-list UNDEFINED`,
+   `match ip address UNDEFINED`, `call UNDEFINED`) are compile
+   errors, not permit-all/no-match guesses. `call` cycles are
+   compile errors too — FRR would instead look the target up at
+   apply time and loop/fail at runtime.
 4. **Totality vs BIRD runtime errors** — see §4.3.
 5. **`set metric`** maps to MED for BGP routes (FRR doc wording); the
    typed `Action::SetMetric` (route metric) has no route-map spelling.
@@ -302,21 +337,39 @@ Maps" summary table:
 8. **proptest** is a dev-dependency of this crate (the W5B/M3
    authorization named sav+rib; the W1-a milestone 5 requirement
    extends it — disclosed in the W1-a report).
+9. **Access-list vs prefix-list coverage defaults** (M2): same network
+   spelling, opposite defaults — access-list entries match subnet-of
+   (exact only with `exact-match`), prefix-list entries match exact
+   (subnets only via `le`/`ge`). Pinned by a unit test asserting the
+   same `permit 10.0.0.0/8` line accepts `10.1.0.0/16` as an ACL and
+   rejects it as a prefix-list.
+10. **`set comm-list` token order** (M2 fix): the parser originally
+   required the inverted `set comm-list delete NAME`; FRR 10.2's CLI
+   is `set comm-list NAME delete` (bgpd/bgp_routemap.c
+   `set_community_delete_cmd`: "set comm-list
+   <(1-99)|(100-500)|COMMUNITY_LIST_NAME> delete"). Verbatim FRR
+   configs now parse; the inverted order is a parse error.
 
 ## 7. §Deferred anchors
 
 - W2-d: bgpd implements `RouteView`; wire the engine into the peer
   import/export seams (bgpd `rib` module's policy seams are
   accept-all v1).
-- FRR constructs refused at import (all with line numbers): `call`,
-  `match peer/src-peer/next-hop/evpn/tag/vpn`, access-lists (named or
-  extended), `set weight/tag/distance/as-path exclude
-  [all]/last-as/aigp/min-metric/max-metric/sr-te/l3vpn/ip|ipv6
-  next-hop/comm-list (non-delete)`, `set metric rtt|igp|aigp`,
-  `bgp community-list expanded` (regex communities), `extcommunity-list`,
-  `large-community-list`, numbered community-lists, the deprecated
-  auto-detect `bgp community-list NAME ...` form, `no` forms of
-  everything above.
+- FRR constructs refused at import (all with line numbers):
+  `match peer/src-peer/next-hop/evpn/tag/vpn`, `match ip|ipv6
+  address prefix-len`, `match extcommunity/large-community/alias`,
+  `match source-instance`, `set weight/tag/distance/as-path exclude
+  [all]/replace/last-as/aigp-metric/min-metric/max-metric/sr-te/
+  l3vpn/ip|ipv6 next-hop/table/large-community/extcommunity/
+  extended-comm-list`, `set metric rtt|igp|aigp`, cisco-style and
+  extended access-list forms (`host A.B.C.D`, `A.B.C.D M.M.M.M`,
+  `access-list NAME ... ip <src> <dst>`, `ip access-list`
+  named-ACL submode, `access-list NAME remark`), `bgp
+  community-list expanded` (regex communities), numbered
+  community-lists (FRR's `set comm-list <1-99|100-500>` numeric
+  names refuse here as undefined named lists), `extcommunity-list`,
+  `large-community-list`, the deprecated auto-detect `bgp
+  community-list NAME ...` form, `no` forms of everything above.
 - IPv4-administrator and opaque extended communities; large
   communities.
 - A BIRD-syntax parser over the same `Term`/`Action` data (the

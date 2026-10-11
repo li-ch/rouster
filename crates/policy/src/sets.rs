@@ -274,6 +274,87 @@ impl fmt::Display for PrefixList {
     }
 }
 
+/// One zebra-style `access-list NAME [seq N] (permit|deny)
+/// (PREFIX [exact-match]|any)` entry (FRR 10.2.2 `lib/filter_cli.c`,
+/// `access_list_cmd` / `ipv6_access_list_cmd`).
+///
+/// Default coverage is **subnet-of** — FRR `lib/filter.c`
+/// `filter_match_zebra` calls `prefix_match(entry, route)`, which is
+/// true when the route prefix is a subnet of the entry network — with
+/// `exact-match` additionally requiring equal prefix lengths. This is
+/// the *inverse* default of `ip prefix-list` (exact unless `le`/`ge`),
+/// which is why access-lists are their own type and never compiled
+/// onto prefix-list semantics: `access-list A permit 10.0.0.0/8`
+/// matches `10.1.0.0/16`; the prefix-list spelling does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessListEntry {
+    pub seq: u32,
+    pub verdict: PrefixListVerdict,
+    /// Derived pattern: `or_longer` (subnet-of) by default, `exact`
+    /// only with `exact-match`; `any` = or_longer of the zero prefix.
+    pub pattern: PrefixPattern,
+}
+
+/// An ordered zebra-style access-list: entries evaluated in sequence
+/// order, first covering entry decides; no match → deny (FRR
+/// `access_list_apply`, lib/filter.c: "if access == NULL return
+/// FILTER_DENY ... return FILTER_DENY" after the scan).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessList {
+    entries: Vec<AccessListEntry>,
+}
+
+impl AccessList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert keeping sequence order; same seq replaces (YANG
+    /// frr-filter.yang keys access-list entries by `sequence`).
+    pub fn insert(&mut self, entry: AccessListEntry) {
+        match self.entries.binary_search_by_key(&entry.seq, |e| e.seq) {
+            Ok(i) => self.entries[i] = entry,
+            Err(i) => self.entries.insert(i, entry),
+        }
+    }
+
+    pub fn entries(&self) -> &[AccessListEntry] {
+        &self.entries
+    }
+
+    /// First-match scan with the access-list coverage rule (subnet-of
+    /// unless the entry was written `exact-match`).
+    pub fn first_match(&self, prefix: &IpPrefix) -> Option<PrefixListVerdict> {
+        self.entries
+            .iter()
+            .find(|e| e.pattern.covers_frr(prefix))
+            .map(|e| e.verdict)
+    }
+}
+
+impl fmt::Display for AccessList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for e in &self.entries {
+            writeln!(
+                f,
+                "seq {} {} {}{}",
+                e.seq,
+                match e.verdict {
+                    PrefixListVerdict::Permit => "permit",
+                    PrefixListVerdict::Deny => "deny",
+                },
+                e.pattern.prefix,
+                if e.pattern.min_len == e.pattern.max_len {
+                    " exact-match"
+                } else {
+                    ""
+                }
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// An AS-number set with an interval representation: sorted, merged,
 /// non-overlapping `(lo, hi)` ranges, membership via binary search
 /// (BIRD's `int set` with `a..b` ranges, §5.2).
@@ -822,6 +903,81 @@ mod tests {
         });
         assert_eq!(pl.entries().len(), 2, "same seq replaces");
         assert_eq!(pl.entries()[0].verdict, PrefixListVerdict::Deny);
+    }
+
+    #[test]
+    fn access_list_subnet_of_default_exact_on_flag() {
+        // FRR lib/filter.c filter_match_zebra: non-exact = prefix_match
+        // (route is a SUBNET of the entry); exact-match additionally
+        // requires equal prefix lengths.
+        let mut al = AccessList::new();
+        al.insert(AccessListEntry {
+            seq: 5,
+            verdict: PrefixListVerdict::Permit,
+            pattern: PrefixPattern::or_longer(p("10.0.0.0/8")),
+        });
+        al.insert(AccessListEntry {
+            seq: 10,
+            verdict: PrefixListVerdict::Permit,
+            pattern: PrefixPattern::exact(p("192.0.2.0/24")),
+        });
+        assert_eq!(
+            al.first_match(&p("10.1.0.0/16")),
+            Some(PrefixListVerdict::Permit)
+        );
+        assert_eq!(
+            al.first_match(&p("10.0.0.0/8")),
+            Some(PrefixListVerdict::Permit),
+            "the entry network itself is covered"
+        );
+        assert_eq!(
+            al.first_match(&p("10.0.0.0/7")),
+            None,
+            "supernet of the entry is NOT covered (subnet-of only)"
+        );
+        // exact entry: same length + same network only.
+        assert_eq!(
+            al.first_match(&p("192.0.2.0/24")),
+            Some(PrefixListVerdict::Permit)
+        );
+        assert_eq!(
+            al.first_match(&p("192.0.2.128/25")),
+            None,
+            "subnet does not match an exact-match entry"
+        );
+        // Family separation.
+        assert_eq!(al.first_match(&p("2001:db8::/32")), None);
+    }
+
+    #[test]
+    fn access_list_first_match_order_and_same_seq() {
+        let mut al = AccessList::new();
+        al.insert(AccessListEntry {
+            seq: 5,
+            verdict: PrefixListVerdict::Permit,
+            pattern: PrefixPattern::or_longer(p("10.0.0.0/8")),
+        });
+        al.insert(AccessListEntry {
+            seq: 10,
+            verdict: PrefixListVerdict::Deny,
+            pattern: PrefixPattern::or_longer(p("10.42.0.0/16")),
+        });
+        assert_eq!(
+            al.first_match(&p("10.42.0.0/24")),
+            Some(PrefixListVerdict::Permit),
+            "seq 5 permit wins first despite the later deny"
+        );
+        // Same seq replaces.
+        al.insert(AccessListEntry {
+            seq: 5,
+            verdict: PrefixListVerdict::Deny,
+            pattern: PrefixPattern::or_longer(p("10.0.0.0/8")),
+        });
+        assert_eq!(al.entries().len(), 2);
+        assert_eq!(
+            al.first_match(&p("10.0.0.1/32")),
+            Some(PrefixListVerdict::Deny)
+        );
     }
 
     #[test]

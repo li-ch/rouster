@@ -27,8 +27,8 @@
 use crate::asregex::AsRegex;
 use crate::route::{AsPath, AsSegment, BgpOrigin, Community, RouteData};
 use crate::sets::{
-    AsPathAccessList, AsSet, CommunityAccessList, CommunitySet, ExtCommunitySet, PrefixList,
-    PrefixListVerdict, PrefixSet,
+    AccessList, AsPathAccessList, AsSet, CommunityAccessList, CommunitySet, ExtCommunitySet,
+    PrefixList, PrefixListVerdict, PrefixSet,
 };
 use common::RouteProtocol;
 
@@ -204,6 +204,13 @@ pub enum Action {
     /// Control flow: continue evaluation at rule `index` (route-map
     /// `continue N` analog; builder validates the target).
     Goto(usize),
+    /// Invoke a compiled sub-filter (FRR route-map `call NAME`). A
+    /// deny return finishes and denies the route; a permit return
+    /// continues with the remaining actions (FRR 10.2 "Route Maps":
+    /// "If it returns deny ... the route is denied, regardless of the
+    /// Matching Policy or the Exit Policy"). The index resolves
+    /// against the owning filter's `calls` table.
+    Call(usize),
     SetLocalPref(u32),
     /// Add (or, for negative values, subtract with saturation) — FRR
     /// `set local-preference +N` / `-N`.
@@ -233,7 +240,7 @@ pub enum Action {
 impl Action {
     fn apply(&self, r: &mut RouteData) {
         match self {
-            Action::Accept | Action::Reject | Action::Goto(_) => {}
+            Action::Accept | Action::Reject | Action::Goto(_) | Action::Call(_) => {}
             Action::SetLocalPref(v) => r.bgp_or_materialize().local_pref = Some(*v),
             Action::AdjustLocalPref(d) => {
                 let b = r.bgp_or_materialize();
@@ -294,6 +301,7 @@ pub struct SetIndex {
 pub enum SetKind {
     Prefix,
     PrefixList,
+    AccessList,
     As,
     Community,
     ExtCommunity,
@@ -323,6 +331,10 @@ pub enum Term {
     /// FRR-ordered prefix-list scan (first covering entry's verdict;
     /// no cover → false, i.e. the list's default deny).
     PrefixList(SetIndex),
+    /// FRR-ordered zebra-style access-list scan (`match ip address
+    /// ACL`): true iff the first covering entry (subnet-of by
+    /// default, exact only on `exact-match`) is a permit.
+    AccessList(SetIndex),
     /// BIRD path-mask match, `bgp_path ~ [= ... =]` (§5.2).
     PathMask(AsPathMask),
     /// FRR AS-path regex match (`bgp as-path access-list` operators).
@@ -407,6 +419,9 @@ impl Term {
             Term::PrefixList(s) => sets
                 .prefix_list(s.idx)
                 .is_some_and(|pl| pl.first_match(&r.prefix) == Some(PrefixListVerdict::Permit)),
+            Term::AccessList(s) => sets
+                .access_list(s.idx)
+                .is_some_and(|al| al.first_match(&r.prefix) == Some(PrefixListVerdict::Permit)),
             Term::PathMask(m) => r.bgp().is_some_and(|b| m.matches(&b.as_path)),
             Term::PathRegex(re) => r.bgp().is_some_and(|b| re.matches_path(&b.as_path)),
             Term::PathIn(s) => sets
@@ -490,6 +505,7 @@ fn empty_when_no_bgp(r: &RouteData) -> &[Community] {
 pub struct SetTables {
     prefix: Vec<PrefixSet>,
     prefix_lists: Vec<PrefixList>,
+    access_lists: Vec<AccessList>,
     as_sets: Vec<AsSet>,
     communities: Vec<CommunitySet>,
     ext_communities: Vec<ExtCommunitySet>,
@@ -504,6 +520,10 @@ impl SetTables {
 
     fn prefix_list(&self, i: usize) -> Option<&PrefixList> {
         self.prefix_lists.get(i)
+    }
+
+    fn access_list(&self, i: usize) -> Option<&AccessList> {
+        self.access_lists.get(i)
     }
 
     fn as_set(&self, i: usize) -> Option<&AsSet> {
@@ -549,6 +569,10 @@ pub struct Filter {
     rules: Vec<Rule>,
     sets: SetTables,
     default: Verdict,
+    /// Compiled sub-filters for `Action::Call` (FRR route-map `call`).
+    /// Cycles are rejected at compile time, so recursion here is
+    /// bounded by the (acyclic) call graph.
+    calls: Vec<Filter>,
 }
 
 impl Filter {
@@ -566,6 +590,21 @@ impl Filter {
                         Action::Goto(j) => {
                             i = *j;
                             continue 'outer;
+                        }
+                        Action::Call(idx) => {
+                            // Deny return finishes and denies (FRR
+                            // `call`); permit return falls through to
+                            // the remaining actions. A dangling index
+                            // (builder hands out only valid ones) fails
+                            // closed, like dangling set indices.
+                            match self.calls.get(*idx) {
+                                Some(sub) => {
+                                    if sub.apply(route) == Verdict::Reject {
+                                        return Verdict::Reject;
+                                    }
+                                }
+                                None => return Verdict::Reject,
+                            }
                         }
                         _ => a.apply(route),
                     }
@@ -594,6 +633,7 @@ pub struct FilterBuilder {
     rules: Vec<Rule>,
     sets: SetTables,
     default: Verdict,
+    calls: Vec<Filter>,
 }
 
 impl Default for FilterBuilder {
@@ -608,6 +648,7 @@ impl FilterBuilder {
             rules: Vec::new(),
             sets: SetTables::default(),
             default: Verdict::Reject,
+            calls: Vec::new(),
         }
     }
 
@@ -631,6 +672,24 @@ impl FilterBuilder {
             kind: SetKind::PrefixList,
             idx: self.sets.prefix_lists.len() - 1,
         }
+    }
+
+    pub fn add_access_list(&mut self, list: AccessList) -> SetIndex {
+        self.sets.access_lists.push(list);
+        SetIndex {
+            kind: SetKind::AccessList,
+            idx: self.sets.access_lists.len() - 1,
+        }
+    }
+
+    /// Register a compiled sub-filter for `Action::Call` (FRR
+    /// route-map `call NAME`). The returned index is what
+    /// `Action::Call` carries; the callee must be built (its own
+    /// control flow validated) before being registered — cycles are
+    /// the caller-compiler's responsibility to reject.
+    pub fn add_call(&mut self, filter: Filter) -> usize {
+        self.calls.push(filter);
+        self.calls.len() - 1
     }
 
     pub fn add_as_set(&mut self, set: AsSet) -> SetIndex {
@@ -703,6 +762,7 @@ impl FilterBuilder {
             rules: self.rules,
             sets: self.sets,
             default: self.default,
+            calls: self.calls,
         })
     }
 }
@@ -712,7 +772,9 @@ mod tests {
     use super::*;
     use crate::route::testutil::{v4_route, v6_route};
     use crate::route::WellKnownCommunity;
-    use crate::sets::{CommunityPattern, PrefixListEntry, PrefixPattern};
+    use crate::sets::{
+        AccessList, AccessListEntry, CommunityPattern, PrefixListEntry, PrefixPattern,
+    };
     use common::IpPrefix;
 
     fn prefix(s: &str) -> IpPrefix {
@@ -876,6 +938,88 @@ mod tests {
         assert_eq!(f.apply(&mut r), Verdict::Reject, "seq 5 deny wins first");
         let mut r = v4_route("192.0.2.0/24", &[]);
         assert_eq!(f.apply(&mut r), Verdict::Reject, "no match → default deny");
+    }
+
+    #[test]
+    fn access_list_term_uses_subnet_of_default() {
+        // The access-list coverage default is the inverse of the
+        // prefix-list's: subnet-of unless exact-match.
+        let mut al = AccessList::new();
+        al.insert(AccessListEntry {
+            seq: 5,
+            verdict: PrefixListVerdict::Permit,
+            pattern: PrefixPattern::or_longer(prefix("10.0.0.0/8")),
+        });
+        let mut b = FilterBuilder::new();
+        let idx = b.add_access_list(al);
+        b.add_rule(Term::AccessList(idx), vec![Action::Accept]);
+        let f = b.build().unwrap();
+        let mut r = v4_route("10.1.0.0/16", &[]);
+        assert_eq!(f.apply(&mut r), Verdict::Accept, "subnet covered");
+        let mut r = v4_route("10.0.0.0/7", &[]);
+        assert_eq!(f.apply(&mut r), Verdict::Reject, "supernet not covered");
+    }
+
+    #[test]
+    fn call_action_deny_short_circuits_and_permit_continues() {
+        // FRR `call`: deny return finishes and denies regardless of
+        // the caller's exit policy; permit return proceeds.
+        let deny_all = {
+            let mut b = FilterBuilder::new();
+            b.add_rule(Term::False, vec![Action::Accept]);
+            b.build().unwrap() // no rule matches → default reject
+        };
+        let permit_all = {
+            let mut b = FilterBuilder::new();
+            b.add_rule(Term::True, vec![Action::Accept]);
+            b.build().unwrap()
+        };
+
+        let mut b = FilterBuilder::new();
+        let deny_idx = b.add_call(deny_all);
+        b.add_rule(
+            Term::True,
+            vec![
+                Action::SetLocalPref(111),
+                Action::Call(deny_idx),
+                Action::Accept,
+            ],
+        );
+        let f = b.build().unwrap();
+        let mut r = v4_route("192.0.2.0/24", &[]);
+        assert_eq!(f.apply(&mut r), Verdict::Reject, "deny return wins");
+        assert_eq!(
+            r.bgp().map(|b| b.local_pref),
+            Some(Some(111)),
+            "sets before the call still applied"
+        );
+
+        let mut b2 = FilterBuilder::new();
+        let permit_idx = b2.add_call(permit_all);
+        b2.add_rule(
+            Term::True,
+            vec![
+                Action::SetLocalPref(222),
+                Action::Call(permit_idx),
+                Action::Accept,
+            ],
+        );
+        let f2 = b2.build().unwrap();
+        let mut r2 = v4_route("192.0.2.0/24", &[]);
+        assert_eq!(
+            f2.apply(&mut r2),
+            Verdict::Accept,
+            "permit return continues"
+        );
+        assert_eq!(r2.bgp().unwrap().local_pref, Some(222));
+
+        // Dangling call index fails closed (builder never hands these
+        // out; defense in depth).
+        let mut b3 = FilterBuilder::new();
+        b3.add_rule(Term::True, vec![Action::Call(99), Action::Accept]);
+        let f3 = b3.build().unwrap();
+        let mut r3 = v4_route("192.0.2.0/24", &[]);
+        assert_eq!(f3.apply(&mut r3), Verdict::Reject);
     }
 
     #[test]

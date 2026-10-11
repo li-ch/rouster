@@ -5,10 +5,11 @@
 //! compatibility lives in adapters, never core abstractions). The
 //! grammar follows FRR 10.2 documented syntax:
 //!
-//! - `route-map NAME (permit|deny) ORDER` with match/set/exit clauses
-//!   (FRR docs, "Route Maps"): "If a route-map entry does not explicitly
+//! - `route-map NAME (permit|deny) ORDER` with match/set/call/exit
+//!   clauses (FRR docs, "Route Maps"): "If a route-map entry does not explicitly
 //!   specify any matching conditions, then it always matches"; permit +
-//!   match applies Set Actions then the Exit Policy; deny + match
+//!   match applies Set Actions, then the Call Action, then the Exit
+//!   Policy; deny + match
 //!   finishes with deny; "The default action of a route-map, if no
 //!   entries match, is to deny."
 //! - Exit Policy: `on-match next`, `continue N`, `on-match goto N` —
@@ -17,6 +18,10 @@
 //! - `ip|ipv6 prefix-list NAME [seq N] (permit|deny) PREFIX [le LEN]
 //!   [ge LEN]` (FRR "Filtering — IP Prefix List": le/ge bounds; "If
 //!   ge ... prefix length is greater than or equal"; no le/ge → exact).
+//! - `access-list|ipv6 access-list NAME [seq N] (permit|deny)
+//!   (PREFIX [exact-match]|any)` — zebra-style access-lists (FRR 10.2
+//!   `lib/filter_cli.c`). Coverage default is the *inverse* of
+//!   prefix-lists: subnet-of unless `exact-match`.
 //! - `bgp as-path access-list WORD [seq N] permit|deny LINE` — LINE is
 //!   a BGP regular expression.
 //! - `bgp community-list standard NAME permit|deny COMMUNITY...` — an
@@ -29,8 +34,9 @@ use crate::asregex::AsRegex;
 use crate::filter::{Action, CommMode, Filter, FilterBuilder, SetIndex, Term};
 use crate::route::{BgpOrigin, Community};
 use crate::sets::{
-    AsPathAccessList, AsPathListEntry, CommunityAccessList, CommunityListEntry, CommunitySet,
-    PrefixList, PrefixListEntry, PrefixListVerdict, PrefixPattern,
+    AccessList, AccessListEntry, AsPathAccessList, AsPathListEntry, CommunityAccessList,
+    CommunityListEntry, CommunitySet, PrefixList, PrefixListEntry, PrefixListVerdict,
+    PrefixPattern,
 };
 use common::{IpPrefix, RouteProtocol};
 use std::collections::BTreeMap;
@@ -67,6 +73,8 @@ pub enum RmPolicy {
 pub enum RmMatch {
     /// `match ip|ipv6 address prefix-list NAME[,NAME...]`
     PrefixList { v6: bool, names: Vec<String> },
+    /// `match ip|ipv6 address ACCESS_LIST` (zebra-style access-list)
+    AccessList { v6: bool, name: String },
     /// `match as-path NAME`
     AsPath(String),
     /// `match community NAME[,NAME...] [exact-match]`
@@ -84,6 +92,7 @@ impl RmMatch {
     fn kind(&self) -> &'static str {
         match self {
             RmMatch::PrefixList { .. } => "prefix-list",
+            RmMatch::AccessList { .. } => "access-list",
             RmMatch::AsPath(_) => "as-path",
             RmMatch::Community { .. } => "community",
             RmMatch::LocalPref(_) => "local-preference",
@@ -121,7 +130,9 @@ pub enum RmSet {
         list: Vec<Community>,
         mode: CommMode,
     },
-    /// `set comm-list delete NAME`
+    /// `set comm-list NAME delete` (FRR 10.2 CLI order — name first,
+    /// `delete` last: `set comm-list <(1-99)|(100-500)|NAME> delete`,
+    /// bgpd/bgp_routemap.c)
     CommunityDelete(String),
     /// `set origin egp|igp|incomplete`
     Origin(BgpOrigin),
@@ -164,6 +175,10 @@ pub struct RmEntry {
     pub policy: RmPolicy,
     pub matches: Vec<RmMatch>,
     pub sets: Vec<RmSet>,
+    /// `call NAME` — invoked after Set Actions (FRR "Route Maps": a
+    /// deny return finishes and denies; a permit return proceeds to
+    /// the exit policy).
+    pub call: Option<String>,
     pub exit: RmExit,
 }
 
@@ -188,6 +203,7 @@ impl RouteMap {
 #[derive(Debug, Clone, Default)]
 pub struct PolicyDocument {
     pub prefix_lists: BTreeMap<String, PrefixList>,
+    pub access_lists: BTreeMap<String, AccessList>,
     pub as_path_lists: BTreeMap<String, AsPathAccessList>,
     pub community_lists: BTreeMap<String, CommunityAccessList>,
     pub route_maps: BTreeMap<String, RouteMap>,
@@ -232,6 +248,7 @@ pub fn parse_policy_config(text: &str) -> Result<PolicyDocument, PolicyConfigErr
             "route-map" => parse_route_map_header(&toks, line_no, &mut open, &mut doc)?,
             "match" => parse_match(&toks, line_no, &mut open)?,
             "set" => parse_set(&toks, line_no, &mut open)?,
+            "call" => parse_call(&toks, line_no, &mut open)?,
             "continue" | "on-match" => parse_exit(&toks, line_no, &mut open)?,
             "description" => {
                 let Some((_, entry)) = open.as_mut() else {
@@ -242,9 +259,23 @@ pub fn parse_policy_config(text: &str) -> Result<PolicyDocument, PolicyConfigErr
                     entry.seq
                 ));
             }
+            "access-list" => {
+                close_entry(&mut open, &mut doc);
+                parse_access_list(&toks, line_no, &mut doc)?;
+            }
             "ip" | "ipv6" if toks.get(1) == Some(&"prefix-list") => {
                 close_entry(&mut open, &mut doc);
                 parse_prefix_list(&toks, line_no, &mut doc)?;
+            }
+            "ipv6" if toks.get(1) == Some(&"access-list") => {
+                close_entry(&mut open, &mut doc);
+                parse_access_list(&toks, line_no, &mut doc)?;
+            }
+            "ip" if toks.get(1) == Some(&"access-list") => {
+                return err(
+                    line_no,
+                    "`ip access-list` (cisco-style/named ACL submode) is not supported at import (see docs/protocols/policy.md §Deferred)",
+                );
             }
             "bgp" if toks.get(1) == Some(&"as-path") && toks.get(2) == Some(&"access-list") => {
                 close_entry(&mut open, &mut doc);
@@ -264,7 +295,7 @@ pub fn parse_policy_config(text: &str) -> Result<PolicyDocument, PolicyConfigErr
             other => {
                 return err(
                     line_no,
-                    format!("unknown directive `{other}` (policy grammar: route-map, ip/ipv6 prefix-list, bgp as-path access-list, bgp community-list)"),
+                    format!("unknown directive `{other}` (policy grammar: route-map, access-list, ip/ipv6 prefix-list, bgp as-path access-list, bgp community-list)"),
                 );
             }
         }
@@ -343,6 +374,7 @@ fn parse_route_map_header(
             policy,
             matches: Vec::new(),
             sets: Vec::new(),
+            call: None,
             exit: RmExit::None,
         },
     ));
@@ -377,14 +409,22 @@ fn parse_match(
                     let names = parse_name_list(toks[4]);
                     RmMatch::PrefixList { v6, names }
                 }
-                _ => {
+                Some("prefix-len") => {
                     return err(
                         line,
-                        format!(
-                            "unsupported match `{}` (access-list matching not supported; expected `prefix-list NAME`)",
-                            join_tail(toks, 2)
-                        ),
+                        "match ip address prefix-len: unsupported at import (see docs/protocols/policy.md §Deferred)",
                     );
+                }
+                Some(name) => {
+                    // FRR "Route Maps": `match ip address ACCESS_LIST`
+                    // references a zebra-style access-list.
+                    RmMatch::AccessList {
+                        v6,
+                        name: name.to_string(),
+                    }
+                }
+                None => {
+                    return err(line, "match ip address: missing name");
                 }
             }
         }
@@ -489,16 +529,20 @@ fn parse_set(
             RmSet::Community { list, mode }
         }
         Some("comm-list") => {
-            if toks.len() < 4 || toks[2] != "delete" {
+            // FRR 10.2 CLI order (bgpd/bgp_routemap.c
+            // set_community_delete_cmd): "set comm-list
+            // <(1-99)|(100-500)|COMMUNITY_LIST_NAME> delete" — the
+            // list name comes first, `delete` last.
+            if toks.len() != 4 || toks[3] != "delete" {
                 return err(
                     line,
                     format!(
-                        "unsupported set `{}` (expected `comm-list delete NAME`)",
+                        "unsupported set `{}` (expected `comm-list NAME delete`)",
                         join_tail(toks, 1)
                     ),
                 );
             }
-            RmSet::CommunityDelete(toks[3].to_string())
+            RmSet::CommunityDelete(toks[2].to_string())
         }
         Some("origin") => {
             if toks.len() < 3 {
@@ -591,6 +635,27 @@ fn parse_exit(
         }
     };
     entry.exit = exit;
+    Ok(())
+}
+
+/// `call NAME` — the Call Action of a route-map entry (FRR "Route
+/// Maps": invoked after Set Actions; "If it returns deny ... the route
+/// is denied, regardless of the Matching Policy or the Exit Policy").
+fn parse_call(
+    toks: &[&str],
+    line: u32,
+    open: &mut Option<(String, RmEntry)>,
+) -> Result<(), PolicyConfigError> {
+    let Some((_, entry)) = open.as_mut() else {
+        return err(line, "`call` outside a route-map entry");
+    };
+    if toks.len() != 2 {
+        return err(
+            line,
+            format!("call: expected `call NAME`, got `{}`", join_tail(toks, 0)),
+        );
+    }
+    entry.call = Some(toks[1].to_string());
     Ok(())
 }
 
@@ -732,6 +797,106 @@ fn parse_len(line: u32, s: &str, max: u8) -> Result<u8, PolicyConfigError> {
         );
     }
     Ok(v)
+}
+
+/// Zebra-style access-list stanza (FRR 10.2 `lib/filter_cli.c`):
+/// `access-list NAME [seq N] (permit|deny) (PREFIX [exact-match]|any)`
+/// and the `ipv6 access-list` twin. Cisco-style entry forms
+/// (`host A.B.C.D`, `A.B.C.D M.M.M.M`, destination parts) are refused —
+/// see docs/protocols/policy.md §Deferred.
+fn parse_access_list(
+    toks: &[&str],
+    line: u32,
+    doc: &mut PolicyDocument,
+) -> Result<(), PolicyConfigError> {
+    let want_v6 = toks[0] == "ipv6";
+    let mut i = if want_v6 { 2 } else { 1 };
+    let Some(&name) = toks.get(i) else {
+        return err(line, "access-list: missing name");
+    };
+    i += 1;
+    let mut seq = None;
+    if toks.get(i) == Some(&"seq") {
+        let Some(n) = toks.get(i + 1) else {
+            return err(line, "access-list seq: missing number");
+        };
+        seq = Some(parse_u32(line, n, "sequence")?);
+        i += 2;
+    }
+    let verdict = match toks.get(i).copied() {
+        Some("permit") => PrefixListVerdict::Permit,
+        Some("deny") => PrefixListVerdict::Deny,
+        _ => {
+            return err(
+                line,
+                format!(
+                    "access-list: expected permit|deny, got `{}`",
+                    join_tail(toks, i)
+                ),
+            )
+        }
+    };
+    i += 1;
+    let Some(&value_s) = toks.get(i) else {
+        return err(line, "access-list: missing prefix");
+    };
+    i += 1;
+    let exact = toks.get(i) == Some(&"exact-match");
+    if exact {
+        i += 1;
+    }
+    if let Some(&t) = toks.get(i) {
+        return err(line, format!("access-list: unexpected token `{t}`"));
+    }
+
+    let pattern = if value_s == "any" {
+        if exact {
+            // FRR CLI grammar: `exact-match` pairs with the PREFIX
+            // alternative only (`A.B.C.D/M [exact-match]|any`).
+            return err(line, "access-list: `any` takes no `exact-match`");
+        }
+        let any: IpPrefix = if want_v6 {
+            "::/0".parse().expect("valid literal prefix")
+        } else {
+            "0.0.0.0/0".parse().expect("valid literal prefix")
+        };
+        PrefixPattern::or_longer(any)
+    } else {
+        let prefix: IpPrefix = value_s.parse().map_err(|e| PolicyConfigError {
+            line,
+            message: format!("access-list: invalid prefix `{value_s}`: {e}"),
+        })?;
+        let is_v6 = matches!(prefix, IpPrefix::V6(_));
+        if is_v6 != want_v6 {
+            return err(
+                line,
+                format!(
+                    "access-list: {} list given {} prefix `{value_s}`",
+                    if want_v6 { "an IPv6" } else { "an IPv4" },
+                    if is_v6 { "an IPv6" } else { "an IPv4" },
+                ),
+            );
+        }
+        // FRR lib/filter.c filter_match_zebra: subnet-of by default
+        // (prefix_match), equal prefix lengths additionally only with
+        // `exact-match` — the inverse default of prefix-lists.
+        if exact {
+            PrefixPattern::exact(prefix)
+        } else {
+            PrefixPattern::or_longer(prefix)
+        }
+    };
+
+    let list = doc.access_lists.entry(name.to_string()).or_default();
+    // FRR auto-numbering (lib/filter_cli.c acl_get_seq): max existing
+    // sequence + 5 (not the prefix-list "next multiple of five").
+    let auto_seq = list.entries().last().map_or(5, |e| e.seq + 5);
+    list.insert(AccessListEntry {
+        seq: seq.unwrap_or(auto_seq),
+        verdict,
+        pattern,
+    });
+    Ok(())
 }
 
 fn parse_as_path_list(
@@ -885,15 +1050,35 @@ fn join_tail(toks: &[&str], from: usize) -> String {
 ///
 /// Execution model (FRR "Route Maps" summary table):
 /// - entry matches (AND of clauses; empty = always) + permit → apply
-///   sets, then exit policy;
-/// - entry matches + deny → deny (sets and exit policy on a matched
-///   deny entry are unreachable — recorded as warnings);
+///   sets, then `call` (a deny return finishes and denies; a permit
+///   return proceeds), then exit policy;
+/// - entry matches + deny → deny (sets, call and exit policy on a
+///   matched deny entry are unreachable — recorded as warnings);
 /// - no match → next entry; nothing matched → implicit deny.
+///
+/// `call NAME` targets must be defined route-maps and acyclic — both
+/// are compile errors (the typed-engine convention for undefined
+/// references; FRR instead looks the name up at apply time).
 pub fn compile_route_map(
     doc: &PolicyDocument,
     name: &str,
 ) -> Result<CompileOutput, PolicyConfigError> {
+    let mut out = compile_route_map_inner(doc, name, &[name])?;
     let mut warnings = doc.warnings.clone();
+    warnings.append(&mut out.warnings);
+    out.warnings = warnings;
+    Ok(out)
+}
+
+/// `stack` is the chain of route-map names currently being compiled
+/// (for `call` cycle detection); `name` is appended to it for
+/// recursive compiles.
+fn compile_route_map_inner(
+    doc: &PolicyDocument,
+    name: &str,
+    stack: &[&str],
+) -> Result<CompileOutput, PolicyConfigError> {
+    let mut warnings = Vec::new();
     let rm = doc.route_maps.get(name).ok_or_else(|| PolicyConfigError {
         line: 0,
         message: format!("route-map `{name}` not found"),
@@ -901,6 +1086,7 @@ pub fn compile_route_map(
 
     let mut b = FilterBuilder::new(); // default verdict: Reject (implicit deny-all)
     let mut pl_idx: BTreeMap<String, SetIndex> = BTreeMap::new();
+    let mut acl_idx: BTreeMap<String, SetIndex> = BTreeMap::new();
     let mut asl_idx: BTreeMap<String, SetIndex> = BTreeMap::new();
     let mut cl_idx: BTreeMap<String, SetIndex> = BTreeMap::new();
     let mut cl_removal: BTreeMap<String, CommunitySet> = BTreeMap::new();
@@ -955,6 +1141,24 @@ pub fn compile_route_map(
                         ors.push(Term::PrefixList(idx));
                     }
                     terms.push(or_or_identity(ors));
+                }
+                RmMatch::AccessList { name, .. } => {
+                    let list = doc
+                        .access_lists
+                        .get(name)
+                        .ok_or_else(|| PolicyConfigError {
+                            line: entry.line,
+                            message: format!("match: undefined access-list `{name}`"),
+                        })?;
+                    let idx = match acl_idx.get(name) {
+                        Some(x) => *x,
+                        None => {
+                            let x = b.add_access_list(list.clone());
+                            acl_idx.insert(name.clone(), x);
+                            x
+                        }
+                    };
+                    terms.push(Term::AccessList(idx));
                 }
                 RmMatch::AsPath(n) => {
                     let list = doc.as_path_lists.get(n).ok_or_else(|| PolicyConfigError {
@@ -1064,6 +1268,32 @@ pub fn compile_route_map(
                         }
                     }
                 }
+                // Call Action, after Set Actions (FRR "Route Maps").
+                // The callee is compiled now: an undefined name or a
+                // cycle is a compile error (undefined-ref convention —
+                // FRR looks the name up at apply time instead).
+                if let Some(callee) = &entry.call {
+                    if stack.contains(&callee.as_str()) {
+                        return err(
+                            entry.line,
+                            format!(
+                                "call `{callee}`: recursive route-map call (cycle via {})",
+                                stack.join(" -> ")
+                            ),
+                        );
+                    }
+                    if !doc.route_maps.contains_key(callee) {
+                        return err(entry.line, format!("call: undefined route-map `{callee}`"));
+                    }
+                    let mut sub_stack: Vec<&str> = stack.to_vec();
+                    sub_stack.push(callee);
+                    // Structural warnings of the callee surface too
+                    // (e.g. set clauses on its matched deny entries).
+                    let mut sub_out = compile_route_map_inner(doc, callee, &sub_stack)?;
+                    warnings.append(&mut sub_out.warnings);
+                    let idx = b.add_call(sub_out.filter);
+                    actions.push(Action::Call(idx));
+                }
                 // Exit policy (FRR Route Maps — Matching/Exit Policy):
                 // none → finish and permit; next → fall through to the
                 // next entry (no terminal action — the evaluator
@@ -1083,6 +1313,12 @@ pub fn compile_route_map(
                 if !entry.sets.is_empty() {
                     warnings.push(format!(
                         "line {}: route-map seq {}: set clauses on a matched deny entry are never applied (ignored)",
+                        entry.line, entry.seq
+                    ));
+                }
+                if entry.call.is_some() {
+                    warnings.push(format!(
+                        "line {}: route-map seq {}: call on a matched deny entry is never applied (ignored)",
                         entry.line, entry.seq
                     ));
                 }
@@ -1300,7 +1536,7 @@ route-map aspath permit 20
         let text = "\
 bgp community-list standard DEL permit 65000:1 65000:2
 route-map polish permit 10
- set comm-list delete DEL
+ set comm-list DEL delete
  set metric +50
  set origin egp
  set as-path prepend 64512 64513
@@ -1441,7 +1677,11 @@ route-map in-bound permit 20
     #[test]
     fn unknown_keywords_error_with_line_numbers() {
         let cases = [
-            ("route-map x permit 10\n call other-map\n", 2, "call"),
+            (
+                "route-map x permit 10\n match ip address prefix-len 12\n",
+                2,
+                "prefix-len",
+            ),
             ("route-map x permit 10\n match peer 10.0.0.1\n", 2, "peer"),
             ("route-map x permit 10\n set weight 100\n", 2, "weight"),
             (
@@ -1586,5 +1826,299 @@ route-map x permit 10
         );
         let mut r192 = v4_route("192.0.2.0/24", &[]);
         assert_eq!(out.filter.apply(&mut r192), Verdict::Accept);
+    }
+
+    #[test]
+    fn comm_list_frr_token_order_regression() {
+        // FRR 10.2 CLI (bgpd/bgp_routemap.c set_community_delete_cmd):
+        // "set comm-list <(1-99)|(100-500)|COMMUNITY_LIST_NAME> delete"
+        // — the name FIRST, `delete` LAST. Verbatim FRR configs must
+        // parse; the previously-accepted inverted order must not.
+        let text = "\
+bgp community-list standard DEL permit 65000:1
+route-map r permit 10
+ set comm-list DEL delete
+";
+        let out = compile_ok(text, "r");
+        let mut r = v4_route("192.0.2.0/24", &[65001]);
+        r.bgp_or_materialize().communities = vec![Community::Pair(65000, 1), Community::Pair(1, 1)];
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept);
+        assert_eq!(r.bgp().unwrap().communities, vec![Community::Pair(1, 1)]);
+
+        let e = parse_policy_config(
+            "bgp community-list standard DEL permit 65000:1\nroute-map r permit 10\n set comm-list delete DEL\n",
+        )
+        .unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(e.message.contains("comm-list NAME delete"), "{}", e.message);
+    }
+
+    #[test]
+    fn call_deny_return_short_circuits() {
+        // FRR "Route Maps": the Call Action runs after Set Actions; "If
+        // it returns deny ... the route is denied, regardless of the
+        // Matching Policy or the Exit Policy." The callee's implicit
+        // deny-all counts as a deny return.
+        let text = "\
+ip prefix-list bogon permit 10.0.0.0/8 le 32
+route-map blocker deny 10
+ match ip address prefix-list bogon
+route-map blocker permit 20
+route-map main permit 10
+ set local-preference 200
+ call blocker
+";
+        let out = compile_ok(text, "main");
+        let mut bogon = v4_route("10.1.2.0/24", &[65001]);
+        assert_eq!(
+            out.filter.apply(&mut bogon),
+            Verdict::Reject,
+            "deny return finishes and denies"
+        );
+        assert_eq!(
+            bogon.bgp().unwrap().local_pref,
+            Some(200),
+            "caller sets applied before the call"
+        );
+        // Permit return (callee's empty permit tail): the caller's
+        // exit policy (none → permit) proceeds.
+        let mut clean = v4_route("192.0.2.0/24", &[65001]);
+        assert_eq!(out.filter.apply(&mut clean), Verdict::Accept);
+        assert_eq!(clean.bgp().unwrap().local_pref, Some(200));
+    }
+
+    #[test]
+    fn call_permit_return_runs_exit_policy() {
+        // Permit return → matching+exit policy proceed: here
+        // `on-match next`, so the next entry's sets apply on top.
+        // (`set metric` maps to MED — docs/protocols/policy.md §6.5.)
+        let text = "\
+route-map sub permit 5
+ set metric 42
+route-map main permit 10
+ set local-preference 150
+ call sub
+ on-match next
+route-map main permit 20
+ set origin egp
+";
+        let out = compile_ok(text, "main");
+        let mut r = v4_route("192.0.2.0/24", &[65001]);
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept);
+        let b = r.bgp().unwrap();
+        assert_eq!(b.local_pref, Some(150), "caller set before call");
+        assert_eq!(b.med, Some(42), "callee set persists after permit return");
+        assert_eq!(b.origin, Some(BgpOrigin::Egp), "next entry after call");
+    }
+
+    #[test]
+    fn call_undefined_target_and_cycles_are_compile_errors() {
+        let doc = parse_policy_config("route-map x permit 10\n call ghost\n").unwrap();
+        let e = compile_route_map(&doc, "x").unwrap_err();
+        assert_eq!(e.line, 1, "entry opened on line 1");
+        assert!(
+            e.message.contains("undefined route-map `ghost`"),
+            "{}",
+            e.message
+        );
+
+        // Direct self-call and mutual cycles are compile errors.
+        let selfy = parse_policy_config("route-map x permit 10\n call x\n").unwrap();
+        let e = compile_route_map(&selfy, "x").unwrap_err();
+        assert!(e.message.contains("cycle"), "{}", e.message);
+
+        let mutual =
+            parse_policy_config("route-map a permit 10\n call b\nroute-map b permit 10\n call a\n")
+                .unwrap();
+        let e = compile_route_map(&mutual.clone(), "a").unwrap_err();
+        assert!(e.message.contains("cycle"), "{}", e.message);
+        let e = compile_route_map(&mutual, "b").unwrap_err();
+        assert!(e.message.contains("cycle"), "{}", e.message);
+
+        // A shared (non-cyclic) callee twice in one chain is fine.
+        let dag = parse_policy_config(
+            "route-map leaf permit 5\nroute-map mid permit 10\n call leaf\nroute-map top permit 20\n call leaf\n call mid\n",
+        )
+        .unwrap();
+        assert!(compile_route_map(&dag, "top").is_ok());
+    }
+
+    #[test]
+    fn call_on_deny_entry_warns() {
+        let text = "\
+route-map callee permit 5
+route-map x deny 10
+ call callee
+";
+        let doc = parse_policy_config(text).unwrap();
+        let out = compile_route_map(&doc, "x").unwrap();
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("call on a matched deny")));
+    }
+
+    #[test]
+    fn access_list_stanza_and_match_integration() {
+        // Zebra-style ACLs match SUBNET-OF by default (FRR
+        // lib/filter.c filter_match_zebra) — the inverse of
+        // prefix-lists; `exact-match` flips an entry to exact.
+        let text = "\
+access-list IN permit 10.0.0.0/8
+access-list IN seq 3 deny 10.99.0.0/16
+access-list IN deny 192.0.2.128/25 exact-match
+access-list IN seq 100 permit any
+route-map r permit 10
+ match ip address IN
+";
+        let out = compile_ok(text, "r");
+        // seq 5 (auto) permit 10/8 covers subnets...
+        let mut r = v4_route("10.1.0.0/16", &[]);
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept, "subnet-of");
+        // ...but seq 3's deny of 10.99/16 comes first in seq order.
+        let mut denied = v4_route("10.99.1.0/24", &[]);
+        assert_eq!(out.filter.apply(&mut denied), Verdict::Reject, "seq order");
+        // exact-match entry: the /25 is denied even though the
+        // trailing `any` (seq 100) would permit it — seq 10 wins.
+        let mut exact = v4_route("192.0.2.128/25", &[]);
+        assert_eq!(out.filter.apply(&mut exact), Verdict::Reject);
+        let mut other = v4_route("198.51.100.0/24", &[]);
+        assert_eq!(
+            out.filter.apply(&mut other),
+            Verdict::Accept,
+            "trailing permit any = permit-the-rest"
+        );
+    }
+
+    #[test]
+    fn access_list_default_is_subnet_of_prefix_list_default_is_exact() {
+        // Pins the Q4 trap: same network spelling, opposite defaults.
+        let acl_text = "\
+access-list A permit 10.0.0.0/8
+route-map a permit 10
+ match ip address A
+";
+        let pl_text = "\
+ip prefix-list P permit 10.0.0.0/8
+route-map p permit 10
+ match ip address prefix-list P
+";
+        let acl = compile_ok(acl_text, "a");
+        let pl = compile_ok(pl_text, "p");
+        let mut subnet = v4_route("10.1.0.0/16", &[]);
+        assert_eq!(acl.filter.apply(&mut subnet), Verdict::Accept);
+        assert_eq!(
+            pl.filter.apply(&mut subnet),
+            Verdict::Reject,
+            "prefix-list without le/ge is exact"
+        );
+        // Subnet-of means the entry network itself and longer subnets
+        // only — never a supernet.
+        let mut supernet = v4_route("10.0.0.0/7", &[]);
+        assert_eq!(
+            acl.filter.apply(&mut supernet),
+            Verdict::Reject,
+            "supernet not covered"
+        );
+        let mut self_net = v4_route("10.0.0.0/8", &[]);
+        assert_eq!(acl.filter.apply(&mut self_net), Verdict::Accept);
+    }
+
+    #[test]
+    fn ipv6_access_list_stanza_and_match() {
+        let text = "\
+ipv6 access-list V6 deny 2001:db8:bad::/48
+ipv6 access-list V6 permit 2001:db8::/32
+route-map r permit 10
+ match ipv6 address V6
+";
+        let out = compile_ok(text, "r");
+        let mut bad = crate::route::testutil::v6_route("2001:db8:bad:1::/64", &[]);
+        assert_eq!(out.filter.apply(&mut bad), Verdict::Reject);
+        let mut good = crate::route::testutil::v6_route("2001:db8:1::/48", &[]);
+        assert_eq!(out.filter.apply(&mut good), Verdict::Accept);
+        // Family separation at the stanza level.
+        let e = parse_policy_config("access-list A permit 2001:db8::/32\n").unwrap_err();
+        assert!(
+            e.message.contains("an IPv4 list given an IPv6 prefix"),
+            "{}",
+            e.message
+        );
+        let e = parse_policy_config("ipv6 access-list A permit 10.0.0.0/8\n").unwrap_err();
+        assert!(
+            e.message.contains("an IPv6 list given an IPv4 prefix"),
+            "{}",
+            e.message
+        );
+        // `any` is family-scoped: the v6 list's any must not leak v4.
+        let v6any = compile_ok(
+            "ipv6 access-list ALL permit any\nroute-map r permit 10\n match ipv6 address ALL\n",
+            "r",
+        );
+        let mut v4 = v4_route("192.0.2.0/24", &[]);
+        assert_eq!(v6any.filter.apply(&mut v4), Verdict::Reject);
+    }
+
+    #[test]
+    fn access_list_seq_numbering_and_replaces() {
+        // Auto-seq = max existing sequence + 5 (FRR filter_cli.c
+        // acl_get_seq — NOT the prefix-list "next multiple of five").
+        let doc = parse_policy_config(
+            "\
+access-list A permit 10.0.0.0/8
+access-list A permit 192.0.2.0/24
+access-list A seq 7 deny 198.51.100.0/24
+access-list A permit 203.0.113.0/24
+",
+        )
+        .unwrap();
+        let al = doc.access_lists.get("A").unwrap();
+        let seqs: Vec<u32> = al.entries().iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![5, 7, 10, 15], "5; max=5→10; seq 7; max=10→15");
+        // Same explicit seq replaces.
+        let doc2 = parse_policy_config(
+            "\
+access-list A seq 5 permit 10.0.0.0/8
+access-list A seq 5 deny 10.0.0.0/8
+",
+        )
+        .unwrap();
+        let al2 = doc2.access_lists.get("A").unwrap();
+        assert_eq!(al2.entries().len(), 1);
+        assert_eq!(al2.entries()[0].verdict, PrefixListVerdict::Deny);
+    }
+
+    #[test]
+    fn access_list_undefined_reference_is_compile_error() {
+        let doc = parse_policy_config("route-map x permit 10\n match ip address NOPE\n").unwrap();
+        let e = compile_route_map(&doc, "x").unwrap_err();
+        assert_eq!(e.line, 1);
+        assert!(
+            e.message.contains("undefined access-list `NOPE`"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn cisco_style_access_lists_refused() {
+        // Cisco-style entry forms and the named-ACL submode stay
+        // refused loudly (see docs/protocols/policy.md §Deferred):
+        // the zebra form takes exactly PREFIX [exact-match]|any, so
+        // the trailing cisco tokens are unexpected, `host` is not a
+        // prefix, and the submode head is an explicit refusal.
+        let e = parse_policy_config("access-list A permit 10.0.0.0 0.255.255.255\n").unwrap_err();
+        assert_eq!(e.line, 1);
+        assert!(e.message.contains("unexpected token"), "{}", e.message);
+        let e = parse_policy_config("access-list A permit host 10.0.0.1\n").unwrap_err();
+        assert!(
+            e.message.contains("invalid prefix `host`") || e.message.contains("unexpected token"),
+            "{}",
+            e.message
+        );
+        let e = parse_policy_config("ip access-list extended A\n").unwrap_err();
+        assert!(e.message.contains("not supported"), "{}", e.message);
+        let e = parse_policy_config("access-list A remark hello\n").unwrap_err();
+        assert!(e.message.contains("permit|deny"), "{}", e.message);
     }
 }

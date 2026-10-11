@@ -40,9 +40,10 @@
 //! as a tuning decision.
 //!
 //! W2-d: `import`/`export` name route-maps defined by the policy
-//! stanzas (`route-map`, `ip|ipv6 prefix-list`, `bgp as-path
-//! access-list`, `bgp community-list standard` — the W1-a
-//! compatibility grammar). Those lines are collected verbatim into
+//! stanzas (`route-map`, `access-list`, `ip|ipv6 prefix-list`,
+//! `ipv6 access-list`, `bgp as-path access-list`,
+//! `bgp community-list standard`) — the W1-a compatibility grammar.
+//! Those lines are collected verbatim into
 //! [`BgpdConfig::policy_text`] — a blank-padded fragment that keeps
 //! the file's line numbers, so `policy::parse_policy_config` errors
 //! point at the real file — and compiled at startup by
@@ -258,8 +259,10 @@ fn is_policy_stanza_head(tokens: &[&str]) -> bool {
     matches!(
         tokens,
         ["route-map", ..]
+            | ["access-list", ..]
             | ["ip", "prefix-list", ..]
             | ["ipv6", "prefix-list", ..]
+            | ["ipv6", "access-list", ..]
             | ["bgp", "as-path", ..]
             | ["bgp", "community-list", ..]
     )
@@ -271,7 +274,12 @@ fn is_policy_stanza_head(tokens: &[&str]) -> bool {
 fn is_policy_child(tokens: &[&str]) -> bool {
     matches!(
         tokens,
-        ["match", ..] | ["set", ..] | ["continue", ..] | ["on-match", ..] | ["description", ..]
+        ["match", ..]
+            | ["set", ..]
+            | ["call", ..]
+            | ["continue", ..]
+            | ["on-match", ..]
+            | ["description", ..]
     )
 }
 
@@ -777,6 +785,48 @@ ip prefix-list CUST seq 5 permit 203.0.113.0/24
         // And the extracted grammar actually parses.
         let doc = policy::parse_policy_config(&config.policy_text).unwrap();
         assert!(doc.route_maps.contains_key("IN"));
+    }
+
+    #[test]
+    fn access_list_and_call_stanzas_divert_to_policy_text() {
+        // The M2 grammar additions must survive the bgpd.conf sectioning
+        // verbatim (a dropped `access-list` or `call` line would be a
+        // silent policy change) and compile end-to-end.
+        let sample = "\
+router bgp 65000
+ bgp router-id 10.0.0.1
+ import IN
+route-map IN permit 10
+ match ip address NETS
+ call CHOP
+ set local-preference 200
+access-list NETS permit 10.0.0.0/8
+ipv6 access-list V6 permit 2001:db8::/32
+route-map CHOP permit 5
+ set comm-list CHOP-COMM delete
+bgp community-list standard CHOP-COMM permit 65000:1
+";
+        let config = parse_config(sample).unwrap();
+        let doc = policy::parse_policy_config(&config.policy_text).unwrap();
+        assert!(doc.access_lists.contains_key("NETS"));
+        assert!(doc.access_lists.contains_key("V6"));
+        let out = policy::compile_route_map(&doc, "IN").unwrap();
+        // 10.1.0.0/16 is a subnet of the ACL's 10/8 entry (subnet-of
+        // default) → entry matches; the call's comm-list delete runs
+        // (FRR token order: NAME first, `delete` last).
+        let mut r = policy::route::RouteData {
+            prefix: "10.1.0.0/16".parse::<IpPrefix>().unwrap(),
+            protocol: common::RouteProtocol::Bgp,
+            metric: 0,
+            nexthops: common::NexthopGroup::new(),
+            bgp: Some(policy::route::BgpAttrs::materialized_default()),
+        };
+        r.bgp.as_mut().unwrap().communities = vec![policy::route::Community::Pair(65000, 1)];
+        assert_eq!(out.filter.apply(&mut r), policy::Verdict::Accept);
+        assert!(
+            r.bgp.unwrap().communities.is_empty(),
+            "comm-list delete ran"
+        );
     }
 
     #[test]
