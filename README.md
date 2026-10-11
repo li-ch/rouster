@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" width="360" alt="Rouster — a weathervane rooster">
+</p>
+
 # Rouster
 
 A routing protocol suite in Rust — **rou**ter + Ru**st**.
