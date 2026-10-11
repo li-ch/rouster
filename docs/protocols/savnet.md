@@ -24,6 +24,11 @@ two landed surfaces, selected by savd.conf's `backend <rp_filter|nft>`
   sets, blocklists, router-scale prefix ops, IPv4 and IPv6, monitor
   actions as named kernel counters (`sav_monitor_counts` answers from
   them — the dataplane-first path), drop actions as enforced denies.
+  Interval sets declare `auto-merge`: a daemon-fed allowlist can hold
+  a covering and a covered prefix at once (the SIB merges the
+  interface mirror's connected prefixes with RIB-derived ones), and a
+  plain interval set rejects overlapping elements — auto-merge
+  resolves them to the union, the list's own semantics either way.
   Enforcement lives only in the table: the sysctl surface is never
   touched and clear is a single `destroy table`. Since N6B the
   counters also answer PER OP (`sav_monitor_per_op` joins the
@@ -34,7 +39,11 @@ two landed surfaces, selected by savd.conf's `backend <rp_filter|nft>`
   time; savd installs before reading, so its flow always answers).
   Evidence: `scripts/test-sav-nft.sh` (spoof-differential vs the
   rp_filter baseline, same topology; both scripts' readouts recorded
-  under the stage's quarantine).
+  under the stage's quarantine) and `scripts/test-savd-nft.sh` (the
+  savd daemon end-to-end on this backend: SIB from the ZAPI
+  redistribute push, kernel ruleset install, spoof/legit differential
+  in monitor counters and drop loss, status-file count lines, clean
+  SIGTERM teardown — sysctls stay 0 in every leg).
 
 The verdict semantics are backend-independent: the nft ruleset's
 interpreted decisions are pinned equal to the reference pipeline
