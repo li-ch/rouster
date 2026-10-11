@@ -364,13 +364,37 @@ fork it. The concrete seams, documented where they bite:
   conventions are RFC/ADD-A2-pinned and vector-tested; an
   FRR-10.2.2 key-chain HMAC-SHA-256 leg is the natural next interop.
 
+## Incremental SPF (2026-10-11, the N3 M4 slice — §16.5/§16.6)
+
+- **The RFC's "incremental" means class- and area-scoped reruns, not
+  Dijkstra subtree pruning** (the survey's naming caution: FRR/Cisco
+  iSPF is a proprietary technique nobody in the BIRD/Holo survey
+  implements either). What landed:
+- **Per-area §16.1 caching**: each area keeps its last `SpfResult`;
+  the router-wide §16 walk recomputes Dijkstra only for areas whose
+  own topology changed (their own FRR-parity 0/50/5000 ms throttle —
+  the N2 disclosure "recomputes ALL areas" is closed); unchanged
+  areas reuse the cache. A `table_dirty` flag runs the §16.2/§16.4/
+  export walk alone — the AS-scope class (type-5 installs, summary
+  metric changes, type-7s) never recomputes an SPT (§16.5/§16.6's
+  "not necessary to recalculate the entire routing table").
+- **Class-based dirtying** at every change site: router/network-LSA
+  changes mark the area; summary/external classes mark the table
+  (`after_report` classifies per LSA type; so do the aging flushes).
+- **Tests**: only-changed-areas-recompute (run counters), the AS-
+  scope class updating routes with zero SPT runs, per-area backoff
+  independence (a flap storm backs off ITS scheduler while a quiet
+  area runs at the initial delay), and the W5B fixed-seed agreement
+  property — randomized LSDB mutation sequences, incremental vs a
+  forced-full twin, identical routing tables every step and strictly
+  fewer §16.1 runs.
+
 ## §Deferred (updated day-3 anchors)
 
 - §16.3 (transit areas' summary-LSAs — only meaningful with virtual
-  links, which set TransitCapability); incremental SPF (§16.5/§16.6);
-  virtual links (§15); authentication
-  (Appendix D); graceful restart (RFC 3623); DNA honoring; OSPFv3
-  bodies (the ladder's codecs-only scope).
+  links, which set TransitCapability); virtual links (§15); graceful
+  restart (RFC 3623); DNA honoring; OSPFv3 bodies (the ladder's
+  codecs-only scope).
 - NSSA remainder: translator election (Nt bit, Candidate role,
   TranslatorStabilityInterval — RFC 3101 §3.1), Type-7 address
   ranges, §3.2 LS-ID remapping, the Appendix E P-bit-default

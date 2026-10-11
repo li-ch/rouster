@@ -162,6 +162,15 @@ pub struct AreaState {
     spf_sched: SpfScheduler,
     spf_dirty: bool,
     router_lsa_dirty: bool,
+    /// The last §16.1 result — the incremental cache. Recomputed
+    /// only when this area's topology changed (its own scheduler
+    /// due); otherwise the router-wide §16 walk reuses it (§16.5's
+    /// "it is not necessary to recalculate the entire routing
+    /// table").
+    last_result: Option<spf::SpfResult>,
+    /// How many §16.1 runs this area has computed (test surface for
+    /// the only-changed-areas-recompute property).
+    spf_runs: u64,
 }
 
 impl AreaState {
@@ -173,6 +182,8 @@ impl AreaState {
             spf_sched: SpfScheduler::new(0, 50, 5000),
             spf_dirty: false,
             router_lsa_dirty: true,
+            last_result: None,
+            spf_runs: 0,
         }
     }
 }
@@ -204,6 +215,11 @@ pub struct Ospfd {
     summaries: BTreeMap<(u32, LsaKey), ()>,
     /// Whether any external LSA exists (the router-LSA E-bit, §12.4.3).
     asbr: bool,
+    /// The router-wide §16 walk is due WITHOUT any area's §16.1
+    /// recompute — the AS-scope class (type-5 installs, summary
+    /// metric changes): §16.5/§16.6's "incremental updates" (only
+    /// the affected route computations rerun; the SPT is unchanged).
+    table_dirty: bool,
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     redistribute_static: bool,
 }
@@ -378,6 +394,7 @@ impl Ospfd {
             network_lsa_dirty: Vec::new(),
             summaries: BTreeMap::new(),
             asbr: false,
+            table_dirty: true,
             zapi: None,
             redistribute_static: cfg.redistribute_static,
         })
@@ -413,12 +430,12 @@ impl Ospfd {
         }
     }
 
-    /// Mark EVERY area dirty (the AS-scoped changes: type-5s, our
-    /// ASBR status flip).
-    fn mark_all_spf_dirty(&mut self, now: u64) {
-        for area in self.areas.keys().copied().collect::<Vec<_>>() {
-            self.mark_spf_dirty(area, now);
-        }
+    /// Mark the router-wide table walk due without any §16.1
+    /// recompute — the AS-scope class (§16.5/§16.6: a type-5 or
+    /// summary-LSA change reruns only those route computations; the
+    /// per-area SPT is untouched).
+    fn mark_table_dirty(&mut self) {
+        self.table_dirty = true;
     }
 
     #[cfg(test)]
@@ -815,14 +832,14 @@ impl Ospfd {
                     let stored = entry.lsa.clone();
                     self.flood_own(&stored, Some(nssa), now, out);
                 }
-                self.mark_spf_dirty(nssa, now);
+                self.mark_table_dirty();
                 info!(area = nssa, prefix = %prefix, "ospfd: type-7 LSA originated (RFC 3101 §2.4)");
             }
         }
         if originated {
             let first = !self.asbr;
             self.asbr = true;
-            self.mark_all_spf_dirty(now);
+            self.mark_table_dirty();
             if first {
                 // The E-bit change re-originates the router-LSA
                 // (every area — the NSSA ASBR sets E per RFC 3101
@@ -896,7 +913,7 @@ impl Ospfd {
                 .and_then(|s| s.lsdb.premature_age(&key));
             if let Some(maxage) = aged {
                 self.flood_own(&maxage, Some(nssa), now, out);
-                self.mark_spf_dirty(nssa, now);
+                self.mark_table_dirty();
             }
         }
         // Translations of the withdrawn type-7s stop being justified
@@ -1120,7 +1137,7 @@ impl Ospfd {
                         let stored = entry.lsa.clone();
                         let _ = state;
                         self.flood_own(&stored, Some(area), now, out);
-                        self.mark_spf_dirty(area, now);
+                        self.mark_table_dirty();
                         continue;
                     }
                 }
@@ -1584,8 +1601,19 @@ impl Ospfd {
             }
         }
         if !report.changed.is_empty() {
-            // The SPF throttle (FRR-parity 0/50/5000 ms backoff).
-            self.mark_spf_dirty(area, now);
+            // Class-based dirtying (§16.5/§16.6): router/network-LSA
+            // changes recompute the area's SPT (on the FRR-parity
+            // throttle backoff); the summary/external classes only
+            // rerun the affected route computations.
+            if report
+                .changed
+                .iter()
+                .any(|k| matches!(k.ls_type, LsaType::ROUTER | LsaType::NETWORK))
+            {
+                self.mark_spf_dirty(area, now);
+            } else {
+                self.mark_table_dirty();
+            }
         }
     }
 
@@ -1603,20 +1631,42 @@ impl Ospfd {
         out: &mut Vec<WireOut>,
         zapi_out: &mut Vec<ZedgeCommand>,
     ) {
+        // The incremental scheduling wrapper (§16.5/§16.6's "it is
+        // not necessary to recalculate the entire routing table"):
+        // an area whose topology changed recomputes its §16.1 on its
+        // OWN backoff schedule (FRR-parity throttle); unchanged
+        // areas reuse their cached result. The AS-scope class
+        // (type-5/summary changes — `table_dirty`) runs the
+        // router-wide walk without ANY §16.1 recompute (the SPT is
+        // untouched by those LSA classes).
         let any_due = self
             .areas
             .values()
             .any(|a| a.spf_dirty && a.spf_sched.is_due(now * 1000));
-        if !any_due {
+        if !any_due && !self.table_dirty {
             return;
         }
         let area_ids: Vec<u32> = self.areas.keys().copied().collect();
+        // Refresh only the due-and-dirty areas; snapshot everyone's
+        // result for the walk below.
+        let mut results: Vec<(u32, spf::SpfResult)> = Vec::new();
         for area in &area_ids {
-            if let Some(a) = self.areas.get_mut(area) {
+            let Some(a) = self.areas.get_mut(area) else {
+                continue;
+            };
+            let recompute =
+                a.spf_dirty && a.spf_sched.is_due(now * 1000) || a.last_result.is_none();
+            if recompute {
                 a.spf_sched.mark_run(now * 1000);
                 a.spf_dirty = false;
+                a.last_result = Some(spf::calculate(self.router_id, &a.lsdb));
+                a.spf_runs += 1;
+            }
+            if let Some(r) = &a.last_result {
+                results.push((*area, r.clone()));
             }
         }
+        self.table_dirty = false;
 
         // ---- §16.1: the intra-area paths, per attached area ----
         // The unified routing table (§11's shape): network
@@ -1624,11 +1674,7 @@ impl Ospfd {
         // ASBR) keyed by Router ID, one path per area.
         let mut ribs: BTreeMap<(u32, u32), RibPath> = BTreeMap::new();
         let mut routers: BTreeMap<RouterId, Vec<RouterPath>> = BTreeMap::new();
-        for area in &area_ids {
-            let Some(state) = self.areas.get(area) else {
-                continue;
-            };
-            let result = spf::calculate(self.router_id, &state.lsdb);
+        for (area, result) in &results {
             for route in &result.routes {
                 match route.destination {
                     Destination::Network { addr, mask } => {
@@ -2280,7 +2326,7 @@ impl Ospfd {
                         let stored = entry.lsa.clone();
                         info!(area, "ospfd: type-7 default originated (RFC 3101 §2.7)");
                         self.flood_own(&stored, Some(*area), now, out);
-                        self.mark_spf_dirty(*area, now);
+                        self.mark_table_dirty();
                     }
                 }
                 continue;
@@ -2319,7 +2365,7 @@ impl Ospfd {
                     if let Some(stored) = stored {
                         info!(area, key = ?key, "ospfd: summary-LSA originated (§12.4.3)");
                         self.flood_own(&stored, Some(*area), now, out);
-                        self.mark_spf_dirty(*area, now);
+                        self.mark_table_dirty();
                     }
                 }
                 Err(e) => {
@@ -2485,7 +2531,7 @@ impl Ospfd {
                     prefix = prefix_str,
                     "ospfd: type-7 translated to type-5 (RFC 3101 §3.2)"
                 );
-                self.mark_all_spf_dirty(now);
+                self.mark_table_dirty();
             }
         }
         // Flush the translations no longer justified.
@@ -2544,7 +2590,7 @@ impl Ospfd {
             if let Some(maxage) = aged {
                 info!(area, key = ?key, "ospfd: summary-LSA flushed (§12.4.3)");
                 self.flood_own(&maxage, Some(*area), now, out);
-                self.mark_spf_dirty(*area, now);
+                self.mark_table_dirty();
             }
         }
     }
@@ -2701,18 +2747,26 @@ impl Ospfd {
                 pending_maxage_floods.push((area, lsas));
             }
             let flushable = state.lsdb.flush_ready(syncing);
-            let mut spf_needed = false;
+            let mut spt_changed = false;
+            let mut table_changed = false;
             for key in flushable {
                 if state.lsdb.remove(&key).is_some() {
                     debug!(key = ?key, "ospfd: LSA flushed (MaxAge)");
-                    spf_needed = true;
+                    if matches!(key.ls_type, LsaType::ROUTER | LsaType::NETWORK) {
+                        spt_changed = true;
+                    } else {
+                        table_changed = true;
+                    }
                     // A withdrawn summary changes the inter-area
                     // table.
                     self.summaries.remove(&(area, key));
                 }
             }
-            if spf_needed {
+            if spt_changed {
                 self.mark_spf_dirty(area, now);
+            }
+            if table_changed {
+                self.mark_table_dirty();
             }
             // §12.4 refresh floods, now past the area borrow.
             for (lsa, scope) in pending_refresh_floods.drain(..) {
@@ -5130,6 +5184,248 @@ mod tests {
         assert_eq!(packet.header.au_type, 2);
         // The plain decoder rejects the trailer (strict framing).
         assert!(Packet::decode(&bytes).is_err());
+    }
+
+    // ---- incremental SPF (§16.5/§16.6, N3 M4) -----------------------
+
+    fn spf_runs(core: &Ospfd, area: u32) -> u64 {
+        core.areas.get(&area).map(|a| a.spf_runs).unwrap_or(0)
+    }
+
+    /// A random router-LSA for the mutation sequences (the W5B
+    /// fixed-seed convention; links may dangle — one-way edges are
+    /// legal input the SPT simply drops).
+    fn random_router_lsa(seed: &mut u64, rid: u32, seq: u32) -> Lsa {
+        // XorShift64 — the same convention as spf.rs's tests.
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let rng = &mut || next(seed);
+        let n_links = (rng() % 4) as usize;
+        let mut links = Vec::new();
+        for i in 0..n_links {
+            let peer = 10 + (rng() % 6) as u32;
+            links.push(crate::lsa::RouterLink {
+                link_id: crate::lsa::LinkStateId(
+                    Ipv4Addr::new(10, 200, (peer % 256) as u8, 1).into(),
+                ),
+                link_data: u32::from(Ipv4Addr::new(172, 31, rid as u8, (i + 1) as u8)),
+                link_type: if rng() % 2 == 0 {
+                    crate::lsa::LinkType::PointToPoint
+                } else {
+                    crate::lsa::LinkType::Stub
+                },
+                metric: (1 + rng() % 9) as u16,
+                tos: vec![],
+            });
+        }
+        Lsa {
+            header: crate::lsa::LsaHeader {
+                ls_age: 1,
+                options: Options(Options::E),
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(rid),
+                adv_router: RouterId(rid),
+                seq,
+                checksum: 0,
+                length: 0,
+            },
+            body: crate::lsa::LsaBody::Router(crate::lsa::RouterLsa {
+                v_bit: false,
+                e_bit: rng() % 4 == 0,
+                b_bit: rng() % 4 == 0,
+                links,
+            }),
+        }
+        .with_computed_header()
+    }
+
+    /// Only the CHANGED area recomputes its §16.1: the unchanged
+    /// area's Dijkstra run count does not move.
+    #[test]
+    fn only_changed_areas_recompute() {
+        let mut cores = vec![abr_core(), area0_core(), area1_core(false)];
+        let now = run_multi(&mut cores, 0, 8);
+        let abr = &mut cores[0];
+        // Drain any deferred (MinLSInterval) originations so the
+        // baseline is quiet.
+        let mut o = Vec::new();
+        let mut z = Vec::new();
+        abr.tick(now + 1, &mut o, &mut z);
+        let (runs0, runs1) = (spf_runs(abr, 0), spf_runs(abr, 1));
+        assert!(runs0 > 0 && runs1 > 0, "both areas computed at least once");
+        // A topology change in area 1 only.
+        let mut seed = 7u64;
+        let lsa = random_router_lsa(&mut seed, 0x0a0a_0a0a, 5);
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        {
+            let state = abr.areas.get_mut(&1).unwrap();
+            let _ = state.lsdb.install(lsa, true, now + 2);
+        }
+        abr.mark_spf_dirty(1, now + 2);
+        abr.tick(now + 3, &mut out, &mut zap);
+        assert_eq!(spf_runs(abr, 1), runs1 + 1, "the changed area recomputed");
+        assert_eq!(spf_runs(abr, 0), runs0, "the untouched area did not");
+    }
+
+    /// The AS-scope class (§16.5/§16.6): a type-5 change reruns the
+    /// route walk with NO §16.1 recompute at all.
+    #[test]
+    fn type5_change_updates_routes_without_spt_recompute() {
+        let mut cores = vec![abr_core(), area0_core()];
+        let now = run_multi(&mut cores, 0, 8);
+        let peer_id = cores[1].router_id;
+        let abr = &mut cores[0];
+        let (runs0, runs1) = (spf_runs(abr, 0), spf_runs(abr, 1));
+        let ext = crate::origination::build_external_lsa(
+            peer_id,
+            ip("198.51.100.0"),
+            ip("255.255.255.0"),
+            20,
+            true,
+        )
+        .with_computed_header();
+        {
+            let state = abr.areas.get_mut(&0).unwrap();
+            let _ = state.lsdb.install(ext, true, now + 1);
+        }
+        abr.mark_table_dirty();
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        abr.tick(now + 2, &mut out, &mut zap);
+        assert_eq!(spf_runs(abr, 0), runs0, "area 0's SPT untouched (§16.6)");
+        assert_eq!(spf_runs(abr, 1), runs1, "area 1's SPT untouched");
+        assert!(
+            abr.routes.contains_key("198.51.100.0/24"),
+            "the external route still installed (the walk ran)"
+        );
+    }
+
+    /// Per-area backoff independence: a flap storm in one area backs
+    /// ITS scheduler off (FRR-parity 50 ms increments) while a quiet
+    /// area's single change runs at the initial delay.
+    #[test]
+    fn per_area_backoff_is_independent() {
+        let mut abr = abr_core();
+        let mut zap = Vec::new();
+        let mut out = Vec::new();
+        abr.tick(0, &mut out, &mut zap);
+        // Prime: one run each at t=0 (initial delay 0).
+        let (_, runs1) = (spf_runs(&abr, 0), spf_runs(&abr, 1));
+        // Refresh area 0's last_run at t=10 first (one change, one
+        // run), so the storm below arrives OUTSIDE the idle window.
+        let mut seed = 1u64;
+        let lsa = random_router_lsa(&mut seed, 0x0b0b_0b01, 3);
+        {
+            let state = abr.areas.get_mut(&0).unwrap();
+            let _ = state.lsdb.install(lsa, true, 10);
+        }
+        abr.mark_spf_dirty(0, 10);
+        let mut o = Vec::new();
+        let mut z = Vec::new();
+        abr.maybe_spf(10, &mut o, &mut z);
+        let runs0 = spf_runs(&abr, 0);
+        // 20 rapid topology changes in area 0 within the same
+        // instant: current_delay climbs to 1000 ms — due at t=11 s.
+        for i in 0..20u32 {
+            let mut seed = (i + 1) as u64;
+            let lsa = random_router_lsa(&mut seed, 0x0b0b_0b00 + i, 3);
+            {
+                let state = abr.areas.get_mut(&0).unwrap();
+                let _ = state.lsdb.install(lsa, true, 10);
+            }
+            abr.mark_spf_dirty(0, 10);
+        }
+        // One quiet change in area 1 at the same instant.
+        let mut seed = 99u64;
+        let lsa = random_router_lsa(&mut seed, 0x0c0c_0c0c, 3);
+        {
+            let state = abr.areas.get_mut(&1).unwrap();
+            let _ = state.lsdb.install(lsa, true, 10);
+        }
+        abr.mark_spf_dirty(1, 10);
+        let mut out = Vec::new();
+        let mut zap2 = Vec::new();
+        abr.maybe_spf(10, &mut out, &mut zap2);
+        assert_eq!(
+            spf_runs(&abr, 1),
+            runs1 + 1,
+            "the single-change area ran at the initial delay"
+        );
+        assert_eq!(
+            spf_runs(&abr, 0),
+            runs0,
+            "the storming area's backoff deferred its run"
+        );
+        // Its due time arrives a second later.
+        let mut out = Vec::new();
+        let mut zap3 = Vec::new();
+        abr.maybe_spf(11, &mut out, &mut zap3);
+        assert_eq!(spf_runs(&abr, 0), runs0 + 1, "the deferred run fired");
+    }
+
+    /// The agreement property (W5B fixed-seed convention): randomized
+    /// LSDB mutation sequences produce IDENTICAL routing tables
+    /// under the incremental scheduler and a forced-full twin.
+    #[test]
+    fn property_incremental_and_full_recompute_agree() {
+        struct XorShift(u64);
+        impl XorShift {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+        }
+        for seed in [0x0050_0466_0170_0310u64, 0x7ea1_0002_dead_0003] {
+            let mut rng = XorShift(seed);
+            let mut incremental = abr_core();
+            let mut full = abr_core();
+            let mut now = 1u64;
+            for step in 0..60u32 {
+                let area = u32::from(rng.next().is_multiple_of(2));
+                let rid = 0x0a64_0000 + (rng.next() % 8) as u32;
+                let lsa = random_router_lsa(&mut rng.0, rid, 0x8000_0001u32 + step);
+                for core in [&mut incremental, &mut full] {
+                    let state = core.areas.get_mut(&area).unwrap();
+                    let _ = state.lsdb.install(lsa.clone(), true, now);
+                }
+                // The incremental core dirties only the changed
+                // area; the twin forces a full recompute everywhere.
+                // The evaluation clock jumps past the throttle's
+                // maximum (5 s) each step, so both schedulers leave
+                // their idle cycles and run at the initial delay —
+                // the comparison is about WHAT recomputes, not when.
+                incremental.mark_spf_dirty(area, now);
+                full.mark_spf_dirty(0, now);
+                full.mark_spf_dirty(1, now);
+                now += 10;
+                let mut o1 = Vec::new();
+                let mut z1 = Vec::new();
+                let mut o2 = Vec::new();
+                let mut z2 = Vec::new();
+                incremental.maybe_spf(now, &mut o1, &mut z1);
+                full.maybe_spf(now, &mut o2, &mut z2);
+                assert_eq!(
+                    incremental.routes, full.routes,
+                    "seed {seed:016x} step {step}: tables diverged"
+                );
+            }
+            // And the incremental core genuinely skipped work: the
+            // untouched area ran far fewer §16.1 computations.
+            let (inc0, inc1) = (spf_runs(&incremental, 0), spf_runs(&incremental, 1));
+            let (full0, full1) = (spf_runs(&full, 0), spf_runs(&full, 1));
+            assert_eq!(full0, full1, "the twin recomputed both areas every step");
+            assert!(
+                inc0 + inc1 < full0 + full1,
+                "incremental ({inc0}+{inc1}) did less work than full ({full0}+{full1})"
+            );
+        }
     }
 
     #[test]
