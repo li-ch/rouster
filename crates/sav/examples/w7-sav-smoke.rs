@@ -1,33 +1,39 @@
 //! W7 SAV enforcement smoke binary — the musl consumer that drives the
-//! enforcement leg inside the test container
-//! (`scripts/test-w7-sav.sh`).
+//! enforcement leg inside the test containers
+//! (`scripts/test-w7-sav.sh`, `scripts/test-sav-nft.sh`).
 //!
 //! Everything goes through the `Dataplane` trait (architecture
 //! invariant: the dataplane crate owns all kernel I/O): `install`
 //! builds the same IBA ops the SAV table manager would compile from
 //! the container topology, converts them with [`sav::program`], and
 //! installs them on the real netlink backend; `simulate` runs the
-//! monitor-mode route-lookup counting; `clear` removes what was
-//! installed.
+//! monitor-mode route-lookup counting; `counts` reads the backend's
+//! monitor counters (the dataplane-first path — the nft backend
+//! answers from kernel counters; rp_filter answers Unsupported);
+//! `clear` removes what was installed.
 //!
 //! Usage (no external crates — manual arg parsing):
 //!
 //! ```text
 //! w7-sav-smoke install  --mode strict|loose --action monitor|drop \
 //!                       --iba <ifindex>[:<prefix>[,<prefix>...]] [--iba ...]
+//!                       [--backend rp_filter|nft]
 //! w7-sav-smoke simulate --mode ... --iba ... --observe <ip>@<ifindex> [...]
-//! w7-sav-smoke clear
+//! w7-sav-smoke counts   [--backend rp_filter|nft]
+//! w7-sav-smoke clear    [--backend rp_filter|nft]
 //! ```
 //!
 //! A per-interface allowlist of several prefixes is written either as
 //! one comma-split `--iba` or as repeated `--iba` flags for the same
 //! ifindex (they merge; the compile step below still emits one op per
-//! interface).
+//! interface). `--backend` defaults to `rp_filter` (the landed W7
+//! surface); `nft` selects the nftables ruleset backend.
 
 use std::net::IpAddr;
 use std::process::ExitCode;
 
 use common::{Dataplane, IpPrefix};
+use netlink_dp::sav_nft::SavBackend;
 use netlink_dp::NetlinkDataplane;
 use sav::gen::UrpfMode;
 use sav::mode::{SavAction, ValidationMode};
@@ -47,13 +53,16 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("install") => run(&args[1..], Command::Install),
         Some("simulate") => run(&args[1..], Command::Simulate),
+        Some("counts") => run(&args[1..], Command::Counts),
         Some("clear") => run(&args[1..], Command::Clear),
         _ => {
-            eprintln!("usage: w7-sav-smoke install|simulate|clear [options]");
+            eprintln!("usage: w7-sav-smoke install|simulate|counts|clear [options]");
             eprintln!("  install|simulate: --mode strict|loose --action monitor|drop");
             eprintln!("                    --iba <ifindex>[:<prefix>[,<prefix>...]]");
             eprintln!("                      (repeatable; entries for one ifindex merge)");
             eprintln!("  simulate also:     --observe <ip>@<ifindex> (repeatable)");
+            eprintln!("  counts:            reads the backend's monitor counters");
+            eprintln!("  all kernel cmds:   --backend rp_filter|nft (default rp_filter)");
             ExitCode::FAILURE
         }
     }
@@ -63,6 +72,7 @@ fn main() -> ExitCode {
 enum Command {
     Install,
     Simulate,
+    Counts,
     Clear,
 }
 
@@ -75,6 +85,7 @@ struct Iba {
 fn run(args: &[String], command: Command) -> ExitCode {
     let mut mode = UrpfMode::Strict;
     let mut action = SavAction::Monitor;
+    let mut backend = SavBackend::RpFilter;
     let mut ibas: Vec<Iba> = Vec::new();
     let mut observes: Vec<(IpAddr, u32)> = Vec::new();
 
@@ -94,6 +105,14 @@ fn run(args: &[String], command: Command) -> ExitCode {
                 Some("drop") => action = SavAction::Drop,
                 other => {
                     eprintln!("bad --action {other:?} (monitor|drop)");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--backend" => match it.next().map(String::as_str) {
+                Some("rp_filter") => backend = SavBackend::RpFilter,
+                Some("nft") => backend = SavBackend::Nft,
+                other => {
+                    eprintln!("bad --backend {other:?} (rp_filter|nft)");
                     return ExitCode::FAILURE;
                 }
             },
@@ -160,7 +179,7 @@ fn run(args: &[String], command: Command) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Install/clear: real dataplane through the trait.
+    // Install/clear/counts: real dataplane through the trait.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -180,25 +199,34 @@ fn run(args: &[String], command: Command) -> ExitCode {
             }
         };
         tokio::spawn(conn);
-        let result = if command == Command::Install {
-            let program = program(&ops, mode);
-            dp.sav_install(&program).await
-        } else {
-            dp.sav_clear().await
+        let dp = dp.with_sav_backend(backend);
+        let result = match command {
+            Command::Install => {
+                let program = program(&ops, mode);
+                dp.sav_install(&program).await
+            }
+            Command::Counts => dp.sav_monitor_counts().await.map(|c| {
+                println!(
+                    "sav-counts: invalid={} valid={} unknown={}",
+                    c.invalid, c.valid, c.unknown
+                );
+            }),
+            Command::Clear => dp.sav_clear().await,
+            Command::Simulate => unreachable!("simulate returned above"),
         };
         match result {
             Ok(()) => {
-                let what = if command == Command::Install {
-                    format!(
-                        "install ok: {} iba op(s), mode {mode}, action {action}, \
-                         validation mode {}",
+                if command == Command::Install {
+                    println!(
+                        "sav-install ok: {} iba op(s), mode {mode}, action {action}, \
+                         validation mode {}, backend {backend:?}",
                         ops.len(),
                         ValidationMode::Iba
-                    )
-                } else {
-                    "clear ok".to_string()
-                };
-                println!("sav-{what}");
+                    );
+                } else if command == Command::Clear {
+                    println!("sav-clear ok (backend {backend:?})");
+                }
+                // counts prints its own line above.
                 ExitCode::SUCCESS
             }
             Err(e) => {
