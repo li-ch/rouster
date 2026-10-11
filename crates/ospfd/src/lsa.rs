@@ -115,8 +115,74 @@ impl LsaType {
     /// carries the P-bit.
     pub const NSSA: Self = Self(7);
 
+    // The OSPFv3 LS types (RFC 5340 A.4.2.1's function-code table).
+    // Unlike v2, where the u16 is encoded into one header octet, the
+    // whole 16 bits go on the v3 wire and the high three bits carry
+    // the U/S2/S1 generic properties (see [`LsaType::u_bit`] and
+    // [`LsaType::scope`]).
+    /// 0x2001: router-LSA (area scope).
+    pub const V3_ROUTER: Self = Self(0x2001);
+    /// 0x2002: network-LSA (area scope).
+    pub const V3_NETWORK: Self = Self(0x2002);
+    /// 0x2003: inter-area-prefix-LSA (the v2 type-3, area scope).
+    pub const V3_INTER_AREA_PREFIX: Self = Self(0x2003);
+    /// 0x2004: inter-area-router-LSA (the v2 type-4, area scope).
+    pub const V3_INTER_AREA_ROUTER: Self = Self(0x2004);
+    /// 0x4005: AS-external-LSA (AS scope).
+    pub const V3_AS_EXTERNAL: Self = Self(0x4005);
+    /// 0x2006: deprecated (was MOSPF; may be reassigned) — never a
+    /// known type, decodes into the v3 `Unknown` body.
+    pub const V3_DEPRECATED_MOSPF: Self = Self(0x2006);
+    /// 0x2007: NSSA-LSA (RFC 3101 for IPv6, area scope) — the v3
+    /// body is exactly the AS-external shape (RFC 5340 A.4.8).
+    pub const V3_NSSA: Self = Self(0x2007);
+    /// 0x0008: link-LSA (link-local scope, no v2 counterpart).
+    pub const V3_LINK: Self = Self(0x0008);
+    /// 0x2009: intra-area-prefix-LSA (area scope) — absorbs the v2
+    /// stub links and network-LSA prefixes.
+    pub const V3_INTRA_AREA_PREFIX: Self = Self(0x2009);
+
+    /// The U-bit (RFC 5340 A.4.2.1 bit 15): how a router that does
+    /// not recognize the function code handles the LSA (0 → treat as
+    /// link-local scope; 1 → store and flood as if understood).
+    pub const U_BIT: u16 = 0x8000;
+    /// The S2/S1 flooding-scope mask (bits 14/13).
+    pub const SCOPE_MASK: u16 = 0x6000;
+    /// The function-code mask (low 13 bits).
+    pub const FUNCTION_CODE_MASK: u16 = 0x1fff;
+
     pub fn is_known_v2(self) -> bool {
         matches!(self.0, 1..=5 | 7)
+    }
+
+    /// The eight live OSPFv3 function codes (A.4.2.1's table minus
+    /// the deprecated 0x2006). Unknown codes are NOT rejected in v3 —
+    /// the U-bit contract (§3.4/A.4.2.1) requires storing and
+    /// flooding them; `is_known_v3` only decides whether the body is
+    /// decodable.
+    pub fn is_known_v3(self) -> bool {
+        matches!(self.0, 0x2001..=0x2004 | 0x4005 | 0x2007 | 0x0008 | 0x2009)
+    }
+
+    /// The U-bit value (RFC 5340 A.4.2.1).
+    pub fn u_bit(self) -> bool {
+        self.0 & Self::U_BIT != 0
+    }
+
+    /// The flooding scope encoded in the S2/S1 bits (A.4.2.1).
+    /// `0b11` is reserved and rejected at header decode.
+    pub fn scope(self) -> Scope {
+        match (self.0 & Self::SCOPE_MASK) >> 13 {
+            0b00 => Scope::Link,
+            0b01 => Scope::Area,
+            0b10 => Scope::As,
+            _ => Scope::Reserved,
+        }
+    }
+
+    /// The 13-bit LSA function code (A.4.2.1).
+    pub fn function_code(self) -> u16 {
+        self.0 & Self::FUNCTION_CODE_MASK
     }
 
     pub fn name(self) -> &'static str {
@@ -127,9 +193,34 @@ impl LsaType {
             4 => "summary(ASBR)",
             5 => "AS-external",
             7 => "NSSA-external",
+            0x2001 => "router",
+            0x2002 => "network",
+            0x2003 => "inter-area-prefix",
+            0x2004 => "inter-area-router",
+            0x4005 => "AS-external",
+            0x2006 => "deprecated(0x2006)",
+            0x2007 => "NSSA-external",
+            0x0008 => "link",
+            0x2009 => "intra-area-prefix",
             _ => "unknown",
         }
     }
+}
+
+/// The OSPFv3 flooding scope carried in the LS type's S2/S1 bits
+/// (RFC 5340 A.4.2.1). The scope lives *in the type bits*, so v3
+/// admission control is a mask test rather than the v2 type table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// 0b00: flooded only on the originating link (link-LSAs, and
+    /// unknown-type LSAs with U=0).
+    Link,
+    /// 0b01: flooded only within the originating area.
+    Area,
+    /// 0b10: flooded throughout the AS.
+    As,
+    /// 0b11: reserved — rejected at header decode.
+    Reserved,
 }
 
 impl std::fmt::Display for LsaType {
@@ -1494,5 +1585,75 @@ mod tests {
         let l = LinkStateId::new(0x0a00_0002);
         assert_eq!(l.to_ipv4(), "10.0.0.2".parse::<Ipv4Addr>().unwrap());
         assert_eq!(LsaType(3).name(), "summary(network)");
+    }
+
+    // ---- The OSPFv3 LS-type surface (RFC 5340 A.4.2.1) ----
+
+    #[test]
+    fn v3_ls_type_constants_scope_and_u_bit() {
+        // A.4.2.1's function-code table, each row implying its U/S
+        // bits: (LS type, scope, U-bit).
+        let table = [
+            (LsaType::V3_ROUTER, Scope::Area, false),
+            (LsaType::V3_NETWORK, Scope::Area, false),
+            (LsaType::V3_INTER_AREA_PREFIX, Scope::Area, false),
+            (LsaType::V3_INTER_AREA_ROUTER, Scope::Area, false),
+            (LsaType::V3_AS_EXTERNAL, Scope::As, false),
+            (LsaType::V3_NSSA, Scope::Area, false),
+            (LsaType::V3_LINK, Scope::Link, false),
+            (LsaType::V3_INTRA_AREA_PREFIX, Scope::Area, false),
+        ];
+        for (ty, scope, u) in table {
+            assert_eq!(ty.scope(), scope, "{}", ty.0);
+            assert_eq!(ty.u_bit(), u, "{}", ty.0);
+            assert!(ty.is_known_v3(), "{} is a live function code", ty.0);
+        }
+        // The wire values themselves (0x2001.. table verbatim).
+        assert_eq!(LsaType::V3_ROUTER.0, 0x2001);
+        assert_eq!(LsaType::V3_NETWORK.0, 0x2002);
+        assert_eq!(LsaType::V3_INTER_AREA_PREFIX.0, 0x2003);
+        assert_eq!(LsaType::V3_INTER_AREA_ROUTER.0, 0x2004);
+        assert_eq!(LsaType::V3_AS_EXTERNAL.0, 0x4005);
+        assert_eq!(LsaType::V3_DEPRECATED_MOSPF.0, 0x2006);
+        assert_eq!(LsaType::V3_NSSA.0, 0x2007);
+        assert_eq!(LsaType::V3_LINK.0, 0x0008);
+        assert_eq!(LsaType::V3_INTRA_AREA_PREFIX.0, 0x2009);
+        // Function-code extraction: the low 13 bits, U/S bits masked.
+        assert_eq!(LsaType::V3_AS_EXTERNAL.function_code(), 5);
+        assert_eq!(LsaType(0xA021).function_code(), 33); // RFC 8362 E-Router
+        assert_eq!(LsaType(0x800A).function_code(), 10);
+        // A U=1 unknown type reports its bit (§3.4: store and flood).
+        assert!(LsaType(0x800A).u_bit());
+        assert!(!LsaType(0x000A).u_bit());
+        assert_eq!(LsaType(0x000A).scope(), Scope::Link);
+    }
+
+    #[test]
+    fn v3_known_type_excludes_deprecated_and_v2_codes() {
+        // 0x2006 is deprecated (was MOSPF, "may be reassigned") —
+        // never known, so it decodes into the v3 Unknown body.
+        assert!(!LsaType::V3_DEPRECATED_MOSPF.is_known_v3());
+        // RFC 8362's extended-LSA codes are NOT in tonight's family.
+        assert!(!LsaType(0xA021).is_known_v3());
+        assert!(!LsaType(0xC025).is_known_v3());
+        // The v2 octet values are distinct 16-bit values in v3's
+        // space (1..5 are U=0 link-scope unknowns there).
+        for v in 1..=5u16 {
+            assert!(!LsaType(v).is_known_v3(), "v2 code {v} is not a v3 type");
+        }
+        // Reserved flooding scope 0b11 is its own rejection class
+        // (S2=S1=1, the 0x6000 mask, regardless of the U-bit).
+        assert_eq!(LsaType(0x6009).scope(), Scope::Reserved);
+        assert_eq!(LsaType(0xE009).scope(), Scope::Reserved);
+        // 0xC001 is U=1 + AS scope — an unknown but *legal* type
+        // (§3.2: stored in the AS-scope data structure).
+        assert_eq!(LsaType(0xC001).scope(), Scope::As);
+        assert!(LsaType(0xC001).u_bit());
+        // The two families coexist in one u16-backed type.
+        assert!(LsaType::ROUTER.is_known_v2() && !LsaType::ROUTER.is_known_v3());
+        assert!(LsaType::V3_ROUTER.is_known_v3() && !LsaType::V3_ROUTER.is_known_v2());
+        assert_eq!(LsaType::V3_INTER_AREA_PREFIX.name(), "inter-area-prefix");
+        assert_eq!(LsaType::V3_INTRA_AREA_PREFIX.name(), "intra-area-prefix");
+        assert_eq!(LsaType::V3_LINK.name(), "link");
     }
 }

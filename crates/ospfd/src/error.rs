@@ -29,6 +29,17 @@ pub enum OspfError {
     #[error("reserved bits set in {field}: {value:#04x}")]
     ReservedBits { field: &'static str, value: u8 },
 
+    #[error("reserved bits set in {field}: {value:#06x}")]
+    ReservedBits16 { field: &'static str, value: u16 },
+
+    #[error(
+        "LSA flooding scope bits S2/S1 = 0b11 are reserved (LS type {0:#06x}, RFC 5340 A.4.2.1)"
+    )]
+    ReservedScope(u16),
+
+    #[error("OSPFv3 forwarding address must be a global IPv6 address (RFC 5340 A.4.7 MUST NOT), got {0}")]
+    BadForwardingAddress(std::net::Ipv6Addr),
+
     #[error("LS checksum mismatch: header says {header:#06x}, computed {computed:#06x}")]
     ChecksumMismatch { header: u16, computed: u16 },
 
