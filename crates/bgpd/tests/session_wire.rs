@@ -18,6 +18,7 @@ use tokio::sync::watch;
 const CONFIG: &str = "\
 router bgp 65000
  bgp router-id 10.0.0.1
+ listen-port 22179
  neighbor 127.0.0.1 remote-as 65001
  neighbor 127.0.0.1 passive
  network 203.0.113.0/24
