@@ -48,8 +48,8 @@ use tracing::{info, warn};
 use crate::packet::{PORT_ECHO, PORT_MULTIHOP, PORT_SINGLEHOP};
 use crate::session::SessionConfig;
 use crate::transport::{
-    bind_control_tx, echo_disposition, spawn_session, EchoDisposition, EchoPdu, InboundPacket,
-    PeerSpec, SessionCtl, SessionHandle, SessionSnapshot,
+    arm_v6_recv_hoplimit, bind_control_tx, echo_disposition, spawn_session, EchoDisposition,
+    EchoPdu, InboundPacket, PeerSpec, SessionCtl, SessionHandle, SessionSnapshot,
 };
 
 /// Default control timing (FRR bfdd's): 300 ms × 3.
@@ -393,7 +393,17 @@ impl BfddDaemon {
             } else {
                 SocketAddr::new(IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), port)
             };
-            let sock = UdpSocket::bind(bind_addr).await?;
+            // The v6 single-hop listener arms §5's receive half
+            // (IPV6_RECVHOPLIMIT — the socket2-safe step; the cmsg
+            // read-back is the fenced remainder, transport.rs).
+            // Multihop is never armed: RFC 5883 §3 pins that the
+            // 255/255 rule does not work across multiple hops.
+            let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+            if v6 && !multihop {
+                arm_v6_recv_hoplimit(&std_sock)?;
+            }
+            std_sock.set_nonblocking(true)?;
+            let sock = UdpSocket::from_std(std_sock)?;
             daemon.listeners.push(Arc::new(sock));
         }
 

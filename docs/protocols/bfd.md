@@ -88,6 +88,10 @@ Shared receive sockets on 3784 (single-hop, RFC 5881 §4) / 4784
 (multihop, RFC 5883 §3) per address family; one connected transmit
 socket per session with a source port in 49152–65535 (§4) and TTL
 255 (§5; also satisfies FRR's multihop minimum-hop threshold).
+The v6 single-hop listener arms `IPV6_RECVHOPLIMIT` — §5's receive
+half (the read-back is deviation 1); multihop listeners are never
+armed (RFC 5883 §3: the 255/255 rule "does not work across multiple
+hops"; FRR's minimum-hop threshold defaults to 254, local policy).
 Demultiplexing: by Your Discriminator once learned, by (peer,
 path) while bootstrapping (§6.8.6 steps 7–9; RFC 5883 §3's address
 pair). One demux table, shared with the listeners, rewritten on
@@ -95,17 +99,27 @@ reload.
 
 ## Deviations (fences, disclosed)
 
-1. **Receive-side TTL/hop-limit check not enforced** (5881 §5
-   SHOULD): reading the received TTL needs the recvmsg cmsg.
-   socket2 (adopted, owner decision A1) can ARM reception
-   (`set_recv_hoplimit_v6`) but 0.6.5 hands the control buffer back
-   as `&mut [MaybeUninit<u8>]` with no safe initialized-prefix read,
-   ships no cmsg parser and no `set_recv_ttl_v4`; libc's setsockopt +
-   a hand-rolled cmsghdr cast are both unsafe — the no-unsafe fence
-   stands. The SAFE half is landed and unit-tested
-   (`transport.rs`: `parse_cmsgs`, `received_hop_limit`); a fence
-   lift makes it a wiring change. v4 receive is fail-open; transmit
-   TTL 255 is proven by FRR's checker (the interop smoke).
+1. **Receive-side TTL/hop-limit check: ARMED, not yet readable**
+   (5881 §5 MUST for the no-auth form): the night N1 slice armed the
+   v6 single-hop listener (`IPV6_RECVHOPLIMIT` via socket2 — the
+   safe half) and landed the full parse/verdict seam
+   (`parse_cmsgs`, `received_hop_limit`, the new v4 `received_ttl`,
+   `single_hop_receive_ok` — all unit-tested, the drop/pass matrix
+   at the seam). The remaining wall is exactly one step: socket2
+   0.6.5's `recvmsg` hands the control buffer back as
+   `&mut [MaybeUninit<u8>]` with only a `control_len()` — no safe
+   initialized-prefix read, no cmsg parser — and there is no
+   `set_recv_ttl_v4` setter at all (libc's `setsockopt` + a
+   `cmsghdr` cast are both unsafe; the no-unsafe fence stands). A
+   socket2 upgrade with a safe control read, or a one-line
+   owner-approved fence exception, turns the landed seam into the
+   full check. **Multihop has no 255 rule** (RFC 5883 §3: the
+   255/255 check "does not work across multiple hops"; §4 is
+   demultiplexing only) — transmit 255 satisfies FRR's multihop
+   minimum-hop threshold (default 254, local policy); the multihop
+   listener is never armed and nothing is enforced on multihop
+   receive. v4 single-hop receive stays fail-open; transmit TTL 255
+   is proven by FRR's checker (the interop smoke).
 2. **Keyed digest auth unimplemented** (RFC 5880 §6.7.3–§6.7.6):
    parses and accounts exactly but never verifies — MD5/SHA1
    primitives would be new dependencies (fence); a session configured
@@ -202,10 +216,16 @@ DOWN report in bgpd through the 26 fan-out.
 - ~~zapi integration~~ — LANDED (W1-b): pins in the 10.2 pinned doc,
   codec arms, rousterd relay + fan-out, `bfdd --zapi`, the
   `test-bfd-zapi.sh` smoke (the section above).
-- **Receive-TTL check on v4** (the §5 SHOULD): the safe half is
-  landed (`parse_cmsgs`/`received_hop_limit`, unit-tested); landing
-  the kernel half needs the no-unsafe fence lifted (socket2 0.6.5
-  has no safe cmsg read-back — deviation 1 above).
+- **Receive-TTL check on v4, and the v6 read-back** (the §5 MUST):
+  the night N1 slice closed everything safe: the v6 single-hop
+  listener is armed (`arm_v6_recv_hoplimit`), the v4 extractor
+  (`received_ttl` — the kernel's native-int `IP_TTL` cmsg, pinned to
+  `ip_sockglue.c`) and the verdict seam
+  (`single_hop_receive_ok`) are landed and tested. The one remaining
+  step is socket2's safe control-buffer read (0.6.5 returns
+  `&mut [MaybeUninit<u8>]` with no initialized-prefix read and no
+  `set_recv_ttl_v4`) — a socket2 upgrade or a one-line owner-approved
+  fence exception wires the seam into the listener (deviation 1).
 - ~~bgpd-emitted single-hop REGISTER frame~~ — LANDED (M1, night of
   2026-10-11): wire-pinned in both forms plus the DEREGISTER/UPDATE
   lifecycle (`docs/interop/zapi-10.2-pinned.md`, M1N addendum); no

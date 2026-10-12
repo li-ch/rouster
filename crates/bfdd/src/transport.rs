@@ -6,23 +6,31 @@
 //! §5's TTL 255.
 //!
 //! W1-b (M6, socket2 adopted — owner decision A1) closes P2-a's
-//! deviation list where a SAFE API exists:
+//! deviation list where a SAFE API exists, and the night N1 slice
+//! (2026-10-12) pushed the §5 receive wall as far as the no-unsafe
+//! fence permits:
 //!
 //! - **IPv6 transmit hop limit is 255** (RFC 5881 §5) — CLOSED via
 //!   `IPV6_UNICAST_HOPS` on every v6 transmit socket (std/mio reach
 //!   IP_TTL only; P2-a's deviation (b) is gone).
-//! - **Receive-side TTL/hop-limit checks remain fenced, disclosed
-//!   with the exact wall**: reading the received TTL needs the
-//!   recvmsg cmsg. socket2 0.6.5 can ARM reception
-//!   (`set_recv_hoplimit_v6`), but hands the control buffer back as
-//!   `&mut [MaybeUninit<u8>]` with no safe initialized-prefix read,
-//!   ships no cmsg parser and no `set_recv_ttl_v4`; libc's
-//!   `setsockopt` + a hand-rolled `cmsghdr` cast are both unsafe —
-//!   and the no-unsafe fence stands. The SAFE half is landed and
-//!   unit-tested below ([`parse_cmsgs`], [`received_hop_limit`]) so
-//!   a fence-lift is a wiring change, not a rewrite; v4 receive
-//!   stays fail-open (transmit TTL 255 is proven by FRR's checker,
-//!   P2-a's smoke).
+//! - **The v6 single-hop listener now ARMS the receive half**
+//!   (`IPV6_RECVHOPLIMIT` via [`arm_v6_recv_hoplimit`], socket2's
+//!   safe setter — wired at daemon bind). The READ-BACK itself stays
+//!   fenced, disclosed with the exact wall: socket2 0.6.5's `recvmsg`
+//!   exists (`MsgHdrMut`) but hands the control buffer back as
+//!   `&mut [MaybeUninit<u8>]` with only a `control_len()` — no safe
+//!   initialized-prefix read, no cmsg parser; the v4 arm has no
+//!   socket2 setter at all (`set_recv_ttl_v4` is missing) and
+//!   `libc::setsockopt` is unsafe. One narrow step (a safe control
+//!   read, a socket2 upgrade, or a one-line fence exception) turns
+//!   the landed parsers + verdict below into the full check; v4
+//!   receive stays fail-open meanwhile (transmit TTL 255 is proven by
+//!   FRR's checker, P2-a's smoke).
+//! - **Multihop has no 255 rule** (RFC 5883 §3: the 255/255 check
+//!   "does not work across multiple hops"; its §4 is demultiplexing)
+//!   — transmit 255 satisfies FRR's multihop minimum-hop threshold
+//!   (default 254, local policy); the multihop listener is never
+//!   armed and nothing is enforced on multihop receive.
 //! - **Authentication at the socket layer**: nothing to wire — RFC
 //!   5880's keyed digests live IN the packet (§6.7), not in socket
 //!   options; the codec models the auth sections and refuses
@@ -638,12 +646,12 @@ pub struct RawCmsg<'a> {
 /// and `cmsg_type` u32 (4+4), then the data; the next header starts
 /// at `cmsg_len` rounded up to the usize alignment.
 ///
-/// The SAFE half of the RFC 5881 §5 receive check: arming the socket
-/// is safe (`Socket::set_recv_hoplimit_v6`), but socket2 0.6.5 hands
-/// the control buffer back as `&mut [MaybeUninit<u8>]` with no safe
-/// initialized-prefix read — landing the kernel half needs the
-/// no-unsafe fence lifted (module docs). Published and unit-tested so
-/// that lift is a wiring change, not a rewrite.
+/// One half of the RFC 5881 §5 receive check, landed and unit-tested
+/// so the fenced remainder is a wiring change, not a rewrite (module
+/// head): arming the v6 listener is safe
+/// ([`arm_v6_recv_hoplimit`]), but socket2 0.6.5 hands the control
+/// buffer back as `&mut [MaybeUninit<u8>]` with no safe
+/// initialized-prefix read.
 pub fn parse_cmsgs(mut ctrl: &[u8]) -> Vec<RawCmsg<'_>> {
     let mut out = Vec::new();
     const HDR: usize = 8 + 4 + 4;
@@ -684,6 +692,55 @@ pub fn received_hop_limit(ctrl: &[u8]) -> Option<u32> {
             let raw: [u8; 4] = c.data.try_into().ok()?;
             Some(u32::from_be_bytes(raw))
         })
+}
+
+/// cmsg constants for the v4 TTL lookup: `IPPROTO_IP` (SOL_IP, 0)
+/// and the `IP_TTL` cmsg type (2). Stable kernel ABI on Linux
+/// (ip(7): `IP_RECVTTL` ... "the received TTL is passed as a
+/// control message" of type `IP_TTL`).
+const IPPROTO_IP_CMSG: u32 = 0;
+const IP_TTL_CMSG: u32 = 2;
+
+/// Extracts the received IPv4 TTL from a control buffer. The kernel
+/// passes a native-endian `int` (Linux `net/ipv4/ip_sockglue.c`:
+/// `put_cmsg(msg, SOL_IP, IP_TTL, sizeof(int), &ttl)` — unlike the
+/// RFC 3542 v6 hop limit, which is network byte order); the value is
+/// 0-255 and sits in the int's low byte. `None` when the buffer
+/// carries no TTL cmsg. The RFC 5881 §5 single-hop rule then drops
+/// when `Some(ttl) != 255`.
+pub fn received_ttl(ctrl: &[u8]) -> Option<u32> {
+    parse_cmsgs(ctrl)
+        .into_iter()
+        .find(|c| c.level == IPPROTO_IP_CMSG && c.kind == IP_TTL_CMSG)
+        .and_then(|c| {
+            let raw: [u8; 4] = c.data.get(..4)?.try_into().ok()?;
+            Some(u32::from_ne_bytes(raw) & 0xff)
+        })
+}
+
+/// Arms the §5 receive half on the v6 single-hop listener socket
+/// (`IPV6_RECVHOPLIMIT`) — socket2's safe setter (W1-b noted the
+/// arming is safe; the cmsg read-back is the fenced remainder, the
+/// module head). The multihop listener is never armed: RFC 5883 §3
+/// pins that the 255/255 rule "does not work across multiple hops"
+/// (its §4 is demultiplexing; FRR's multihop minimum-hop threshold
+/// defaults to 254 — local policy, not enforced).
+pub fn arm_v6_recv_hoplimit(sock: &std::net::UdpSocket) -> io::Result<()> {
+    socket2::SockRef::from(sock).set_recv_hoplimit_v6(true)
+}
+
+/// RFC 5881 §5's receive-side verdict for a single-hop listener:
+/// "All received BFD Control packets that are demultiplexed to the
+/// session MUST be discarded if the received TTL or Hop Limit is
+/// not equal to 255." `None` (no cmsg delivered — the unarmed path)
+/// is fail-open: the current v4 behavior, disclosed at the module
+/// head. The multihop listener applies no such rule at all.
+pub fn single_hop_receive_ok(ttl: Option<u32>) -> bool {
+    match ttl {
+        Some(255) => true,
+        Some(_) => false,
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -781,6 +838,67 @@ mod tests {
         let mut bad = ctrl.clone();
         bad[..8].copy_from_slice(&4usize.to_ne_bytes());
         assert!(parse_cmsgs(&bad).is_empty());
+    }
+
+    /// The v4 TTL cmsg (night N1): level SOL_IP (0), type IP_TTL (2),
+    /// data = the kernel's native-endian int (Linux ip_sockglue.c's
+    /// `put_cmsg(..., sizeof(int), &ttl)`) whose low byte carries
+    /// the 0-255 value.
+    #[test]
+    fn cmsg_parser_walks_the_v4_ttl() {
+        let ttl_cmsg = |ttl: u32| {
+            let mut ctrl = Vec::new();
+            ctrl.extend_from_slice(&20usize.to_ne_bytes());
+            ctrl.extend_from_slice(&0u32.to_ne_bytes()); // IPPROTO_IP
+            ctrl.extend_from_slice(&2u32.to_ne_bytes()); // IP_TTL
+            ctrl.extend_from_slice(&ttl.to_ne_bytes());
+            ctrl
+        };
+        assert_eq!(received_ttl(&ttl_cmsg(255)), Some(255), "§5's pass value");
+        assert_eq!(received_ttl(&ttl_cmsg(254)), Some(254), "the §5 drop value");
+        assert_eq!(
+            received_ttl(&ttl_cmsg(63)),
+            Some(63),
+            "a routed-looking TTL"
+        );
+        // Truncated data (a 1-byte tail) and no cmsg parse to None.
+        let mut short = ttl_cmsg(255);
+        short.truncate(17);
+        assert_eq!(received_ttl(&short), None);
+        assert_eq!(received_ttl(&[]), None);
+        // The v6 walk ignores the v4 cmsg and vice versa.
+        assert_eq!(received_hop_limit(&ttl_cmsg(255)), None);
+    }
+
+    /// RFC 5881 §5 verbatim: "All received BFD Control packets that
+    /// are demultiplexed to the session MUST be discarded if the
+    /// received TTL or Hop Limit is not equal to 255" (no-auth
+    /// form). The verdict seam the read-back wires into; `None` is
+    /// the unarmed path's fail-open, disclosed at the module head.
+    #[test]
+    fn single_hop_receive_verdict() {
+        assert!(single_hop_receive_ok(Some(255)), "the pass value");
+        assert!(
+            !single_hop_receive_ok(Some(254)),
+            "one hop of degradation drops"
+        );
+        assert!(!single_hop_receive_ok(Some(0)), "anything else drops");
+        assert!(single_hop_receive_ok(None), "unarmed fail-open (disclosed)");
+    }
+
+    /// The v6 single-hop listener arming: `arm_v6_recv_hoplimit`
+    /// flips IPV6_RECVHOPLIMIT on (read back through socket2's
+    /// getter), the safe half of the §5 receive check; the cmsg
+    /// read-back is the fenced remainder.
+    #[test]
+    fn v6_listener_arms_the_hoplimit_read() {
+        let sock = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        assert!(!socket2::SockRef::from(&sock).recv_hoplimit_v6().unwrap());
+        arm_v6_recv_hoplimit(&sock).unwrap();
+        assert!(
+            socket2::SockRef::from(&sock).recv_hoplimit_v6().unwrap(),
+            "§5's receive half armed (RFC 5881 §5)"
+        );
     }
 
     /// The destination ports: 3784 single-hop, 4784 multihop (RFC
