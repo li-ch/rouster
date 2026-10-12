@@ -289,36 +289,51 @@ fn err(output: &Output) -> String {
 
 /// Spawns the real server binary with a temp config (inside the
 /// scratch run dir) on a free port; returns the child and the port.
+/// Bind-retries on AddrInUse — the free-port probe races other tests
+/// for the port between probe and bind (the bfdd flake class;
+/// likelier under `cargo test --workspace` parallelism on CI).
 fn spawn_server_binary(tag: &str, run_dir: &Path) -> (Child, u16) {
-    let port = free_port();
-    let config = run_dir.join(format!("vtyd-{tag}.conf"));
-    std::fs::write(
-        &config,
-        format!(
-            "! smoke config\nport {port}\nbind 127.0.0.1\nrun-dir {}\nhostname bin-r1\n",
-            run_dir.display()
-        ),
-    )
-    .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vtyd"))
-        .arg("--config")
-        .arg(&config)
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn vtyd server");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return (child, port);
+    let mut last_status = None;
+    for _ in 0..8 {
+        let port = free_port();
+        let config = run_dir.join(format!("vtyd-{tag}.conf"));
+        std::fs::write(
+            &config,
+            format!(
+                "! smoke config\nport {port}\nbind 127.0.0.1\nrun-dir {}\nhostname bin-r1\n",
+                run_dir.display()
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_vtyd"))
+            .arg("--config")
+            .arg(&config)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vtyd server");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return (child, port);
+            }
+            match child.try_wait().expect("child state") {
+                Some(status) => {
+                    last_status = Some(status);
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_millis(25)),
+            }
         }
-        match child.try_wait().expect("child state") {
-            Some(status) => panic!("vtyd server exited early: {status}"),
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
+        // Early exit (port taken) or listen deadline — fresh port.
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("vtyd server never listened on {port}");
+    panic!(
+        "vtyd server never listened after 8 attempts{}",
+        last_status
+            .map(|s| format!("; last early exit: {s}"))
+            .unwrap_or_default()
+    );
 }
 
 #[test]
