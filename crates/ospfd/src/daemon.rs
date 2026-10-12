@@ -41,7 +41,7 @@ use crate::neighbor::{HelloParams, NeighborEvent, NeighborState};
 use crate::origination::{build_external_lsa, build_router_lsa, InterfaceAdv};
 use crate::packet::{Hello, LsUpdate, Packet, PacketBody};
 use crate::spf::{self, Destination, SpfScheduler};
-use crate::transport::{OspfRawSocket, Received};
+use crate::transport::{is_multicast_dst, unicast_ttl_ok, OspfRawSocket, Received};
 use crate::zedge::{RedistributedRoute, ZedgeCommand};
 
 /// An inbound packet event: (interface index, datagram).
@@ -233,6 +233,13 @@ pub struct Ospfd {
     table_dirty: bool,
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     redistribute_static: bool,
+    /// Receive-side TTL enforcement counter (night N1): unicast
+    /// exchange packets dropped because their TTL is not 1 (§A.1's
+    /// single-hop transmit mandate — a degraded TTL means the packet
+    /// was relayed, not sent by an on-link peer). INFO-logged per
+    /// drop. Multicast Hellos are not checked (the kernel's rule —
+    /// see `transport.rs`).
+    pub dropped_degraded_ttl: u64,
     /// The SAVNET agent hooks (experimental-savnet, default OFF, then
     /// default None — no agent hosted, no calls made): in-process
     /// reporting of SAV-relevant events. Changed LSAs report from the
@@ -479,6 +486,7 @@ impl Ospfd {
             table_dirty: true,
             zapi: None,
             redistribute_static: cfg.redistribute_static,
+            dropped_degraded_ttl: 0,
             #[cfg(feature = "experimental-savnet")]
             sav_agent: None,
         })
@@ -1472,6 +1480,26 @@ impl Ospfd {
     /// interface by the run loop's on-link test).
     pub fn on_packet(&mut self, iface_idx: usize, received: &Received, now: u64) -> Vec<WireOut> {
         let out = Vec::new();
+        // The receive-side TTL check (night N1, closing the W2-e
+        // fence): §A.1 mandates TTL 1 on EVERY OSPF send, so a
+        // UNICAST exchange packet (DD/LSR/LSU/LSAck, p2p Hellos)
+        // arriving with a degraded TTL cannot have come from an
+        // on-link peer — dropped and counted. Multicast Hellos keep
+        // the kernel's rule: no check (RFC 2328 places no
+        // receive-side TTL rule; §A.1's TTL-1 is a transmit
+        // mandate). The check precedes authentication, the RFC
+        // 5881 §5-style early discard (cheap; no crypto on doomed
+        // packets).
+        if !is_multicast_dst(received.dst) && !unicast_ttl_ok(received.ttl) {
+            self.dropped_degraded_ttl += 1;
+            info!(
+                src = %received.src,
+                dst = %received.dst,
+                ttl = received.ttl,
+                "ospfd: unicast packet dropped: TTL != 1 (RFC 2328 §A.1's single-hop TTL)"
+            );
+            return out;
+        }
         // Appendix D.5: authenticate before ANY further processing
         // ("processing of the received packet, as described in
         // Section 8.2, continues only if the packet is
@@ -3445,6 +3473,8 @@ mod tests {
                     },
                     dst: crate::packet::ALL_SPF_ROUTERS,
                     payload,
+
+                    ttl: 1,
                 },
                 now,
             ));
@@ -3818,6 +3848,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -3875,6 +3907,8 @@ mod tests {
                             src: from_addr,
                             dst: crate::packet::ALL_SPF_ROUTERS,
                             payload: payload.clone(),
+
+                            ttl: 1,
                         },
                         now,
                     );
@@ -4158,6 +4192,8 @@ mod tests {
                         src,
                         dst: crate::packet::ALL_SPF_ROUTERS,
                         payload: payload.clone(),
+
+                        ttl: 1,
                     },
                     now,
                 );
@@ -4284,6 +4320,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -4325,6 +4363,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -4372,6 +4412,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -4586,6 +4628,8 @@ mod tests {
                 src: ip("10.99.0.2"),
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             1,
         );
@@ -4604,6 +4648,8 @@ mod tests {
                 src: ip("10.99.0.2"),
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             2,
         );
@@ -4657,6 +4703,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -4685,6 +4733,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -4877,6 +4927,8 @@ mod tests {
                 src: ip("10.99.0.2"),
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             1,
         );
@@ -4894,6 +4946,8 @@ mod tests {
                 src: ip("10.99.0.2"),
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             2,
         );
@@ -4908,10 +4962,94 @@ mod tests {
                 src: ip("10.99.0.2"),
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             3,
         );
         assert!(!a.neighbor_states().is_empty(), "N-set Hello accepted");
+    }
+
+    /// The receive-side TTL wall closed (night N1) — the drop/pass
+    /// matrix at the daemon level. The policy keys on the IP-level
+    /// destination class and TTL: a UNICAST exchange packet (p2p
+    /// conversations; dst = our address) with a degraded TTL is
+    /// dropped before ANY §8.2 processing and counted; the identical
+    /// packet at TTL 1 (§A.1's send value) is processed; a multicast
+    /// Hello keeps the kernel's rule — no TTL gate.
+    #[test]
+    fn receive_ttl_enforcement_drop_pass_matrix() {
+        let mut a = core_for("10.255.1.1", "eth0", "10.99.0.1");
+        let b = core_for("10.255.1.2", "eth0", "10.99.0.2");
+        let hello = Hello {
+            network_mask: Ipv4Addr::from(0xffff_fffc),
+            // core_for's interfaces run the §C.3 defaults (10/40) —
+            // the crafted Hello must agree or §10.5 rejects it.
+            hello_interval: 10,
+            options: Options(Options::E),
+            router_priority: 1,
+            router_dead_interval: 40,
+            designated_router: Ipv4Addr::UNSPECIFIED,
+            backup_designated_router: Ipv4Addr::UNSPECIFIED,
+            neighbors: vec![],
+        };
+        let payload = b.packet(0, PacketBody::Hello(hello.clone())).encode();
+
+        // Drop arm: unicast dst (us) at TTL 63 — relayed-looking.
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: ip("10.99.0.2"),
+                dst: a.interfaces[0].addr,
+                payload: payload.clone(),
+                ttl: 63,
+            },
+            1,
+        );
+        assert!(
+            a.neighbor_states().is_empty(),
+            "a degraded-TTL unicast never reaches §8.2"
+        );
+        assert_eq!(a.dropped_degraded_ttl, 1, "and it is counted");
+
+        // Pass arm: the same packet at §A.1's TTL 1 is processed.
+        a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: ip("10.99.0.2"),
+                dst: a.interfaces[0].addr,
+                payload: payload.clone(),
+                ttl: 1,
+            },
+            2,
+        );
+        assert!(
+            !a.neighbor_states().is_empty(),
+            "TTL-1 unicast is processed normally"
+        );
+        assert_eq!(a.dropped_degraded_ttl, 1, "the pass arm does not count");
+
+        // Multicast arm: Hellos keep the kernel's rule — a degraded
+        // TTL on 224.0.0.5 traffic is not gated (RFC 2328 places no
+        // receive-side TTL rule; §A.1's TTL-1 is a transmit mandate).
+        let mut c = core_for("10.255.1.3", "eth0", "10.99.0.5");
+        let d = core_for("10.255.1.4", "eth0", "10.99.0.6");
+        let payload = d.packet(0, PacketBody::Hello(hello)).encode();
+        c.on_packet(
+            0,
+            &crate::transport::Received {
+                src: ip("10.99.0.6"),
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload,
+                ttl: 63,
+            },
+            1,
+        );
+        assert!(
+            !c.neighbor_states().is_empty(),
+            "a multicast Hello is not TTL-gated (kernel's rule)"
+        );
+        assert_eq!(c.dropped_degraded_ttl, 0, "the multicast arm never counts");
     }
 
     /// RFC 3101 §2.3/§13: type-7s flood within the NSSA and are
@@ -4954,6 +5092,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -4983,6 +5123,8 @@ mod tests {
                 src: y.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now2 + 1,
         );
@@ -5266,6 +5408,8 @@ mod tests {
                 src: c.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload,
+
+                ttl: 1,
             },
             now + 2,
         );
@@ -5296,6 +5440,8 @@ mod tests {
                     src: b.interfaces[0].addr,
                     dst: crate::packet::ALL_SPF_ROUTERS,
                     payload,
+
+                    ttl: 1,
                 },
                 now + t,
             );
@@ -5358,6 +5504,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload: tampered,
+
+                ttl: 1,
             },
             now + 1,
         );
@@ -5369,6 +5517,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload: signed,
+
+                ttl: 1,
             },
             now + 2,
         );
@@ -5406,6 +5556,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload: older,
+
+                ttl: 1,
             },
             now + 3,
         );
@@ -5443,6 +5595,8 @@ mod tests {
                 src: b.interfaces[0].addr,
                 dst: crate::packet::ALL_SPF_ROUTERS,
                 payload: wrong_id,
+
+                ttl: 1,
             },
             now + 4,
         );
@@ -5793,6 +5947,8 @@ mod tests {
                             src,
                             dst: crate::packet::ALL_SPF_ROUTERS,
                             payload: payload.clone(),
+
+                            ttl: 1,
                         },
                         now,
                     );

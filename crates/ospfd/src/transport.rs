@@ -18,20 +18,31 @@
 //! real readiness, the bfdd `spawn_socket_pump` convention without
 //! its polling loop.
 //!
-//! Two disclosed fences, both inherited from the bfdd W1-b M6
+//! The receive-side TTL check is CLOSED (night N1, 2026-10-12) — and
+//! it needed no cmsg at all. The raw-socket semantics differ from the
+//! UDP cmsg path bfdd needs: on a raw `SOCK_RAW` socket the kernel
+//! delivers the whole IPv4 header with every datagram (raw(7),
+//! raw(4)) — the TTL octet at offset 8 is part of the buffer, read
+//! pure by [`parse_ipv4`] alongside src/dst/IHL/length. `IP_RECVTTL`
+//! (ip(7)) is the *UDP/TCP-socket* mechanism for the same readout;
+//! a raw socket never needs it for v4. Enforced: a unicast exchange
+//! packet arriving with TTL != 1 is dropped and counted (§A.1
+//! mandates TTL 1 on every OSPF send, so a degraded TTL unicast
+//! cannot be from an on-link peer); multicast Hellos keep the
+//! kernel's rule — no receive check (RFC 2328 places none; §A.1's
+//! TTL-1 is a transmit mandate). The OSPFv3 runtime's v6 raw socket
+//! WILL need the cmsg walk (RFC 3542 §6 `IPV6_RECVHOPLIMIT`: raw v6
+//! sockets do NOT deliver the IPv6 header) — recorded in ospf.md.
+//!
+//! One disclosed fence remains, inherited from the bfdd W1-b M6
 //! precedent:
 //!
-//! 1. **No receive-side TTL check** — reading the received TTL needs
-//!    the recvmsg cmsg walk and socket2 0.6.5 ships no cmsg parser
-//!    (bfdd's transport.rs documents the same wall for BFD's
-//!    hop-limit). Transmit TTL 1 is set and verified; the inbound
-//!    check rides with the container-leg interop evidence instead.
-//! 2. **No SO_BINDTODEVICE** — socket2 0.6.5 has no `bind_device`,
-//!    so a per-interface socket cannot scope its *reception*; every
-//!    raw proto-89 socket in the process receives every OSPF packet.
-//!    The daemon demultiplexes by on-link source address (the
-//!    zapi-interface-mirror test) and processes each packet exactly
-//!    once, on the socket of the interface the source is on.
+//! - **No SO_BINDTODEVICE** — socket2 0.6.5 has no `bind_device`,
+//!   so a per-interface socket cannot scope its *reception*; every
+//!   raw proto-89 socket in the process receives every OSPF packet.
+//!   The daemon demultiplexes by on-link source address (the
+//!   zapi-interface-mirror test) and processes each packet exactly
+//!   once, on the socket of the interface the source is on.
 //!
 //! The IP header itself is parsed pure ([`parse_ipv4`]) — Linux and
 //! the BSDs both deliver received raw datagrams with the IP header
@@ -55,16 +66,39 @@ pub struct Received {
     pub src: Ipv4Addr,
     /// The destination address (224.0.0.5/224.0.0.6 multicast or us).
     pub dst: Ipv4Addr,
+    /// The received TTL (the header's octet 8). The raw-socket
+    /// readout for the unicast receive-side check: §A.1 mandates
+    /// TTL 1 on every OSPF send, so a unicast exchange packet with
+    /// a degraded TTL cannot have come from an on-link peer.
+    pub ttl: u8,
     /// The OSPF packet bytes (header first), starting at IHL*4.
     pub payload: Vec<u8>,
 }
 
-/// Parse one IPv4 datagram header: (src, dst, IHL, total length).
+/// Whether `dst` is one of OSPF's two multicast addresses
+/// (AllSPFRouters/AllDRouters). Multicast receive keeps the kernel's
+/// rule — no TTL check (RFC 2328 places no receive-side rule; §A.1's
+/// TTL-1 mandate is on transmit).
+pub fn is_multicast_dst(dst: Ipv4Addr) -> bool {
+    dst == ALL_SPF_ROUTERS || dst == ALL_D_ROUTERS
+}
+
+/// The unicast receive-side TTL policy (night N1): §A.1's single-hop
+/// intent pins every OSPF packet's transmit TTL at 1, so a unicast
+/// exchange packet (DD/LSR/LSU/LSAck, p2p Hellos) must arrive with
+/// TTL 1 — a degraded TTL means the packet was relayed, and it is
+/// dropped. (TTL 0 never reaches a socket; the kernel discards it.)
+pub fn unicast_ttl_ok(ttl: u8) -> bool {
+    ttl == OSPF_TTL as u8
+}
+
+/// Parse one IPv4 datagram header: (src, dst, IHL, total length,
+/// TTL).
 ///
 /// Total length bounds the payload against receive-buffer padding;
 /// a total length beyond the buffer (or a truncated header) is a
 /// malformed datagram → `None`. Pure, table-tested.
-pub fn parse_ipv4(buf: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, usize, usize)> {
+pub fn parse_ipv4(buf: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, usize, usize, u8)> {
     if buf.len() < 20 {
         return None;
     }
@@ -82,15 +116,16 @@ pub fn parse_ipv4(buf: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, usize, usize)> {
     }
     let src = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
     let dst = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
-    Some((src, dst, ihl, total_len))
+    Some((src, dst, ihl, total_len, buf[8]))
 }
 
 /// Slice the OSPF payload out of one received raw datagram.
 pub fn extract_ospf(buf: &[u8]) -> Option<Received> {
-    let (src, dst, ihl, total_len) = parse_ipv4(buf)?;
+    let (src, dst, ihl, total_len, ttl) = parse_ipv4(buf)?;
     Some(Received {
         src,
         dst,
+        ttl,
         payload: buf[ihl..total_len].to_vec(),
     })
 }
@@ -228,6 +263,7 @@ mod tests {
     fn datagram(
         version_ihl: u8,
         total_len: u16,
+        ttl: u8,
         src: [u8; 4],
         dst: [u8; 4],
         payload: &[u8],
@@ -235,7 +271,7 @@ mod tests {
         let mut buf = vec![version_ihl, 0];
         buf.extend_from_slice(&total_len.to_be_bytes());
         // id(2) + flags/frag(2) + ttl(1) + proto 89(1) + checksum(2)
-        buf.extend_from_slice(&[0, 0, 0, 0, 64, 89, 0, 0]);
+        buf.extend_from_slice(&[0, 0, 0, 0, ttl, 89, 0, 0]);
         buf.extend_from_slice(&src);
         buf.extend_from_slice(&dst);
         buf.extend_from_slice(payload);
@@ -247,6 +283,7 @@ mod tests {
         let pkt = datagram(
             0x45,
             20 + 8,
+            1,
             [10, 77, 0, 1],
             [224, 0, 0, 5],
             &[0x02, 0x01, 0, 0, 1, 2, 3, 4],
@@ -261,7 +298,7 @@ mod tests {
     fn ihl_options_are_honored() {
         // IHL=6 → 24-byte header; the payload starts past the
         // options words.
-        let mut pkt = datagram(0x46, 24 + 4, [1, 1, 1, 1], [224, 0, 0, 5], &[9, 9, 9, 9]);
+        let mut pkt = datagram(0x46, 24 + 4, 1, [1, 1, 1, 1], [224, 0, 0, 5], &[9, 9, 9, 9]);
         // Grow the header region to 24 bytes: insert one option word
         // (4 bytes) before the payload and re-stamp the length.
         for _ in 0..4 {
@@ -275,17 +312,26 @@ mod tests {
     #[test]
     fn malformed_headers_are_rejected() {
         // Not version 4.
-        assert!(extract_ospf(&datagram(0x55, 28, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none());
+        assert!(
+            extract_ospf(&datagram(0x55, 28, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none()
+        );
         // Total length beyond the buffer.
-        assert!(extract_ospf(&datagram(0x45, 999, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none());
+        assert!(
+            extract_ospf(&datagram(0x45, 999, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none()
+        );
         // Total length shorter than the header.
-        assert!(extract_ospf(&datagram(0x45, 12, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none());
+        assert!(
+            extract_ospf(&datagram(0x45, 12, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none()
+        );
         // Truncated buffer.
         assert!(
-            extract_ospf(&datagram(0x45, 28, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])[..10]).is_none()
+            extract_ospf(&datagram(0x45, 28, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])[..10])
+                .is_none()
         );
         // IHL < 5.
-        assert!(extract_ospf(&datagram(0x44, 16, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none());
+        assert!(
+            extract_ospf(&datagram(0x44, 16, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8])).is_none()
+        );
     }
 
     #[test]
@@ -293,10 +339,51 @@ mod tests {
         // The kernel can deliver more bytes than the datagram claims
         // (e.g. on some loopback paths); the payload must follow the
         // header's total length, not the receive count.
-        let mut pkt = datagram(0x45, 24, [1, 1, 1, 1], [2, 2, 2, 2], &[7, 7, 7, 7]);
+        let mut pkt = datagram(0x45, 24, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[7, 7, 7, 7]);
         pkt.extend_from_slice(&[0xff, 0xff]); // padding beyond total_len
         let rec = extract_ospf(&pkt).unwrap();
         assert_eq!(rec.payload, vec![7, 7, 7, 7]);
+    }
+
+    /// The TTL readout (octet 8 of the delivered header — raw(7)):
+    /// the raw-socket read that closes the receive-side wall without
+    /// any cmsg (the header is always in the buffer on raw sockets,
+    /// unlike the UDP/TCP-socket IP_RECVTTL path bfdd needs).
+    #[test]
+    fn ttl_reads_back_from_the_delivered_header() {
+        let on_link = datagram(0x45, 28, 1, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8]);
+        assert_eq!(extract_ospf(&on_link).unwrap().ttl, 1, "§A.1's TTL-1 send");
+
+        let degraded = datagram(0x45, 28, 63, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8]);
+        assert_eq!(
+            extract_ospf(&degraded).unwrap().ttl,
+            63,
+            "a relayed packet's TTL"
+        );
+
+        let max = datagram(0x45, 28, 255, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8]);
+        assert_eq!(extract_ospf(&max).unwrap().ttl, 255);
+
+        // The readout survives option words (IHL=6, TTL at offset 8).
+        let mut opt = datagram(0x46, 28, 7, [1, 1, 1, 1], [2, 2, 2, 2], &[0; 8]);
+        for _ in 0..4 {
+            opt.insert(20, 0xaa);
+        }
+        assert_eq!(extract_ospf(&opt).unwrap().ttl, 7);
+    }
+
+    /// The receive-side policy table (night N1): unicast exchange
+    /// packets must carry TTL 1 (§A.1's transmit mandate makes any
+    /// other value non-on-link); multicast Hellos keep the kernel's
+    /// rule — no check, so the policy functions never apply to them.
+    #[test]
+    fn unicast_ttl_policy() {
+        assert!(unicast_ttl_ok(1), "the on-link pass value");
+        assert!(!unicast_ttl_ok(63), "relayed — drop");
+        assert!(!unicast_ttl_ok(255), "far end — drop");
+        assert!(is_multicast_dst(ALL_SPF_ROUTERS));
+        assert!(is_multicast_dst(ALL_D_ROUTERS));
+        assert!(!is_multicast_dst(Ipv4Addr::new(192, 0, 2, 1)));
     }
 
     /// Opens the real raw socket. On unprivileged runs this fails
@@ -340,5 +427,59 @@ mod tests {
         sock.join_all_drouters().unwrap(); // idempotent
         sock.leave_all_drouters().unwrap();
         sock.leave_all_drouters().unwrap(); // idempotent
+    }
+
+    /// The wire proof of the TTL readout: two real raw proto-89
+    /// sockets on loopback — the sender degrades its TTL to 63, the
+    /// receiver reads it back from the delivered header octet
+    /// (raw(7)). Privileged-gated like `raw_socket_opens_and_arms_ttl`
+    /// (raw sockets need root), and skip-gated again on platforms
+    /// whose loopback path does not deliver local raw traffic — the
+    /// container interop leg is the wire proof there.
+    #[tokio::test]
+    async fn raw_loopback_reads_back_the_header_ttl() {
+        let sender = match OspfRawSocket::open(Ipv4Addr::LOCALHOST) {
+            Ok(s) => s,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: raw sockets need root here ({err})");
+                return;
+            }
+            Err(err) => panic!("unexpected open error: {err}"),
+        };
+        let receiver = match OspfRawSocket::open(Ipv4Addr::LOCALHOST) {
+            Ok(s) => s,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: raw sockets need root here ({err})");
+                return;
+            }
+            Err(err) => panic!("unexpected open error: {err}"),
+        };
+        // Degrade the transmit TTL to a routed-looking value (63).
+        sender
+            .socket
+            .lock()
+            .expect("socket lock")
+            .set_ttl_v4(63)
+            .unwrap();
+        sender
+            .send_unicast(&[0x02, 0x01], Ipv4Addr::LOCALHOST)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv(&mut buf)).await;
+        let received = match read {
+            Ok(Ok(Some(received))) => received,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                eprintln!("skipping: no loopback raw delivery here (platform routing)");
+                return;
+            }
+        };
+        assert_eq!(
+            received.ttl, 63,
+            "the header's TTL octet is the raw-socket readout"
+        );
+        assert_eq!(received.src, Ipv4Addr::LOCALHOST);
     }
 }

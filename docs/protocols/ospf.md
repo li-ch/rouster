@@ -167,13 +167,33 @@ follow-up below.
 - **socket2 adopted for ospfd** (owner decision A1, adopted
   2026-10-11; the Day-1 STOP resolved). `transport.rs` owns the raw
   proto-89 socket: 224.0.0.5 join, IP_MULTICAST_IF, TTL 1 on both
-  arms, AllDRouters join/leave on §9.4 role. Two disclosed fences:
-  no receive-side TTL check (socket2 0.6.5 has no recvmsg cmsg
-  parser — the bfdd wall) and no SO_BINDTODEVICE (the same crate
-  version) — the daemon demultiplexes by on-link source instead.
-  The safe-IO seam: socket2's recv wants `MaybeUninit` buffers, so
-  the armed fd is dup'ed into a tokio `UdpSocket` (same kernel
-  socket) for safe async send/recv.
+  arms, AllDRouters join/leave on §9.4 role. The safe-IO seam:
+  socket2's recv wants `MaybeUninit` buffers, so the armed fd is
+  dup'ed into a tokio `UdpSocket` (same kernel socket) for safe async
+  send/recv.
+- **The receive-side TTL check is CLOSED (night N1, 2026-10-12)**
+  — with no cmsg at all: a raw `SOCK_RAW` socket delivers the whole
+  IPv4 header with every datagram (raw(7)/raw(4)), and the TTL octet
+  (header offset 8) is read pure by the existing `parse_ipv4`.
+  `IP_RECVTTL` (ip(7)) is the UDP/TCP-socket mechanism for the same
+  readout — a raw v4 socket never needs it (the disclosed
+  raw-vs-UDP cmsg difference). Enforced: a UNICAST exchange packet
+  (DD/LSR/LSU/LSAck, p2p Hellos) arriving with TTL != 1 is dropped
+  and counted (`Ospfd::dropped_degraded_ttl`, INFO-logged per drop) —
+  §A.1 mandates TTL 1 on every OSPF send, so a degraded TTL means the
+  packet was relayed, not sent by an on-link peer. Multicast Hellos
+  keep the kernel's rule: no receive check (RFC 2328 places no
+  receive-side TTL rule; §A.1's TTL-1 is a transmit mandate — FRR
+  checks nothing on receive either). The OSPFv3 runtime's v6 raw
+  socket WILL need the cmsg walk (RFC 3542 §6 `IPV6_RECVHOPLIMIT`:
+  raw v6 sockets do not deliver the IPv6 header) — recorded in
+  §Deferred.
+- **SO_BINDTODEVICE remains fenced** (socket2 0.6.5 has no
+  `bind_device`), so a per-interface socket cannot scope its
+  *reception*; every raw proto-89 socket in the process receives
+  every OSPF packet. The daemon demultiplexes by on-link source
+  address (the zapi-interface-mirror test) and processes each packet
+  exactly once, on the socket of the interface the source is on.
 - **The wire bug the interop caught**: §A.3.3 has NO padding between
   the I/M/MS octet and the DD sequence number — Day-1's codec wrote
   (and read, symmetric, so its own tests passed) two spurious pad
@@ -608,8 +628,12 @@ follow-up below.
 - NBMA and Point-to-MultiPoint networks (§C.3) — the unicast-hello
   and per-neighbor-poll machinery; the §9.4 election's NBMA step
   (6) rides with it.
-- Receive-side TTL verification (needs the recvmsg cmsg walk — a
-  libc or socket2 upgrade); SO_BINDTODEVICE-style interface scoping.
+- Receive-side TTL verification: **CLOSED for the v4 unicast class**
+  (night N1 — the raw-socket header read, no cmsg). What remains:
+  the OSPFv3 runtime's v6 hop-limit read-back (RFC 3542 §6
+  `IPV6_RECVHOPLIMIT` — raw v6 sockets do not deliver the IPv6
+  header, so the cmsg walk is required there; same wall as bfdd's
+  v6 read-back) and SO_BINDTODEVICE-style interface scoping.
 - Interface link-state tracking ONGOING (the dump's startup snapshot
   landed with ADD-C2 above: a down/loopback interface stays Down at
   construction and sends no Hellos; what remains is reacting to
