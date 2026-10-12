@@ -135,6 +135,11 @@ async fn bfd_register_relay_and_status_fanout_over_real_socket() {
         std::collections::HashMap::new();
     let mut bfd_clients: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut bfd_daemon: Option<u64> = None;
+    // The register can beat the attach to this driver on the wire (the
+    // real rousterd driver records registrations and relays on attach —
+    // mirror that ordering-robustness instead of assuming attach-first;
+    // Linux schedulers make the other order real).
+    let mut pending_registers: Vec<zapi::ZapiBfdSessionCmd> = Vec::new();
 
     // Daemon claims the role first (replay set is empty — nothing to
     // replay), THEN the client registers interest and the destination.
@@ -171,19 +176,29 @@ async fn bfd_register_relay_and_status_fanout_over_real_socket() {
                 assert_eq!(pid, 30);
                 assert_ne!(owner, 0);
                 bfd_daemon = Some(owner);
+                for cmd in pending_registers.drain(..) {
+                    pushes
+                        .get(&owner)
+                        .expect("daemon push channel")
+                        .try_send(zapi::SessionPush::ForwardBfdRegister { cmd, update: false })
+                        .expect("relay queued");
+                    relayed = true;
+                }
             }
             RibCommand::BfdClientRegistered { owner } => {
                 bfd_clients.insert(owner);
             }
-            RibCommand::RegisterBfdDest { cmd, .. } => {
-                let daemon = bfd_daemon.expect("daemon attached before the register");
-                pushes
-                    .get(&daemon)
-                    .expect("daemon push channel")
-                    .try_send(zapi::SessionPush::ForwardBfdRegister { cmd, update: false })
-                    .expect("relay queued");
-                relayed = true;
-            }
+            RibCommand::RegisterBfdDest { cmd, .. } => match bfd_daemon {
+                Some(daemon) => {
+                    pushes
+                        .get(&daemon)
+                        .expect("daemon push channel")
+                        .try_send(zapi::SessionPush::ForwardBfdRegister { cmd, update: false })
+                        .expect("relay queued");
+                    relayed = true;
+                }
+                None => pending_registers.push(cmd),
+            },
             other => panic!("unexpected command {other:?}"),
         }
     }
