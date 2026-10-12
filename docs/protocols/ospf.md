@@ -633,7 +633,12 @@ follow-up below.
   the OSPFv3 runtime's v6 hop-limit read-back (RFC 3542 §6
   `IPV6_RECVHOPLIMIT` — raw v6 sockets do not deliver the IPv6
   header, so the cmsg walk is required there; same wall as bfdd's
-  v6 read-back) and SO_BINDTODEVICE-style interface scoping.
+  v6 read-back). Placement note (N1): the cmsg walker stays
+  bfdd-local for now — ospfd's v4 read is header-based (no
+  duplication arose) and bfdd stays common-free (the P2-a dep
+  decision); the OSPFv3 runtime is the trigger to hoist the walker
+  into `common` and drop bfdd's copy. SO_BINDTODEVICE-style
+  interface scoping rides with it.
 - Interface link-state tracking ONGOING (the dump's startup snapshot
   landed with ADD-C2 above: a down/loopback interface stays Down at
   construction and sends no Hellos; what remains is reacting to
