@@ -21,10 +21,10 @@
 //!   ONLY in [`arm_v4_recv_ttl`] and [`recvmsg_ctl`], each with its
 //!   audit comment — AGENTS.md's no-unsafe invariant carries a named
 //!   exception for exactly these, owner-approved 2026-10-12. The
-//!   kernel layouts are target-pinned: Linux uses cmsg type 2/51 and
-//!   network-order v6 data; macOS/BSD use types 24/47, a 4-byte
-//!   `cmsg_len`, single-byte v4 data, and native-order v6 data (all
-//!   pinned empirically by `recvmsg_reads_back_*`).
+//!   kernel layouts are target-pinned empirically (the
+//!   `recvmsg_reads_back_*` tests): Linux delivers cmsg types 2/52 with
+//!   native-order data; macOS/BSD types 24/47, a 4-byte `cmsg_len`,
+//!   single-byte v4 data, native-order v6 data.
 //! - **Multihop has no 255 rule** (RFC 5883 §3: the 255/255 check
 //!   "does not work across multiple hops"; its §4 is demultiplexing)
 //!   — transmit 255 satisfies FRR's multihop minimum-hop threshold
@@ -630,10 +630,13 @@ pub fn spawn_socket_pump(socket: UdpSocket, feed: mpsc::Sender<InboundPacket>) {
 /// `IPV6_HOPLIMIT` cmsg type. Stable kernel ABI on Linux, macOS and
 /// the BSDs (socket2 exposes no constants for the cmsg walk itself).
 const IPPROTO_IPV6_CMSG: u32 = 41;
+/// RFC 3542's type for the received hop limit (51), plus the value the
+/// target's kernel ACTUALLY delivers: Linux 52 (the 2292-era
+/// constant), macOS/BSD 47 — both pinned empirically.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const IPV6_HOPLIMIT_CMSG: u32 = 51; // RFC 3542
+const IPV6_HOPLIMIT_CMSG_KINDS: [u32; 2] = [51, 52];
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-const IPV6_HOPLIMIT_CMSG: u32 = 47; // macOS/BSD deliver type 47
+const IPV6_HOPLIMIT_CMSG_KINDS: [u32; 2] = [51, 47];
 
 /// One parsed control message: level, type, and the data bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,28 +692,24 @@ pub fn parse_cmsgs(mut ctrl: &[u8]) -> Vec<RawCmsg<'_>> {
     out
 }
 
-/// Extracts the received IPv6 hop limit from a control buffer
-/// (RFC 3542 §6: a u32 in network byte order on Linux; macOS/BSD
-/// pass a single byte, the same shape as their v4 TTL cmsg). `None`
-/// when the buffer carries no hop-limit cmsg. The RFC 5881 §5
-/// single-hop rule then drops when `Some(hl) < 255`.
+/// Extracts the received IPv6 hop limit from a control buffer. The
+/// delivered cmsg type and byte order are both target-dependent and
+/// pinned empirically: Linux hands back a native-order u32 under type
+/// 52 (the 2292-era constant, not RFC 3542's 51); macOS/BSD use type
+/// 47 with the same native-order u32. `None` when the buffer carries
+/// no hop-limit cmsg. The RFC 5881 §5 single-hop rule then drops when
+/// `Some(hl) < 255`.
 pub fn received_hop_limit(ctrl: &[u8]) -> Option<u32> {
     parse_cmsgs(ctrl)
         .into_iter()
-        .find(|c| c.level == IPPROTO_IPV6_CMSG && c.kind == IPV6_HOPLIMIT_CMSG)
+        .find(|c| c.level == IPPROTO_IPV6_CMSG && IPV6_HOPLIMIT_CMSG_KINDS.contains(&c.kind))
         .and_then(|c| match c.data.len() {
             4 => {
                 let raw: [u8; 4] = c.data.try_into().ok()?;
-                // RFC 3542 mandates network order; macOS delivers the
-                // native order instead (pinned empirically).
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                {
-                    Some(u32::from_be_bytes(raw))
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                {
-                    Some(u32::from_ne_bytes(raw))
-                }
+                // NATIVE byte order on both targets (the RFC's network
+                // order is what Linux writes into the packet, not what
+                // it hands back — pinned empirically on both).
+                Some(u32::from_ne_bytes(raw))
             }
             1 => Some(u32::from(c.data[0])),
             _ => None,
@@ -939,11 +938,8 @@ mod tests {
             let mut ctrl = Vec::new();
             put_cmsg_len(&mut ctrl, (GOLDEN_LEN_SIZE + 8 + 4) as u32);
             ctrl.extend_from_slice(&IPPROTO_IPV6_CMSG.to_ne_bytes());
-            ctrl.extend_from_slice(&IPV6_HOPLIMIT_CMSG.to_ne_bytes());
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            ctrl.extend_from_slice(&hl.to_be_bytes());
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            ctrl.extend_from_slice(&hl.to_ne_bytes());
+            ctrl.extend_from_slice(&IPV6_HOPLIMIT_CMSG_KINDS[0].to_ne_bytes());
+            ctrl.extend_from_slice(&hl.to_ne_bytes()); // native order, both targets
             ctrl
         };
         let ctrl = hop_cmsg(255);

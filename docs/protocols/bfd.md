@@ -224,9 +224,10 @@ DOWN report in bgpd through the 26 fan-out.
   limit through the safe parsers into `single_hop_receive_ok`;
   degraded packets drop at the listener with a counter + INFO line.
   Kernel layouts are target-pinned empirically (the
-  `recvmsg_reads_back_*` tests): Linux cmsg types 2/51 with
-  network-order v6 data; macOS/BSD types 24/47, 4-byte `cmsg_len`,
-  single-byte v4 data, native-order v6 data. Deviation 1 is closed;
+  `recvmsg_reads_back_*` tests): Linux cmsg types 2/52 (the 2292-era
+  hop-limit constant, not RFC 3542's 51) with native-order data;
+  macOS/BSD types 24/47, 4-byte `cmsg_len`, single-byte v4 data,
+  native-order v6 data. Deviation 1 is closed;
   the multihop minimum-hop threshold (FRR's 254 default) stays local
   policy, unenforced — see §3.
 - ~~bgpd-emitted single-hop REGISTER frame~~ — LANDED (M1, night of
