@@ -54,14 +54,14 @@ SAVNET splits into a stable part (build now) and a draft-tracking part (feature-
 - `bgpd` v1: FSM, 4-byte AS, MP-BGP (IPv4/IPv6 unicast), route refresh, capabilities, RIB-in/out, ZAPI client.
 - **RPKI from the start:** RTR client (RFC 8210/8210bis), ROV states into policy; ASPA path verification + RFC 9234 roles/OTC (this leapfrogs FRR, which has no ASPA as of 2026-03, and matches BIRD).
 - Policy engine is the typed, BIRD-inspired one (compiled, typed filters), with a route-map compatibility grammar layered on top for frr.conf import.
-- BGP-carried intra-domain SAVNET signaling hook (draft-cheng-savnet-intra-domain-sav-bgp), behind `experimental-savnet`.
+- BGP-carried intra-domain SAVNET signaling hook (the intra-domain SAVNET signaling drafts — names omitted on purpose: drafts rotate, see the SAVNET workstream rules in §4), behind `experimental-savnet`.
 - Fuzz the BGP codec (cargo-fuzz), interop vs. FRR/BIRD/GoBGP in CI.
 
 ### Phase 3 — IGP: OSPFv2 (10–14 weeks)
 
 - LSA database, flooding, SPF (with back-off), areas/stub/NSSA, authentication.
 - AF-generic single codebase (Holo pattern) — OSPFv3 then falls out nearly free.
-- IGP-carried intra-domain SAVNET signaling (draft-cheng-savnet-intra-domain-sav-igp), behind `experimental-savnet`.
+- IGP-carried intra-domain SAVNET signaling (same deliberately unnamed drafts — §4 tracks what is stable), behind `experimental-savnet`.
 
 ### Phase 4 — Management plane (parallel track, from Phase 1 on)
 
@@ -353,3 +353,12 @@ The phase text above is unchanged; this block is status only.
   against the cached FRR 10.2.2 testbed (dynamic: Full adjacency,
   redistribute both directions, 30 s soak, exit 0). Gate: fmt +
   clippy -D warnings clean, workspace tests 0 failures.
+
+- 2026-10-12 — Morning adjudication (night sheet CI-1/CI-2/POL-1/SAV-1/
+  RH-1): socket2→ospfd ratified (N1 unblocked); CI = GitHub mirror
+  github.com/li-ch/rouster with Actions (Gitee stays the public face;
+  mirror reachable over SSH from this host); policy `call` semantics =
+  compile-error on undefined, cycle-reject at load, comm-list token
+  order fixed in M2; the expired cheng-draft citations generalized
+  (this doc, Phase 2/3 lines); rousterctl→common ratified for the
+  rundir reader (N8).

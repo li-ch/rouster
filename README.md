@@ -2,6 +2,10 @@
   <img src="docs/assets/logo.png" width="360" alt="Rouster — a weathervane rooster">
 </p>
 
+<p align="center">
+  <a href="https://github.com/li-ch/rouster/actions/workflows/ci.yml"><img src="https://github.com/li-ch/rouster/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
 # Rouster
 
 A routing protocol suite in Rust — **rou**ter + Ru**st**.
