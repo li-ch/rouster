@@ -243,9 +243,14 @@ async fn bfd_register_relay_and_status_fanout_over_real_socket() {
         )
         .await;
 
-    // Fan the 26 out to every BFD client.
+    // Fan the 26 out to every BFD client. Both events must be handled
+    // before this loop exits — the status fan-out and the 29-update
+    // relay can arrive in either order (the two sessions share one
+    // command queue; Linux's scheduler reliably produces the opposite
+    // order from macOS's).
     let mut fanned = false;
-    while !fanned {
+    let mut update_relayed = false;
+    while !(fanned && update_relayed) {
         match rx.recv().await.expect("command") {
             RibCommand::BfdDaemonStatusUpdate { status } => {
                 for owner in &bfd_clients {
@@ -266,6 +271,7 @@ async fn bfd_register_relay_and_status_fanout_over_real_socket() {
                     .expect("daemon push channel")
                     .try_send(zapi::SessionPush::ForwardBfdRegister { cmd, update })
                     .expect("update relay queued");
+                update_relayed = true;
             }
             RibCommand::SessionEstablished { .. }
             | RibCommand::AttachSession { .. }
