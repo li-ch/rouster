@@ -389,9 +389,12 @@ mod tests {
     /// Opens the real raw socket. On unprivileged runs this fails
     /// with EPERM — the test then skips (the container interop leg
     /// is the wire proof; this pins the arming on any privileged
-    /// host, the Linux gate included).
-    #[test]
-    fn raw_socket_opens_and_arms_ttl() {
+    /// host, the Linux gate included). Tokio-flavored because
+    /// `open`'s safe-I/O seam registers the dup'd fd with the
+    /// reactor (`from_std` needs one — a plain #[test] panics
+    /// where raw sockets are permitted, e.g. in a NET_RAW container).
+    #[tokio::test]
+    async fn raw_socket_opens_and_arms_ttl() {
         let sock = match OspfRawSocket::open(Ipv4Addr::LOCALHOST) {
             Ok(sock) => sock,
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
