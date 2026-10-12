@@ -2,7 +2,10 @@
 
 Status: v1 landed 2026-10-11 (weekend program stream W1-a); extended
 the same night (micro M2) with `call`, zebra-style access-lists, and
-the `set comm-list NAME delete` token-order fix. Scope:
+the `set comm-list NAME delete` token-order fix; the morning
+adjudication (POL-1 A) pinned the `call` error shape — undefined
+target = compile error at the call site's own line, cycles rejected at
+load with the full cycle path in the message. Scope:
 `RouteView` (the generic route window), the BIRD-inspired typed filter
 language as a Rust API, sets-as-data with longest-match tags, the
 dependency-free FRR AS-path regex subset, the route-map
@@ -263,8 +266,10 @@ Maps" summary table:
   `on-match goto N` → jump to the first entry with order ≥ N; target
   must exceed the current sequence — "jumping to a previous entry is
   not permitted"). `call NAME` targets must be defined route-maps and
-  acyclic — both are compile errors (Rouster's undefined-ref
-  convention; FRR instead looks the name up at apply time).
+  acyclic — both are compile errors carrying the `call` clause's own
+  line number; the cycle error names the full cycle path (e.g.
+  `a -> b -> a`). POL-1, owner-adjudicated: Rouster's undefined-ref
+  convention — FRR instead looks the name up at apply time.
 - **Match + deny** → deny immediately; set clauses and exit policy on a
   matched deny entry are unreachable — surfaced as compile warnings.
 - **No match** → next entry. **Nothing matched** → implicit deny
@@ -324,9 +329,10 @@ Maps" summary table:
    example `3.0.0.0/8-` covering `0.0.0.0/0` — now a unit test.
 3. **Undefined references** (`match ... prefix-list UNDEFINED`,
    `match ip address UNDEFINED`, `call UNDEFINED`) are compile
-   errors, not permit-all/no-match guesses. `call` cycles are
-   compile errors too — FRR would instead look the target up at
-   apply time and loop/fail at runtime.
+   errors, not permit-all/no-match guesses. `call` errors carry the
+   call clause's line number; `call` cycles are compile errors whose
+   message names the full cycle path (`a -> b -> a`) — FRR would
+   instead look the target up at apply time and loop/fail at runtime.
 4. **Totality vs BIRD runtime errors** — see §4.3.
 5. **`set metric`** maps to MED for BGP routes (FRR doc wording); the
    typed `Action::SetMetric` (route metric) has no route-map spelling.

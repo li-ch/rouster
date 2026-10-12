@@ -177,8 +177,10 @@ pub struct RmEntry {
     pub sets: Vec<RmSet>,
     /// `call NAME` — invoked after Set Actions (FRR "Route Maps": a
     /// deny return finishes and denies; a permit return proceeds to
-    /// the exit policy).
-    pub call: Option<String>,
+    /// the exit policy). The u32 is the 1-based line of the `call`
+    /// clause itself, so compile errors point at the call site
+    /// (POL-1, owner-adjudicated).
+    pub call: Option<(String, u32)>,
     pub exit: RmExit,
 }
 
@@ -655,7 +657,7 @@ fn parse_call(
             format!("call: expected `call NAME`, got `{}`", join_tail(toks, 0)),
         );
     }
-    entry.call = Some(toks[1].to_string());
+    entry.call = Some((toks[1].to_string(), line));
     Ok(())
 }
 
@@ -1057,8 +1059,10 @@ fn join_tail(toks: &[&str], from: usize) -> String {
 /// - no match → next entry; nothing matched → implicit deny.
 ///
 /// `call NAME` targets must be defined route-maps and acyclic — both
-/// are compile errors (the typed-engine convention for undefined
-/// references; FRR instead looks the name up at apply time).
+/// are compile errors carrying the `call` clause's own line; the cycle
+/// error names the full cycle path (POL-1, owner-adjudicated — the
+/// typed-engine convention for undefined references; FRR instead looks
+/// the name up at apply time).
 pub fn compile_route_map(
     doc: &PolicyDocument,
     name: &str,
@@ -1269,21 +1273,25 @@ fn compile_route_map_inner(
                     }
                 }
                 // Call Action, after Set Actions (FRR "Route Maps").
-                // The callee is compiled now: an undefined name or a
-                // cycle is a compile error (undefined-ref convention —
-                // FRR looks the name up at apply time instead).
-                if let Some(callee) = &entry.call {
+                // The callee is compiled now. POL-1 (owner-adjudicated):
+                // an undefined target is a compile error at the call
+                // site's own line, and a cycle is rejected at load with
+                // the full cycle path in the message — FRR looks the
+                // name up at apply time instead.
+                if let Some((callee, call_line)) = &entry.call {
                     if stack.contains(&callee.as_str()) {
+                        let mut path: Vec<&str> = stack.to_vec();
+                        path.push(callee);
                         return err(
-                            entry.line,
+                            *call_line,
                             format!(
-                                "call `{callee}`: recursive route-map call (cycle via {})",
-                                stack.join(" -> ")
+                                "call `{callee}`: recursive route-map call (cycle: {})",
+                                path.join(" -> ")
                             ),
                         );
                     }
                     if !doc.route_maps.contains_key(callee) {
-                        return err(entry.line, format!("call: undefined route-map `{callee}`"));
+                        return err(*call_line, format!("call: undefined route-map `{callee}`"));
                     }
                     let mut sub_stack: Vec<&str> = stack.to_vec();
                     sub_stack.push(callee);
@@ -1854,6 +1862,40 @@ route-map r permit 10
     }
 
     #[test]
+    fn comm_list_exact_accepted_input_shape() {
+        // POL-1 companion: the accepted shape is exactly FRR 10.2.2's
+        // `set comm-list <(1-99)|(100-500)|NAME> delete` — numeric list
+        // names included, `delete` last, nothing after it.
+        let text = "\
+bgp community-list standard 1 permit 65000:1 65000:2
+route-map r permit 10
+ set comm-list 1 delete
+";
+        let out = compile_ok(text, "r");
+        let mut r = v4_route("192.0.2.0/24", &[65001]);
+        r.bgp_or_materialize().communities = vec![
+            Community::Pair(65000, 1),
+            Community::Pair(65000, 2),
+            Community::Pair(65000, 3),
+        ];
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept);
+        assert_eq!(
+            r.bgp().unwrap().communities,
+            vec![Community::Pair(65000, 3)]
+        );
+
+        // Missing `delete` and trailing tokens are shape errors naming
+        // the expected form.
+        let e = parse_policy_config("route-map r permit 10\n set comm-list DEL\n").unwrap_err();
+        assert_eq!(e.line, 2);
+        assert!(e.message.contains("comm-list NAME delete"), "{}", e.message);
+        let e = parse_policy_config("route-map r permit 10\n set comm-list DEL delete junk\n")
+            .unwrap_err();
+        assert_eq!(e.line, 2);
+        assert!(e.message.contains("comm-list NAME delete"), "{}", e.message);
+    }
+
+    #[test]
     fn call_deny_return_short_circuits() {
         // FRR "Route Maps": the Call Action runs after Set Actions; "If
         // it returns deny ... the route is denied, regardless of the
@@ -1912,28 +1954,88 @@ route-map main permit 20
     }
 
     #[test]
+    fn call_chain_a_to_b_to_c_evaluates() {
+        // POL-1: a legitimate chain (A→B→C) compiles and evaluates —
+        // caller sets first, then each callee's sets, innermost last.
+        let text = "\
+route-map c permit 5
+ set origin egp
+route-map b permit 10
+ set metric 42
+ call c
+route-map a permit 10
+ set local-preference 150
+ call b
+";
+        let out = compile_ok(text, "a");
+        let mut r = v4_route("192.0.2.0/24", &[65001]);
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept);
+        let b = r.bgp().unwrap();
+        assert_eq!(b.local_pref, Some(150), "outermost caller's set");
+        assert_eq!(b.med, Some(42), "middle callee's set");
+        assert_eq!(b.origin, Some(BgpOrigin::Egp), "innermost callee's set");
+        // Every link of the chain compiles standalone too.
+        let mut rb = v4_route("192.0.2.0/24", &[]);
+        assert!(compile_ok(text, "b").filter.apply(&mut rb).is_accept());
+        assert_eq!(rb.bgp().unwrap().origin, Some(BgpOrigin::Egp));
+        let mut rc = v4_route("192.0.2.0/24", &[]);
+        assert!(compile_ok(text, "c").filter.apply(&mut rc).is_accept());
+        assert_eq!(rc.bgp().unwrap().origin, Some(BgpOrigin::Egp));
+    }
+
+    #[test]
+    fn call_mutual_non_cyclic_references_work() {
+        // POL-1: cross-references that do not close a cycle stay legal.
+        // second → first → shared is a DAG; each head compiles on its
+        // own and the composed result evaluates end to end.
+        let text = "\
+route-map shared permit 5
+ set origin egp
+route-map first permit 10
+ call shared
+route-map second permit 10
+ call first
+";
+        let out = compile_ok(text, "second");
+        let mut r = v4_route("192.0.2.0/24", &[65001]);
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept);
+        assert_eq!(r.bgp().unwrap().origin, Some(BgpOrigin::Egp));
+        let mut rf = v4_route("192.0.2.0/24", &[]);
+        assert!(compile_ok(text, "first").filter.apply(&mut rf).is_accept());
+        assert_eq!(rf.bgp().unwrap().origin, Some(BgpOrigin::Egp));
+        let mut rs = v4_route("192.0.2.0/24", &[]);
+        assert!(compile_ok(text, "shared").filter.apply(&mut rs).is_accept());
+        assert_eq!(rs.bgp().unwrap().origin, Some(BgpOrigin::Egp));
+    }
+
+    #[test]
     fn call_undefined_target_and_cycles_are_compile_errors() {
+        // POL-1 (owner-adjudicated): an undefined call target is a
+        // compile error at the CALL SITE's line, not the entry header.
         let doc = parse_policy_config("route-map x permit 10\n call ghost\n").unwrap();
         let e = compile_route_map(&doc, "x").unwrap_err();
-        assert_eq!(e.line, 1, "entry opened on line 1");
+        assert_eq!(e.line, 2, "the `call` clause's own line");
         assert!(
             e.message.contains("undefined route-map `ghost`"),
             "{}",
             e.message
         );
 
-        // Direct self-call and mutual cycles are compile errors.
+        // Direct self-call and mutual cycles are compile errors whose
+        // message names the full cycle path.
         let selfy = parse_policy_config("route-map x permit 10\n call x\n").unwrap();
         let e = compile_route_map(&selfy, "x").unwrap_err();
-        assert!(e.message.contains("cycle"), "{}", e.message);
+        assert_eq!(e.line, 2);
+        assert!(e.message.contains("cycle: x -> x"), "{}", e.message);
 
         let mutual =
             parse_policy_config("route-map a permit 10\n call b\nroute-map b permit 10\n call a\n")
                 .unwrap();
         let e = compile_route_map(&mutual.clone(), "a").unwrap_err();
-        assert!(e.message.contains("cycle"), "{}", e.message);
+        assert_eq!(e.line, 4, "b's `call a` (line 4) is the closing edge");
+        assert!(e.message.contains("cycle: a -> b -> a"), "{}", e.message);
         let e = compile_route_map(&mutual, "b").unwrap_err();
-        assert!(e.message.contains("cycle"), "{}", e.message);
+        assert!(e.message.contains("cycle: b -> a -> b"), "{}", e.message);
 
         // A shared (non-cyclic) callee twice in one chain is fine.
         let dag = parse_policy_config(
