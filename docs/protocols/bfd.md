@@ -217,15 +217,18 @@ DOWN report in bgpd through the 26 fan-out.
   codec arms, rousterd relay + fan-out, `bfdd --zapi`, the
   `test-bfd-zapi.sh` smoke (the section above).
 - **Receive-TTL check on v4, and the v6 read-back** (the §5 MUST):
-  the night N1 slice closed everything safe: the v6 single-hop
-  listener is armed (`arm_v6_recv_hoplimit`), the v4 extractor
-  (`received_ttl` — the kernel's native-int `IP_TTL` cmsg, pinned to
-  `ip_sockglue.c`) and the verdict seam
-  (`single_hop_receive_ok`) are landed and tested. The one remaining
-  step is socket2's safe control-buffer read (0.6.5 returns
-  `&mut [MaybeUninit<u8>]` with no initialized-prefix read and no
-  `set_recv_ttl_v4`) — a socket2 upgrade or a one-line owner-approved
-  fence exception wires the seam into the listener (deviation 1).
+  **CLOSED (2026-10-12, the owner-approved audited block)** — the
+  single-hop listeners arm `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` and the
+  blocking recvmsg read-back (`recvmsg_ctl`, the two audited unsafe
+  lines named in AGENTS.md's exception) feeds the received TTL/hop
+  limit through the safe parsers into `single_hop_receive_ok`;
+  degraded packets drop at the listener with a counter + INFO line.
+  Kernel layouts are target-pinned empirically (the
+  `recvmsg_reads_back_*` tests): Linux cmsg types 2/51 with
+  network-order v6 data; macOS/BSD types 24/47, 4-byte `cmsg_len`,
+  single-byte v4 data, native-order v6 data. Deviation 1 is closed;
+  the multihop minimum-hop threshold (FRR's 254 default) stays local
+  policy, unenforced — see §3.
 - ~~bgpd-emitted single-hop REGISTER frame~~ — LANDED (M1, night of
   2026-10-11): wire-pinned in both forms plus the DEREGISTER/UPDATE
   lifecycle (`docs/interop/zapi-10.2-pinned.md`, M1N addendum); no

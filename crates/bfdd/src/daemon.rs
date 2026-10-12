@@ -48,8 +48,9 @@ use tracing::{info, warn};
 use crate::packet::{PORT_ECHO, PORT_MULTIHOP, PORT_SINGLEHOP};
 use crate::session::SessionConfig;
 use crate::transport::{
-    arm_v6_recv_hoplimit, bind_control_tx, echo_disposition, spawn_session, EchoDisposition,
-    EchoPdu, InboundPacket, PeerSpec, SessionCtl, SessionHandle, SessionSnapshot,
+    arm_v4_recv_ttl, bind_control_tx, echo_disposition, recvmsg_ctl, single_hop_receive_ok,
+    spawn_session, EchoDisposition, EchoPdu, InboundPacket, PeerSpec, SessionCtl, SessionHandle,
+    SessionSnapshot, CTL_BUFSZ,
 };
 
 /// Default control timing (FRR bfdd's): 300 ms × 3.
@@ -327,8 +328,15 @@ pub struct BfddDaemon {
     /// drops (a dropped daemon must release its well-known ports).
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// The shared listeners' sockets (kept alive; their tasks run
-    /// until the channels close).
+    /// until the channels close). Multihop only: the single-hop
+    /// listeners live in [`Self::recv_sockets`] (the recvmsg path).
     listeners: Vec<Arc<UdpSocket>>,
+    /// The single-hop receive sockets (blocking `socket2::Socket`s,
+    /// armed with the §5 TTL/hop-limit read-back), with their family.
+    recv_sockets: Vec<(Arc<socket2::Socket>, bool)>,
+    /// §5 drop counter: single-hop control packets that arrived with
+    /// a degraded TTL/hop limit (reported in the status surface).
+    dropped_degraded_ttl: Arc<std::sync::atomic::AtomicU64>,
     /// Echo sockets per family, when any peer runs echo. Bound once
     /// at spawn; a reload adding the FIRST echo peer cannot grow
     /// them (disclosed; restart to add echo).
@@ -365,6 +373,8 @@ impl BfddDaemon {
             demux: Demux::new(),
             tasks: Vec::new(),
             listeners: Vec::new(),
+            recv_sockets: Vec::new(),
+            dropped_degraded_ttl: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             echo_sockets: Vec::new(),
             watches: Vec::new(),
             config,
@@ -393,18 +403,44 @@ impl BfddDaemon {
             } else {
                 SocketAddr::new(IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), port)
             };
-            // The v6 single-hop listener arms §5's receive half
-            // (IPV6_RECVHOPLIMIT — the socket2-safe step; the cmsg
-            // read-back is the fenced remainder, transport.rs).
-            // Multihop is never armed: RFC 5883 §3 pins that the
-            // 255/255 rule does not work across multiple hops.
-            let std_sock = std::net::UdpSocket::bind(bind_addr)?;
-            if v6 && !multihop {
-                arm_v6_recv_hoplimit(&std_sock)?;
+            if multihop {
+                // Multihop is never armed (RFC 5883 §3: the 255/255
+                // rule does not work across multiple hops) — the plain
+                // tokio recv_from path.
+                let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+                std_sock.set_nonblocking(true)?;
+                daemon
+                    .listeners
+                    .push(Arc::new(UdpSocket::from_std(std_sock)?));
+            } else {
+                // Single-hop: a blocking socket2 socket armed with the
+                // §5 receive half — v6 via the safe setter, v4 via the
+                // audited libc setsockopt (owner-approved 2026-10-12);
+                // the read-back runs on the recvmsg task below.
+                let domain = if v6 {
+                    socket2::Domain::IPV6
+                } else {
+                    socket2::Domain::IPV4
+                };
+                let sock = socket2::Socket::new(
+                    domain,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )?;
+                sock.bind(&bind_addr.into())?;
+                if v6 {
+                    sock.set_recv_hoplimit_v6(true)?;
+                } else {
+                    arm_v4_recv_ttl(&sock)?;
+                }
+                // Nonblocking: the receive task polls (see below) — a
+                // parked BLOCKING recvmsg cannot be woken portably
+                // (close() keeps the file description alive until the
+                // syscall returns on every unix target), which would
+                // wedge the runtime's blocking-task join on drop.
+                sock.set_nonblocking(true)?;
+                daemon.recv_sockets.push((Arc::new(sock), v6));
             }
-            std_sock.set_nonblocking(true)?;
-            let sock = UdpSocket::from_std(std_sock)?;
-            daemon.listeners.push(Arc::new(sock));
         }
 
         // The echo reflector's sockets, per family, when needed.
@@ -465,6 +501,58 @@ impl BfddDaemon {
                         }
                         Err(err) => {
                             warn!(%err, "bfdd: listener read failed; stopping");
+                            return;
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Single-hop receive tasks: the recvmsg read-back (the audited
+        // block, transport.rs) feeds RFC 5881 §5 — a degraded TTL/hop
+        // limit drops the packet at the listener with a counter + INFO
+        // line, before demultiplexing. Blocking sockets on their own
+        // OS thread; the weak-strong close discipline is the same as
+        // the async listeners'.
+        for (sock, v6) in &daemon.recv_sockets {
+            let sock = Arc::downgrade(sock);
+            let v6 = *v6;
+            let demux = daemon.demux.clone();
+            let dropped = daemon.dropped_degraded_ttl.clone();
+            daemon.tasks.push(tokio::task::spawn_blocking(move || {
+                let mut payload = [std::mem::MaybeUninit::<u8>::uninit(); 2048];
+                let mut ctrl = [std::mem::MaybeUninit::<u8>::uninit(); CTL_BUFSZ];
+                loop {
+                    let Some(sock) = sock.upgrade() else { return };
+                    match recvmsg_ctl(&sock, &mut payload, &mut ctrl, v6) {
+                        Ok((data, ttl, from)) => {
+                            if !single_hop_receive_ok(ttl) {
+                                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::info!(
+                                    peer = %from,
+                                    ?ttl,
+                                    "bfdd: control packet dropped: degraded TTL"
+                                );
+                                continue;
+                            }
+                            let feed = demux.route(from, false, peek_your_discr(data));
+                            if let Some(feed) = feed {
+                                let _ = feed.blocking_send((from, data.to_vec()));
+                            }
+                        }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            // Poll rhythm: BFD's fastest cadence is
+                            // tens of ms — a 10 ms poll adds negligible
+                            // latency, and it is what makes the task
+                            // terminable on drop (see the bind note).
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(%err, "bfdd: single-hop listener read failed; stopping");
                             return;
                         }
                     }
@@ -569,9 +657,11 @@ impl BfddDaemon {
     /// Operator status (A21): one line per session, the savd shape.
     pub fn status_text(&self, pid: u32) -> String {
         let mut out = format!(
-            "bfdd {} pid {pid}\npeers {}\n",
+            "bfdd {} pid {pid}\npeers {}\ndropped-degraded-ttl {}\n",
             env!("CARGO_PKG_VERSION"),
-            self.sessions.len()
+            self.sessions.len(),
+            self.dropped_degraded_ttl
+                .load(std::sync::atomic::Ordering::Relaxed)
         );
         for snap in self.snapshots() {
             out.push_str(&format!(
@@ -785,10 +875,19 @@ impl Drop for BfddDaemon {
         for task in &self.tasks {
             task.abort();
         }
-        // The sessions' feeds close with the daemon's senders; their
-        // tasks exit on the closed channel. (Production exits via
-        // shutdown_all first; this is the library-object hygiene
-        // path.)
+        // A thread parked in a BLOCKING recvmsg is not woken by close()
+        // on any unix target (the file description stays alive until
+        // the syscall returns), and the tokio runtime waits for its
+        // blocking tasks on shutdown — so the single-hop receive
+        // sockets are shut down explicitly: shutdown(Read) wakes the
+        // parked recvmsg with an error and the tasks exit, letting the
+        // runtime drop. (The listeners' weak-close discipline covers
+        // the async tasks; the sessions' feeds close with the daemon's
+        // senders. Production exits via shutdown_all first; this is
+        // the library-object hygiene path.)
+        for (sock, _) in &self.recv_sockets {
+            let _ = sock.shutdown(std::net::Shutdown::Read);
+        }
     }
 }
 

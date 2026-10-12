@@ -362,3 +362,13 @@ The phase text above is unchanged; this block is status only.
   order fixed in M2; the expired cheng-draft citations generalized
   (this doc, Phase 2/3 lines); rousterctl→common ratified for the
   rundir reader (N8).
+
+- 2026-10-12 (afternoon) — Owner decision: the audited unsafe block.
+  BFD's receive-side TTL/hop-limit read-back is CLOSED (the AGENTS.md
+  no-unsafe exception names exactly `arm_v4_recv_ttl` + `recvmsg_ctl`
+  in bfdd's transport; both audited, kernel-proven on macOS AND via
+  the Linux CI). The kernel tests that pinned it caught three real
+  target-layout facts: macOS cmsg types 24/47 vs Linux 2/51, the
+  4-byte `cmsg_len`, and macOS's single-byte v4 / native-order v6
+  cmsg data. P2-a's deviation 1 is gone; only the multihop
+  minimum-hop threshold remains unenforced local policy.

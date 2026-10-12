@@ -17,7 +17,7 @@ be open-sourced; write code and docs accordingly.
 4. **Policy engine is typed and compiled** (BIRD-inspired); route-map grammar exists only as an import-compatibility layer.
 5. **YANG-native transactional config is primary**; vtysh is a translator on top, never the source of truth.
 6. **All dataplane programming goes through the `Dataplane` trait** (`crates/common/src/dataplane.rs`): netlink today, FPM/eBPF later. No direct rtnetlink calls outside `netlink-dp`.
-7. **No `unsafe` in protocol code.** Fuzz every wire codec (cargo-fuzz) before calling it done.
+7. **No `unsafe` in protocol code.** Fuzz every wire codec (cargo-fuzz) before calling it done. **Named exception (owner decision 2026-10-12):** the BFD receive-side TTL read-back — exactly two functions, `arm_v4_recv_ttl` and `recvmsg_ctl` in `crates/bfdd/src/transport.rs`, each carrying its audit comment; the invariant otherwise stands absolute.
 
 ## SAVNET rules
 

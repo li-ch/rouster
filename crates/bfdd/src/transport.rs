@@ -6,26 +6,25 @@
 //! §5's TTL 255.
 //!
 //! W1-b (M6, socket2 adopted — owner decision A1) closes P2-a's
-//! deviation list where a SAFE API exists, and the night N1 slice
-//! (2026-10-12) pushed the §5 receive wall as far as the no-unsafe
-//! fence permits:
+//! deviation list where a SAFE API exists, and the §5 receive wall is
+//! now FULLY CLOSED (2026-10-12, the owner-approved audited block):
 //!
 //! - **IPv6 transmit hop limit is 255** (RFC 5881 §5) — CLOSED via
 //!   `IPV6_UNICAST_HOPS` on every v6 transmit socket (std/mio reach
 //!   IP_TTL only; P2-a's deviation (b) is gone).
-//! - **The v6 single-hop listener now ARMS the receive half**
-//!   (`IPV6_RECVHOPLIMIT` via [`arm_v6_recv_hoplimit`], socket2's
-//!   safe setter — wired at daemon bind). The READ-BACK itself stays
-//!   fenced, disclosed with the exact wall: socket2 0.6.5's `recvmsg`
-//!   exists (`MsgHdrMut`) but hands the control buffer back as
-//!   `&mut [MaybeUninit<u8>]` with only a `control_len()` — no safe
-//!   initialized-prefix read, no cmsg parser; the v4 arm has no
-//!   socket2 setter at all (`set_recv_ttl_v4` is missing) and
-//!   `libc::setsockopt` is unsafe. One narrow step (a safe control
-//!   read, a socket2 upgrade, or a one-line fence exception) turns
-//!   the landed parsers + verdict below into the full check; v4
-//!   receive stays fail-open meanwhile (transmit TTL 255 is proven by
-//!   FRR's checker, P2-a's smoke).
+//! - **Single-hop receive enforcement** — CLOSED for BOTH families:
+//!   the listeners arm `IP_RECVTTL`/`IPV6_RECVHOPLIMIT` and the
+//!   blocking recvmsg read-back ([`recvmsg_ctl`]) feeds the received
+//!   TTL/hop limit through the safe parsers into
+//!   [`single_hop_receive_ok`]: degraded packets are dropped at the
+//!   listener with a counter + INFO line. The two unsafe lines live
+//!   ONLY in [`arm_v4_recv_ttl`] and [`recvmsg_ctl`], each with its
+//!   audit comment — AGENTS.md's no-unsafe invariant carries a named
+//!   exception for exactly these, owner-approved 2026-10-12. The
+//!   kernel layouts are target-pinned: Linux uses cmsg type 2/51 and
+//!   network-order v6 data; macOS/BSD use types 24/47, a 4-byte
+//!   `cmsg_len`, single-byte v4 data, and native-order v6 data (all
+//!   pinned empirically by `recvmsg_reads_back_*`).
 //! - **Multihop has no 255 rule** (RFC 5883 §3: the 255/255 check
 //!   "does not work across multiple hops"; its §4 is demultiplexing)
 //!   — transmit 255 satisfies FRR's multihop minimum-hop threshold
@@ -55,6 +54,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -630,7 +630,10 @@ pub fn spawn_socket_pump(socket: UdpSocket, feed: mpsc::Sender<InboundPacket>) {
 /// `IPV6_HOPLIMIT` cmsg type. Stable kernel ABI on Linux, macOS and
 /// the BSDs (socket2 exposes no constants for the cmsg walk itself).
 const IPPROTO_IPV6_CMSG: u32 = 41;
-const IPV6_HOPLIMIT_CMSG: u32 = 51;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const IPV6_HOPLIMIT_CMSG: u32 = 51; // RFC 3542
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const IPV6_HOPLIMIT_CMSG: u32 = 47; // macOS/BSD deliver type 47
 
 /// One parsed control message: level, type, and the data bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,34 +645,40 @@ pub struct RawCmsg<'a> {
 
 /// Walks a recvmsg control buffer, safely: the `cmsghdr` fields are
 /// read bytewise (`from_ne_bytes` — no pointer casts, no unsafe).
-/// Layout on the unix targets: `cmsg_len` usize (8), `cmsg_level`
+/// Layout on the unix targets: `cmsg_len` — `size_t` (8 bytes) on
+/// Linux, `socklen_t` (4 bytes) on macOS/the BSDs — then `cmsg_level`
 /// and `cmsg_type` u32 (4+4), then the data; the next header starts
-/// at `cmsg_len` rounded up to the usize alignment.
-///
-/// One half of the RFC 5881 §5 receive check, landed and unit-tested
-/// so the fenced remainder is a wiring change, not a rewrite (module
-/// head): arming the v6 listener is safe
-/// ([`arm_v6_recv_hoplimit`]), but socket2 0.6.5 hands the control
-/// buffer back as `&mut [MaybeUninit<u8>]` with no safe
-/// initialized-prefix read.
+/// at `cmsg_len` rounded up to the `cmsg_len` alignment. The per-target
+/// width is what the real kernel actually emits — the synthetic goldens
+/// below pin both shapes, and the kernel round-trip tests
+/// (`recvmsg_reads_back_*`) pin the host's own.
 pub fn parse_cmsgs(mut ctrl: &[u8]) -> Vec<RawCmsg<'_>> {
     let mut out = Vec::new();
-    const HDR: usize = 8 + 4 + 4;
-    const ALIGN: usize = std::mem::size_of::<usize>();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LEN_SIZE: usize = std::mem::size_of::<usize>(); // size_t, 8
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LEN_SIZE: usize = 4; // socklen_t is u32 on macOS/BSD
+                               // CMSG_ALIGN steps by alignof(cmsghdr), which equals the len
+                               // field's width on every target we build (8 on Linux, 4 on BSDs).
+    const ALIGN: usize = LEN_SIZE;
     loop {
-        if ctrl.len() < HDR {
+        if ctrl.len() < LEN_SIZE + 4 + 4 {
             break;
         }
-        let cmsg_len = usize::from_ne_bytes(ctrl[..8].try_into().expect("8 bytes"));
-        if cmsg_len < HDR || cmsg_len > ctrl.len() {
+        let mut len_buf = [0u8; 8];
+        len_buf[..LEN_SIZE].copy_from_slice(&ctrl[..LEN_SIZE]);
+        let cmsg_len = usize::from_ne_bytes(len_buf);
+        let level_at = LEN_SIZE;
+        let kind_at = LEN_SIZE + 4;
+        if cmsg_len < LEN_SIZE + 8 || cmsg_len > ctrl.len() {
             break; // malformed tail: stop walking
         }
-        let level = u32::from_ne_bytes(ctrl[8..12].try_into().expect("4 bytes"));
-        let kind = u32::from_ne_bytes(ctrl[12..16].try_into().expect("4 bytes"));
+        let level = u32::from_ne_bytes(ctrl[level_at..level_at + 4].try_into().expect("4 bytes"));
+        let kind = u32::from_ne_bytes(ctrl[kind_at..kind_at + 4].try_into().expect("4 bytes"));
         out.push(RawCmsg {
             level,
             kind,
-            data: &ctrl[HDR..cmsg_len],
+            data: &ctrl[LEN_SIZE + 8..cmsg_len],
         });
         let step = cmsg_len.div_ceil(ALIGN) * ALIGN;
         if step >= ctrl.len() {
@@ -681,41 +690,57 @@ pub fn parse_cmsgs(mut ctrl: &[u8]) -> Vec<RawCmsg<'_>> {
 }
 
 /// Extracts the received IPv6 hop limit from a control buffer
-/// (RFC 3542 §6: a u32 in network byte order). `None` when the
-/// buffer carries no hop-limit cmsg. The RFC 5881 §5 single-hop rule
-/// then drops when `Some(hl) < 255`.
+/// (RFC 3542 §6: a u32 in network byte order on Linux; macOS/BSD
+/// pass a single byte, the same shape as their v4 TTL cmsg). `None`
+/// when the buffer carries no hop-limit cmsg. The RFC 5881 §5
+/// single-hop rule then drops when `Some(hl) < 255`.
 pub fn received_hop_limit(ctrl: &[u8]) -> Option<u32> {
     parse_cmsgs(ctrl)
         .into_iter()
         .find(|c| c.level == IPPROTO_IPV6_CMSG && c.kind == IPV6_HOPLIMIT_CMSG)
-        .and_then(|c| {
-            let raw: [u8; 4] = c.data.try_into().ok()?;
-            Some(u32::from_be_bytes(raw))
+        .and_then(|c| match c.data.len() {
+            4 => {
+                let raw: [u8; 4] = c.data.try_into().ok()?;
+                // RFC 3542 mandates network order; macOS delivers the
+                // native order instead (pinned empirically).
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    Some(u32::from_be_bytes(raw))
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    Some(u32::from_ne_bytes(raw))
+                }
+            }
+            1 => Some(u32::from(c.data[0])),
+            _ => None,
         })
 }
 
 /// cmsg constants for the v4 TTL lookup: `IPPROTO_IP` (SOL_IP, 0)
-/// and the `IP_TTL` cmsg type (2). Stable kernel ABI on Linux
-/// (ip(7): `IP_RECVTTL` ... "the received TTL is passed as a
-/// control message" of type `IP_TTL`).
+/// and the received-TTL cmsg type — 2 on Linux (ip(7)'s `IP_TTL`),
+/// 24 on macOS/BSD (the value the kernel actually delivers; pinned
+/// empirically by `recvmsg_reads_back_the_v4_ttl`).
 const IPPROTO_IP_CMSG: u32 = 0;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const IP_TTL_CMSG: u32 = 2;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const IP_TTL_CMSG: u32 = 24;
 
 /// Extracts the received IPv4 TTL from a control buffer. The kernel
-/// passes a native-endian `int` (Linux `net/ipv4/ip_sockglue.c`:
-/// `put_cmsg(msg, SOL_IP, IP_TTL, sizeof(int), &ttl)` — unlike the
-/// RFC 3542 v6 hop limit, which is network byte order); the value is
-/// 0-255 and sits in the int's low byte. `None` when the buffer
-/// carries no TTL cmsg. The RFC 5881 §5 single-hop rule then drops
-/// when `Some(ttl) != 255`.
+/// payload shape differs by target: Linux passes a native-endian `int`
+/// (`ip(7)`: the received TTL arrives as an `IP_TTL` control message,
+/// `sizeof(int)`) whose low byte carries the value; macOS/BSD pass a
+/// single byte. In both shapes the FIRST byte is the value (the int is
+/// native-endian — little-endian on every target we build — and the
+/// value sits in its low byte). `None` when the buffer carries no TTL
+/// cmsg. The RFC 5881 §5 single-hop rule then drops when
+/// `Some(ttl) != 255`.
 pub fn received_ttl(ctrl: &[u8]) -> Option<u32> {
     parse_cmsgs(ctrl)
         .into_iter()
         .find(|c| c.level == IPPROTO_IP_CMSG && c.kind == IP_TTL_CMSG)
-        .and_then(|c| {
-            let raw: [u8; 4] = c.data.get(..4)?.try_into().ok()?;
-            Some(u32::from_ne_bytes(raw) & 0xff)
-        })
+        .and_then(|c| c.data.first().copied().map(u32::from))
 }
 
 /// Arms the §5 receive half on the v6 single-hop listener socket
@@ -741,6 +766,92 @@ pub fn single_hop_receive_ok(ttl: Option<u32>) -> bool {
         Some(_) => false,
         None => true,
     }
+}
+
+// ---------------------------------------------------------------------
+// The audited receive read-back (owner-approved 2026-10-12; AGENTS.md's
+// no-unsafe invariant carries a named exception for exactly these two
+// functions — see the audit lines below). This closes N1's fenced
+// remainder: the kernel capture behind the safe parsers above.
+// ---------------------------------------------------------------------
+
+/// Control-buffer size for the read-back: one TTL/hop-limit cmsg
+/// (16-byte header + 4-byte value) plus alignment margin.
+pub const CTL_BUFSZ: usize = 64;
+
+/// Arms the §5 receive half on a v4 socket (`IP_RECVTTL`), so the
+/// kernel attaches the received TTL as a control message. socket2
+/// 0.6.5 has no setter for it — this is the audited `libc::setsockopt`
+/// (owner-approved 2026-10-12):
+///
+/// SAFETY: `optval` is a pointer to a live `c_int` of value 1 for the
+/// duration of the call; `optlen` is exactly `size_of::<c_int>()`; the
+/// level/optname pair is the ip(7)-documented `IPPROTO_IP`/`IP_RECVTTL`
+/// (libc constants match every target we build: Linux and macOS).
+/// The call cannot observe the pointer after it returns.
+pub fn arm_v4_recv_ttl(sock: &socket2::Socket) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_RECVTTL,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// One blocking `recvmsg` with a control buffer on a single-hop
+/// listener socket. Returns the payload slice, the received TTL (v4)
+/// or hop limit (v6), and the sender. The two audited unsafe lines
+/// (owner-approved 2026-10-12):
+///
+/// SAFETY (control read): after `recvmsg`, `msg.control_len()` is the
+/// kernel-reported count of INITIALIZED bytes in `ctrl`; the kernel
+/// never writes past the buffer it was handed (truncation sets
+/// MSG_CTRUNC, it never overflows), and `from_raw_parts` reads exactly
+/// that prefix within this function's scope.
+///
+/// SAFETY (payload read): `recvmsg` returns the count of initialized
+/// bytes in the iovec; `slice_assume_init_ref` re-interprets exactly
+/// that prefix. Both slices are consumed only by the safe byte-wise
+/// parsers (`parse_cmsgs`, `received_ttl`, `received_hop_limit`) or
+/// copied out before the buffers are reused.
+pub fn recvmsg_ctl<'a>(
+    sock: &socket2::Socket,
+    buf: &'a mut [std::mem::MaybeUninit<u8>],
+    ctrl: &mut [std::mem::MaybeUninit<u8>],
+    v6: bool,
+) -> io::Result<(&'a [u8], Option<u32>, SocketAddr)> {
+    // A per-family dummy address the kernel fills in: a listener only
+    // ever sees its own family's senders, so the storage always fits.
+    let mut addr: socket2::SockAddr = if v6 {
+        std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()
+    } else {
+        std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let mut iov = [socket2::MaybeUninitSlice::new(buf)];
+    let mut msg = socket2::MsgHdrMut::new()
+        .with_addr(&mut addr)
+        .with_buffers(&mut iov)
+        .with_control(ctrl);
+    let len = sock.recvmsg(&mut msg, 0)?;
+    let clen = msg.control_len();
+    let ctl = unsafe { std::slice::from_raw_parts(ctrl.as_ptr() as *const u8, clen) };
+    let ttl = if v6 {
+        received_hop_limit(ctl)
+    } else {
+        received_ttl(ctl)
+    };
+    let from = addr.as_socket().expect("kernel-filled peer address");
+    let payload = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
+    Ok((payload, ttl, from))
 }
 
 #[cfg(test)]
@@ -802,41 +913,66 @@ mod tests {
     /// The cmsg walk (the safe half of the §5 receive check): a
     /// hop-limit cmsg parses with its big-endian u32, other ancillaries
     /// pass through untouched, and the alignment walk survives a
-    /// padded two-message buffer.
+    /// padded two-message buffer. The goldens build the HOST's native
+    /// `cmsg_len` width (the kernel round-trip tests pin the real one).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const GOLDEN_LEN_SIZE: usize = std::mem::size_of::<usize>();
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const GOLDEN_LEN_SIZE: usize = 4;
+
+    fn put_cmsg_len(buf: &mut Vec<u8>, len: u32) {
+        let raw = (len as usize).to_ne_bytes();
+        buf.extend_from_slice(&raw[..GOLDEN_LEN_SIZE]);
+    }
+
+    fn native_pad(len: usize) -> usize {
+        len.div_ceil(GOLDEN_LEN_SIZE) * GOLDEN_LEN_SIZE
+    }
+
     #[test]
     fn cmsg_parser_walks_the_hop_limit() {
-        // One IPV6_HOPLIMIT cmsg: len 20 (16 hdr + 4 data), level 41,
-        // type 51, data 00 00 00 ff (=255, network order).
-        let mut ctrl = Vec::new();
-        ctrl.extend_from_slice(&20usize.to_ne_bytes());
-        ctrl.extend_from_slice(&41u32.to_ne_bytes());
-        ctrl.extend_from_slice(&51u32.to_ne_bytes());
-        ctrl.extend_from_slice(&[0, 0, 0, 0xff]);
+        // One IPV6_HOPLIMIT cmsg: hdr + 4 data, the HOST's level/type
+        // constants and data byte order (network order on Linux per
+        // RFC 3542, native order on macOS — both pinned empirically by
+        // the kernel round-trip tests).
+        let hop_cmsg = |hl: u32| {
+            let mut ctrl = Vec::new();
+            put_cmsg_len(&mut ctrl, (GOLDEN_LEN_SIZE + 8 + 4) as u32);
+            ctrl.extend_from_slice(&IPPROTO_IPV6_CMSG.to_ne_bytes());
+            ctrl.extend_from_slice(&IPV6_HOPLIMIT_CMSG.to_ne_bytes());
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ctrl.extend_from_slice(&hl.to_be_bytes());
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            ctrl.extend_from_slice(&hl.to_ne_bytes());
+            ctrl
+        };
+        let ctrl = hop_cmsg(255);
         assert_eq!(received_hop_limit(&ctrl), Some(255), "a correct 255 passes");
 
         // Degraded: 254 — the §5 drop case.
-        let mut degraded = ctrl.clone();
-        let last = degraded.len() - 1;
-        degraded[last] = 0xfe;
+        let degraded = hop_cmsg(254);
         assert_eq!(received_hop_limit(&degraded), Some(254));
 
         // Two messages with padding: hoplimit first (len 20 → padded
-        // step 24), then a 16-byte empty one; the walk finds both and
+        // step), then a 16-byte empty one; the walk finds both and
         // does not run off the buffer.
+        let hdr = GOLDEN_LEN_SIZE + 8;
+        let first_len = hdr + 4;
         let mut two = ctrl.clone();
-        two.resize(24, 0); // pad to the alignment boundary
-        two.extend_from_slice(&16usize.to_ne_bytes());
+        two.resize(native_pad(first_len), 0); // pad to the alignment boundary
+        put_cmsg_len(&mut two, hdr as u32);
         two.extend_from_slice(&0u32.to_ne_bytes());
         two.extend_from_slice(&0u32.to_ne_bytes());
         assert_eq!(parse_cmsgs(&two).len(), 2);
         assert_eq!(received_hop_limit(&two), Some(255));
 
         // Truncated and empty buffers parse to nothing.
-        assert!(parse_cmsgs(&ctrl[..10]).is_empty());
+        assert!(parse_cmsgs(&ctrl[..GOLDEN_LEN_SIZE + 4]).is_empty());
         assert!(parse_cmsgs(&[]).is_empty());
         // A cmsg_len below the header size stops the walk (defensive).
         let mut bad = ctrl.clone();
-        bad[..8].copy_from_slice(&4usize.to_ne_bytes());
+        let raw = 4usize.to_ne_bytes();
+        bad[..GOLDEN_LEN_SIZE].copy_from_slice(&raw[..GOLDEN_LEN_SIZE]);
         assert!(parse_cmsgs(&bad).is_empty());
     }
 
@@ -848,9 +984,9 @@ mod tests {
     fn cmsg_parser_walks_the_v4_ttl() {
         let ttl_cmsg = |ttl: u32| {
             let mut ctrl = Vec::new();
-            ctrl.extend_from_slice(&20usize.to_ne_bytes());
-            ctrl.extend_from_slice(&0u32.to_ne_bytes()); // IPPROTO_IP
-            ctrl.extend_from_slice(&2u32.to_ne_bytes()); // IP_TTL
+            put_cmsg_len(&mut ctrl, (GOLDEN_LEN_SIZE + 8 + 4) as u32);
+            ctrl.extend_from_slice(&IPPROTO_IP_CMSG.to_ne_bytes());
+            ctrl.extend_from_slice(&IP_TTL_CMSG.to_ne_bytes());
             ctrl.extend_from_slice(&ttl.to_ne_bytes());
             ctrl
         };
@@ -861,9 +997,9 @@ mod tests {
             Some(63),
             "a routed-looking TTL"
         );
-        // Truncated data (a 1-byte tail) and no cmsg parse to None.
+        // Truncated data (a header-only tail) and no cmsg parse to None.
         let mut short = ttl_cmsg(255);
-        short.truncate(17);
+        short.truncate(GOLDEN_LEN_SIZE + 8);
         assert_eq!(received_ttl(&short), None);
         assert_eq!(received_ttl(&[]), None);
         // The v6 walk ignores the v4 cmsg and vice versa.
@@ -1058,5 +1194,100 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+// --- the audited receive read-back, proven against the real kernel ---
+
+/// A v4 sender/receiver pair on loopback: the sender sets a TTL,
+/// the receiver is armed with IP_RECVTTL and read back through the
+/// audited recvmsg path. Loopback never decrements TTL, so the
+/// sent value is the received value — the §5 drop/pass matrix on
+/// the real kernel (macOS and Linux both deliver the IP_TTL cmsg).
+#[test]
+fn recvmsg_reads_back_the_v4_ttl() {
+    let sender = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let receiver = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap();
+    receiver
+        .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    arm_v4_recv_ttl(&receiver).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let dst = receiver.local_addr().unwrap().as_socket().unwrap();
+
+    let mut payload = [std::mem::MaybeUninit::<u8>::uninit(); 64];
+    let mut ctrl = [std::mem::MaybeUninit::<u8>::uninit(); CTL_BUFSZ];
+
+    for sent in [255u8, 2, 63] {
+        sender.set_ttl(sent as u32).unwrap();
+        sender.send_to(b"probe", dst).unwrap();
+        // Nonblocking: the datagram lands before we read it (the
+        // same thread sent it); a WouldBlock here is a test bug.
+        let (data, ttl, from) = loop {
+            match recvmsg_ctl(&receiver, &mut payload, &mut ctrl, false) {
+                Ok(got) => break got,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("recvmsg failed: {e}"),
+            }
+        };
+        assert_eq!(data, b"probe");
+        assert_eq!(from.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(ttl, Some(sent as u32), "sent TTL {sent} reads back");
+        assert_eq!(single_hop_receive_ok(ttl), sent == 255);
+    }
+}
+
+/// The v6 mirror: IPV6_RECVHOPLIMIT + IPV6_UNICAST_HOPS, read back
+/// through the same audited path (RFC 3542 §6's network-byte-order
+/// u32 in the cmsg — the safe parser's own golden tests cover the
+/// byte order; this pins the kernel end of the loop).
+#[test]
+fn recvmsg_reads_back_the_v6_hop_limit() {
+    let sender = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap();
+    sender
+        .bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    let receiver = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap();
+    receiver
+        .bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    receiver.set_recv_hoplimit_v6(true).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let dst = receiver.local_addr().unwrap().as_socket().unwrap();
+
+    let mut payload = [std::mem::MaybeUninit::<u8>::uninit(); 64];
+    let mut ctrl = [std::mem::MaybeUninit::<u8>::uninit(); CTL_BUFSZ];
+
+    for sent in [255u32, 1] {
+        sender.set_unicast_hops_v6(sent).unwrap();
+        sender.send_to(b"probe", &dst.into()).unwrap();
+        let (_, ttl, _) = loop {
+            match recvmsg_ctl(&receiver, &mut payload, &mut ctrl, true) {
+                Ok(got) => break got,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("recvmsg failed: {e}"),
+            }
+        };
+        assert_eq!(ttl, Some(sent), "sent hop limit {sent} reads back");
+        assert_eq!(single_hop_receive_ok(ttl), sent == 255);
     }
 }
