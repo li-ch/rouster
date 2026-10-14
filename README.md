@@ -19,7 +19,7 @@ first-class subsystem. The reasoning is recorded in
 [docs/architecture.md](docs/architecture.md); the phase plan lives in
 [docs/implementation-plan.md](docs/implementation-plan.md).
 
-## Status — early stage
+## Status — v0.1.0
 
 Phases 0–1.5 of the plan are landed and exercised by a container-based
 smoke suite (`scripts/run-smokes.sh`). What actually runs today:
@@ -54,16 +54,54 @@ smoke suite (`scripts/run-smokes.sh`). What actually runs today:
   from the RIB and config; the IBA/IBB/PBA/PBB validation-mode rule model
   (draft-ietf-savnet-general-sav-capabilities); uRPF-family rule
   generation (RFC 3704/8704); enforcement behind the dataplane trait
-  (an `rp_filter` backend today). Monitor-only by default — drop mode
-  refuses without an explicit opt-in, and spoof-block/legit-pass are
-  exercised with real traffic (`scripts/test-w7-sav.sh`,
+  with two backends (`rp_filter` and nftables —
+  `scripts/test-sav-nft.sh`); event-driven re-evaluation with RFC 8704
+  deletion hysteresis. Monitor-only by default — drop mode refuses
+  without an explicit opt-in, and spoof-block/legit-pass are exercised
+  with real traffic (`scripts/test-w7-sav.sh`,
   `scripts/test-w8-savd.sh`). No general-purpose suite (FRR, BIRD, Holo)
   ships packet-plane SAV today; the plan's §4 has the strategic framing.
+- **native protocol daemons** — all live with real-FRR interop:
+  - **bgpd** (`scripts/test-bgp-*.sh`): RFC 4271 FSM and codec,
+    4-byte AS, MP-BGP v4/v6, route refresh, ADD-PATH both directions,
+    route reflection, route-server mode, graceful restart
+    (helper + restarting speaker, Hard Reset), RFC 7606 revised
+    error handling — and **RPKI from the start**: an RTR client
+    (`rpki` crate, proven against a real gortr cache) feeding
+    RFC 6811 ROV, ASPA verification and RFC 9234 roles/OTC into the
+    decision path, gated by the typed policy engine
+    (`policy` crate, BIRD-cited semantics + an FRR route-map
+    compatibility grammar).
+  - **ospfd** (`scripts/test-ospf*.sh`, `test-ospfv3-*.sh`): the
+    RFC 2328 stack end-to-end — LSA database, flooding, SPF with
+    back-off and partial recompute, broadcast networks and DR
+    election, inter-area summary routes, stub/NSSA areas, Appendix-D
+    authentication (MD5 + HMAC-SHA-256 key chains), virtual links —
+    and **OSPFv3 on the same AF-generic codebase**, reaching Full
+    adjacency with real FRR ospf6d and exchanging routes both ways.
+  - **bfdd** (`scripts/test-bfd-*.sh`): RFC 5880–5883 — the exact
+    state machine, TTL-255 single-hop enforcement on both address
+    families (receive-side, kernel-proven), multihop, echo, and the
+    ZAPI-BFD integration feeding bgpd's fast-down path.
+- **management plane** (Phase 4, opened):
+  - **vtyd** — a vtysh-compatible VTY server (Cisco-style grammar,
+    run-dir show commands, config mode with `write file` applying
+    through configd);
+  - **configd** — the transactional config manager: one canonical
+    `rouster.conf`, structural + per-daemon deep validation
+    (`--validate-config` across the fleet), atomic staged apply with
+    generation tracking, and automatic rollback on daemon failure;
+  - **rousterctl** — the read-only operator CLI over the run-dir
+    contract (`show sav` / `status` / the interface, neighbour and
+    VRF views).
 
-Not there yet, per the plan: native protocol daemons (BFD/BGP in Phase 2,
-OSPF in Phase 3) and the YANG northbound + vtysh shim (Phase 4). Until the
-native daemons exist, the protocol daemons in every interop topology above
-are FRR's — that is the point of building the ZAPI edge first.
+The full suite runs as `scripts/run-smokes.sh` (34 scripts, all
+green in CI on Linux); the gate is `cargo fmt --check` + `clippy -D
+warnings` + 1400+ tests.
+
+Still ahead per the plan: IS-IS and the Phase-5 breadth, the YANG
+northbound, and BAR-SAV allowlist derivation on top of the BGP/RPKI
+data.
 
 ## Quickstart
 
