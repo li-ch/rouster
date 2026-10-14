@@ -218,10 +218,31 @@ announced to that peer are not modified"). v1 semantics:
   its End-of-RIB marker (v4: the bare minimum UPDATE; MP: an empty
   MP_UNREACH — sent unconditionally, RFC 4724 §3 recommends EOR
   generally; a restarting session's marker follows its deferred dump).
+- **Graceful Notification (RFC 8538, B-7)**: the N bit — "The second
+  most significant bit is defined in this document as the Graceful
+  Notification ('N') bit" (§2) — rides every GR capability bgpd
+  advertises. Receive side (§4.1): a NOTIFICATION from an N-advertising
+  peer that is not a Hard Reset is a graceful close — the peer's
+  routes are retained marked stale, swept by the existing §4.2
+  machinery (re-establishment flush, the restart timer). A Hard
+  Reset — Cease subcode 9 whose data portion carries the encapsulated
+  reason `ErrCode | Subcode | Data` (§3.1) — is §3.2's exception: the
+  speaker "MUST terminate the BGP session following the standard
+  procedures in [RFC4271]" (the plain delete). Send side (§5.1's
+  table): toward an N peer the permanent Cease reasons (1 Max
+  Prefixes, 2 Administrative Shutdown, 3 Peer De-configured) are sent
+  as a Hard Reset wrapping the reason (our SIGTERM/ManualStop lands
+  here); transient Cease subcodes 5-8 ride plain ("Graceful Cease");
+  Administrative Reset (4) is the table's "user control" row — v1
+  sends it plain, a knob waits for a user; non-Cease error codes are
+  never wrapped ("use of Hard Reset does not appear to be
+  indicated"). A peer without the N bit changes nothing (the RFC 4724
+  §4.2 deliberate close).
 - §Deferred: per-family F-bit granularity (v1 treats the family
   presence + R bit coarsely; the deferral ends at the FIRST family's
   EOR), the RFC 8542 long-lived stale timers, BFD-triggered early
-  flush, cross-process restart persistence.
+  flush, cross-process restart persistence, the RFC 8538 subcode-4
+  user-control knob.
 
 ### ADD-PATH receive (N5B, RFC 7911)
 

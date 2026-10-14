@@ -249,15 +249,18 @@ impl BgpOpen {
 
     /// The peer's Graceful Restart capability (RFC 4724 §3),
     /// flattened to the receiving-speaker facts: the Restart State
-    /// (R) bit and the 12-bit Restart Time.
+    /// (R) bit, the 12-bit Restart Time, and RFC 8538 §2's Graceful
+    /// Notification (N) bit.
     pub fn graceful_restart(&self) -> Option<crate::fsm::GracefulRestartInfo> {
         self.capabilities.iter().find_map(|c| match c {
             Capability::GracefulRestart {
                 restart_state,
+                graceful_notification,
                 restart_time,
                 ..
             } => Some(crate::fsm::GracefulRestartInfo {
                 restart_state: *restart_state,
+                graceful_notification: *graceful_notification,
                 restart_time: *restart_time,
             }),
             _ => None,
@@ -817,6 +820,77 @@ impl BgpNotification {
             code: error::error_code::CEASE,
             subcode,
             data: Vec::new(),
+        }
+    }
+
+    /// A Hard Reset (RFC 8538 §3): a Cease NOTIFICATION with the Hard
+    /// Reset subcode (9) whose data portion "carries an encapsulated
+    /// NOTIFICATION" — the reason for the reset. §3.1's wire form:
+    /// `ErrCode(1) | Subcode(1) | Data(variable)` — the encapsulated
+    /// notification's code, subcode, and data in that order.
+    pub fn hard_reset(reason: &Self) -> Self {
+        let mut data = Vec::with_capacity(2 + reason.data.len());
+        data.push(reason.code);
+        data.push(reason.subcode);
+        data.extend_from_slice(&reason.data);
+        Self {
+            code: error::error_code::CEASE,
+            subcode: error::cease_subcode::HARD_RESET,
+            data,
+        }
+    }
+
+    /// Whether this is a Hard Reset (RFC 8538 §3: Cease with subcode
+    /// 9) — the one NOTIFICATION class a receiving speaker must
+    /// answer with the plain RFC 4271 session termination (§3.2:
+    /// "Whenever a BGP speaker receives a Hard Reset, the speaker
+    /// MUST terminate the BGP session following the standard
+    /// procedures in [RFC4271]").
+    pub fn is_hard_reset(&self) -> bool {
+        self.code == error::error_code::CEASE && self.subcode == error::cease_subcode::HARD_RESET
+    }
+
+    /// The encapsulated reason of a Hard Reset (RFC 8538 §3.1), when
+    /// the data portion actually carries one — a Hard Reset with a
+    /// truncated body (no two leading octets) logs as reason-less
+    /// rather than failing the session.
+    pub fn hard_reset_reason(&self) -> Option<Self> {
+        if !self.is_hard_reset() || self.data.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            code: self.data[0],
+            subcode: self.data[1],
+            data: self.data[2..].to_vec(),
+        })
+    }
+
+    /// RFC 8538 §5.1's suggested send-side classification, row by
+    /// row (the table's own caveat: "These suggestions are only
+    /// that -- suggestions, not requirements"): toward a peer whose
+    /// Graceful Restart capability carried the N bit, the permanent
+    /// Cease reasons — Maximum Number of Prefixes Reached (1),
+    /// Administrative Shutdown (2), Peer De-configured (3), and a
+    /// Hard Reset reason itself (9) — are sent AS a Hard Reset
+    /// wrapping the reason; the transient Cease subcodes 5-8 are a
+    /// "Graceful Cease" (the notification rides plain, letting the
+    /// peer retain); Administrative Reset (4) is listed as "user
+    /// control" — v1 sends it plain (graceful; a knob can come with
+    /// the first user who wants the hard shape). Non-Cease error
+    /// codes are never wrapped: §5.1 notes "use of Hard Reset does
+    /// not appear to be indicated" for them. Toward a peer that did
+    /// not offer the N bit, every notification rides plain — an
+    /// RFC 4486-only speaker has no Hard Reset semantics.
+    pub fn wrapped_for_n_peer(&self, n_exchanged: bool) -> Self {
+        if !n_exchanged || self.code != error::error_code::CEASE {
+            return self.clone();
+        }
+        match self.subcode {
+            error::cease_subcode::MAX_PREFIXES
+            | error::cease_subcode::ADMIN_SHUTDOWN
+            | error::cease_subcode::PEER_DECONFIGURED
+            | error::cease_subcode::HARD_RESET => Self::hard_reset(self),
+            _ => self.clone(),
         }
     }
 
@@ -1578,6 +1652,113 @@ mod tests {
             BgpMessage::decode(&frame, false).unwrap(),
             BgpMessage::Notification(n)
         );
+    }
+
+    /// RFC 8538 §3.1's Hard Reset wire form: Cease (6) with subcode 9
+    /// and "an encapsulated NOTIFICATION" in the data portion —
+    /// `ErrCode(1) | Subcode(1) | Data` of the reason. A reason
+    /// carrying its own data (RFC 4486 subcode 1's prefix limit)
+    /// keeps it after the two leading octets.
+    #[test]
+    fn hard_reset_wire_format_and_round_trip() {
+        let reason = BgpNotification {
+            code: 6,
+            subcode: error::cease_subcode::ADMIN_SHUTDOWN,
+            data: vec![],
+        };
+        let hr = BgpNotification::hard_reset(&reason);
+        assert!(hr.is_hard_reset());
+        assert_eq!(hr.code, 6);
+        assert_eq!(hr.subcode, error::cease_subcode::HARD_RESET);
+        assert_eq!(hr.data, vec![6, 2]);
+        // frame tail: length 23, type 3, 6, 9, 6, 2.
+        let frame = BgpMessage::Notification(hr.clone()).encode(false).unwrap();
+        assert_eq!(&frame[16..], &[0, 23, 3, 6, 9, 6, 2]);
+        let back = match BgpMessage::decode(&frame, false).unwrap() {
+            BgpMessage::Notification(n) => n,
+            other => panic!("{other:?}"),
+        };
+        assert!(back.is_hard_reset());
+        let unwrapped = back.hard_reset_reason().unwrap();
+        assert_eq!((unwrapped.code, unwrapped.subcode), (6, 2));
+
+        // A reason with data: RFC 4486 subcode 1 carries the limit.
+        let maxpfx = BgpNotification {
+            code: 6,
+            subcode: error::cease_subcode::MAX_PREFIXES,
+            data: vec![0x00, 0x0c, 0x00, 0x00],
+        };
+        let hr = BgpNotification::hard_reset(&maxpfx);
+        assert_eq!(hr.data, vec![6, 1, 0x00, 0x0c, 0x00, 0x00]);
+        let unwrapped = hr.hard_reset_reason().unwrap();
+        assert_eq!((unwrapped.code, unwrapped.subcode), (6, 1));
+        assert_eq!(unwrapped.data, vec![0x00, 0x0c, 0x00, 0x00]);
+
+        // A truncated reason body logs as reason-less, never panics.
+        let bare = BgpNotification {
+            code: 6,
+            subcode: error::cease_subcode::HARD_RESET,
+            data: vec![6],
+        };
+        assert!(bare.is_hard_reset());
+        assert!(bare.hard_reset_reason().is_none());
+        // And a plain Cease is not a Hard Reset.
+        assert!(!reason.is_hard_reset());
+        assert!(reason.hard_reset_reason().is_none());
+    }
+
+    /// RFC 8538 §5.1's table, row by row, plus the two global rules:
+    /// toward a peer that did not offer the N bit nothing is wrapped,
+    /// and non-Cease error codes are never wrapped ("use of Hard
+    /// Reset does not appear to be indicated"). Subcode 4
+    /// (Administrative Reset) is the table's "user control" row — v1
+    /// sends it plain (graceful).
+    #[test]
+    fn rfc8538_send_classification_table() {
+        let table = [
+            (1u8, true), // Maximum Number of Prefixes Reached
+            (2, true),   // Administrative Shutdown
+            (3, true),   // Peer De-configured
+            (4, false),  // Administrative Reset — user control (v1: plain)
+            (5, false),  // Connection Rejected
+            (6, false),  // Other Configuration Change
+            (7, false),  // Connection Collision Resolution
+            (8, false),  // Out of Resources
+        ];
+        for (subcode, expect_hard) in table {
+            let plain = BgpNotification::cease(subcode);
+            let sent = plain.wrapped_for_n_peer(true);
+            assert_eq!(
+                sent.is_hard_reset(),
+                expect_hard,
+                "Cease/{subcode} wrapped={} expected={expect_hard}",
+                sent.is_hard_reset()
+            );
+            if expect_hard {
+                let reason = sent.hard_reset_reason().unwrap();
+                assert_eq!((reason.code, reason.subcode), (6, subcode));
+            } else {
+                assert_eq!(sent, plain);
+            }
+            // Without the N bit: everything rides plain.
+            assert_eq!(plain.wrapped_for_n_peer(false), plain);
+        }
+        // Non-Cease codes are never wrapped, N bit or not.
+        for (code, subcode) in [
+            (1u8, 3u8), // Message Header / Bad Message Type
+            (2, 2),     // OPEN / Bad Peer AS
+            (3, 11),    // UPDATE / Malformed AS_PATH
+            (4, 0),     // Hold Timer Expired
+            (5, 0),     // Finite State Machine
+        ] {
+            let plain = BgpNotification {
+                code,
+                subcode,
+                data: vec![],
+            };
+            assert_eq!(plain.wrapped_for_n_peer(true), plain);
+            assert!(!plain.is_hard_reset());
+        }
     }
 
     #[test]

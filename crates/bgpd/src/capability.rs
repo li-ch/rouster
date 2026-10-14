@@ -51,8 +51,12 @@ pub enum Capability {
     /// followed by up to 63 `<AFI(2), SAFI(1), Flags(1)>` triples
     /// whose top flag bit is the per-family Forwarding State (F)
     /// bit. An empty family list = receiving-side support only.
+    /// RFC 8538 §2 defines the second-most-significant Restart Flags
+    /// bit as the Graceful Notification ("N") bit — "used to indicate
+    /// Graceful Restart support for BGP NOTIFICATION messages".
     GracefulRestart {
         restart_state: bool,
+        graceful_notification: bool,
         restart_time: u16,
         families: Vec<(u16, u8, bool)>,
     },
@@ -92,10 +96,13 @@ impl Capability {
             Self::FourOctetAsNumber { asn } => out.extend_from_slice(&asn.to_be_bytes()),
             Self::GracefulRestart {
                 restart_state,
+                graceful_notification,
                 restart_time,
                 families,
             } => {
-                let restart = (*restart_state as u16) << 15 | (restart_time & 0x0fff);
+                let restart = (*restart_state as u16) << 15
+                    | (*graceful_notification as u16) << 14
+                    | (restart_time & 0x0fff);
                 out.extend_from_slice(&restart.to_be_bytes());
                 for (afi, safi, forwarding) in families {
                     out.extend_from_slice(&afi.to_be_bytes());
@@ -209,6 +216,7 @@ pub fn decode_capabilities(buf: &[u8]) -> BgpResult<Vec<Capability>> {
                 }
                 Capability::GracefulRestart {
                     restart_state: restart & 0x8000 != 0,
+                    graceful_notification: restart & 0x4000 != 0,
                     restart_time: restart & 0x0fff,
                     families,
                 }
@@ -321,6 +329,7 @@ mod tests {
     fn graceful_restart_capability_wire_format() {
         let cap = Capability::GracefulRestart {
             restart_state: true,
+            graceful_notification: false,
             restart_time: 120,
             families: vec![(1, 1, true), (2, 1, false)],
         };
@@ -337,6 +346,7 @@ mod tests {
         // No restart bit, no families (receive-only speaker).
         let bare = Capability::GracefulRestart {
             restart_state: false,
+            graceful_notification: false,
             restart_time: 90,
             families: vec![],
         };
@@ -344,6 +354,38 @@ mod tests {
         encode_capabilities(std::slice::from_ref(&bare), &mut buf);
         assert_eq!(buf, vec![64, 2, 0x00, 0x5a]);
         assert_eq!(decode_capabilities(&buf).unwrap(), vec![bare]);
+    }
+
+    /// RFC 8538 §2: "The second most significant bit is defined in
+    /// this document as the Graceful Notification ('N') bit" of the
+    /// Restart Flags — bit 14 of the 2-octet field, between the R bit
+    /// (15) and the 12-bit Restart Time. The golden bytes pin its
+    /// position on the wire both alone and under the R bit.
+    #[test]
+    fn graceful_restart_n_bit_wire_format() {
+        // N set, R clear: 0x4000 | 120 = 0x4078.
+        let n = Capability::GracefulRestart {
+            restart_state: false,
+            graceful_notification: true,
+            restart_time: 120,
+            families: vec![],
+        };
+        let mut buf = Vec::new();
+        encode_capabilities(std::slice::from_ref(&n), &mut buf);
+        assert_eq!(buf, vec![64, 2, 0x40, 0x78]);
+        assert_eq!(decode_capabilities(&buf).unwrap(), vec![n]);
+
+        // R and N both set: 0xC000 | 90 = 0xC05A.
+        let rn = Capability::GracefulRestart {
+            restart_state: true,
+            graceful_notification: true,
+            restart_time: 90,
+            families: vec![],
+        };
+        let mut buf = Vec::new();
+        encode_capabilities(std::slice::from_ref(&rn), &mut buf);
+        assert_eq!(buf, vec![64, 2, 0xc0, 0x5a]);
+        assert_eq!(decode_capabilities(&buf).unwrap(), vec![rn]);
     }
 
     /// RFC 7911 §4: the ADD-PATH capability tuples. One family rides

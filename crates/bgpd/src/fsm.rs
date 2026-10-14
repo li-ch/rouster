@@ -203,10 +203,13 @@ pub struct Negotiated {
 
 /// The RFC 4724 §3 facts a receiving speaker needs from the peer's
 /// capability: whether the peer restarted (R) and how long its routes
-/// may be retained (Restart Time, seconds).
+/// may be retained (Restart Time, seconds). RFC 8538 §2 adds the
+/// Graceful Notification (N) bit — the peer supports NOTIFICATION
+/// messages inside the graceful-restart procedures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GracefulRestartInfo {
     pub restart_state: bool,
+    pub graceful_notification: bool,
     pub restart_time: u16,
 }
 
@@ -917,6 +920,7 @@ mod tests {
             "10.9.9.9".parse().unwrap(),
             vec![crate::capability::Capability::GracefulRestart {
                 restart_state: true,
+                graceful_notification: true,
                 restart_time: 150,
                 families: vec![(1, 1, true)],
             }],
@@ -928,6 +932,7 @@ mod tests {
             f.negotiated().unwrap().graceful_restart,
             Some(crate::fsm::GracefulRestartInfo {
                 restart_state: true,
+                graceful_notification: true,
                 restart_time: 150
             })
         );

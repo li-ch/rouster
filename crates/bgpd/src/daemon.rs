@@ -770,6 +770,7 @@ mod tests {
         let helper = Some(GracefulRestartRole::Helper);
         let gr = Some(crate::fsm::GracefulRestartInfo {
             restart_state: false,
+            graceful_notification: false,
             restart_time: 30,
         });
         let lost = SessionEnd::Transport("connection reset".into());

@@ -461,10 +461,15 @@ where
     /// unicast families with the Forwarding bit clear (v1 does not
     /// claim forwarding-state preservation for families beyond the
     /// memory-only RIB's reach — F-bit granularity is §Deferred).
+    /// The Graceful Notification (N) bit rides every capability we
+    /// advertise (RFC 8538 §2): bgpd implements §3.1/§3.2/§4.1, so
+    /// it can both send and receive NOTIFICATIONs under the
+    /// graceful-restart procedures.
     pub fn with_graceful_restart(mut self, restart_time: u16) -> Self {
         self.gr_advertise = Some(restart_time);
         self.advertise.push(Capability::GracefulRestart {
             restart_state: false,
+            graceful_notification: true,
             restart_time,
             families: vec![(1, 1, false), (2, 1, false)],
         });
@@ -975,17 +980,40 @@ where
                 self.step(Event::UpdateMsg, sink).await
             }
             BgpMessage::Notification(n) => {
+                let hard = n.is_hard_reset();
+                // RFC 8538 §4: "if a BGP speaker has received the 'N'
+                // bit from a peer" and receives a NOTIFICATION that is
+                // not a Hard Reset, it follows the Receiving Speaker
+                // rules (§4.1: "MUST retain the routes received from
+                // the peer ... MUST mark them as stale routing
+                // information"). A Hard Reset is the exception (§3.2:
+                // "Whenever a BGP speaker receives a Hard Reset, the
+                // speaker MUST terminate the BGP session following the
+                // standard procedures in [RFC4271]" — the RFC 4271
+                // delete). Without the N bit the RFC 4724 §4.2 rule
+                // stands: a peer-chosen close is deliberate, no
+                // retention.
+                let n_exchanged = self
+                    .gr_negotiated
+                    .is_some_and(|gr| gr.graceful_notification);
+                if hard || !n_exchanged {
+                    self.gr_hard_clear = true;
+                }
+                if hard {
+                    info!(
+                        reason = ?n.hard_reset_reason().map(|r| (r.code, r.subcode)),
+                        peer = %self.peer.address,
+                        "bgpd: Hard Reset received (RFC 8538 §3.2), terminating per RFC 4271"
+                    );
+                }
                 info!(
                     code = n.code,
                     subcode = n.subcode,
+                    graceful = n_exchanged && !hard,
                     peer = %self.peer.address,
                     "bgpd: NOTIFICATION received"
                 );
                 let actions = self.fsm.fire(Event::NotifMsg);
-                // A received NOTIFICATION is a deliberate close — no
-                // graceful-restart retention (RFC 4724 §4.2 deletes
-                // on a peer-chosen close).
-                self.gr_hard_clear = true;
                 let _ = self.perform_all(actions, sink).await;
                 #[cfg(feature = "experimental-savnet")]
                 self.sav_adjacency_down();
@@ -1111,16 +1139,31 @@ where
                 self.write_message(&BgpMessage::Keepalive).await?;
             }
             Action::Notify(code, subcode) => {
-                let notification = BgpNotification {
+                let plain = BgpNotification {
                     code,
                     subcode,
                     data: Vec::new(),
                 };
+                // RFC 8538 §5.1's send-side classification (toward an
+                // N-bit peer only): the permanent Cease reasons ride as
+                // a Hard Reset wrapping the reason; everything else —
+                // transient Cease subcodes, wire-error codes ("use of
+                // Hard Reset does not appear to be indicated") — goes
+                // plain. A graceful close of an N session lets the
+                // peer retain our routes per §4.1.
+                let n_exchanged = self
+                    .gr_negotiated
+                    .is_some_and(|gr| gr.graceful_notification);
+                let notification = plain.wrapped_for_n_peer(n_exchanged);
                 info!(
-                    code, subcode, peer = %self.peer.address,
+                    code, subcode, hard_reset = notification.is_hard_reset(),
+                    peer = %self.peer.address,
                     "bgpd: sending NOTIFICATION"
                 );
-                self.end = Some(SessionEnd::Notified(code, subcode));
+                self.end = Some(SessionEnd::Notified(
+                    notification.code,
+                    notification.subcode,
+                ));
                 self.write_message(&BgpMessage::Notification(notification))
                     .await?;
                 let _ = self.io.shutdown().await;
@@ -2546,13 +2589,19 @@ mod tests {
     // ---- RFC 4724 graceful restart at the session (N5 M3) -------
 
     /// A speaking partner that advertises the GR capability.
-    fn gr_open(asn: u32, restart_state: bool, restart_time: u16) -> BgpOpen {
+    fn gr_open(
+        asn: u32,
+        restart_state: bool,
+        graceful_notification: bool,
+        restart_time: u16,
+    ) -> BgpOpen {
         BgpOpen::new(
             asn,
             30,
             "10.9.9.9".parse().unwrap(),
             vec![Capability::GracefulRestart {
                 restart_state,
+                graceful_notification,
                 restart_time,
                 families: vec![(1, 1, true)],
             }],
@@ -2579,7 +2628,7 @@ mod tests {
             let _ = BgpMessage::decode(&frame, true).unwrap();
             write_bytes(
                 &mut theirs,
-                &BgpMessage::Open(gr_open(65001, false, 30))
+                &BgpMessage::Open(gr_open(65001, false, false, 30))
                     .encode(true)
                     .unwrap(),
             )
@@ -2623,7 +2672,7 @@ mod tests {
             let _ = BgpMessage::decode(&frame, true).unwrap();
             write_bytes(
                 &mut theirs,
-                &BgpMessage::Open(gr_open(65001, true, 30))
+                &BgpMessage::Open(gr_open(65001, true, false, 30))
                     .encode(true)
                     .unwrap(),
             )
@@ -2670,7 +2719,7 @@ mod tests {
             let _ = BgpMessage::decode(&frame, true).unwrap();
             write_bytes(
                 &mut theirs,
-                &BgpMessage::Open(gr_open(65001, false, 30))
+                &BgpMessage::Open(gr_open(65001, false, false, 30))
                     .encode(true)
                     .unwrap(),
             )
@@ -2692,7 +2741,7 @@ mod tests {
             let _ = BgpMessage::decode(&frame, true).unwrap();
             write_bytes(
                 &mut theirs,
-                &BgpMessage::Open(gr_open(65001, false, 30))
+                &BgpMessage::Open(gr_open(65001, false, false, 30))
                     .encode(true)
                     .unwrap(),
             )
@@ -2710,6 +2759,187 @@ mod tests {
             }
             theirs.shutdown().await.unwrap();
             let _ = driver.await.unwrap();
+        }
+    }
+
+    // ---- RFC 8538 graceful notification (B-7, S8-a) ----------------
+
+    /// The shared harness leg: establish with a peer whose OPEN
+    /// carries the GR capability (N set per `n`), learn one route.
+    async fn n_session_established_with_route(theirs: &mut tokio::io::DuplexStream, n: bool) {
+        let frame = read_bytes(theirs).await;
+        let _ = BgpMessage::decode(&frame, true).unwrap();
+        write_bytes(
+            theirs,
+            &BgpMessage::Open(gr_open(65001, false, n, 30))
+                .encode(true)
+                .unwrap(),
+        )
+        .await;
+        let _ = read_bytes(theirs).await; // our KEEPALIVE
+        write_bytes(theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+        let update = BgpMessage::Update(BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+            ],
+            nlri: vec!["203.0.113.0/24".parse().unwrap()],
+        });
+        write_bytes(theirs, &update.encode(true).unwrap()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    /// RFC 8538 §4/§4.1: a NOTIFICATION received over a session whose
+    /// peer advertised the N bit — and that is not a Hard Reset — is a
+    /// GRACEFUL close: the Receiving Speaker rules retain the peer's
+    /// routes marked stale instead of the RFC 4724 §4.2 deliberate
+    /// delete. The restart-timer flush (daemon side) sweeps them if
+    /// the peer never returns.
+    #[tokio::test]
+    async fn graceful_notification_retains_stale() {
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let (ours, mut theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        n_session_established_with_route(&mut theirs, true).await;
+        // A transient Cease (6/7, Collision Resolution — §5.1's
+        // "Graceful Cease" row) from the N-bit peer.
+        write_bytes(
+            &mut theirs,
+            &BgpMessage::Notification(BgpNotification::cease(
+                error::cease_subcode::COLLISION_RESOLUTION_FAILURE,
+            ))
+            .encode(true)
+            .unwrap(),
+        )
+        .await;
+        let end = driver.await.unwrap();
+        assert!(matches!(
+            end,
+            SessionEnd::PeerNotified {
+                code: 6,
+                subcode: 7
+            }
+        ));
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.retained, 1, "routes retained stale (RFC 8538 §4.1)");
+        assert_eq!(sink.cleared, 0, "no RFC 4271 delete on a graceful close");
+    }
+
+    /// RFC 8538 §3.2: "Whenever a BGP speaker receives a Hard Reset,
+    /// the speaker MUST terminate the BGP session following the
+    /// standard procedures in [RFC4271]" — the routes are deleted even
+    /// though the N bit was exchanged (the encapsulated reason rides
+    /// along for the log).
+    #[tokio::test]
+    async fn hard_reset_received_hard_clears() {
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let (ours, mut theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        n_session_established_with_route(&mut theirs, true).await;
+        let hard = BgpNotification::hard_reset(&BgpNotification::cease(
+            error::cease_subcode::ADMIN_SHUTDOWN,
+        ));
+        write_bytes(
+            &mut theirs,
+            &BgpMessage::Notification(hard).encode(true).unwrap(),
+        )
+        .await;
+        let end = driver.await.unwrap();
+        assert!(matches!(
+            end,
+            SessionEnd::PeerNotified {
+                code: 6,
+                subcode: 9
+            }
+        ));
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.cleared, 1, "RFC 4271 delete (Hard Reset)");
+        assert_eq!(sink.retained, 0);
+    }
+
+    /// The same notification WITHOUT the N bit stays the RFC 4724
+    /// §4.2 deliberate close (B-7 changes nothing for a 4724-only
+    /// peer).
+    #[tokio::test]
+    async fn notification_without_n_bit_still_hard_clears() {
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let (ours, mut theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        n_session_established_with_route(&mut theirs, false).await;
+        write_bytes(
+            &mut theirs,
+            &BgpMessage::Notification(BgpNotification::cease(
+                error::cease_subcode::COLLISION_RESOLUTION_FAILURE,
+            ))
+            .encode(true)
+            .unwrap(),
+        )
+        .await;
+        let _ = driver.await.unwrap();
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.cleared, 1, "no N bit: the RFC 4724 delete stands");
+        assert_eq!(sink.retained, 0);
+    }
+
+    /// Send side (§5.1 + §3.1): our ManualStop's Administrative
+    /// Shutdown (Cease/2 — a "Hard Reset" table row) rides toward an
+    /// N-bit peer as Cease/9 wrapping the reason; toward a 4724-only
+    /// peer it stays the plain Cease/2.
+    #[tokio::test]
+    async fn manual_stop_wraps_shutdown_only_for_n_peer() {
+        for n_peer in [true, false] {
+            let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+            let (ours, mut theirs) = duplex(8192);
+            let mut sess = session(ours, 65001, None);
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let (_refresh_tx, refresh_rx) = tokio::sync::watch::channel(0u64);
+            let mut driver_sink = sink.clone();
+            let driver = tokio::spawn(async move {
+                sess.run_with_signals(&mut driver_sink, stop_rx, refresh_rx)
+                    .await
+            });
+            n_session_established_with_route(&mut theirs, n_peer).await;
+            stop_tx.send(true).unwrap();
+            // Skip past the initial dump's EOR markers to the Cease.
+            let mut notified = None;
+            for _ in 0..8 {
+                let frame = read_bytes(&mut theirs).await;
+                if let BgpMessage::Notification(n) = BgpMessage::decode(&frame, true).unwrap() {
+                    notified = Some(n);
+                    break;
+                }
+            }
+            let notified = notified.expect("expected NOTIFICATION");
+            if n_peer {
+                assert_eq!((notified.code, notified.subcode), (6, 9), "Hard Reset");
+                let reason = notified.hard_reset_reason().unwrap();
+                assert_eq!(
+                    (reason.code, reason.subcode),
+                    (6, error::cease_subcode::ADMIN_SHUTDOWN)
+                );
+            } else {
+                assert_eq!(
+                    (notified.code, notified.subcode),
+                    (6, error::cease_subcode::ADMIN_SHUTDOWN),
+                    "plain Cease toward a 4724-only peer"
+                );
+                assert!(!notified.is_hard_reset());
+            }
+            let end = driver.await.unwrap();
+            assert!(matches!(end, SessionEnd::ManualStop));
+            // Our own ManualStop is a deliberate close of our side —
+            // the received routes are deleted, never retained.
+            let sink = sink.0.lock().unwrap();
+            assert_eq!(sink.cleared, 1);
+            assert_eq!(sink.retained, 0);
         }
     }
 
@@ -2745,7 +2975,8 @@ mod tests {
         let mut sink = NullSink;
         let driver = tokio::spawn(async move { sess.run(&mut sink).await });
 
-        // Our OPEN carries capability 64 with time 120, R clear.
+        // Our OPEN carries capability 64 with time 120, R clear, N set
+        // (RFC 8538 §2 — every GR capability bgpd advertises).
         let frame = read_bytes(&mut theirs).await;
         let open = match BgpMessage::decode(&frame, true).unwrap() {
             BgpMessage::Open(o) => o,
@@ -2754,6 +2985,7 @@ mod tests {
         assert!(
             open.capabilities.contains(&Capability::GracefulRestart {
                 restart_state: false,
+                graceful_notification: true,
                 restart_time: 120,
                 families: vec![(1, 1, false), (2, 1, false)],
             }),
@@ -2810,7 +3042,8 @@ mod tests {
         let mut sink = NullSink;
         let driver = tokio::spawn(async move { sess.run(&mut sink).await });
 
-        // Our OPEN: the GR capability with the R bit SET (§4.1).
+        // Our OPEN: the GR capability with the R bit SET (§4.1) — and
+        // the N bit survives the rewrite (8538 §2).
         let frame = read_bytes(&mut theirs).await;
         let open = match BgpMessage::decode(&frame, true).unwrap() {
             BgpMessage::Open(o) => o,
@@ -2819,6 +3052,7 @@ mod tests {
         assert!(
             open.capabilities.contains(&Capability::GracefulRestart {
                 restart_state: true,
+                graceful_notification: true,
                 restart_time: 120,
                 families: vec![(1, 1, false), (2, 1, false)],
             }),
@@ -2998,20 +3232,30 @@ mod tests {
             let keepalive = BgpMessage::Keepalive.encode(true).unwrap();
             theirs.write_all(&keepalive).await.unwrap();
 
-            // One UPDATE: announce 203.0.113.0/24 via 192.0.2.9 and
-            // withdraw 198.51.100.0/24.
-            let update = BgpMessage::Update(BgpUpdate {
-                withdrawn: vec!["198.51.100.0/24".parse().unwrap()],
-                attrs: vec![
-                    PathAttribute::Origin(Origin::Igp),
-                    PathAttribute::AsPath(AsPath::sequence([65001])),
-                    PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
-                ],
+            // Two UPDATEs (RFC 7606 §5.1: one route container each —
+            // B-4's encode guard rejects the mixed frame): announce
+            // 203.0.113.0/24 via 192.0.2.9, then withdraw
+            // 198.51.100.0/24.
+            let attrs = vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+            ];
+            let announce = BgpMessage::Update(BgpUpdate {
+                attrs,
                 nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
             })
             .encode(true)
             .unwrap();
-            theirs.write_all(&update).await.unwrap();
+            theirs.write_all(&announce).await.unwrap();
+            let withdraw = BgpMessage::Update(BgpUpdate {
+                withdrawn: vec!["198.51.100.0/24".parse().unwrap()],
+                ..Default::default()
+            })
+            .encode(true)
+            .unwrap();
+            theirs.write_all(&withdraw).await.unwrap();
 
             // Teardown by NOTIFICATION (Cease): adjacency down fires.
             let notification = BgpMessage::Notification(BgpNotification::cease(3))

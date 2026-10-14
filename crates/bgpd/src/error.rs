@@ -53,6 +53,12 @@ pub mod cease_subcode {
     /// RFC 4486: "the BGP speaker decided to drop the connection due
     /// to collision resolution" (RFC 4271 §6.8).
     pub const COLLISION_RESOLUTION_FAILURE: u8 = 7;
+    /// RFC 8538 §3, the Hard Reset subcode: "This document defines a
+    /// new subcode for BGP Cease NOTIFICATION messages, called the
+    /// Hard Reset subcode". Its data portion carries an encapsulated
+    /// NOTIFICATION — the reason for the reset (§3.1: ErrCode,
+    /// Subcode, then that notification's data).
+    pub const HARD_RESET: u8 = 9;
 }
 
 /// A codec or protocol error. `notification` holds the (code, subcode)
