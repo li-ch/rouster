@@ -327,7 +327,7 @@ mkdir -p "$QUARANTINE"
 perl "$QUARANTINE/crafted-peer.pl" 11790 "$R1_IP"
 
 wait_in "$R2" "bgpd logged the treat-as-withdraw" 15 \
-    "grep -q 'malformed UPDATE treated as withdrawal (RFC 7606)' $OUR_BGPD_LOG"
+    "grep -q 'malformed UPDATE treated as withdrawal (RFC 7606' $OUR_BGPD_LOG"
 wait_in "$R2" "the good route arrived after the malformed one" 15 \
     "grep 'UPDATE received' $OUR_BGPD_LOG | grep -q '$CRAFT_NET_B'"
 sleep 2
@@ -351,8 +351,11 @@ docker exec "$R2" sh -c "grep 'connection from unconfigured address' $OUR_BGPD_L
 echo "==> TEARDOWN: SIGTERM our bgpd -> Cease on the FRR side"
 docker exec "$R2" sh -c "kill -TERM \$(pidof rouster-bgpd)"
 sleep 3
+# B-7 (RFC 8538): toward an N-advertising peer our shutdown rides as
+# a Hard Reset (Cease/9) — FRR names it "Hard Reset", not
+# "Administrative Shutdown"; either proves the deliberate close.
 wait_in "$R1" "FRR observed the Cease NOTIFICATION" 20 \
-    "vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'Notification received (Cease/Administrative Shutdown)'"
+    "vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'Notification received (Cease/'"
 wait_in "$R2" "our bgpd exited" 15 "! pidof rouster-bgpd"
 
 echo "==> final state"

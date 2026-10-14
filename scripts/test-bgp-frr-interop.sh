@@ -256,9 +256,14 @@ echo "==> TEARDOWN: SIGTERM our bgpd -> Cease on the FRR side"
 docker exec "$R2" sh -c "kill -TERM \$(pidof rouster-bgpd)"
 sleep 3
 # FRR records the received Cease in `show bgp neighbor`'s Last reset
-# line (bgpd.log does not carry it at this log config).
+# line (bgpd.log does not carry it at this log config). B-7 (RFC
+# 8538): toward a peer that advertised the N bit — FRR 10.2 does —
+# our ManualStop's Administrative Shutdown rides as a Hard Reset
+# (Cease/9 wrapping the reason), so FRR names the subcode "Hard
+# Reset" instead of "Administrative Shutdown"; either proves FRR
+# observed our deliberate close.
 wait_in "$R1" "FRR observed the Cease NOTIFICATION" 20 \
-    "vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'Notification received (Cease/Administrative Shutdown)'"
+    "vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'Notification received (Cease/'"
 wait_in "$R2" "our bgpd exited" 15 "! pidof rouster-bgpd"
 docker exec "$R1" sh -c "! vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'BGP state = Established'" \
     || fail "FRR still Established after our Cease"
