@@ -396,6 +396,19 @@ Maps" summary table:
    together is a parse error); a lone `any` token names a list called
    "any" (FRR's flag alternation is optional), resolving as an
    undefined-list compile error.
+12. **Multi-name `match` clauses are a deliberate superset** (POL-3,
+   owner-adjudicated 2026-10-14: "keep Rouster superset — already
+   documented; strict-FRR = user's choice later"). FRR 10.2.2 takes
+   exactly ONE name in `match ip|ipv6 address prefix-list NAME`
+   (zebra/zebra_routemap.c `route_match_address_prefix_list_compile`
+   handles a single argument) and `match community LIST`
+   (bgpd/bgp_routemap.c `route_match_community_compile` splits one
+   name plus an optional flag); Rouster additionally accepts the
+   comma-separated form
+   `A,B,C`, OR-ing the referenced lists. The superset is intentional
+   import ergonomics — verbatim single-name FRR configs parse
+   identically either way — and stays until an operator asks for a
+   strict-FRR compatibility mode.
 
 ## 7. §Deferred anchors
 
