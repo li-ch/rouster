@@ -109,6 +109,14 @@ pub enum RuleOrigin {
     /// A SAVNET agent's rule (the draft-dependent signaling behind
     /// `experimental-savnet`; nothing sets it tonight).
     SavnetAgent,
+    /// The BAR-SAV derivation (draft-ietf-sidrops-bar-sav-10 §4/§8):
+    /// per-interface permissible source-prefix allowlists derived
+    /// from BGP UPDATE AS_PATHs + ASPA + ROA. Deliberately its own
+    /// origin — BAR-SAV derives from chartered-RFC data (ROA/ASPA)
+    /// plus the local Adj-RIBs-In, not from any draft-dependent
+    /// SAVNET signaling, so it is NOT [`RuleOrigin::SavnetAgent`]
+    /// and never sits behind `experimental-savnet`.
+    BarSav,
 }
 
 impl fmt::Display for RuleOrigin {
@@ -118,6 +126,7 @@ impl fmt::Display for RuleOrigin {
             RuleOrigin::Fib => "fib",
             RuleOrigin::Bgp => "bgp",
             RuleOrigin::SavnetAgent => "savnet-agent",
+            RuleOrigin::BarSav => "bar-sav",
         };
         f.write_str(name)
     }

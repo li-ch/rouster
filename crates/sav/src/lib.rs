@@ -63,6 +63,7 @@
 //! reload), and refuses to start in drop mode without the explicit
 //! `i-understand-drop-mode yes` friction line.
 
+pub mod barsav;
 pub mod gen;
 pub mod mode;
 pub mod monitor;

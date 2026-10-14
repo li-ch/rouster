@@ -19,6 +19,13 @@ common.workspace = true
 rib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# BAR-SAV (S9-a, draft-ietf-sidrops-bar-sav-10 §4/§8): the VRP/ASPA
+# tables + the ROV/ASPA-verification functions the derivation's
+# security preamble consumes. Pre-existing workspace member, path-only
+# dependency (the bgpd→rpki precedent; the root workspace file is
+# intentionally untouched — no new crates, no lock entries beyond
+# sav's own edge list).
+rpki = { path = "../rpki" }
 # savd daemon wiring (W8): the ZAPI client (RIB view via redistribute
 # pushes), the netlink backend (Dataplane installs + interface mirror),
 # the async runtime, and log output. All pre-existing workspace members

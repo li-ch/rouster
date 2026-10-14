@@ -603,6 +603,7 @@ dependencies = [
  "netlink-dp",
  "proptest",
  "rib",
+ "rpki",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
