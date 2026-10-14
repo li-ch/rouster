@@ -1772,6 +1772,47 @@ mod tests {
         );
     }
 
+    /// Reflection keeps the peer's own LOCAL_PREF (§5.1.5 shape only
+    /// synthesizes when missing): a client's 200 rides to the other
+    /// client, never flattened to 100.
+    #[test]
+    fn rr_reflection_keeps_the_peer_local_pref() {
+        let mut rib = LocRib::new(65000);
+        let client_a = peer("10.0.0.21", 65000, 21);
+        let client_b_addr: IpAddr = "10.0.0.22".parse().unwrap();
+        rib.set_route_reflector_clients(vec![client_a.address, client_b_addr]);
+        let mut attrs = base_attrs(vec![65042], None);
+        attrs.push(PathAttribute::LocalPref(200));
+        rib.announce(
+            &client_a,
+            &BgpUpdate {
+                attrs,
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        rib.recompute();
+        let out = LocRibOut::new(
+            Arc::new(Mutex::new(rib)),
+            crate::peer::ConfiguredNetworks::new(65000, vec![]),
+            Arc::new(AcceptAll),
+        );
+        let updates = crate::peer::OutRib::advertisements(
+            &out,
+            1,
+            1,
+            "10.0.0.1".parse().unwrap(),
+            client_b_addr,
+            true,
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].attr(attr_type::LOCAL_PREF),
+            Some(&PathAttribute::LocalPref(200)),
+            "the client's own LOCAL_PREF rides the reflection"
+        );
+    }
+
     /// §9.1.3's floor: "A route SHALL NOT be installed in the
     /// Adj-Rib-Out unless the destination, and NEXT_HOP described by
     /// this route, may be forwarded appropriately" — a candidate with

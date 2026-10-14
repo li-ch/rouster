@@ -1398,15 +1398,16 @@ pub fn originated_update(
     }
 }
 
-/// Builds the UPDATE that withdraws `prefixes` (v4 in the NLRI field,
-/// v6 via MP_UNREACH, per RFC 4760 §4). Classic withdrawals — path
-/// id 0 (locally originated routes have no ADD-PATH identity).
+/// Builds the UPDATE that withdraws `prefixes`: v4 in the Withdrawn
+/// Routes field (RFC 4271 §4.3), v6 via MP_UNREACH (RFC 4760 §4).
+/// Classic withdrawals — path id 0 (the tx send path stamps the
+/// ADD-PATH ids a tx peer knows, RFC 7911 §5's replacement key).
 pub fn withdrawal_update(prefixes: &[IpPrefix]) -> BgpUpdate {
     let mut update = BgpUpdate::default();
     let mut v6 = Vec::new();
     for prefix in prefixes {
         match prefix {
-            IpPrefix::V4(_) => update.nlri.push(Nlri::from(*prefix)),
+            IpPrefix::V4(_) => update.withdrawn.push(Nlri::from(*prefix)),
             IpPrefix::V6(_) => v6.push(Nlri::from(*prefix)),
         }
     }
@@ -1772,7 +1773,11 @@ mod tests {
             "203.0.113.0/24".parse().unwrap(),
             "2001:db8:1::/48".parse().unwrap(),
         ]);
-        assert_eq!(update.nlri.len(), 1);
+        // RFC 4271 §4.3: the v4 prefix rides the Withdrawn Routes
+        // field (never the NLRI field — a withdrawal is not
+        // reachability).
+        assert_eq!(update.withdrawn.len(), 1);
+        assert!(update.nlri.is_empty());
         assert!(matches!(
             update.attrs.last(),
             Some(PathAttribute::MpUnreach(_))
@@ -2291,6 +2296,155 @@ mod tests {
         assert_eq!(mp.nlri.len(), 1);
         assert_eq!(mp.nlri[0].path_id, 1, "the MP_REACH NLRI carries our id");
         driver.abort();
+    }
+
+    /// `addpath both` on one wire: S/R 3 exchanged both ways, the
+    /// session decodes the peer's extended NLRI (the N5B receive leg)
+    /// AND emits its own under our ids (§5's two directions are
+    /// independent MUSTs negotiated by one capability).
+    #[tokio::test]
+    async fn add_path_both_directions_on_one_session() {
+        let (ours, theirs) = duplex(8192);
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_rx_v4 = true;
+        config.add_path_tx_v4 = true;
+        let mut sess = PeerSession::new(
+            ours,
+            config,
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            Some(Arc::new(Networks(vec!["203.0.113.0/24".parse().unwrap()]))),
+            Duration::ZERO,
+        );
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+        let mut peer = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+
+        // Our OPEN: S/R 3 for v4 (both directions, one instance).
+        let frame = read_bytes(&mut peer.io).await;
+        let our_open = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Open(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert!(our_open.capabilities.iter().any(|c| matches!(c,
+            Capability::AddPath(tuples)
+                if tuples == &vec![AddPathFamily { afi: 1, safi: 1, send_receive: 3 }])));
+
+        // The peer answers S/R 3 too: BOTH directions negotiate.
+        let mine = BgpOpen::new(
+            65001,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![Capability::AddPath(vec![AddPathFamily {
+                afi: 1,
+                safi: 1,
+                send_receive: 3,
+            }])],
+        );
+        write_bytes(&mut peer.io, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let frame = read_bytes(&mut peer.io).await;
+        assert_eq!(frame[18], message_type::KEEPALIVE);
+        write_bytes(&mut peer.io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        // TX leg: our initial UPDATE carries the extended form (id 1).
+        let tx_ctx = crate::attr::AddPathCtx {
+            v4: true,
+            v6: false,
+        };
+        let frame = read_bytes(&mut peer.io).await;
+        let sent = match BgpMessage::decode_with_handling(
+            &frame,
+            true,
+            crate::attr::UpdateHandling::StrictRfc4271,
+            tx_ctx,
+        )
+        .unwrap()
+        .0
+        {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected UPDATE, got {other:?}"),
+        };
+        assert_eq!(
+            sent.nlri[0].path_id, 1,
+            "our id under the extended encoding"
+        );
+
+        // RX leg: the peer sends a sibling pair; both land keyed.
+        let prefix: IpPrefix = "198.51.100.0/24".parse().unwrap();
+        let update = BgpMessage::Update(BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+            ],
+            nlri: vec![Nlri { prefix, path_id: 5 }, Nlri { prefix, path_id: 6 }],
+        })
+        .encode_with(true, tx_ctx)
+        .unwrap();
+        write_bytes(&mut peer.io, &update).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        {
+            let sink = sink.0.lock().unwrap();
+            assert!(sink.announced.contains_key(&Nlri { prefix, path_id: 5 }));
+            assert!(sink.announced.contains_key(&Nlri { prefix, path_id: 6 }));
+        }
+        driver.abort();
+    }
+
+    /// RFC 7911 §5's replacement key on OUR side: a withdrawal of a
+    /// prefix we advertised toward a tx peer carries exactly the id
+    /// the announcement used — the peer removes that path, not a
+    /// phantom classic key.
+    #[tokio::test]
+    async fn add_path_tx_withdrawals_carry_the_advertised_id() {
+        let (ours, _theirs) = duplex(64);
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_tx_v4 = true;
+        let mut sess = PeerSession::new(
+            ours,
+            config,
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            None,
+            Duration::ZERO,
+        );
+        // Simulate the negotiated tx direction (Established minus the
+        // wire: the FSM record is what current_add_path_tx_ctx reads).
+        sess.fsm.fire(Event::Start { passive: false });
+        sess.fsm.fire(Event::TcpConnectionConfirmed);
+        sess.fsm.fire(Event::BgpOpen(BgpOpen::new(
+            65001,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![Capability::AddPath(vec![AddPathFamily {
+                afi: 1,
+                safi: 1,
+                send_receive: 1,
+            }])],
+        )));
+        let prefix: IpPrefix = "203.0.113.0/24".parse().unwrap();
+        let mut announce = originated_update(prefix, 65000, "192.0.2.1".parse().unwrap(), false);
+        sess.assign_tx_path_ids(&mut announce);
+        assert_eq!(announce.nlri[0].path_id, 1, "announced under id 1");
+        let mut withdraw = withdrawal_update(&[prefix]);
+        sess.assign_tx_path_ids(&mut withdraw);
+        assert_eq!(
+            withdraw.withdrawn[0].path_id, 1,
+            "the withdrawal keys the same path (RFC 7911 §5)"
+        );
     }
 
     /// The B-19 allocator as a unit: ids start at 1 (0 is the classic
