@@ -248,6 +248,7 @@ route-map NAME (permit|deny) SEQ
 access-list NAME [seq N] (permit|deny) (PREFIX [exact-match]|any)
 ipv6 access-list NAME [seq N] (permit|deny) (PREFIX [exact-match]|any)
 ip|ipv6 prefix-list NAME [seq N] (permit|deny) PREFIX [le E] [ge E]
+ip|ipv6 prefix-list NAME description ...   # accepted, warning-ignored (POL-5)
 bgp as-path access-list NAME [seq N] (permit|deny) REGEX
 bgp community-list standard NAME [seq N] (permit|deny) COMM...
 ```
@@ -344,8 +345,15 @@ Maps" summary table:
 4. **Totality vs BIRD runtime errors** — see §4.3.
 5. **`set metric`** maps to MED for BGP routes (FRR doc wording); the
    typed `Action::SetMetric` (route metric) has no route-map spelling.
-6. **`description`** lines inside route-map entries are
-   warning-ignored; `ip prefix-list NAME description` is an error (§7).
+6. **`description`** lines are warning-ignored in BOTH stanza families
+   (POL-5, owner-adjudicated 2026-10-14: "warn-ignore both — cosmetic
+   lines; failing configs over them is hostile"): inside route-map
+   entries (FRR keeps the text on the index, lib/routemap.c) and the
+   `ip|ipv6 prefix-list NAME description ...` line (FRR keeps it on
+   the list, "Filtering" filter.rst 110-119). Rouster drops the text
+   and pushes a warning instead. A freestanding `description` (no open
+   route-map entry) stays an error, and the zebra access-list grammar
+   has no `description` in FRR — that form is still refused loudly.
 7. **AS_SET in masks**: a set element acts as one position matching any
    token its members satisfy (BIRD's first/last zero rule generalized).
 8. **proptest** is a dev-dependency of this crate (the W5B/M3

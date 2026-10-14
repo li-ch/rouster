@@ -732,7 +732,15 @@ fn parse_prefix_list(
         i += 2;
     }
     if toks.get(i) == Some(&"description") {
-        return err(line, "prefix-list description: not supported at import (see docs/protocols/policy.md §Deferred)");
+        // POL-5 (owner-adjudicated 2026-10-14): a cosmetic line —
+        // warn-ignore, exactly like route-map `description`; failing a
+        // config over it is hostile. FRR keeps the text on the list
+        // object (docs "Filtering", filter.rst 110-119); Rouster drops
+        // it and says so in the warnings.
+        doc.warnings.push(format!(
+            "line {line}: prefix-list {name} description ignored"
+        ));
+        return Ok(());
     }
     let verdict = match toks.get(i).copied() {
         Some("permit") => PrefixListVerdict::Permit,
@@ -2559,6 +2567,79 @@ route-map r permit 20
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn description_lines_warn_ignore_in_both_stanza_families() {
+        // POL-5 (owner-adjudicated 2026-10-14: "warn-ignore both"):
+        // cosmetic `description` lines parse-and-ignore with a WARN in
+        // BOTH route-map entries (FRR lib/routemap.c keeps them on the
+        // index) and prefix-list stanzas (filter.rst 110-119 keeps them
+        // on the list) — a config must not FAIL over them.
+        let text = "\
+ip prefix-list CUST description customer routes we accept
+ip prefix-list CUST permit 198.51.100.0/24
+ipv6 prefix-list V6 description the v6 space
+route-map in-bound permit 10
+ description peer-one import policy
+ match ip address prefix-list CUST
+";
+        let doc = parse_policy_config(text).expect("warn-ignore, never fail");
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| w.contains("prefix-list CUST description ignored")),
+            "{:?}",
+            doc.warnings
+        );
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| w.contains("prefix-list V6 description ignored")),
+            "{:?}",
+            doc.warnings
+        );
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| w.contains("route-map seq 10 description ignored")),
+            "{:?}",
+            doc.warnings
+        );
+        // The warnings surface through compile_route_map, and the rest
+        // of the config still works end to end.
+        let out = compile_ok(text, "in-bound");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("description ignored")),
+            "{:?}",
+            out.warnings
+        );
+        let mut r = v4_route("198.51.100.0/24", &[]);
+        assert_eq!(out.filter.apply(&mut r), Verdict::Accept);
+
+        // A description on a list with no entries yet does not create a
+        // phantom empty prefix-list.
+        let doc2 =
+            parse_policy_config("ip prefix-list GHOST description nothing defined yet\n").unwrap();
+        assert!(doc2.prefix_lists.is_empty());
+        assert!(
+            doc2.warnings
+                .iter()
+                .any(|w| w.contains("prefix-list GHOST description ignored")),
+            "{:?}",
+            doc2.warnings
+        );
+
+        // `description` outside any stanza stays an error, and the
+        // zebra access-list form has no description grammar in FRR —
+        // that refusal is unchanged.
+        let e = parse_policy_config("description freestanding\n").unwrap_err();
+        assert_eq!(e.line, 1);
+        assert!(e.message.contains("outside a route-map entry"));
+        let e2 = parse_policy_config("access-list A description not a thing\n").unwrap_err();
+        assert!(e2.message.contains("permit|deny"), "{}", e2.message);
     }
 
     #[test]
