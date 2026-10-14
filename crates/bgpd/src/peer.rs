@@ -53,7 +53,7 @@ pub trait RouteSink: Send {
     /// "Deletes all routes associated with this connection" (the
     /// Established teardown rows).
     fn clear_peer(&mut self, peer: &PeerInfo);
-    /// RFC 4724 §4.1 (receiving speaker, GR negotiated): the session
+    /// RFC 4724 §4.2 (receiving speaker, GR negotiated): the session
     /// went down — retain the peer's routes, marked stale, instead of
     /// deleting them. Default: the non-GR behavior (delete).
     fn retain_stale(&mut self, peer: &PeerInfo) {
@@ -264,11 +264,26 @@ pub struct PeerSession<IO> {
     /// UPDATE error handling for this session (RFC 7606 by default;
     /// strict-RFC-4271 is the per-neighbor compatibility knob).
     update_handling: UpdateHandling,
-    /// Sending-side graceful restart (RFC 4724 §4.2, N5 scope): the
+    /// Sending-side graceful restart (RFC 4724 §3, N5 scope): the
     /// restart time to advertise in the OPEN capability. EOR markers
     /// are emitted regardless (RFC 4724 §3 recommends them generally).
     gr_advertise: Option<u16>,
-    /// RFC 4724 §4.1: the teardown retained this peer's routes as
+    /// RFC 4724 §4.1 (restarting speaker): this session re-establishes
+    /// after our own abnormal loss — the R bit rides the OPEN and the
+    /// initial Adj-RIB-Out dump defers until the peer's EOR or the
+    /// Selection_Deferral_Timer.
+    gr_restarted: bool,
+    /// The §4.1 Selection_Deferral_Timer (default 120 s; the
+    /// `graceful-restart deferral` knob).
+    gr_deferral: Duration,
+    /// The armed deferral deadline while [`Self::gr_restarted`] holds
+    /// the initial dump (FAR = disarmed).
+    deferral_sleep: Pin<Box<tokio::time::Sleep>>,
+    /// A restarting session's initial dump is pending (§4.1: deferred
+    /// route selection — nothing advertised until the peer's EOR or
+    /// the timer).
+    deferred_dump: bool,
+    /// RFC 4724 §4.2: the teardown retained this peer's routes as
     /// stale (suppresses the FSM's clear_peer action; the daemon arms
     /// the restart-timer flush).
     gr_retained: bool,
@@ -370,6 +385,10 @@ where
             now: Instant::now,
             update_handling: UpdateHandling::default(),
             gr_advertise: None,
+            gr_restarted: false,
+            gr_deferral: Duration::from_secs(crate::config::GR_DEFERRAL_DEFAULT as u64),
+            deferral_sleep: Box::pin(tokio::time::sleep_until(now + FAR)),
+            deferred_dump: false,
             gr_retained: false,
             gr_hard_clear: false,
             gr_negotiated: None,
@@ -439,8 +458,8 @@ where
     /// Advertise the Graceful Restart capability (RFC 4724 §3, the
     /// sending side): the given Restart Time, no restart state, both
     /// unicast families with the Forwarding bit clear (v1 does not
-    /// preserve forwarding state across a restart — the full
-    /// restart-preserving-local-RIB machinery is §Deferred).
+    /// claim forwarding-state preservation for families beyond the
+    /// memory-only RIB's reach — F-bit granularity is §Deferred).
     pub fn with_graceful_restart(mut self, restart_time: u16) -> Self {
         self.gr_advertise = Some(restart_time);
         self.advertise.push(Capability::GracefulRestart {
@@ -448,6 +467,34 @@ where
             restart_time,
             families: vec![(1, 1, false), (2, 1, false)],
         });
+        self
+    }
+
+    /// RFC 4724 §4.1 (restarting speaker): this session re-establishes
+    /// after OUR abnormal loss — flip the advertised Restart State
+    /// bit, so the peer retains the routes we advertised before the
+    /// restart for the advertised Restart Time and does not wait for
+    /// our End-of-RIB before advertising. Call after
+    /// [`Self::with_graceful_restart`]; rewrites the capability in
+    /// place. The same call arms the §4.1 selection deferral: the
+    /// initial Adj-RIB-Out dump (and its EOR markers) waits for the
+    /// peer's EOR or the Selection_Deferral_Timer.
+    pub fn with_restart_state(mut self) -> Self {
+        self.gr_restarted = true;
+        for cap in self.advertise.iter_mut() {
+            if let Capability::GracefulRestart { restart_state, .. } = cap {
+                *restart_state = true;
+            }
+        }
+        self
+    }
+
+    /// Override the RFC 4724 §4.1 Selection_Deferral_Timer (the upper
+    /// bound the restarting speaker's deferred initial dump waits for
+    /// the peer's End-of-RIB; default 120 s, `graceful-restart
+    /// deferral <1-3600>`).
+    pub fn with_gr_deferral(mut self, secs: u32) -> Self {
+        self.gr_deferral = Duration::from_secs(secs.max(1) as u64);
         self
     }
 
@@ -635,6 +682,22 @@ where
                         return end;
                     }
                 }
+                _ = &mut self.deferral_sleep => {
+                    // RFC 4724 §4.1: the Selection_Deferral_Timer
+                    // expired without the peer's EOR — proceed with
+                    // route selection (flush the retained stale) and
+                    // run the initial dump anyway.
+                    if self.deferred_dump {
+                        self.deferred_dump = false;
+                        info!(peer = %self.peer.address,
+                            "bgpd: GR selection deferral timer expired, proceeding (RFC 4724 §4.1)");
+                        sink.flush_stale(&self.peer);
+                        if let Err(e) = self.initial_dump().await {
+                            self.end = Some(SessionEnd::Transport(e.to_string()));
+                            return self.end.clone().unwrap();
+                        }
+                    }
+                }
                 changed = async {
                     match stop.as_mut() {
                         Some(stop) => stop.changed().await.is_ok() && *stop.borrow(),
@@ -724,7 +787,7 @@ where
             if let Some(shared) = &self.shared {
                 shared.note_established();
             }
-            // RFC 4724 §4.1 (receiving speaker): the peer's OPEN said
+            // RFC 4724 §4.2 (receiving speaker): the peer's OPEN said
             // whether it restarted. With the R bit set, stale routes
             // stay until the per-family End-of-RIB; without it, they
             // are deleted immediately — before the new exchange.
@@ -732,7 +795,7 @@ where
                 Some(gr) if gr.restart_state => {
                     info!(peer = %self.peer.address,
                         restart_time = gr.restart_time,
-                        "bgpd: peer restarted (R bit), stale routes retained until EOR (RFC 4724 §4.1)");
+                        "bgpd: peer restarted (R bit), stale routes retained until EOR (RFC 4724 §4.2)");
                 }
                 Some(_) => {
                     info!(peer = %self.peer.address,
@@ -799,6 +862,23 @@ where
                     info!(peer = %self.peer.address, afi, safi,
                         "bgpd: End-of-RIB received (RFC 4724)");
                     sink.eor_received(&self.peer, afi, safi);
+                    // RFC 4724 §4.1 (restarting speaker): the peer's
+                    // EOR ends the selection deferral — re-selection
+                    // happened above (that family's stale flushed),
+                    // the initial dump follows, closed by our own EOR.
+                    // (v1 coarse: the FIRST family's EOR ends it —
+                    // same coarseness as the family-presence R-bit
+                    // handling, disclosed.)
+                    if self.deferred_dump {
+                        self.deferred_dump = false;
+                        self.disarm_deferral();
+                        info!(peer = %self.peer.address,
+                            "bgpd: EOR ended the selection deferral, advertising (RFC 4724 §4.1)");
+                        if let Err(e) = self.initial_dump().await {
+                            self.end = Some(SessionEnd::Transport(e.to_string()));
+                            return Some(self.end.clone().unwrap());
+                        }
+                    }
                     return self.step(Event::UpdateMsg, sink).await;
                 }
                 if let Err(err) = update.validate_well_known() {
@@ -907,7 +987,7 @@ where
                 );
                 let actions = self.fsm.fire(Event::NotifMsg);
                 // A received NOTIFICATION is a deliberate close — no
-                // graceful-restart retention (RFC 4724 §4.1 deletes
+                // graceful-restart retention (RFC 4724 §4.2 deletes
                 // on a peer-chosen close).
                 self.gr_hard_clear = true;
                 let _ = self.perform_all(actions, sink).await;
@@ -955,11 +1035,29 @@ where
         None
     }
 
-    /// The Established transition: initial advertisement of the
-    /// Adj-RIB-Out for every family, each dump closed by its
-    /// End-of-RIB marker (RFC 4724 §3 — recommended generally; an
-    /// empty UPDATE is a no-op for a non-GR receiver).
+    /// The Established transition: the initial advertisement of the
+    /// Adj-RIB-Out. A restarting speaker (RFC 4724 §4.1) defers it —
+    /// route selection waits for the peer's End-of-RIB markers or the
+    /// Selection_Deferral_Timer; the deferred flushes live in the
+    /// UPDATE arm (EOR) and the select loop (timer).
     async fn on_established(&mut self) -> io::Result<()> {
+        if self.gr_restarted {
+            self.deferred_dump = true;
+            self.deferral_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.gr_deferral);
+            info!(peer = %self.peer.address, deferral = ?self.gr_deferral,
+                "bgpd: restarting speaker, initial dump deferred until EOR (RFC 4724 §4.1)");
+            return Ok(());
+        }
+        self.initial_dump().await
+    }
+
+    /// The initial Adj-RIB-Out advertisement for every family, each
+    /// dump closed by its End-of-RIB marker (RFC 4724 §3 — recommended
+    /// generally, and §4.1's MUST after a restart's initial update; an
+    /// empty UPDATE is a no-op for a non-GR receiver).
+    async fn initial_dump(&mut self) -> io::Result<()> {
         let families = match self.out_rib.as_ref() {
             Some(rib) => rib.families(),
             // No Adj-RIB-Out source: still close the default
@@ -1066,7 +1164,7 @@ where
                 }
             }
             Action::ReleaseResources | Action::WithdrawRoutes => {
-                // RFC 4724 §4.1: with the GR capability negotiated,
+                // RFC 4724 §4.2: with the GR capability negotiated,
                 // a lost session retains the peer's routes marked
                 // stale (our own ManualStop and a received
                 // NOTIFICATION are deliberate closes — hard clear).
@@ -1075,7 +1173,7 @@ where
                     self.gr_retained = true;
                     sink.retain_stale(&self.peer);
                     info!(peer = %self.peer.address,
-                        "bgpd: session lost, routes retained stale (RFC 4724 §4.1)");
+                        "bgpd: session lost, routes retained stale (RFC 4724 §4.2)");
                 } else {
                     sink.clear_peer(&self.peer);
                 }
@@ -1089,6 +1187,14 @@ where
         let far = tokio::time::Instant::now() + FAR;
         self.hold_sleep.as_mut().reset(far);
         self.keepalive_sleep.as_mut().reset(far);
+        self.disarm_deferral();
+    }
+
+    /// Disarm the §4.1 deferral timer (the EOR beat it).
+    fn disarm_deferral(&mut self) {
+        self.deferral_sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + FAR);
     }
 
     async fn send_update(&mut self, update: &mut BgpUpdate) -> io::Result<()> {
@@ -2296,7 +2402,7 @@ mod tests {
         )
     }
 
-    /// The receiving-side lifecycle (RFC 4724 §4.1): a session with
+    /// The receiving-side lifecycle (RFC 4724 §4.2): a session with
     /// a GR peer loses the transport — routes are RETAINED (marked
     /// stale by the RIB sink), not cleared. The peer returns with
     /// the R bit set: stale stays until the End-of-RIB marker for the
@@ -2342,7 +2448,7 @@ mod tests {
         let flushed_before;
         {
             let sink = observed.0.lock().unwrap();
-            assert_eq!(sink.retained, 1, "routes retained stale (RFC 4724 §4.1)");
+            assert_eq!(sink.retained, 1, "routes retained stale (RFC 4724 §4.2)");
             assert_eq!(sink.cleared, 0, "no delete on a GR session loss");
             // (The first life's own Established ran an R-clear flush
             // over an empty stale table — a no-op.)
@@ -2516,6 +2622,148 @@ mod tests {
             other => panic!("expected the v6 EOR, got {other:?}"),
         };
         assert_eq!(eor6.end_of_rib(), Some(Some((2, 1))), "empty MP_UNREACH");
+        driver.abort();
+    }
+
+    // ---- RFC 4724 §4.1: the restarting speaker (S7-b M3) ----------
+
+    /// §4.1's re-establishment duties: the OPEN carries the Restart
+    /// State bit, and the initial Adj-RIB-Out dump is DEFERRED —
+    /// nothing is advertised until the peer's End-of-RIB arrives, then
+    /// the dump runs and closes with our own EOR ("the End-of-RIB
+    /// marker MUST be sent" once the initial update completes).
+    #[tokio::test]
+    async fn restarting_session_sets_r_bit_and_defers_until_eor() {
+        let (ours, mut theirs) = duplex(8192);
+        let mut sess = PeerSession::new(
+            ours,
+            SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90),
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            Some(Arc::new(Networks(vec!["203.0.113.0/24".parse().unwrap()]))),
+            Duration::ZERO,
+        )
+        .with_graceful_restart(120)
+        .with_restart_state()
+        .with_gr_deferral(1);
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+
+        // Our OPEN: the GR capability with the R bit SET (§4.1).
+        let frame = read_bytes(&mut theirs).await;
+        let open = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Open(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            open.capabilities.contains(&Capability::GracefulRestart {
+                restart_state: true,
+                restart_time: 120,
+                families: vec![(1, 1, false), (2, 1, false)],
+            }),
+            "the R bit rides the re-establishment OPEN: {:?}",
+            open.capabilities
+        );
+        let mine = BgpOpen::new(65001, 30, "10.9.9.9".parse().unwrap(), vec![]);
+        write_bytes(&mut theirs, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let _ = read_bytes(&mut theirs).await; // our KEEPALIVE
+        write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        // Established — the dump must NOT follow: §4.1 defers route
+        // selection until the peer's EOR (300 ms of real silence; the
+        // negotiated keepalive is 10 s, so only the deferral could
+        // break the silence).
+        let nothing =
+            tokio::time::timeout(Duration::from_millis(300), read_bytes(&mut theirs)).await;
+        assert!(
+            nothing.is_err(),
+            "the initial dump is deferred (RFC 4724 §4.1)"
+        );
+
+        // The peer's v4 End-of-RIB ends the deferral: the network
+        // UPDATE arrives and the dump closes with our own EOR.
+        write_bytes(
+            &mut theirs,
+            &BgpUpdate::default().encode_frame(true).unwrap(),
+        )
+        .await;
+        let frame = read_bytes(&mut theirs).await;
+        let update = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected the deferred UPDATE, got {other:?}"),
+        };
+        assert_eq!(update.nlri, vec!["203.0.113.0/24".parse().unwrap()]);
+        let frame = read_bytes(&mut theirs).await;
+        let eor = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected our EOR, got {other:?}"),
+        };
+        assert_eq!(
+            eor.end_of_rib(),
+            Some(None),
+            "§4.1: EOR after the initial update"
+        );
+        driver.abort();
+    }
+
+    /// §4.1's Selection_Deferral_Timer: without the peer's EOR, the
+    /// timer expires and the restart proceeds anyway — the retained
+    /// stale is flushed (re-selection) and the dump advertises.
+    /// Paused clock: idle time auto-advances the 120 s deferral
+    /// (keepalives at the 10 s cadence pass by unread).
+    #[tokio::test(start_paused = true)]
+    async fn restarting_deferral_timer_flushes_the_dump() {
+        let (ours, mut theirs) = duplex(8192);
+        let mut sess = PeerSession::new(
+            ours,
+            SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90),
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            Some(Arc::new(Networks(vec!["203.0.113.0/24".parse().unwrap()]))),
+            Duration::ZERO,
+        )
+        .with_graceful_restart(120)
+        .with_restart_state()
+        .with_gr_deferral(1);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let observed = sink.clone();
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let frame = read_bytes(&mut theirs).await;
+        let _ = BgpMessage::decode(&frame, true).unwrap();
+        let mine = BgpOpen::new(65001, 30, "10.9.9.9".parse().unwrap(), vec![]);
+        write_bytes(&mut theirs, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let _ = read_bytes(&mut theirs).await;
+        write_bytes(&mut theirs, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        // No EOR will ever arrive: idle paused time advances past the
+        // keepalives (10 s cadence) to the 120 s deferral — the first
+        // UPDATE frame is the timer-flushed dump.
+        let frame = loop {
+            let frame = read_bytes(&mut theirs).await;
+            if frame[18] == message_type::UPDATE {
+                break frame;
+            }
+        };
+        let update = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Update(u) => u,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(update.nlri, vec!["203.0.113.0/24".parse().unwrap()]);
+        // Re-selection ran: the stale sweep fired on the sink.
+        {
+            let sink = observed.0.lock().unwrap();
+            assert_eq!(sink.flushed, 1, "the expired deferral flushed the stale");
+        }
         driver.abort();
     }
 

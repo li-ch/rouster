@@ -26,7 +26,7 @@
 //! The ZAPI edge (NHT for peer addresses, RIB view) lives in `zedge`
 //! and is wired in by the binary when the config names a socket.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -41,7 +41,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::{BgpdConfig, NeighborConfig};
+use crate::config::{BgpdConfig, GracefulRestartRole, NeighborConfig};
 use crate::error::{cease_subcode, error_code};
 use crate::fsm::SessionConfig;
 use crate::message::{BgpMessage, BgpNotification};
@@ -199,6 +199,7 @@ impl Daemon {
         let registry: Registry = Arc::new(Mutex::new(BTreeMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let live = Arc::new(AtomicUsize::new(0));
+        let restarts: Arc<Mutex<BTreeSet<IpAddr>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
         // Connectors for every non-passive neighbor (Events 1/3: the
         // active side; ConnectRetry per §10).
@@ -213,6 +214,7 @@ impl Daemon {
                 registry: Arc::clone(&registry),
                 next_id: Arc::clone(&next_id),
                 live: Arc::clone(&live),
+                restarts: Arc::clone(&restarts),
             };
             let mut stop = stop.clone();
             let mut refresh = refresh.clone();
@@ -260,6 +262,7 @@ impl Daemon {
                                 registry: Arc::clone(&registry_accept),
                                 next_id: Arc::clone(&next_id_accept),
                                 live: Arc::clone(&live_accept),
+                                restarts: Arc::clone(&restarts),
                             };
                             let conn = Connection {
                                 peer_addr: peer.ip(),
@@ -440,13 +443,21 @@ impl AsyncWrite for ReplayStream {
     }
 }
 
-/// Shared session plumbing (registry + signals).
+/// Shared session plumbing (registry + signals + the RFC 4724 §4.1
+/// restart marks).
 struct SessionCtx<S: RouteSink> {
     sink: SharedSink<S>,
     out_rib: Arc<dyn OutRib>,
     registry: Registry,
     next_id: Arc<AtomicU64>,
     live: Arc<AtomicUsize>,
+    /// RFC 4724 §4.1 (restarting speaker): neighbors whose previous
+    /// GR-negotiated session was lost abnormally — their NEXT session
+    /// advertises the Restart State bit (and defers selection). A
+    /// deliberate close (our ManualStop, the peer's NOTIFICATION) is
+    /// not a restart; a mark set but never followed by a session is
+    /// inert.
+    restarts: Arc<Mutex<BTreeSet<IpAddr>>>,
 }
 
 impl<S: RouteSink> Clone for SessionCtx<S> {
@@ -457,6 +468,7 @@ impl<S: RouteSink> Clone for SessionCtx<S> {
             registry: Arc::clone(&self.registry),
             next_id: Arc::clone(&self.next_id),
             live: Arc::clone(&self.live),
+            restarts: Arc::clone(&self.restarts),
         }
     }
 }
@@ -527,6 +539,10 @@ where
     // session refines `internal` from the negotiated OPEN, so the
     // config side only carries the mode.
     let internal = neighbor.remote_as == config.local_as;
+    // RFC 4724 §4.1 (restarting speaker): a mark from the previous
+    // session's abnormal loss makes THIS session announce our restart
+    // (the R bit + selection deferral). Consumed exactly once.
+    let restarting = ctx.restarts.lock().unwrap().remove(&peer_addr);
     let mut session = PeerSession::new(
         io,
         session_config,
@@ -536,12 +552,22 @@ where
         Duration::from_secs(neighbor.mrai),
     )
     .with_shared(shared)
-    .with_update_handling(neighbor.update_handling.handling(internal));
-    // RFC 4724 §4.2 (sending side, N5 scope): advertise the
-    // capability when configured. (The receiving side is
-    // unconditional for peers that offer it.)
-    if let Some(restart_time) = neighbor.graceful_restart {
+    .with_update_handling(neighbor.update_handling.handling(internal))
+    .with_gr_deferral(config.gr_deferral);
+    // RFC 4724 §3: advertise the capability when the role is
+    // restart-capable (`graceful-restart <secs>`); the receiving side
+    // (§4.2) is unconditional for peers that offer it, whatever the
+    // local role.
+    if let Some(restart_time) = neighbor
+        .graceful_restart
+        .and_then(|role| role.restart_time())
+    {
         session = session.with_graceful_restart(restart_time);
+        if restarting {
+            info!(peer = %peer_addr,
+                "bgpd: re-establishment after abnormal loss, announcing restart (RFC 4724 §4.1)");
+            session = session.with_restart_state();
+        }
     }
     let mut sink = ctx.sink;
     let end = session
@@ -549,12 +575,18 @@ where
         .await;
     info!(peer = %peer_addr, ?end, "bgpd: session ended");
     release(&ctx.registry, peer_addr, id);
-    // RFC 4724 §4.1: the restart timer — if the session had the GR
-    // capability and the loss retained stale routes, whatever is
-    // still stale is deleted once the advertised Restart Time
-    // passes without a re-establishment. (Earlier EOR or
-    // re-establishment flushes are idempotent with this.)
+    // RFC 4724 §4.1: an abnormal loss of a GR-negotiated session sets
+    // the restart mark — the NEXT session announces the R bit (a
+    // deliberate close is not a restart).
     let peer_gr = *shared_for_gr.peer_gr.lock().unwrap();
+    if should_announce_restart(neighbor.graceful_restart, peer_gr, &end) {
+        ctx.restarts.lock().unwrap().insert(peer_addr);
+    }
+    // RFC 4724 §4.2 (receiving speaker): the restart timer — if the
+    // session had the GR capability and the loss retained stale
+    // routes, whatever is still stale is deleted once the advertised
+    // Restart Time passes without a re-establishment. (Earlier EOR or
+    // re-establishment flushes are idempotent with this.)
     if let Some(gr) = peer_gr {
         if !matches!(end, SessionEnd::ManualStop) {
             let mut flush_sink = flush_sink_for;
@@ -569,6 +601,27 @@ where
             });
         }
     }
+}
+
+/// RFC 4724 §4.1 (restarting speaker), the daemon's mark decision:
+/// the NEXT session to this neighbor announces our restart when
+/// (a) we are restart-capable (`graceful-restart <secs>` — a
+/// helper-only or unconfigured neighbor has nothing to announce),
+/// (b) the lost session had the GR capability negotiated (the peer
+/// can act as a receiving speaker), and (c) the loss was abnormal —
+/// our own ManualStop and the peer's NOTIFICATION are deliberate
+/// closes, not restarts.
+fn should_announce_restart(
+    role: Option<GracefulRestartRole>,
+    peer_gr: Option<crate::fsm::GracefulRestartInfo>,
+    end: &SessionEnd,
+) -> bool {
+    role.is_some_and(|role| role.restart_time().is_some())
+        && peer_gr.is_some()
+        && !matches!(
+            end,
+            SessionEnd::ManualStop | SessionEnd::PeerNotified { .. }
+        )
 }
 
 /// The active side: dial the neighbor, run the session, back off
@@ -704,6 +757,49 @@ pub fn signal_channels() -> std::io::Result<SignalChannels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 4724 §4.1, the mark decision table: only a restart-capable
+    /// role with a GR-negotiated session lost ABNORMALLY announces the
+    /// restart on re-establishment — our ManualStop and the peer's
+    /// NOTIFICATION are deliberate closes, helper-only and
+    /// unconfigured roles have nothing to announce, and a peer that
+    /// never advertised GR cannot act on the R bit.
+    #[test]
+    fn should_announce_restart_table() {
+        let restart = Some(GracefulRestartRole::Restart { restart_time: 120 });
+        let helper = Some(GracefulRestartRole::Helper);
+        let gr = Some(crate::fsm::GracefulRestartInfo {
+            restart_state: false,
+            restart_time: 30,
+        });
+        let lost = SessionEnd::Transport("connection reset".into());
+        // §4.1: restart-capable + GR-negotiated + abnormal loss.
+        assert!(should_announce_restart(restart, gr, &lost));
+        assert!(should_announce_restart(
+            restart,
+            gr,
+            &SessionEnd::Notified(4, 0)
+        ));
+        // Deliberate closes are not restarts.
+        assert!(!should_announce_restart(
+            restart,
+            gr,
+            &SessionEnd::ManualStop
+        ));
+        assert!(!should_announce_restart(
+            restart,
+            gr,
+            &SessionEnd::PeerNotified {
+                code: 6,
+                subcode: 3
+            }
+        ));
+        // Helper-only / unconfigured: nothing to announce.
+        assert!(!should_announce_restart(helper, gr, &lost));
+        assert!(!should_announce_restart(None, gr, &lost));
+        // No GR capability negotiated with the peer.
+        assert!(!should_announce_restart(restart, None, &lost));
+    }
 
     #[test]
     fn session_config_prefers_neighbor_timers() {

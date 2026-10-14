@@ -40,7 +40,7 @@ use crate::peer::{PeerInfo, RouteSink};
 /// import (RFC 6811 §2 / RFC 9234 §5 visibility for show output).
 ///
 /// [`PartialEq`] deliberately ignores [`Route::stale`]: marking a
-/// route stale (RFC 4724 §4.1 retention) is bookkeeping, not a route
+/// route stale (RFC 4724 §4.2 retention) is bookkeeping, not a route
 /// change — `recompute` must not report a best-path flip for it.
 #[derive(Debug, Clone, Eq)]
 pub struct Route {
@@ -62,7 +62,7 @@ pub struct Route {
     /// NEXT_HOP/MED preserved) and never installs into the kernel —
     /// the RS RIB stays separate from the kernel RIB.
     pub rs_client: bool,
-    /// RFC 4724 §4.1: retained across a GR peer's session loss. Stale
+    /// RFC 4724 §4.2: retained across a GR peer's session loss. Stale
     /// routes keep feeding forwarding/best-path until flushed (EOR,
     /// re-establishment without the R bit, or the restart timer); a
     /// re-advertised prefix simply replaces its stale entry.
@@ -406,7 +406,7 @@ impl LocRib {
         }
     }
 
-    /// RFC 4724 §4.1: mark every route of a lost GR session stale —
+    /// RFC 4724 §4.2: mark every route of a lost GR session stale —
     /// retained (still a best-path candidate) until flushed.
     pub fn mark_peer_stale(&mut self, peer: &PeerInfo) {
         if let Some(rib) = self.adj_in.get_mut(&peer.address) {
@@ -428,7 +428,7 @@ impl LocRib {
 
     /// [`Self::flush_stale`] for one family (`Some(true)` = v6,
     /// `Some(false)` = v4, `None` = both) — the per-family EOR
-    /// trigger (RFC 4724 §3/§4.1).
+    /// trigger (RFC 4724 §3/§4.2).
     pub fn flush_stale_family(&mut self, peer: &PeerInfo, v6: Option<bool>) -> usize {
         let Some(rib) = self.adj_in.get_mut(&peer.address) else {
             return 0;
@@ -580,7 +580,7 @@ impl RouteSink for RibSink {
         let mut rib = self.rib.lock().unwrap();
         rib.mark_peer_stale(peer);
         // No recompute: stale routes stay best-path candidates until
-        // flushed (RFC 4724 §4.1 retention).
+        // flushed (RFC 4724 §4.2 retention).
     }
 
     fn flush_stale(&mut self, peer: &PeerInfo) {
@@ -1397,7 +1397,7 @@ mod tests {
             .is_some_and(|a| a == 65001));
     }
 
-    /// RFC 4724 §4.1 stale lifecycle: a lost GR session retains the
+    /// RFC 4724 §4.2 stale lifecycle: a lost GR session retains the
     /// routes marked stale (still best-path candidates); a
     /// re-advertised prefix replaces its stale entry; the per-family
     /// EOR flush removes only that family's leftovers; a full flush
@@ -1501,6 +1501,48 @@ mod tests {
         sink.retain_stale(&p);
         sink.eor_received(&p, 1, 1);
         assert_eq!(rib.lock().unwrap().route_count(), 0, "v4 EOR flushed it");
+    }
+
+    /// RFC 4724 §4.1's forwarding window: routes retained stale at a
+    /// GR session loss stay best-path candidates ("MUST NOT
+    /// differentiate between stale and other information during
+    /// forwarding") — recompute produces NO withdrawal, so nothing
+    /// reaches `zebra_commands` and the kernel keeps forwarding
+    /// through the grace window.
+    #[test]
+    fn restart_window_preserves_forwarding() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        rib.announce(
+            &p,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        let changes = rib.recompute();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].best.as_ref().is_some());
+
+        // The session is lost and the routes retained stale: no
+        // withdrawal — the best survives untouched (§4.1).
+        rib.mark_peer_stale(&p);
+        assert_eq!(rib.stale_count(&p), 1);
+        let changes = rib.recompute();
+        assert!(
+            changes.is_empty(),
+            "stale retention produces no best-path change (RFC 4724 §4.1)"
+        );
+        // The best table itself is untouched — the snapshot from
+        // before the loss keeps exporting (that non-differentiation
+        // IS §4.1's rule).
+        let best = rib.best_routes().next().unwrap();
+        assert_eq!(best.source.address, p.address);
+        assert!(
+            route_entry(best).is_some(),
+            "still exportable — forwarding continues"
+        );
     }
 
     /// The RS RIB stays out of the kernel (FRR's view semantics): an

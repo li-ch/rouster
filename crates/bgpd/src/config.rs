@@ -160,6 +160,45 @@ impl std::fmt::Display for UpdateErrorHandling {
     }
 }
 
+/// Graceful Restart role per neighbor (RFC 4724; B-5 helper-first).
+/// The receiving-speaker retention (§4.2) runs for any peer that
+/// advertises the capability, whatever the local role; the role knob
+/// governs what WE advertise and the restarting-speaker duties (§4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GracefulRestartRole {
+    /// `graceful-restart helper`: receiving side only — no capability
+    /// advertised, nothing to announce on our own re-establishment
+    /// (the N5 default posture, made explicit).
+    Helper,
+    /// `graceful-restart <1-4095>`: restart-capable — advertise the
+    /// capability with that Restart Time, and on a re-establishment
+    /// after an abnormal session loss perform the §4.1 restarting-
+    /// speaker duties (the R bit, selection deferral, EOR after the
+    /// initial dump). Helper behavior is implied (a restart-capable
+    /// speaker receives like anyone else).
+    Restart { restart_time: u16 },
+}
+
+impl GracefulRestartRole {
+    /// The Restart Time to advertise (§3's 12-bit field); `None` for
+    /// the helper-only role (nothing advertised).
+    pub fn restart_time(self) -> Option<u16> {
+        match self {
+            Self::Helper => None,
+            Self::Restart { restart_time } => Some(restart_time),
+        }
+    }
+}
+
+impl std::fmt::Display for GracefulRestartRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Helper => f.write_str("helper"),
+            Self::Restart { restart_time } => write!(f, "restart {restart_time}s"),
+        }
+    }
+}
+
 /// Per-neighbor configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborConfig {
@@ -181,11 +220,12 @@ pub struct NeighborConfig {
     /// prepend, NEXT_HOP/MED preserved (FRR `neighbor PEER
     /// route-server-client`, doc/user/routeserver.rst).
     pub route_server: bool,
-    /// Graceful Restart sending side (RFC 4724 §4.2, N5): the
-    /// Restart Time advertised in the capability (seconds, 1..=4095
-    /// — the 12-bit wire field). The receiving side is always on for
-    /// peers that advertise the capability.
-    pub graceful_restart: Option<u16>,
+    /// Graceful Restart role (RFC 4724; B-5 helper-first): the
+    /// receiving-speaker retention (§4.2) is on for any peer that
+    /// advertises the capability, whatever the local role — the knob
+    /// governs what WE advertise and the restarting-speaker duties
+    /// (§4.1).
+    pub graceful_restart: Option<GracefulRestartRole>,
     /// ADD-PATH receive (RFC 7911, `neighbor X addpath rx|both`):
     /// advertise Send/Receive 1 for v4+v6 unicast; when the peer
     /// offers to send (S/R 2/3), inbound NLRI for those families uses
@@ -223,6 +263,11 @@ pub struct BgpdConfig {
     /// Policy stanzas extracted verbatim (blank-padded: line numbers
     /// match the source file). Empty when none are present.
     pub policy_text: String,
+    /// `graceful-restart deferral <1-3600>` (router level): the RFC
+    /// 4724 §4.1 Selection_Deferral_Timer — the upper bound the
+    /// restarting speaker's deferred route selection waits for
+    /// End-of-RIB markers before proceeding anyway. Default 120 s.
+    pub gr_deferral: u32,
 }
 
 impl Default for BgpdConfig {
@@ -240,9 +285,13 @@ impl Default for BgpdConfig {
             rpki: RpkiConfig::default(),
             aspa: AspaMode::default(),
             policy_text: String::new(),
+            gr_deferral: GR_DEFERRAL_DEFAULT,
         }
     }
 }
+
+/// Default Selection_Deferral_Timer (RFC 4724 §4.1): 120 s.
+pub const GR_DEFERRAL_DEFAULT: u32 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -419,6 +468,25 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
             ["export", name] if in_router => {
                 set_filter_name(&mut config.export_filter, name, line_no, "export")?;
             }
+            ["graceful-restart", "deferral", secs] if in_router => {
+                // RFC 4724 §4.1's Selection_Deferral_Timer (the
+                // upper bound deferred route selection waits for
+                // End-of-RIB markers). Router level: it bounds the
+                // whole selection process, not one neighbor.
+                let secs: u32 = secs.parse().map_err(|_| {
+                    err(
+                        line_no,
+                        format!("graceful-restart deferral expects seconds 1..=3600, got `{secs}`"),
+                    )
+                })?;
+                if !(1..=3600).contains(&secs) {
+                    return Err(err(
+                        line_no,
+                        format!("graceful-restart deferral expects seconds 1..=3600, got `{secs}`"),
+                    ));
+                }
+                config.gr_deferral = secs;
+            }
             ["bgp", "router-id", id] if in_router => {
                 let id: Ipv4Addr = id.parse().map_err(|_| {
                     err(
@@ -529,21 +597,47 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
                         neighbor.route_server = true;
                     }
-                    ["graceful-restart", secs] => {
-                        let secs: u16 = secs.parse().map_err(|_| {
-                            err(
-                                line_no,
-                                format!("graceful-restart expects seconds 1..=4095, got `{secs}`"),
-                            )
-                        })?;
-                        if !(1..=4095).contains(&secs) {
-                            return Err(err(
-                                line_no,
-                                format!("graceful-restart expects seconds 1..=4095, got `{secs}` (the RFC 4724 §3 12-bit field)"),
-                            ));
-                        }
+                    ["graceful-restart", rest @ ..] => {
+                        // RFC 4724 role knob (B-5 helper-first):
+                        // `helper` = receiving side only (nothing
+                        // advertised); `<secs>` 1..=4095 =
+                        // restart-capable (capability + §4.1 duties).
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
-                        neighbor.graceful_restart = Some(secs);
+                        let role = match rest {
+                            ["helper"] => GracefulRestartRole::Helper,
+                            [secs] => {
+                                let secs: u16 = secs.parse().map_err(|_| {
+                                    err(
+                                        line_no,
+                                        format!(
+                                            "graceful-restart expects helper or seconds \
+                                             1..=4095, got `{secs}`"
+                                        ),
+                                    )
+                                })?;
+                                if !(1..=4095).contains(&secs) {
+                                    return Err(err(
+                                        line_no,
+                                        format!(
+                                            "graceful-restart expects seconds 1..=4095, \
+                                             got `{secs}` (the RFC 4724 §3 12-bit field)"
+                                        ),
+                                    ));
+                                }
+                                GracefulRestartRole::Restart { restart_time: secs }
+                            }
+                            other => {
+                                return Err(err(
+                                    line_no,
+                                    format!(
+                                        "graceful-restart expects helper or seconds \
+                                         1..=4095, got `{}`",
+                                        other.join(" ")
+                                    ),
+                                ))
+                            }
+                        };
+                        neighbor.graceful_restart = Some(role);
                     }
                     ["addpath", dir @ ..] => {
                         // RFC 7911 knob (BIRD-shaped, default off):
@@ -960,14 +1054,26 @@ bgp community-list standard CHOP-COMM permit 65000:1
         .unwrap();
         assert_eq!(
             config.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].graceful_restart,
-            Some(120)
+            Some(GracefulRestartRole::Restart { restart_time: 120 })
         );
-        for bad in ["0", "4096", "junk"] {
+        // The helper-only role: receiving side, nothing advertised.
+        let helper = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 graceful-restart helper\n",
+        )
+        .unwrap();
+        assert_eq!(
+            helper.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].graceful_restart,
+            Some(GracefulRestartRole::Helper)
+        );
+        for bad in ["0", "4096", "junk", "helper extra"] {
             let e = parse_config(&format!(
                 "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 graceful-restart {bad}\n"
             ))
             .unwrap_err();
-            assert!(e.to_string().contains("1..=4095"), "{bad}: {e}");
+            assert!(
+                e.to_string().contains("1..=4095") || e.to_string().contains("helper"),
+                "{bad}: {e}"
+            );
         }
         // Unconfigured neighbors default to None (receiving side only).
         let bare = parse_config(
@@ -978,6 +1084,31 @@ bgp community-list standard CHOP-COMM permit 65000:1
             bare.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].graceful_restart,
             None
         );
+    }
+
+    /// RFC 4724 §4.1's Selection_Deferral_Timer: router-level
+    /// `graceful-restart deferral <1-3600>`, default 120 s.
+    #[test]
+    fn graceful_restart_deferral_timer_parses() {
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\ngraceful-restart deferral 30\n",
+        )
+        .unwrap();
+        assert_eq!(config.gr_deferral, 30);
+        assert_eq!(
+            parse_config("router bgp 65000\nbgp router-id 10.0.0.1\n")
+                .unwrap()
+                .gr_deferral,
+            GR_DEFERRAL_DEFAULT,
+            "default 120 s"
+        );
+        for bad in ["0", "3601", "junk"] {
+            let e = parse_config(&format!(
+                "router bgp 65000\nbgp router-id 10.0.0.1\ngraceful-restart deferral {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(e.to_string().contains("1..=3600"), "{bad}: {e}");
+        }
     }
 
     #[test]
