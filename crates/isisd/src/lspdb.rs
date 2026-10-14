@@ -155,6 +155,12 @@ impl Lspdb {
         self.entries.values().map(|s| &s.lsp)
     }
 
+    /// The stored records (LSP + arrival clock) — the SPF's aging
+    /// view.
+    pub fn stored_lsps(&self) -> impl Iterator<Item = &StoredLsp> {
+        self.entries.values()
+    }
+
     /// Install (or reject) a received LSP at clock `now` — the
     /// §7.3.15.1 receive path restricted to the database actions.
     /// Purges (zero remaining lifetime) install as header-only

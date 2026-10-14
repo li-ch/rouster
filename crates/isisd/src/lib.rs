@@ -33,6 +33,7 @@ pub mod checksum;
 pub mod error;
 pub mod lspdb;
 pub mod pdu;
+pub mod spf;
 pub mod system;
 pub mod tlv;
 pub mod wire;
