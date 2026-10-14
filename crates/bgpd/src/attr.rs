@@ -229,6 +229,10 @@ fn asn_widen(asn: u32) -> u16 {
 }
 
 /// MP_REACH next hop (RFC 4760 §3): the length field decides the form.
+/// There is no raw/unknown arm on purpose (B-23, strict capability
+/// trust): bgpd speaks only the unicast families, whose next-hop
+/// lengths are exactly 4 (v4), 16, or 32 (v6 global [+ link-local]) —
+/// anything else is malformed input, not a shape to guess at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MpNextHop {
     V4(Ipv4Addr),
@@ -236,9 +240,6 @@ pub enum MpNextHop {
         global: Ipv6Addr,
         link_local: Option<Ipv6Addr>,
     },
-    /// An opaque next hop for an AFI/SAFI bgpd does not understand —
-    /// kept verbatim, never routed through.
-    Raw([u8; 16]),
 }
 
 impl MpNextHop {
@@ -262,10 +263,6 @@ impl MpNextHop {
             } => {
                 out.extend_from_slice(&global.octets());
                 16
-            }
-            Self::Raw(bytes) => {
-                out.extend_from_slice(bytes);
-                bytes.len()
             }
         }
     }
@@ -1106,13 +1103,18 @@ fn decode_one(
                     global: ipv6_from(&nh_bytes[..16]),
                     link_local: Some(ipv6_from(&nh_bytes[16..32])),
                 },
+                // B-23 (strict capability trust): no receive-side
+                // heuristic on untrusted input. A next-hop length the
+                // family cannot produce is a next-hop length
+                // inconsistency — RFC 7606 §5.3's reset disposition
+                // (the landed table's row for MP_REACH content
+                // errors). The old Raw arm zero-padded such bytes and
+                // passed them downstream — a guess on attacker input.
                 _ => {
-                    if nh_len > 16 {
-                        return Err(mp_malformed("MP_REACH next-hop length too large"));
-                    }
-                    let mut raw = [0u8; 16];
-                    raw[..nh_len].copy_from_slice(nh_bytes);
-                    MpNextHop::Raw(raw)
+                    return Err(mp_malformed(&format!(
+                        "MP_REACH next-hop length {nh_len} invalid for AFI {afi}/SAFI {safi} \
+                         (strict capability trust, no heuristic)"
+                    )))
                 }
             };
             // Reserved octet: MUST be 0 on send, SHOULD be ignored on
@@ -1359,6 +1361,44 @@ mod tests {
             err.notification,
             Some((3, error::update_subcode::OPTIONAL_ATTRIBUTE_ERROR))
         );
+    }
+
+    /// B-23 (strict capability trust): every next-hop length the
+    /// family cannot produce is REJECTED — no Raw/guessing arm on
+    /// untrusted input. A v6 family with a 4-octet next hop, a v4
+    /// family with 16, a v6 with 24 (not 16/32), and a zero-length
+    /// next hop are all next-hop length inconsistencies — RFC 7606
+    /// §5.3's reset disposition, as the doc's table has claimed all
+    /// along (the old Raw arm silently zero-padded them instead).
+    #[test]
+    fn mp_reach_invalid_next_hop_shapes_rejected() {
+        // (afi, safi, nh_len) — each with the declared body present.
+        let cases: [(u16, u8, usize); 4] = [(2, 1, 4), (1, 1, 16), (2, 1, 24), (1, 1, 0)];
+        for (afi, safi, nh_len) in cases {
+            let mut bytes = vec![0x80, 14];
+            let mut value = Vec::new();
+            value.extend_from_slice(&afi.to_be_bytes());
+            value.push(safi);
+            value.push(nh_len as u8);
+            value.extend(std::iter::repeat_n(0x0a, nh_len));
+            value.push(0); // reserved
+            value.push(24); // one classic NLRI octet (/0)
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(&value);
+            let err = decode_attributes(&bytes, true)
+                .expect_err(&format!("({afi},{safi},{nh_len}) must not decode"));
+            assert_eq!(
+                err.notification,
+                Some((3, error::update_subcode::OPTIONAL_ATTRIBUTE_ERROR)),
+                "({afi},{safi},{nh_len}): {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("strict capability trust"),
+                "the reason names the policy: {}",
+                err.message
+            );
+        }
     }
 
     #[test]

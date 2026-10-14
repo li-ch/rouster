@@ -1482,7 +1482,6 @@ fn bgp_next_hop(update: &BgpUpdate) -> Option<IpAddr> {
                 crate::attr::MpNextHop::V6 { global, .. } => {
                     return Some(IpAddr::V6(*global));
                 }
-                crate::attr::MpNextHop::Raw(_) => return None,
             },
             _ => {}
         }

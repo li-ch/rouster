@@ -669,9 +669,13 @@ pub fn forwardable(route: &Route) -> bool {
     if route.attr(attr_type::NEXT_HOP).is_some() {
         return true;
     }
-    route.attrs.iter().any(|attr| {
-        matches!(attr, PathAttribute::MpReach(mp) if !matches!(mp.next_hop, crate::attr::MpNextHop::Raw(_)))
-    })
+    // Any decoded MP_REACH carries a well-formed next hop by
+    // construction (B-23: the codec rejects inconsistent lengths
+    // instead of guessing a Raw shape).
+    route
+        .attrs
+        .iter()
+        .any(|attr| matches!(attr, PathAttribute::MpReach(_)))
 }
 
 /// RFC 4271 §5.1.5 (LOCAL_PREF), verified wording: "If it is contained

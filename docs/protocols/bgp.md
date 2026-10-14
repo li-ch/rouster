@@ -145,6 +145,17 @@ prepared to receive these fields in any position or combination"),
 pinned by the merge-decode test, which builds the mixed frame by hand
 since the codec now refuses to produce it.
 
+**Strict capability trust (B-23)**: the receive side never guesses an
+encoding from the bytes. ADD-PATH NLRI decodes extended only where
+the §5 negotiation said so (the negotiated fact, not a wire guess —
+the classic/extended mis-gates are loud errors, not fallbacks); the
+RFC 9072 extended-parameters detection is that RFC's own type-255
+rule. The one heuristic the audit found is deleted: an MP_REACH next
+hop whose length the family cannot produce is rejected as a §5.3
+next-hop length inconsistency (session reset) — the old
+`MpNextHop::Raw` arm zero-padded such bytes and passed them
+downstream, a guess on attacker input.
+
 ### Route-server mode v1 (N5 M2)
 
 `neighbor X route-server` marks an RS client (FRR

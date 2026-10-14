@@ -51,7 +51,6 @@ impl PolicyView {
                     crate::attr::MpNextHop::V6 { global, .. } => {
                         NexthopGroup::single(Nexthop::Ipv6(global))
                     }
-                    crate::attr::MpNextHop::Raw(_) => NexthopGroup::new(),
                 },
                 _ => NexthopGroup::new(),
             },
