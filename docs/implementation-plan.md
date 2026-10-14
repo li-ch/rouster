@@ -392,3 +392,20 @@ The phase text above is unchanged; this block is status only.
   adjudication wave (POL-2/3/4/5 + SAV-3/4/7 doc pins). Gate
   1383/0 ×3 stable, clippy clean, smoke suite 34/34 (after one +x
   fix), CI green. Reports: away/2026-10-14/reports/S7-{a,b,c,d}.md.
+
+- 2026-10-14 (evening, round close) — S8 round GREEN after a
+  mid-round platform-quota kill (streams respawned from their prompt
+  files with adopt-or-revert resume discipline; 7 pre-kill milestones
+  counted as landed). Delivered: bgpd's ENTIRE B-item ledger (7606
+  structured outcomes + treat-as-withdraw, §5.1.5-verified LOCAL_PREF
+  reset, encode-side mixed guard, Hard Reset, RS export strip,
+  capability-trust cleanup, errata re-check, drafts named); the
+  security completion wave (v6 cmsg read-back closed under the widened
+  AGENTS.md exception, RFC 8177 key chains feeding both crypto
+  engines, RFC1583 knob); the operator loop (validate flags across
+  the fleet, configd deep validation + auto-rollback, vtyd's write
+  path over configd). Integration: two load-coupled flakes root-caused
+  and hardened (configd's shared-seq race → validate-lock; vty
+  one-shot client timeout → transport-only retry), 8× workspace
+  stability green, gate 1468/0, smokes 34/34, CI pending push.
+  Reports: away/2026-10-14/reports/S8-{a,b,c}.md.
