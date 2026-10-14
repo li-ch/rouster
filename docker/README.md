@@ -82,13 +82,20 @@ binaries. `traceroute` is along for interactive debugging parity.
 ### Equivalence
 
 Equivalence of the rebuilt image is defined functionally: the full
-suite (34/34) green against it. First proof: 2026-10-14, built as
-`frr-testbed:ci` and run via the `frr-testbed:10.2.2` tag alias
-(scripts pin the tag; `docker tag frr-testbed:ci frr-testbed:10.2.2`
-swaps the suite onto the rebuilt image without touching a single
-script). The nightly workflow (`.github/workflows/smokes.yml`) builds
-this Dockerfile on every run, so the suite is permanently pinned to
-the in-repo recipe.
+suite (34/34) green against it. First proof, 2026-10-14: built as
+`frr-testbed:ci` (parity spot-checks: identical `/etc/apk/world`, 41
+installed packages, byte-identical vtysh size, `staticd --version`
+10.2.2, frr-owned `/run/frr` + `/var/log/frr`) and run via the
+`frr-testbed:10.2.2` tag alias — `docker tag frr-testbed:ci
+frr-testbed:10.2.2` swaps the suite onto the rebuilt image without
+touching a single script. Result: 34/34 green (30 in the sequential
+run; the four BFD smokes re-run individually after their quarantine
+`cd` into `<repo>/away` failed in the isolated clean-checkout used
+for the proof — a worktree environment artifact, not an image
+difference; all four green on re-run against the same tags).
+The nightly workflow (`.github/workflows/smokes.yml`) builds this
+Dockerfile on every run, so the suite is permanently pinned to the
+in-repo recipe.
 
 ## Building locally
 
