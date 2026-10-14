@@ -5,7 +5,12 @@ the same night (micro M2) with `call`, zebra-style access-lists, and
 the `set comm-list NAME delete` token-order fix; the morning
 adjudication (POL-1 A) pinned the `call` error shape — undefined
 target = compile error at the call site's own line, cycles rejected at
-load with the full cycle path in the message. Scope:
+load with the full cycle path in the message. The 2026-10-14
+adjudication wave (S7-d) ratified the ordered access-list
+representation (POL-4), made `match community any` a real third mode
+(POL-2), warn-ignored `description` lines in both route-map and
+prefix-list stanzas (POL-5), and recorded the multi-name superset as
+deliberate (POL-3). Scope:
 `RouteView` (the generic route window), the BIRD-inspired typed filter
 language as a Rust API, sets-as-data with longest-match tags, the
 dependency-free FRR AS-path regex subset, the route-map
@@ -142,7 +147,9 @@ deferred (§7).
   (FRR: "match will happen user defined order"); an entry matches when
   the route carries all its communities (an entry with no communities
   matches everything — FRR's doc example `bgp community-list standard
-  FILTER permit` is the permit-the-rest tail); no match → deny.
+  FILTER permit` is the permit-the-rest tail); no match → deny. The
+  list also answers the other two `match community` modes: set
+  equality (`exact_match`) and the any-scan (`any_match`, §6.11).
 
 ## 4. The typed filter language (M2)
 
@@ -180,7 +187,7 @@ default `Reject`; BIRD-style filters should terminate explicitly, per
 | `PathLen {min,max}` / `PathEmpty` | length range / emptiness | BIRD `bgp_path.len` |
 | `CommunityAny(id)` / `CommunityExact(id)` / `CommunityEmpty` | set intersects / set equality / no communities | FRR `match community [exact-match]`; BIRD §5.3 |
 | `ExtCommunityAny(id)` | extended-community set intersects | BIRD eclist §5.3 |
-| `PathList(id)` / `CommunityList(id)` / `CommunityListExact(id)` | FRR ordered access-lists | FRR BGP docs |
+| `PathList(id)` / `CommunityList(id)` / `CommunityListExact(id)` / `CommunityListAny(id)` | FRR ordered access-lists (community default/exact/any modes, §6.11) | FRR BGP docs |
 | `ProtocolIn([RouteProtocol])` | origin-protocol test | BIRD `source`; FRR `match source-protocol` |
 | `OriginIn([BgpOrigin])` | BGP ORIGIN test | BIRD `bgp_origin` |
 | `LocalPrefIn(lo,hi)` / `MedIn` / `OtcIn` / `MetricIn` | numeric ranges (absent attr ⇒ false) | BIRD §5.5; FRR `match local-preference`/`metric` |
@@ -225,7 +232,7 @@ route-map NAME (permit|deny) SEQ
  match ip|ipv6 address ACCESS_LIST
  match ip|ipv6 address prefix-list NAME[,NAME...]
  match as-path NAME
- match community NAME[,NAME...] [exact-match|any]
+ match community NAME[,NAME...] [exact-match|any]   # 3 modes, §6.11
  match local-preference VALUE
  match metric VALUE
  match source-protocol PROTO...            # static bgp ospf connected kernel rip isis local
@@ -295,8 +302,9 @@ Maps" summary table:
 | `match ip address prefix-list X` | `Term::PrefixList(idx)` (+`Or` across names) |
 | `match ipv6 address prefix-list X` | same (AF separation via pattern coverage) |
 | `match as-path X` | `Term::PathList(idx)` |
-| `match community X` | `Term::CommunityList(idx)` |
+| `match community X` | `Term::CommunityList(idx)` (default mode) |
 | `match community X exact-match` | `Term::CommunityListExact(idx)` |
+| `match community X any` | `Term::CommunityListAny(idx)` (POL-2 — a real mode since 2026-10-14; previously aliased default) |
 | `match local-preference V` | `Term::LocalPrefIn(V, V)` |
 | `match metric V` | `Term::MetricIn(V, V)` |
 | `match source-protocol P...` | `Term::ProtocolIn([…])` |
@@ -359,6 +367,27 @@ Maps" summary table:
    `set_community_delete_cmd`: "set comm-list
    <(1-99)|(100-500)|COMMUNITY_LIST_NAME> delete"). Verbatim FRR
    configs now parse; the inverted order is a parse error.
+11. **`match community` three modes** (POL-2, owner-adjudicated
+   2026-10-14): FRR 10.2.2 dispatches three evaluation paths in
+   `route_match_community` (bgpd/bgp_routemap.c, selected by the
+   trailing flag of `match_community_cmd`) — the default
+   `community_list_match` (bgpd/bgp_clist.c:651: ordered entry scan;
+   an entry matches when the route carries **all** its communities,
+   `community_match`, bgpd/bgp_community.c:547: "Every community on
+   com2 needs to be on com1 for this to match"; first matching
+   entry's verdict), `exact-match` `community_list_exact_match`
+   (bgp_clist.c:722: community-set equality via `community_cmp`), and
+   `any` `community_list_any_match` (bgp_clist.c:735: the route needs
+   just **one** listed community; the first hit — route-community
+   order outer, entry order inner, `community_include` — entry's
+   verdict; a community-less route makes FRR's match return RMAP_OKAY,
+   which the route-map apply loop skips: no-match). Until this fix
+   Rouster accepted `any` but compiled it identically to the default
+   mode (the M2-disclosed deviation); each mode now maps to its own
+   term. Grammar: the flag trails and is single (`exact-match any`
+   together is a parse error); a lone `any` token names a list called
+   "any" (FRR's flag alternation is optional), resolving as an
+   undefined-list compile error.
 
 ## 7. §Deferred anchors
 

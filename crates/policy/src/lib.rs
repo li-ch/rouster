@@ -41,7 +41,7 @@ pub use route::{
 };
 pub use routemap::{
     compile_route_map, parse_policy_config, CompileOutput, PolicyConfigError, PolicyDocument,
-    RmEntry, RmExit, RmMatch, RmNum, RmPolicy, RmSet, RouteMap,
+    RmCommunityMode, RmEntry, RmExit, RmMatch, RmNum, RmPolicy, RmSet, RouteMap,
 };
 pub use sets::{
     AccessList, AccessListEntry, AsPathAccessList, AsPathListEntry, AsSet, CommunityAccessList,

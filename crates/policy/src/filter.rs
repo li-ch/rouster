@@ -364,8 +364,8 @@ pub enum Term {
     /// FRR-ordered AS-path access-list scan (`bgp as-path access-list`):
     /// true iff the first matching regex is a permit.
     PathList(SetIndex),
-    /// FRR-ordered standard community-list scan (`match community LIST`
-    /// default/any mode): true iff the first entry whose communities
+    /// FRR-ordered standard community-list scan (`match community LIST`,
+    /// the default mode): true iff the first entry whose communities
     /// are all carried is a permit. Undefined (empty) communities
     /// follow BIRD §5.5 emptiness, so a bare `permit` entry matches
     /// community-less routes too.
@@ -373,6 +373,15 @@ pub enum Term {
     /// `match community LIST exact-match`: true iff some entry's
     /// community set equals the route's and that entry is a permit.
     CommunityListExact(SetIndex),
+    /// `match community LIST any` (POL-2; FRR 10.2.2
+    /// `community_list_any_match`): true iff the first hit of the
+    /// any-scan — route communities outer (in order), entries inner
+    /// (in order) — is a permit. The route needs to carry just one
+    /// listed community; a bare `permit` entry (no communities) never
+    /// hits in this mode, and neither does a community-less route
+    /// (FRR's match returns RMAP_OKAY there, which the route-map apply
+    /// loop skips).
+    CommunityListAny(SetIndex),
     /// Protocol test (BIRD `source`; FRR `match source-protocol`).
     ProtocolIn(Vec<RouteProtocol>),
     /// BGP ORIGIN test.
@@ -471,6 +480,9 @@ impl Term {
             Term::CommunityListExact(s) => sets
                 .community_list(s.idx)
                 .is_some_and(|l| l.exact_match(empty_when_no_bgp(r)) == Some(true)),
+            Term::CommunityListAny(s) => sets
+                .community_list(s.idx)
+                .is_some_and(|l| l.any_match(empty_when_no_bgp(r)) == Some(true)),
             Term::ProtocolIn(v) => v.contains(&r.protocol),
             Term::OriginIn(v) => r
                 .bgp()
@@ -773,7 +785,8 @@ mod tests {
     use crate::route::testutil::{v4_route, v6_route};
     use crate::route::WellKnownCommunity;
     use crate::sets::{
-        AccessList, AccessListEntry, CommunityPattern, PrefixListEntry, PrefixPattern,
+        AccessList, AccessListEntry, CommunityAccessList, CommunityListEntry, CommunityPattern,
+        PrefixListEntry, PrefixPattern,
     };
     use common::IpPrefix;
 
@@ -1057,6 +1070,71 @@ mod tests {
         // empty route communities: exact-match requires non-empty
         r.bgp_or_materialize().communities = vec![];
         assert_eq!(f_exact.apply(&mut r), Verdict::Reject);
+    }
+
+    #[test]
+    fn community_list_three_modes_are_distinct_terms() {
+        // POL-2: the same compiled list under the three mode terms.
+        // Entry 1 denies when ALL of {1,2} are carried (default) or
+        // EITHER is carried (any); entry 2 permits on {3} alone.
+        let mk_list = || {
+            let mut l = CommunityAccessList::new();
+            l.insert(CommunityListEntry {
+                seq: 1,
+                permit: false,
+                communities: vec![Community::Pair(65000, 1), Community::Pair(65000, 2)],
+            });
+            l.insert(CommunityListEntry {
+                seq: 2,
+                permit: true,
+                communities: vec![Community::Pair(65000, 3)],
+            });
+            l
+        };
+        let build = |term_of: fn(SetIndex) -> Term| {
+            let mut b = FilterBuilder::new();
+            let idx = b.add_community_list(mk_list());
+            b.add_rule(term_of(idx), vec![Action::Accept]);
+            b.build().unwrap()
+        };
+        let default = build(Term::CommunityList);
+        let exact = build(Term::CommunityListExact);
+        let any = build(Term::CommunityListAny);
+
+        let mk = |cs: Vec<Community>| {
+            let mut r = v4_route("192.0.2.0/24", &[]);
+            r.bgp_or_materialize().communities = cs;
+            r
+        };
+        // Only :1 carried: default no entry matches; any hits the deny.
+        let mut one = mk(vec![Community::Pair(65000, 1)]);
+        assert_eq!(default.apply(&mut one), Verdict::Reject);
+        assert_eq!(any.apply(&mut one), Verdict::Reject);
+        // :3 alone: all-of and any permit via entry 2; exact EQUALS
+        // entry 2's set and it is a permit entry → accept too.
+        let mut three = mk(vec![Community::Pair(65000, 3)]);
+        assert_eq!(default.apply(&mut three), Verdict::Accept);
+        assert_eq!(any.apply(&mut three), Verdict::Accept);
+        assert_eq!(exact.apply(&mut three), Verdict::Accept);
+        // A SUPERSET of entry 2 ({3,9}): all-of and any still hit
+        // entry 2, but no entry's set equals {3,9} → exact rejects.
+        let mut sup = mk(vec![Community::Pair(65000, 3), Community::Pair(65000, 9)]);
+        assert_eq!(default.apply(&mut sup), Verdict::Accept);
+        assert_eq!(any.apply(&mut sup), Verdict::Accept);
+        assert_eq!(exact.apply(&mut sup), Verdict::Reject);
+        // Exactly {1,2}: the set EQUALS entry 1's — but entry 1 is a
+        // deny, so exact-match resolves Some(false) → reject; default
+        // matches entry 1's all-of → deny → reject as well.
+        let mut eq = mk(vec![Community::Pair(65000, 1), Community::Pair(65000, 2)]);
+        assert_eq!(exact.apply(&mut eq), Verdict::Reject);
+        assert_eq!(default.apply(&mut eq), Verdict::Reject);
+        // A community-less route: every mode false (any never hits;
+        // default would need a bare-permit entry, which this list lacks).
+        let mut none = v4_route("192.0.2.0/24", &[]);
+        none.bgp = None;
+        assert_eq!(default.apply(&mut none), Verdict::Reject);
+        assert_eq!(exact.apply(&mut none), Verdict::Reject);
+        assert_eq!(any.apply(&mut none), Verdict::Reject);
     }
 
     #[test]

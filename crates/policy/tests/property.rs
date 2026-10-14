@@ -5,7 +5,8 @@
 use common::{IpPrefix, RouteProtocol};
 use policy::route::{AsPath, BgpOrigin, Community, RouteData};
 use policy::routemap::{
-    compile_route_map, parse_policy_config, RmEntry, RmExit, RmMatch, RmPolicy, RmSet,
+    compile_route_map, parse_policy_config, RmCommunityMode, RmEntry, RmExit, RmMatch, RmPolicy,
+    RmSet,
 };
 use policy::sets::{PrefixListVerdict, PrefixPattern, PrefixSet};
 use policy::{Action, CommMode, FilterBuilder, Term, Verdict};
@@ -265,14 +266,15 @@ fn oracle_interpret(
                 .bgp()
                 .map(|b| as_lists.get(n).and_then(|l| l.first_match(&b.as_path)) == Some(true))
                 .unwrap_or(false),
-            RmMatch::Community { names, exact } => names.iter().any(|n| {
+            RmMatch::Community { names, mode } => names.iter().any(|n| {
                 static EMPTY: [Community; 0] = [];
                 let list = comm_lists.get(n);
                 let comms = route.bgp().map_or(&EMPTY[..], |b| &b.communities);
-                match list {
-                    Some(l) if *exact => l.exact_match(comms) == Some(true),
-                    Some(l) => l.first_match(comms) == Some(true),
-                    None => false,
+                match (list, mode) {
+                    (Some(l), RmCommunityMode::Exact) => l.exact_match(comms) == Some(true),
+                    (Some(l), RmCommunityMode::Any) => l.any_match(comms) == Some(true),
+                    (Some(l), RmCommunityMode::Default) => l.first_match(comms) == Some(true),
+                    (None, _) => false,
                 }
             }),
             RmMatch::LocalPref(v) => route.bgp().and_then(|b| b.local_pref) == Some(*v),
@@ -419,7 +421,14 @@ fn route_map_strategy() -> BoxedStrategy<GenRouteMap> {
                 }
                 if !cls.is_empty() && idx % 4 == 2 {
                     let i = idx % cls.len();
-                    text.push_str(&format!(" match community CL{i}\n"));
+                    // POL-2: mixed programs across the three
+                    // match-community modes.
+                    let flag = match idx % 3 {
+                        0 => "",
+                        1 => " any",
+                        _ => " exact-match",
+                    };
+                    text.push_str(&format!(" match community CL{i}{flag}\n"));
                 }
                 if idx % 2 == 0 {
                     text.push_str(&format!(" set local-preference {}\n", 50 + seq));

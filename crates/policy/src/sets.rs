@@ -706,6 +706,30 @@ impl CommunityAccessList {
             .map(|e| e.permit)
     }
 
+    /// Any-scan for `match community LIST any` (POL-2; FRR 10.2.2
+    /// `community_list_any_match`, bgpd/bgp_clist.c:735): the route
+    /// needs to carry just ONE community listed in some entry — the
+    /// FRR loop is `for each route community (outer, in order)`
+    /// × `for each entry (inner, in order)` with
+    /// `community_include(entry, val)`, and the first hit's verdict
+    /// wins. So a route whose values could hit entries with different
+    /// verdicts resolves by its own community order, and an entry with
+    /// no communities (the permit-the-rest tail) never hits in any
+    /// mode (`community_include` of an empty entry is always false).
+    /// No hit → `None` (a community-less route never hits either —
+    /// FRR's match returns RMAP_OKAY there, which the route-map apply
+    /// loop skips like a no-match).
+    pub fn any_match(&self, route: &[Community]) -> Option<bool> {
+        for c in route {
+            for e in &self.entries {
+                if e.communities.contains(c) {
+                    return Some(e.permit);
+                }
+            }
+        }
+        None
+    }
+
     /// Union of all communities across entries — the removal set for
     /// `set comm-list delete NAME` (FRR BGP docs example).
     pub fn to_removal_set(&self) -> CommunitySet {
@@ -1042,6 +1066,73 @@ mod tests {
             value_hi: u16::MAX,
         };
         assert!(full.matches(&Community::Pair(9999, 1)));
+    }
+
+    #[test]
+    fn community_list_any_match_mode() {
+        // POL-2: the any-scan (FRR 10.2.2 community_list_any_match,
+        // bgp_clist.c:735) — one listed community suffices, and the
+        // route's own community order picks the winning entry when
+        // values could hit entries with different verdicts.
+        let mut l = CommunityAccessList::new();
+        l.insert(CommunityListEntry {
+            seq: 1,
+            permit: false, // deny if EITHER 65000:1 or 65000:2 is carried
+            communities: vec![Community::Pair(65000, 1), Community::Pair(65000, 2)],
+        });
+        l.insert(CommunityListEntry {
+            seq: 2,
+            permit: true, // permit 65000:3
+            communities: vec![Community::Pair(65000, 3)],
+        });
+        // Default mode (all-of): carrying only :1 does NOT hit entry 1.
+        assert_eq!(l.first_match(&[Community::Pair(65000, 1)]), None);
+        // Any mode: carrying :1 alone hits entry 1 → deny.
+        assert_eq!(
+            l.any_match(&[Community::Pair(65000, 1)]),
+            Some(false),
+            "any mode needs just one listed community"
+        );
+        // Verdict order: route order decides between overlapping
+        // entries — [:3, :1] hits entry 2 first (permit), [:1, :3]
+        // hits entry 1 (deny).
+        assert_eq!(
+            l.any_match(&[Community::Pair(65000, 3), Community::Pair(65000, 1)]),
+            Some(true),
+            "first route community (:3) hits the permit entry"
+        );
+        assert_eq!(
+            l.any_match(&[Community::Pair(65000, 1), Community::Pair(65000, 3)]),
+            Some(false),
+            "first route community (:1) hits the deny entry"
+        );
+        // Empty route communities never hit (FRR: RMAP_OKAY → skipped).
+        assert_eq!(l.any_match(&[]), None);
+        // An unlisted community hits nothing.
+        assert_eq!(l.any_match(&[Community::Pair(65001, 1)]), None);
+    }
+
+    #[test]
+    fn community_list_any_mode_empty_entry_never_hits() {
+        // community_include of a bare `permit` entry (no communities) is
+        // always false in FRR's any-scan — the permit-the-rest tail is
+        // a DEFAULT-mode construct only.
+        let mut l = CommunityAccessList::new();
+        l.insert(CommunityListEntry {
+            seq: 1,
+            permit: true,
+            communities: vec![],
+        });
+        assert_eq!(
+            l.first_match(&[Community::Pair(65000, 1)]),
+            Some(true),
+            "default mode: bare permit matches (empty all-of set)"
+        );
+        assert_eq!(
+            l.any_match(&[Community::Pair(65000, 1)]),
+            None,
+            "any mode: bare permit never hits"
+        );
     }
 
     #[test]

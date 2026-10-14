@@ -68,6 +68,35 @@ pub enum RmPolicy {
     Deny,
 }
 
+/// The `match community` evaluation mode (POL-2, owner-adjudicated
+/// 2026-10-14). FRR 10.2.2 has THREE distinct paths selected by the
+/// clause's trailing flag (bgpd/bgp_routemap.c `match_community_cmd`:
+/// `"match community <(1-99)|(100-500)|COMMUNITY_LIST_NAME>
+/// [<exact-match$exact|any$any>]"`), all dispatched in
+/// `route_match_community`:
+///
+/// - no flag → `community_list_match` (bgpd/bgp_clist.c:651) — ordered
+///   entry scan, an entry matches when the route carries ALL its
+///   communities (`community_match`, bgpd/bgp_community.c:547: "Every
+///   community on com2 needs to be on com1 for this to match"), first
+///   matching entry's permit/deny decides;
+/// - `exact-match` → `community_list_exact_match` (bgp_clist.c:722) —
+///   entry matches on community-set equality (`community_cmp`);
+/// - `any` → `community_list_any_match` (bgp_clist.c:735) — the route
+///   needs to carry just ONE listed community; the first hit
+///   (route-community order outer, entry order inner) entry's verdict
+///   decides, and a community-less route makes FRR's match return
+///   RMAP_OKAY, which the route-map apply loop skips (no-match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RmCommunityMode {
+    /// No flag — all-of-entry ordered scan (`community_list_match`).
+    Default,
+    /// `exact-match` — set-equality scan (`community_list_exact_match`).
+    Exact,
+    /// `any` — one-listed-community scan (`community_list_any_match`).
+    Any,
+}
+
 /// One match clause of a route-map entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RmMatch {
@@ -77,8 +106,11 @@ pub enum RmMatch {
     AccessList { v6: bool, name: String },
     /// `match as-path NAME`
     AsPath(String),
-    /// `match community NAME[,NAME...] [exact-match]`
-    Community { names: Vec<String>, exact: bool },
+    /// `match community NAME[,NAME...] [exact-match|any]`
+    Community {
+        names: Vec<String>,
+        mode: RmCommunityMode,
+    },
     /// `match local-preference VALUE`
     LocalPref(u32),
     /// `match metric VALUE`
@@ -440,17 +472,36 @@ fn parse_match(
             if toks.len() < 3 {
                 return err(line, "match community: missing name");
             }
-            let exact = toks.last() == Some(&"exact-match");
             let mut names_toks = &toks[2..];
-            if exact || toks.last() == Some(&"any") {
-                names_toks = &names_toks[..names_toks.len() - 1];
+            let mut mode = RmCommunityMode::Default;
+            // A trailing flag selects the mode — but only when at least
+            // one name token would remain: `match community any` names a
+            // LIST "any" in FRR's grammar (the flag alternation is
+            // optional and trailing).
+            if names_toks.len() > 1 {
+                mode = match names_toks[names_toks.len() - 1] {
+                    "exact-match" => RmCommunityMode::Exact,
+                    "any" => RmCommunityMode::Any,
+                    _ => RmCommunityMode::Default,
+                };
+                if mode != RmCommunityMode::Default {
+                    names_toks = &names_toks[..names_toks.len() - 1];
+                    if names_toks.len() > 1
+                        && matches!(names_toks[names_toks.len() - 1], "exact-match" | "any")
+                    {
+                        return err(
+                            line,
+                            "match community: one mode flag allowed (`exact-match` or `any`), not both",
+                        );
+                    }
+                }
             }
             if names_toks.is_empty() {
                 return err(line, "match community: missing name");
             }
             RmMatch::Community {
                 names: parse_name_list(&names_toks.join(" ")),
-                exact,
+                mode,
             }
         }
         Some("local-preference") => {
@@ -1179,7 +1230,7 @@ fn compile_route_map_inner(
                     };
                     terms.push(Term::PathList(idx));
                 }
-                RmMatch::Community { names, exact } => {
+                RmMatch::Community { names, mode } => {
                     let mut ors = Vec::new();
                     for n in names {
                         let list = doc
@@ -1197,10 +1248,12 @@ fn compile_route_map_inner(
                                 x
                             }
                         };
-                        ors.push(if *exact {
-                            Term::CommunityListExact(idx)
-                        } else {
-                            Term::CommunityList(idx)
+                        // The mode picks the evaluation path (POL-2; the
+                        // three FRR 10.2.2 functions on RmCommunityMode).
+                        ors.push(match mode {
+                            RmCommunityMode::Default => Term::CommunityList(idx),
+                            RmCommunityMode::Exact => Term::CommunityListExact(idx),
+                            RmCommunityMode::Any => Term::CommunityListAny(idx),
                         });
                     }
                     terms.push(or_or_identity(ors));
@@ -1521,6 +1574,239 @@ route-map exact permit 10
         assert_eq!(out.filter.apply(&mut both), Verdict::Accept);
         let mut one = mk(vec![Community::Pair(65000, 1)]);
         assert_eq!(out.filter.apply(&mut one), Verdict::Reject);
+    }
+
+    #[test]
+    fn match_community_any_is_a_real_mode_not_default() {
+        // POL-2 (owner-adjudicated 2026-10-14): `match community LIST
+        // any` is its own FRR 10.2.2 evaluation path
+        // (community_list_any_match, bgp_clist.c:735) — one listed
+        // community suffices — not an alias of the default all-of scan
+        // (community_list_match, bgp_clist.c:651).
+        let list = "\
+bgp community-list standard PAIR deny 65000:1 65000:2
+bgp community-list standard PAIR permit 65000:3
+";
+        let any_text = format!("{list}route-map r permit 10\n match community PAIR any\n");
+        let out = compile_ok(&any_text, "r");
+        let mk = |cs: Vec<Community>| {
+            let mut r = v4_route("192.0.2.0/24", &[]);
+            r.bgp_or_materialize().communities = cs;
+            r
+        };
+        // Carrying only :1 — default mode would find NO entry (the deny
+        // entry needs both :1 and :2); any mode hits it → deny.
+        let mut one = mk(vec![Community::Pair(65000, 1)]);
+        assert_eq!(
+            out.filter.apply(&mut one),
+            Verdict::Reject,
+            "any mode: one listed community hits the deny entry"
+        );
+        let mut three = mk(vec![Community::Pair(65000, 3)]);
+        assert_eq!(
+            out.filter.apply(&mut three),
+            Verdict::Accept,
+            "any mode: :3 hits the permit entry"
+        );
+        // Contrast: the same list under the default mode.
+        let default_text = format!("{list}route-map r permit 10\n match community PAIR\n");
+        let out2 = compile_ok(&default_text, "r");
+        let mut one2 = mk(vec![Community::Pair(65000, 1)]);
+        assert_eq!(
+            out2.filter.apply(&mut one2),
+            Verdict::Reject,
+            "default mode: no entry matches at all (implicit deny)"
+        );
+        // The verdict-level distinction: carrying {3,1,2} the default
+        // scan's first hit is the DENY entry (entry order: both 1 and 2
+        // carried → all-of satisfied), while the any-scan's first hit
+        // is :3 — the permit entry, by ROUTE order.
+        let mut all3 = mk(vec![
+            Community::Pair(65000, 3),
+            Community::Pair(65000, 1),
+            Community::Pair(65000, 2),
+        ]);
+        assert_eq!(
+            out2.filter.apply(&mut all3),
+            Verdict::Reject,
+            "default: the deny entry's communities are all carried"
+        );
+        let mut all3_any = mk(vec![
+            Community::Pair(65000, 3),
+            Community::Pair(65000, 1),
+            Community::Pair(65000, 2),
+        ]);
+        assert_eq!(
+            out.filter.apply(&mut all3_any),
+            Verdict::Accept,
+            "any: the first route community (:3) hits the permit entry"
+        );
+    }
+
+    #[test]
+    fn match_community_exact_contrasts_default_and_any() {
+        // Exact mode is set EQUALITY (community_cmp): a superset route
+        // matches under default and any but not under exact.
+        let text = "\
+bgp community-list standard PAIR permit 65000:1 65000:2
+route-map exact permit 10
+ match community PAIR exact-match
+route-map anymode permit 10
+ match community PAIR any
+route-map defmode permit 10
+ match community PAIR
+";
+        let doc = parse_policy_config(text).unwrap();
+        let mk = |cs: Vec<Community>| {
+            let mut r = v4_route("192.0.2.0/24", &[]);
+            r.bgp_or_materialize().communities = cs;
+            r
+        };
+        let superset = vec![
+            Community::Pair(65000, 1),
+            Community::Pair(65000, 2),
+            Community::Pair(65000, 9),
+        ];
+        let exact = compile_route_map(&doc, "exact").unwrap();
+        let mut r = mk(superset.clone());
+        assert_eq!(
+            exact.filter.apply(&mut r),
+            Verdict::Reject,
+            "superset route is not an exact set match"
+        );
+        let any = compile_route_map(&doc, "anymode").unwrap();
+        let mut r = mk(superset.clone());
+        assert_eq!(any.filter.apply(&mut r), Verdict::Accept, "any: :1 hits");
+        let default = compile_route_map(&doc, "defmode").unwrap();
+        let mut r = mk(superset);
+        assert_eq!(
+            default.filter.apply(&mut r),
+            Verdict::Accept,
+            "default mode: all of the entry communities are carried"
+        );
+        // And the exact-equal set IS accepted by all three.
+        let eq = vec![Community::Pair(65000, 1), Community::Pair(65000, 2)];
+        for name in ["exact", "anymode", "defmode"] {
+            let out = compile_route_map(&doc, name).unwrap();
+            let mut r = mk(eq.clone());
+            assert_eq!(
+                out.filter.apply(&mut r),
+                Verdict::Accept,
+                "equal set matches in {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_community_mixed_modes_in_one_program() {
+        // One route-map mixing modes across entries. List semantics per
+        // mode (route carrying S):
+        // - default: first entry whose communities ⊆ S is a permit?
+        // - any: first hit (route order × entry order) a permit?
+        let text = "\
+bgp community-list standard TAG deny 65000:1 65000:2
+bgp community-list standard TAG permit 65000:3
+route-map mix permit 5
+ match community TAG
+ set local-preference 50
+route-map mix deny 10
+ match community TAG any
+route-map mix permit 100
+";
+        let out = compile_ok(text, "mix");
+        let mk = |cs: Vec<Community>| {
+            let mut r = v4_route("192.0.2.0/24", &[]);
+            r.bgp_or_materialize().communities = cs;
+            r
+        };
+        // {3}: default mode's first permit hit (entry 2) → entry 5
+        // matches, its set applies.
+        let mut tagged = mk(vec![Community::Pair(65000, 3)]);
+        assert_eq!(out.filter.apply(&mut tagged), Verdict::Accept);
+        assert_eq!(tagged.bgp().unwrap().local_pref, Some(50));
+        // {3,1,2}: default's first hit is the DENY entry (both 1 and 2
+        // carried) → entry 5 does not match; any's first hit is :3 (the
+        // permit entry, route order) → entry 10's deny clause matches.
+        let mut mixed = mk(vec![
+            Community::Pair(65000, 3),
+            Community::Pair(65000, 1),
+            Community::Pair(65000, 2),
+        ]);
+        assert_eq!(
+            out.filter.apply(&mut mixed),
+            Verdict::Reject,
+            "any mode matches where default's deny hit blocks entry 5"
+        );
+        // {1} alone: default no permit hit, any hits the deny entry —
+        // neither clause matches, permit-all tail.
+        let mut lone = mk(vec![Community::Pair(65000, 1)]);
+        assert_eq!(out.filter.apply(&mut lone), Verdict::Accept);
+        assert_eq!(lone.bgp().unwrap().local_pref, Some(100));
+        // Unrelated communities: nothing matches, tail.
+        let mut clean = mk(vec![Community::Pair(65001, 7)]);
+        assert_eq!(out.filter.apply(&mut clean), Verdict::Accept);
+        assert_eq!(clean.bgp().unwrap().local_pref, Some(100));
+    }
+
+    #[test]
+    fn match_community_mode_grammar_shapes() {
+        // The flag must trail, must be single, and a lone `any` is a
+        // LIST NAME in FRR's grammar (the flag alternation is optional).
+        let doc = parse_policy_config(
+            "bgp community-list standard C permit 65000:1\nroute-map r permit 10\n match community C any\n",
+        )
+        .unwrap();
+        let rm = doc.route_maps.get("r").unwrap();
+        assert_eq!(
+            rm.entries[0].matches[0],
+            RmMatch::Community {
+                names: vec!["C".to_string()],
+                mode: RmCommunityMode::Any,
+            }
+        );
+        let doc2 = parse_policy_config(
+            "bgp community-list standard C permit 65000:1\nroute-map r permit 10\n match community C exact-match\n",
+        )
+        .unwrap();
+        let rm2 = doc2.route_maps.get("r").unwrap();
+        assert_eq!(
+            rm2.entries[0].matches[0],
+            RmMatch::Community {
+                names: vec!["C".to_string()],
+                mode: RmCommunityMode::Exact,
+            }
+        );
+        // Both flags written: rejected with one clear message.
+        let e = parse_policy_config(
+            "bgp community-list standard C permit 65000:1\nroute-map r permit 10\n match community C exact-match any\n",
+        )
+        .unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(e.message.contains("one mode flag"), "{}", e.message);
+        // `match community any` — a list NAMED any (FRR: the flag needs
+        // a name before it), so it compiles as an undefined-list error.
+        let doc3 = parse_policy_config("route-map r permit 10\n match community any\n").unwrap();
+        let e3 = compile_route_map(&doc3, "r").unwrap_err();
+        assert!(
+            e3.message.contains("undefined community-list `any`"),
+            "{}",
+            e3.message
+        );
+        // Multi-name superset with a mode applies the mode to every name.
+        let text = "\
+bgp community-list standard A permit 65000:1
+bgp community-list standard B deny 65000:2
+route-map r permit 10
+ match community A,B any
+";
+        let out = compile_ok(text, "r");
+        let mut r = v4_route("192.0.2.0/24", &[]);
+        r.bgp_or_materialize().communities = vec![Community::Pair(65000, 2)];
+        assert_eq!(
+            out.filter.apply(&mut r),
+            Verdict::Reject,
+            "B's any-scan denies; OR across names"
+        );
     }
 
     #[test]
