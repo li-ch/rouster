@@ -245,6 +245,10 @@ pub struct Ospfd {
     table_dirty: bool,
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     redistribute_static: bool,
+    /// §C.1's RFC1583Compatibility (O-2, default enabled — the RFC's
+    /// letter): gates §16.4.1's ASBR-path pruning in the §16.4
+    /// external calculation and the §12.4.3 type-4 pick.
+    rfc1583: bool,
     /// Receive-side TTL enforcement counter (night N1): unicast
     /// exchange packets dropped because their TTL is not 1 (§A.1's
     /// single-hop transmit mandate — a degraded TTL means the packet
@@ -289,13 +293,22 @@ struct RouterPath {
     e_bit: bool,
 }
 
-/// §16.4.1's preference (RFC1583Compatibility disabled — FRR 10.2.2's
-/// probed default): intra-area non-backbone paths first; intra-area
-/// backbone and inter-area paths as equals; then least cost, the
-/// largest area ID breaking ties (§16.4 step 3).
-fn preferred_asbr_path(paths: &[RouterPath]) -> Option<&RouterPath> {
+/// §16.4.1's ASBR-path preference. RFC 2328 §16.4 step (3): if
+/// `RFC1583Compatibility` is "disabled", prune the entry set per
+/// §16.4.1 — intra-area non-backbone paths first, intra-backbone and
+/// inter-area as equals; when "enabled" (§C.1's default) NO pruning
+/// applies ("In any case, among the remaining routing table entries,
+/// select the routing table entry with the least cost"). In both
+/// settings: least cost, then the largest area ID (§16.4 step 3).
+fn preferred_asbr_path(paths: &[RouterPath], rfc1583: bool) -> Option<&RouterPath> {
     paths.iter().min_by_key(|p| {
-        let tier = if !p.inter_area && p.area != 0 { 0 } else { 1 };
+        // Enabled (or an intra-area non-backbone path under either
+        // setting): tier 0 — no demotion.
+        let tier = if rfc1583 || (!p.inter_area && p.area != 0) {
+            0
+        } else {
+            1
+        };
         (tier, p.cost, u32::MAX - p.area)
     })
 }
@@ -502,6 +515,7 @@ impl Ospfd {
             table_dirty: true,
             zapi: None,
             redistribute_static: cfg.redistribute_static,
+            rfc1583: cfg.rfc1583_compatibility,
             dropped_degraded_ttl: 0,
             #[cfg(feature = "experimental-savnet")]
             sav_agent: None,
@@ -2196,13 +2210,14 @@ impl Ospfd {
             if ext.metric >= crate::LS_INFINITY {
                 continue;
             }
-            // (3) the preferred ASBR path (§16.4.1, RFC1583Compatibility
-            // disabled — FRR 10.2.2's default): intra-area non-backbone
-            // paths first, then intra-backbone and inter-area as
-            // equals; least cost, largest area ID breaking ties.
+            // (3) the preferred ASBR path (§16.4 step 3 + §16.4.1):
+            // RFC1583Compatibility DISABLED prunes to intra-area
+            // non-backbone paths first (intra-backbone and inter-area
+            // as equals); ENABLED (§C.1's default) considers every
+            // entry. Both: least cost, largest area ID breaking ties.
             let Some(asbr_path) = routers
                 .get(&entry.header.adv_router)
-                .and_then(|paths| preferred_asbr_path(paths))
+                .and_then(|paths| preferred_asbr_path(paths, self.rfc1583))
             else {
                 continue; // ASBR unreachable
             };
@@ -2587,7 +2602,11 @@ impl Ospfd {
                 continue;
             }
             for (rid, paths) in routers {
-                let Some(preferred) = preferred_asbr_path(paths) else {
+                // The same §16.4.1 preference FRR's ospf_abr task
+                // applies to its type-4 picks (disclosed: RFC 2328
+                // itself specifies the preference for §16.4; the
+                // type-4 site inherits it for consistency).
+                let Some(preferred) = preferred_asbr_path(paths, self.rfc1583) else {
                     continue;
                 };
                 // §12.4.3's first bullet: ABR destinations are
@@ -4491,6 +4510,123 @@ mod tests {
                 .iter()
                 .any(|(nh, _)| matches!(nh, Nexthop::Ipv4(x) if *x == b.interfaces[0].addr)),
             "the next hop is the forwarding address (§16.4 step 3b)"
+        );
+    }
+
+    /// §16.4.1's preference over hand-built path sets: with
+    /// RFC1583Compatibility DISABLED, an intra-area non-backbone path
+    /// beats every other shape regardless of cost ("always the most
+    /// preferred"); ENABLED (§C.1's default) applies no pruning —
+    /// least cost, then the largest area ID (§16.4 step 3).
+    #[test]
+    fn asbr_path_preference_follows_rfc1583() {
+        let path = |area: u32, inter: bool, cost: u32| RouterPath {
+            area,
+            inter_area: inter,
+            cost,
+            hops: vec![],
+            b_bit: false,
+            e_bit: true,
+        };
+        // Intra-area-1 (cost 50) vs intra-backbone (cost 10) vs
+        // inter-area (cost 10): disabled takes the non-backbone
+        // intra path despite the cost; enabled applies no pruning —
+        // least cost wins (an area-0 path, cost 10).
+        let paths = vec![path(1, false, 50), path(0, false, 10), path(0, true, 10)];
+        assert_eq!(preferred_asbr_path(&paths, false).unwrap().cost, 50);
+        assert_eq!(preferred_asbr_path(&paths, true).unwrap().cost, 10);
+        assert_eq!(preferred_asbr_path(&paths, true).unwrap().area, 0);
+        // Without the non-backbone path, disabled groups backbone
+        // and inter-area as equals (cost decides, then the larger
+        // area — identical to enabled).
+        let paths = vec![path(0, false, 30), path(0, true, 10)];
+        assert_eq!(preferred_asbr_path(&paths, false).unwrap().cost, 10);
+        assert_eq!(preferred_asbr_path(&paths, true).unwrap().cost, 10);
+        // Equal (cost, shape): the largest area ID wins (§16.4 step
+        // 3), under BOTH settings.
+        let paths = vec![path(2, true, 10), path(5, true, 10)];
+        assert_eq!(preferred_asbr_path(&paths, false).unwrap().area, 5);
+        assert_eq!(preferred_asbr_path(&paths, true).unwrap().area, 5);
+        assert!(preferred_asbr_path(&[], true).is_none());
+    }
+
+    /// §16.4 step (3) end to end (O-2): the same ASBR reachable
+    /// intra-area through the backbone (cost 10) AND a non-backbone
+    /// area (cost 50). RFC1583Compatibility DISABLED picks the
+    /// non-backbone path ("always the most preferred", §16.4.1) —
+    /// the external next hop is the area-1 link; ENABLED (§C.1's
+    /// default) picks least cost — the area-0 link. Both settings
+    /// demonstrably change the documented tiebreak.
+    #[test]
+    fn rfc1583_knob_changes_the_external_tiebreak() {
+        let run = |rfc1583: &str| -> (Vec<Nexthop>, u32) {
+            // A: eth0 in area 0 (cost 10) and eth1 in area 1 (cost
+            // 50), both p2p to B's matching interface; B: the ASBR.
+            let a_conf = format!(
+                "router ospf\n router-id 10.255.1.1\n{rfc1583} area 0.0.0.0\n  interface eth0\n   address 10.10.0.1/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n area 0.0.0.1\n  interface eth1\n   address 10.20.0.1/30\n   cost 50\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n"
+            );
+            let b_conf = "\
+router ospf\n router-id 10.255.3.1\n area 0.0.0.0\n  interface eth0\n   address 10.10.0.2/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n area 0.0.0.1\n  interface eth1\n   address 10.20.0.2/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n redistribute static\n";
+            let mut cores = vec![
+                Ospfd::new(&parse_config(&a_conf).unwrap()).unwrap(),
+                Ospfd::new(&parse_config(b_conf).unwrap()).unwrap(),
+            ];
+            let now = run_multi(&mut cores, 0, 8);
+            assert!(
+                cores[0]
+                    .neighbor_states()
+                    .iter()
+                    .filter(|(_, _, s)| *s == NeighborState::Full)
+                    .count()
+                    >= 2,
+                "both A-B adjacencies Full"
+            );
+            // B redistributes a type-2 static (metric 20).
+            let mut out: Vec<WireOut> = Vec::new();
+            cores[1].on_redistribute_add(
+                crate::zedge::RedistributedRoute {
+                    prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 24).unwrap()),
+                    metric: 20,
+                },
+                now + 1,
+                &mut out,
+            );
+            deliver_multi(&mut cores, 1, &out, now + 1, &mut Vec::new());
+            run_multi(&mut cores, now + 2, 10);
+            let route = cores[0].routes.get("203.0.113.0/24").expect("installed");
+            (
+                route.nexthops.hops().iter().map(|(nh, _)| *nh).collect(),
+                route.metric,
+            )
+        };
+        // DISABLED: §16.4.1's non-backbone path wins despite 5x the
+        // cost — the next hop rides the area-1 link.
+        let (hops, metric) = run(" rfc1583-compatibility disabled\n");
+        assert_eq!(metric, 20, "type-2 external: the LSA metric");
+        assert!(
+            hops.iter()
+                .any(|nh| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.20.0.2"))),
+            "disabled: the non-backbone ASBR path ({hops:?})"
+        );
+        assert!(
+            !hops
+                .iter()
+                .any(|nh| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.10.0.2"))),
+            "disabled: the cheaper backbone path loses (§16.4.1)"
+        );
+        // ENABLED (the default): no pruning — least cost wins.
+        let (hops, metric) = run("");
+        assert_eq!(metric, 20);
+        assert!(
+            hops.iter()
+                .any(|nh| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.10.0.2"))),
+            "enabled: least cost wins ({hops:?})"
+        );
+        assert!(
+            !hops
+                .iter()
+                .any(|nh| matches!(nh, Nexthop::Ipv4(x) if *x == ip("10.20.0.2"))),
+            "enabled: the non-backbone preference is gone"
         );
     }
 

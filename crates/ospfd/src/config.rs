@@ -87,6 +87,11 @@ pub struct OspfdConfig {
     pub key_chains: Vec<crate::keychain::KeyChain>,
     /// `redistribute static`.
     pub redistribute_static: bool,
+    /// `rfc1583-compatibility <enabled|disabled>` (§C.1, O-2): the
+    /// §16.4 ASBR-path preference. Default ENABLED — RFC 2328 §C.1:
+    /// "Set to 'enabled' by default" (FRR 10.2.2's probed default is
+    /// disabled; the RFC's letter wins here, divergence disclosed).
+    pub rfc1583_compatibility: bool,
 }
 
 impl OspfdConfig {
@@ -327,6 +332,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
         networks: vec![],
         key_chains: Vec::new(),
         redistribute_static: false,
+        rfc1583_compatibility: true,
     };
     let mut in_router = false;
     // The `key chain` stanza state: index of the open chain, whether
@@ -780,6 +786,27 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                             return Err(parse_error(line_no, "expected: redistribute static"));
                         }
                         cfg.redistribute_static = true;
+                    }
+                    "rfc1583-compatibility" => {
+                        // §C.1's global knob (O-2). FRR spells it as
+                        // the `ospf rfc1583compatibility` toggle under
+                        // router ospf — the edge translates.
+                        if words.len() != 2 {
+                            return Err(parse_error(
+                                line_no,
+                                "expected: rfc1583-compatibility <enabled|disabled>",
+                            ));
+                        }
+                        cfg.rfc1583_compatibility = match words[1] {
+                            "enabled" => true,
+                            "disabled" => false,
+                            _ => {
+                                return Err(parse_error(
+                                    line_no,
+                                    "expected: rfc1583-compatibility <enabled|disabled>",
+                                ))
+                            }
+                        };
                     }
                     other => {
                         return Err(parse_error(
@@ -1418,6 +1445,26 @@ router ospf
         let err = parse("router ospf\n area 0.0.0.0\n  interface eth0\n   instance-id 256\n")
             .unwrap_err();
         assert!(err.to_string().contains("0-255"), "{err}");
+    }
+
+    /// §C.1's RFC1583Compatibility knob (O-2): default ENABLED per the
+    /// RFC's letter ("Set to 'enabled' by default" — FRR 10.2.2's
+    /// probed default is disabled; the divergence is disclosed in
+    /// ospf.md), both spellings parse, anything else carries its line.
+    #[test]
+    fn rfc1583_compatibility_parses() {
+        // The default: enabled (§C.1).
+        let cfg = parse("router ospf\n area 0.0.0.0\n").unwrap();
+        assert!(cfg.rfc1583_compatibility, "§C.1: enabled by default");
+        // Both spellings.
+        let cfg = parse("router ospf\n rfc1583-compatibility disabled\n area 0.0.0.0\n").unwrap();
+        assert!(!cfg.rfc1583_compatibility);
+        let cfg = parse("router ospf\n rfc1583-compatibility enabled\n area 0.0.0.0\n").unwrap();
+        assert!(cfg.rfc1583_compatibility);
+        // Strictness: a bad value and a duplicate carry line numbers.
+        let err = parse("router ospf\n rfc1583-compatibility maybe\n area 0.0.0.0\n").unwrap_err();
+        assert!(err.to_string().contains("<enabled|disabled>"), "{err}");
+        assert!(err.to_string().contains("line 2"), "{err}");
     }
 
     // ---- key chains (RFC 8177, O-8, S8-b) -------------------------
