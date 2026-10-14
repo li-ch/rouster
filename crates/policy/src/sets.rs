@@ -12,6 +12,7 @@
 
 use crate::route::{max_plen, AsPath, Community, ExtCommunity, WellKnownCommunity};
 use common::IpPrefix;
+use std::collections::HashMap;
 use std::fmt;
 
 /// Result of asking a prefix-set about a prefix.
@@ -143,9 +144,31 @@ impl fmt::Display for PrefixPattern {
 
 /// A named prefix-set: a bag of patterns, membership = any pattern covers
 /// (BIRD prefix-set literal semantics), plus longest-match tag lookup.
+///
+/// Representation (S10-c M2, measured — §8 of docs/protocols/policy.md):
+/// patterns stay the source of truth in declaration order, and an index
+/// answers [`PrefixSet::matches`] without the full scan. The index is a
+/// bucket map keyed by pattern NETWORK: a covering pattern whose network
+/// length ≤ the probe length always sits at one of the probe's ancestor
+/// networks (coverage requires the first min(len) bits equal), so the
+/// lookup walks the probe's ancestors from most specific down —
+/// O(probe length) hash probes, set size independent. Patterns with
+/// `min_len <` network length (BIRD `-` shapes) can additionally cover
+/// probes SHORTER than their network; those live in a linear side lane
+/// (rare in real sets; a pathological all-`-` set degrades to the old
+/// full scan — disclosed). Equivalence is property-pinned against the
+/// linear-scan oracle (tests/property.rs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrefixSet {
     patterns: Vec<PrefixPattern>,
+    /// Pattern indexes bucketed by their network (declaration order
+    /// within a bucket). Only patterns that can never cover a probe
+    /// shorter than their network (`min_len >=` network length).
+    by_network: HashMap<IpPrefix, Vec<usize>>,
+    /// Indexes of patterns with `min_len <` network length — they can
+    /// win with a specificity above the probe length, which the
+    /// ancestor walk cannot see. Scanned linearly with full `covers`.
+    subsuming: Vec<usize>,
 }
 
 impl PrefixSet {
@@ -154,11 +177,27 @@ impl PrefixSet {
     }
 
     pub fn from_patterns(patterns: Vec<PrefixPattern>) -> Self {
-        Self { patterns }
+        let mut set = Self::new();
+        for p in patterns {
+            set.add_pattern(p);
+        }
+        set
     }
 
-    /// Append one pattern (later patterns lose longest-match ties).
+    /// Append one pattern (later patterns lose longest-match ties);
+    /// the index updates incrementally.
     pub fn add_pattern(&mut self, pattern: PrefixPattern) {
+        let idx = self.patterns.len();
+        if pattern.min_len < crate::route::plen(&pattern.prefix) {
+            self.subsuming.push(idx);
+        } else {
+            // Key by the MASKED network: `covers` ignores pattern
+            // address bits beyond its length, so `10.42.201.0/12`
+            // covers exactly what `10.32.0.0/12` does — the bucket key
+            // must be the canonical form the probe walk computes.
+            let key = ancestor_network(&pattern.prefix, crate::route::plen(&pattern.prefix));
+            self.by_network.entry(key).or_default().push(idx);
+        }
         self.patterns.push(pattern);
     }
 
@@ -166,21 +205,96 @@ impl PrefixSet {
         &self.patterns
     }
 
-    /// Membership + longest-match tag. Linear scan (sets are
-    /// configuration-sized); disclosed in docs/protocols/policy.md.
-    pub fn matches(&self, prefix: &IpPrefix) -> PrefixMatch {
-        let mut best: Option<&PrefixPattern> = None;
-        for p in &self.patterns {
-            if p.covers(prefix) {
-                match best {
-                    Some(b) if b.specificity() >= p.specificity() => {}
-                    _ => best = Some(p),
+    /// Membership + longest-match tag: the covering pattern with the
+    /// longest network wins; ties break toward the earliest declared.
+    fn best_covering(&self, prefix: &IpPrefix) -> Option<&PrefixPattern> {
+        let l = crate::route::plen(prefix);
+        // Walk winner: deepest ancestor network holding a pattern whose
+        // length bounds admit the probe; the bucket's first covering
+        // pattern (declaration order) is that depth's winner.
+        let mut walk: Option<usize> = None;
+        for d in (0..=l).rev() {
+            let key = ancestor_network(prefix, d);
+            if let Some(bucket) = self.by_network.get(&key) {
+                let hit = bucket.iter().copied().find(|&i| {
+                    let p = &self.patterns[i];
+                    p.min_len <= l && l <= p.max_len
+                });
+                if let Some(i) = hit {
+                    walk = Some(i);
+                    break;
                 }
             }
         }
+        // Lane winner: subsuming patterns, full coverage check, max
+        // specificity then earliest declared.
+        let mut lane: Option<usize> = None;
+        for &i in &self.subsuming {
+            let p = &self.patterns[i];
+            if p.covers(prefix)
+                && lane.is_none_or(|cur| {
+                    let c = &self.patterns[cur];
+                    p.specificity() > c.specificity()
+                        || (p.specificity() == c.specificity() && i < cur)
+                })
+            {
+                lane = Some(i);
+            }
+        }
+        match (walk, lane) {
+            (Some(w), None) => Some(&self.patterns[w]),
+            (None, Some(s)) => Some(&self.patterns[s]),
+            (Some(w), Some(s)) => {
+                let (pw, ps) = (&self.patterns[w], &self.patterns[s]);
+                if pw.specificity() > ps.specificity()
+                    || (pw.specificity() == ps.specificity() && w < s)
+                {
+                    Some(pw)
+                } else {
+                    Some(ps)
+                }
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Membership + longest-match tag (see [`Self::best_covering`]).
+    pub fn matches(&self, prefix: &IpPrefix) -> PrefixMatch {
+        let best = self.best_covering(prefix);
         PrefixMatch {
             matched: best.is_some(),
             tag: best.and_then(|p| p.tag),
+        }
+    }
+}
+
+/// The `d`-bit ancestor network of `prefix` (its first `d` bits, zero
+/// filled) — the walk key. d = 0 yields the family's default route.
+fn ancestor_network(prefix: &IpPrefix, d: u8) -> IpPrefix {
+    match prefix {
+        IpPrefix::V4(p) => {
+            let bits = u32::from(p.addr());
+            let mask: u32 = if d == 0 {
+                0
+            } else {
+                u32::MAX << (32 - d as usize)
+            };
+            IpPrefix::V4(
+                common::Ipv4Prefix::new(std::net::Ipv4Addr::from(bits & mask), d)
+                    .expect("ancestor length <= probe length <= 32"),
+            )
+        }
+        IpPrefix::V6(p) => {
+            let bits = u128::from(p.addr());
+            let mask: u128 = if d == 0 {
+                0
+            } else {
+                u128::MAX << (128 - d as usize)
+            };
+            IpPrefix::V6(
+                common::Ipv6Prefix::new(std::net::Ipv6Addr::from(bits & mask), d)
+                    .expect("ancestor length <= probe length <= 128"),
+            )
         }
     }
 }
@@ -871,6 +985,150 @@ mod tests {
         assert!(PrefixPattern::range(p("10.0.0.0/8"), 0, 33).is_err());
         assert!(PrefixPattern::range(p("2001:db8::/32"), 0, 128).is_ok());
         assert!(PrefixPattern::range(p("2001:db8::/32"), 0, 129).is_err());
+    }
+
+    /// S10-c M2: the bucket index + subsuming lane must be exactly the
+    /// old linear scan. Reference implementation (the pre-index
+    /// `matches`), compared over a shape-mixing set and a probe grid.
+    fn linear_matches(patterns: &[PrefixPattern], prefix: &IpPrefix) -> PrefixMatch {
+        let mut best: Option<&PrefixPattern> = None;
+        for pat in patterns {
+            if pat.covers(prefix) {
+                match best {
+                    Some(b) if b.specificity() >= pat.specificity() => {}
+                    _ => best = Some(pat),
+                }
+            }
+        }
+        PrefixMatch {
+            matched: best.is_some(),
+            tag: best.and_then(|b| b.tag),
+        }
+    }
+
+    #[test]
+    fn indexed_matches_equal_the_linear_scan() {
+        let shapes = [
+            ("10.0.0.0/8", 8, 8),       // exact
+            ("10.42.0.0/16", 16, 32),   // or-longer
+            ("10.42.7.0/24", 20, 28),   // range above network length
+            ("10.42.7.128/25", 16, 25), // subsuming: min < network len
+            ("10.128.0.0/9", 0, 9),     // subsuming incl. the default
+            ("192.0.2.0/24", 0, 24),    // subsuming, other branch
+            ("0.0.0.0/0", 0, 32),       // everything
+            ("10.42.7.192/26", 26, 26), // exact, under the /25
+            // NON-CANONICAL networks (host bits set): `covers` ignores
+            // address bits beyond the length, so these behave as their
+            // masked forms (10.32.0.0/12, 10.0.0.0/9) — the index must
+            // key the masked network (a divergence the S10-c bench
+            // checksums caught; pinned here forever).
+            ("10.42.201.0/12", 12, 20),
+            ("10.42.201.0/9", 9, 9),
+            ("2001:db8::/32", 32, 128),     // v6 or-longer
+            ("2001:db8:1::/48", 32, 48),    // v6 subsuming
+            ("2001:db8:1:2::/64", 64, 64),  // v6 exact
+            ("2001:db8:ffff::/48", 40, 48), // v6 range, sibling branch
+        ];
+        let patterns: Vec<PrefixPattern> = shapes
+            .iter()
+            .enumerate()
+            .map(|(i, &(net, lo, hi))| {
+                PrefixPattern::range(p(net), lo, hi)
+                    .unwrap()
+                    .with_tag(i as u32 + 1)
+            })
+            .collect();
+        // Same set two ways: bulk and incremental — identical results
+        // and identical indexes (PartialEq compares both).
+        let bulk = PrefixSet::from_patterns(patterns.clone());
+        let mut incremental = PrefixSet::new();
+        for pat in &patterns {
+            incremental.add_pattern(pat.clone());
+        }
+        assert_eq!(bulk, incremental);
+
+        let probes = [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "10.0.0.0/7",
+            "10.200.0.0/16",
+            "10.42.0.0/16",
+            "10.42.7.0/24",
+            "10.42.7.128/25",
+            "10.42.7.192/26",
+            "10.42.7.200/29",
+            "10.42.8.0/24",
+            "10.42.0.0/15",
+            "192.0.2.0/24",
+            "192.0.2.128/26",
+            "192.0.3.0/24",
+            "0.0.0.0/1",
+            "128.0.0.0/1",
+            // aligned with the non-canonical networks' masked forms
+            "10.32.0.0/12",
+            "10.40.0.0/16",
+            "10.47.255.0/24",
+            "10.48.0.0/12",
+            "10.0.0.0/9",
+            "10.1.2.0/24",
+            "10.128.0.0/9",
+            "2001:db8::/32",
+            "2001:db8::/31",
+            "2001:db8:1::/48",
+            "2001:db8:1:2::/64",
+            "2001:db8:1:2:3::/80",
+            "2001:db8:ffff::/48",
+            "2001:db8:fffe::/48",
+            "::/0",
+            "2001:db8:1::/47",
+        ];
+        for probe in probes {
+            let probe = p(probe);
+            let got = bulk.matches(&probe);
+            let want = linear_matches(&patterns, &probe);
+            assert_eq!(
+                got, want,
+                "probe {probe}: indexed ({got:?}) != linear ({want:?})"
+            );
+            assert_eq!(incremental.matches(&probe), want, "incremental build");
+        }
+    }
+
+    /// S10-c M2: cross-lane ties — a subsuming pattern and an
+    /// ancestor-walk pattern with the SAME specificity must resolve to
+    /// the earliest declared (the old scan's tie rule), and the empty
+    /// set / no-cover probes still report no match.
+    #[test]
+    fn indexed_cross_lane_ties_follow_declaration_order() {
+        // Same /24 network, two patterns: one subsuming ({16,24}), one
+        // not ({24,28}) — both specificity 24 for a /24 probe; the
+        // earliest declared wins.
+        let a = PrefixPattern::range(p("192.0.2.0/24"), 16, 24)
+            .unwrap()
+            .with_tag(11);
+        let b = PrefixPattern::range(p("192.0.2.0/24"), 24, 28)
+            .unwrap()
+            .with_tag(22);
+        let set = PrefixSet::from_patterns(vec![a.clone(), b.clone()]);
+        assert_eq!(
+            set.matches(&p("192.0.2.128/25")).tag,
+            Some(22),
+            "only b covers /25"
+        );
+        assert_eq!(
+            set.matches(&p("192.0.2.0/24")).tag,
+            Some(11),
+            "both cover /24 at specificity 24 — earliest declared"
+        );
+        let flipped = PrefixSet::from_patterns(vec![b, a]);
+        assert_eq!(
+            flipped.matches(&p("192.0.2.0/24")).tag,
+            Some(22),
+            "flipped declaration flips the tie"
+        );
+        // Empty set: no match, no tag.
+        assert!(!PrefixSet::new().matches(&p("10.0.0.0/8")).matched);
+        assert_eq!(PrefixSet::new().matches(&p("10.0.0.0/8")).tag, None);
     }
 
     #[test]

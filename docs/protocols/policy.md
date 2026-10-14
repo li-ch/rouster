@@ -99,9 +99,21 @@ the longest network length; ties break toward the earliest declared
 entry. Use: classifier sets (customer/transit/blackhole) that a filter
 can branch on via `Term::PrefixTagIn`.
 
-Representation: linear scan over patterns — sets are
-configuration-sized (tens to hundreds), and patterns cannot be
-interval-merged without losing tags. Disclosed, not benchmarked.
+Representation (S10-c M2, measured): patterns stay the source of
+truth in declaration order; a bucket map keyed by pattern NETWORK
+(masks host bits — `covers` ignores them) answers `matches` by walking
+the probe's ancestor networks from most specific down — a covering
+pattern whose network length ≤ the probe length always sits at one of
+those ancestors, so the walk is O(probe length), set size independent.
+Patterns with `min_len <` network length (BIRD `-` shapes) can also
+cover probes SHORTER than their network; those live in a linear side
+lane with the full `covers` check (rare in real sets; an all-`-` set
+degrades to the old full scan — disclosed). Equivalence to the linear
+scan is property-pinned (aligned-probe oracle, incl. non-canonical
+networks — the class of bug the bench checksums caught first) and
+checksum-identical on the generated matrices; §8 has the numbers
+(31× at 10k+ entries, ~2× slower at 100-entry config scale where the
+scan was already ~0.1 µs).
 
 ### 3.2 AS sets — interval representation
 
@@ -434,6 +446,9 @@ Maps" summary table:
   communities.
 - A BIRD-syntax parser over the same `Term`/`Action` data (the
   language is Rust-API first by design; the parser is additive later).
+- An index for the subsuming side lane of `PrefixSet` (the `-`-shape
+  patterns; linear today, disclosed in §3.1/§8) if real sets ever
+  carry them at scale.
 
 ## 8. Benchmarks (S10-c)
 
@@ -473,17 +488,37 @@ in W1-a):
 | route-map compile (one-shot) | 100k lines | — | 0.26 ms | — |
 
 Reading: at configuration scale (100 entries) the linear prefix-set
-scan is ~0.1-0.2 µs per lookup — fine. It grows linearly with set
-size and crosses from "configuration-sized" into a real hotspot at
+scan was ~0.1-0.2 µs per lookup — fine. It grew linearly with set
+size and crossed from "configuration-sized" into a real hotspot at
 10k+ entries (17 µs per lookup, 201 µs at 100k — a full-table
-re-filter of 100k routes against a 100k-entry set would cost ~21 s).
-That is the §3.1-disclosed linear longest-match scan, now measured;
-the response is the §3.1 per-network bucket index (below). The FRR
+re-filter of 100k routes against a 100k-entry set would have cost
+~21 s). That was the §3.1-disclosed linear longest-match scan,
+measured; the response is the §3.1 bucket index (below). The FRR
 ordered first-match scans (`PrefixList`, `AccessList`) are also
 linear and stay so deliberately: their semantics is "first covering
 entry in sequence order", which the longest-match index cannot
 answer — sequence order and cover order are independent. Disclosed;
 config-scale only. `AsSet::contains` is the contrast column: the
 §3.2 interval representation ships O(log n) already.
-- Prefix-set trie if sets grow beyond configuration scale (the §8
-  measurement now says when that happens).
+
+**After (S10-c M2 — the §3.1 bucket index + subsuming lane), same
+machine/seeds/profile; checksums identical to baseline row-for-row:**
+
+| Case | entries | evals | best | ns/eval | vs baseline |
+|---|---|---|---|---|---|
+| `PrefixSet::matches` | 100 | 1k | 0.43 ms | 427 | 2.2× slower |
+| `PrefixSet::matches` | 100 | 100k | 21.8 ms | 218 | 2.1× slower |
+| `PrefixSet::matches` | 10k | 1k | 0.55 ms | 552 | 31× faster |
+| `PrefixSet::matches` | 10k | 100k | 55 ms | 554 | 31× faster |
+| `PrefixSet::matches` | 100k | 1k | 6.5 ms | 6 505 | 31× faster |
+| `PrefixSet::matches` | 100k | 100k | 678 ms | 6 777 | 31× faster |
+| `Filter::apply` (8 rules, 1k set) | 8 | 100k | 57 ms | 572 | 4.8× faster |
+
+The two honest costs: (a) at config scale (100 entries) the walk's
+~33 hash probes cost ~2× the old 100-entry scan — an absolute
+0.2-0.4 µs per lookup, noise next to any table operation;
+(b) the residual per-lookup cost still grows with the SUBSUMING
+pattern count (the linear side lane — 5% of entries in the generated
+mix: ~550 ns at 10k, ~6.5 µs at 100k), not with set size. The walk
+lane is flat. `Filter::apply` rode along (its rules scan the set).
+No other operation changed.

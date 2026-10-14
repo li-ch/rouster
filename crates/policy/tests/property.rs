@@ -227,6 +227,88 @@ proptest! {
     }
 }
 
+// S10-c M2: the bucket index + subsuming lane must equal the
+// oracle on sets that INCLUDE BIRD `-` shapes (low < network
+// length — patterns able to cover probes shorter than their own
+// network), the case the original strategy above cannot generate.
+fn subsuming_pattern_strategy() -> BoxedStrategy<(u32, u8, u8, u8, Option<u32>)> {
+    (
+        prop_oneof![
+            Just("10.0.0.0"),
+            Just("10.42.0.0"),
+            Just("192.0.2.0"),
+            Just("198.51.100.0"),
+            Just("0.0.0.0"),
+            Just("203.0.113.128"),
+        ],
+        8u8..=29,
+        0u8..=32, // low, INDEPENDENT of the network length this time
+    )
+        .prop_map(|(addr_s, net_len, low)| {
+            let addr: u32 = addr_s.parse::<std::net::Ipv4Addr>().unwrap().into();
+            let hi = low.max(net_len.min(32)) + (low % 3);
+            let hi = hi.min(32).max(low);
+            let tag = if low % 3 == 0 {
+                Some(low as u32 + 1)
+            } else {
+                None
+            };
+            (addr, net_len, low, hi, tag)
+        })
+        .boxed()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn prefix_set_indexed_matches_oracle_subsuming(
+        pats in prop::collection::vec(subsuming_pattern_strategy(), 0..10),
+        raw_addr in any::<u32>(),
+        probe_len in 0u8..=32,
+        align in prop::bool::ANY,
+        pick in any::<u8>(),
+    ) {
+        let mut set = PrefixSet::new();
+        for &(addr, net_len, lo, hi, tag) in &pats {
+            let a = std::net::Ipv4Addr::from(addr);
+            let pattern = PrefixPattern::range(p4(&format!("{a}/{net_len}")), lo, hi).unwrap();
+            let pattern = if let Some(t) = tag { pattern.with_tag(t) } else { pattern };
+            set.add_pattern(pattern);
+        }
+        // Half the probes are DERIVED hits: a subnet of a pattern's
+        // masked network with length >= the pattern's — the aligned
+        // shape that catches bucket-key mistakes (uniform-random probes
+        // essentially never align and hide them; the S10-c bench
+        // checksums are what exposed the first such bug).
+        let (probe_addr, probe_len) = if align && !pats.is_empty() {
+            let &(p_addr, p_len, ..) = &pats[pick as usize % pats.len()];
+            let mask: u32 = if p_len == 0 { 0 } else { u32::MAX << (32 - p_len as usize) };
+            ((p_addr & mask) | (raw_addr & !mask), probe_len.max(p_len))
+        } else {
+            (raw_addr, probe_len)
+        };
+        let probe_net = std::net::Ipv4Addr::from(probe_addr);
+        let probe = p4(&format!("{probe_net}/{probe_len}"));
+
+        let mut oracle_matched = false;
+        let mut oracle_tag: Option<u32> = None;
+        let mut oracle_spec: i32 = -1;
+        for &(addr, net_len, lo, hi, tag) in &pats {
+            if oracle_covers(addr, net_len, lo, hi, probe_addr, probe_len) {
+                oracle_matched = true;
+                if (net_len as i32) > oracle_spec {
+                    oracle_spec = net_len as i32;
+                    oracle_tag = tag;
+                }
+            }
+        }
+        let got = set.matches(&probe);
+        prop_assert_eq!(got.matched, oracle_matched);
+        prop_assert_eq!(got.tag, oracle_tag);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. Route-map → typed compilation equivalence: a generated route-map,
 //    compiled into a Filter, must agree with an independent interpreter
