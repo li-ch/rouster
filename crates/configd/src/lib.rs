@@ -30,6 +30,7 @@ pub mod render;
 pub mod signal;
 pub mod status;
 pub mod tree;
+pub mod validate;
 
 pub use apply::{
     apply, apply_file, rollback, ApplyError, ApplyOptions, ApplyReport, DaemonOutcome,
@@ -38,3 +39,6 @@ pub use apply::{
 pub use render::{render_all, render_daemon};
 pub use status::{parse_status, read as read_status, ConfigdStatus};
 pub use tree::{parse, BodyLine, Canonical, Daemon, ParseError, Section};
+pub use validate::{
+    refusal_summary, validate_canonical, validate_rendered, SkipReason, Validation,
+};

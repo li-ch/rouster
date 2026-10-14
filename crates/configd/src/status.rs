@@ -166,6 +166,14 @@ mod tests {
                 (Daemon::Savd, DaemonOutcome::Signaled { pid: 4243 }),
                 (Daemon::Bfdd, DaemonOutcome::NotRunning),
             ],
+            validations: vec![
+                (Daemon::Rousterd, crate::validate::Validation::Validated),
+                (Daemon::Savd, crate::validate::Validation::Validated),
+                (
+                    Daemon::Bfdd,
+                    crate::validate::Validation::Skipped(crate::validate::SkipReason::NoBinary),
+                ),
+            ],
             rendered: vec![
                 (Daemon::Rousterd, PathBuf::from("/etc/rouster.conf"), 38),
                 (Daemon::Savd, PathBuf::from("/etc/savd.conf"), 18),

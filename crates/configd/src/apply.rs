@@ -201,6 +201,11 @@ pub struct ApplyReport {
     /// Per-daemon outcomes, in apply order, only for daemons with a
     /// section in the applied file.
     pub outcomes: Vec<(Daemon, DaemonOutcome)>,
+    /// The pre-apply gate's verdicts (S8-c): what each section's deep
+    /// validation did — `validated`, or the disclosed skip (an absent
+    /// or flagless binary). A refusal never reaches a report (it
+    /// fails the apply).
+    pub validations: Vec<(Daemon, crate::validate::Validation)>,
     /// Each daemon file's rendered path + byte length (render proof).
     pub rendered: Vec<(Daemon, PathBuf, usize)>,
 }
@@ -214,6 +219,10 @@ pub enum ApplyError {
     Read { path: PathBuf, err: std::io::Error },
     #[error("canonical file rejected: {0}")]
     Parse(#[from] tree::ParseError),
+    /// A daemon's own parser refused its rendered section (S8-c's
+    /// pre-apply gate): nothing was written, nothing was signaled.
+    #[error("semantic validation refused the apply: {refusal}")]
+    Validation { refusal: String },
     #[error("cannot write {path}: {err}")]
     Write { path: PathBuf, err: std::io::Error },
     #[error("generation store at {path}: {err}")]
@@ -247,6 +256,19 @@ pub fn apply(
         reason: "canonical file is not valid UTF-8".to_string(),
     })?;
     let parsed = tree::parse(text)?;
+
+    // 1.5 (S8-c M2) Deep validation, the pre-apply gate: each
+    // section's rendered bytes through the owning daemon's own
+    // `--validate-config` arm, BEFORE any file is touched. Absent or
+    // flagless binaries are disclosed skips, never failures; a
+    // refusal is — the whole point — an apply error naming the
+    // daemon's line-numbered complaint.
+    let validation_dirs = crate::validate::search_dirs(None);
+    let validation = crate::validate::validate_canonical(&parsed, &validation_dirs);
+    crate::validate::warn_skips(&validation);
+    if let Some(refusal) = crate::validate::refusal_summary(&validation) {
+        return Err(ApplyError::Validation { refusal });
+    }
 
     // 2. Render every section (registry order).
     let mut rendered: Vec<(Daemon, PathBuf, String)> = Vec::new();
@@ -305,6 +327,7 @@ pub fn apply(
         source,
         router_id: parsed.router_id.map(|(_, addr)| addr),
         outcomes,
+        validations: validation,
         rendered: rendered
             .into_iter()
             .map(|(d, p, out)| (d, p, out.len()))
