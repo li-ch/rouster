@@ -154,9 +154,19 @@ that some BGP attributes (as-path, next-hop and MED) of the routes
 announced to that peer are not modified"). v1 semantics:
 
 - Client→client reflection is **transparent**: the client's own
-  AS_PATH (no RS AS prepended), the origin client's NEXT_HOP, and
-  the MED ride through unchanged; the never-reflect-to-origin floor
-  stays.
+  AS_PATH (no RS AS prepended) and the origin client's NEXT_HOP ride
+  through unchanged; the never-reflect-to-origin floor stays. The
+  **B-10 RS export set is stripped**: the origin client's MED
+  (RFC 4271 §5.1.4 — "The MULTI_EXIT_DISC attribute received from a
+  neighboring AS MUST NOT be propagated to other neighboring ASes";
+  FRR's transparency note names MED, but the RFC's MUST NOT wins),
+  LOCAL_PREF (§5.1.5 — "A BGP speaker MUST NOT include this attribute
+  in UPDATE messages it sends to external peers"; an RS client is
+  another AS), and OTC (RFC 9234 — a client's OTC never re-attributes
+  to another client; the §5 ingress leak rule covers role-configured
+  clients, the strip is the export-side belt for role-less ones; the
+  §5 egress synthesis OTC := local AS toward RS-Clients stays with
+  the role machinery, §Deferred).
 - FRR's transparency check requires BOTH ends to be clients
   (bgp_route.c); likewise an RS-client target receives only other
   clients' routes — "Those peers that are configured as RS-clients do
@@ -169,7 +179,9 @@ announced to that peer are not modified"). v1 semantics:
   installed into the kernel routing table").
 - Interop: `scripts/test-bgp-rs-interop.sh` — our RS between two real
   FRR 10.2.2 clients; asserts path exactly the origin client's,
-  preserved next hop + MED 77, and an empty RS kernel. S7-b extended
+  preserved next hop, MED 77 stripped (c1 sends it under a route-map;
+  B-10's §5.1.4 rule keeps the RS from forwarding it), and an empty
+  RS kernel. S7-b extended
   it bidirectional: c2 announces too, c1 pulls the reverse reflection
   with `clear bgp ... soft in` (RFC 2918 — our refresh answer), path
   exactly 65002 / next hop c2 / AS 65000 never appears, each client

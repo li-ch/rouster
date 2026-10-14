@@ -712,6 +712,39 @@ pub fn shape_local_pref(attrs: &mut Vec<PathAttribute>, internal: bool) {
     }
 }
 
+/// The RS export attribute set (B-10): what a client→client
+/// reflection never carries.
+///
+/// - **MED** — RFC 4271 §5.1.4: "The MULTI_EXIT_DISC attribute
+///   received from a neighboring AS MUST NOT be propagated to other
+///   neighboring ASes." Client A and client B are different ASes;
+///   the origin client's MED dies at the route server.
+/// - **LOCAL_PREF** — §5.1.5: "A BGP speaker MUST NOT include this
+///   attribute in UPDATE messages it sends to external peers" — an
+///   RS client is another AS. (The eBGP arm of
+///   [`shape_local_pref`] already strips it; this is the RS-path
+///   belt regardless of session-type plumbing.)
+/// - **OTC** — RFC 9234: a client's OTC never re-attributes to
+///   another client. The §5 ingress rule ("If a route with the OTC
+///   Attribute is received from a Customer or an RS-Client, then it
+///   is a route leak and MUST be considered ineligible") already
+///   kills OTC-bearing client routes when roles are configured —
+///   this is the export-side enforcement for role-less clients.
+///   The §5 egress synthesis (OTC := local AS toward RS-Clients)
+///   stays with the role machinery (§Deferred).
+///
+/// AS_PATH, NEXT_HOP, COMMUNITIES and the rest ride through — the
+/// reflection stays transparent for everything the RFCs do not
+/// forbid.
+pub fn strip_rs_export_attrs(attrs: &mut Vec<PathAttribute>) {
+    attrs.retain(|a| {
+        !matches!(
+            a.attr_type(),
+            attr_type::MULTI_EXIT_DISC | attr_type::LOCAL_PREF | attr_type::OTC
+        )
+    });
+}
+
 /// A withdrawal as a zebra ROUTE_DELETE entry (the fixture shape: no
 /// nexthops in the delete).
 pub fn route_delete_entry(prefix: IpPrefix) -> RouteEntry {
@@ -865,6 +898,12 @@ impl crate::peer::OutRib for LocRibOut {
                 let mut attrs = exported.attrs;
                 // §5.1.5's LOCAL_PREF shape for the session type.
                 shape_local_pref(&mut attrs, internal);
+                // B-10: the RS export attribute set — a client→client
+                // reflection never carries the origin client's MED,
+                // LOCAL_PREF, or OTC (§5.1.4 / §5.1.5 / RFC 9234).
+                if to_is_client {
+                    strip_rs_export_attrs(&mut attrs);
+                }
                 // Phase 3 (§5.1.2): prepend the local AS on eBGP
                 // re-advertisement; keep AS_PATH on iBGP. RS-client
                 // targets are the exception: the reflection is
@@ -1391,18 +1430,21 @@ mod tests {
 
     /// An RS-client's routes carry the rs_client flag; the reflection
     /// toward another client is transparent — the client's own
-    /// AS_PATH and NEXT_HOP unchanged, no local-AS prepend, MED
-    /// preserved.
+    /// AS_PATH and NEXT_HOP unchanged, no local-AS prepend — and the
+    /// B-10 RS export set (MED / LOCAL_PREF / OTC) is stripped.
     #[test]
     fn route_server_reflection_is_transparent() {
         let mut rib = LocRib::new(65000);
         let client_a = peer("192.0.2.101", 65001, 1);
         let client_b_addr: IpAddr = "192.0.2.102".parse().unwrap();
         rib.set_route_server_clients(vec![client_a.address, client_b_addr]);
+        let mut attrs = base_attrs(vec![65001], Some(42));
+        attrs.push(PathAttribute::LocalPref(200));
+        attrs.push(PathAttribute::Otc(65001));
         rib.announce(
             &client_a,
             &BgpUpdate {
-                attrs: base_attrs(vec![65001], Some(42)), // MED rides along
+                attrs,
                 nlri: vec!["203.0.113.0/24".parse().unwrap()],
                 ..Default::default()
             },
@@ -1438,10 +1480,43 @@ mod tests {
             Some(&PathAttribute::NextHop("192.0.2.1".parse().unwrap())),
             "the origin client's next hop preserved"
         );
+        // B-10: §5.1.4 ("MUST NOT be propagated to other neighboring
+        // ASes"), §5.1.5 ("MUST NOT include this attribute ... to
+        // external peers"), RFC 9234 (never re-attribute a client's
+        // OTC to another client).
         assert_eq!(
             update.attr(attr_type::MULTI_EXIT_DISC),
-            Some(&PathAttribute::Med(42))
+            None,
+            "MED stripped"
         );
+        assert_eq!(
+            update.attr(attr_type::LOCAL_PREF),
+            None,
+            "LOCAL_PREF stripped"
+        );
+        assert_eq!(update.attr(attr_type::OTC), None, "OTC stripped");
+    }
+
+    /// The strip itself, purely: the three RS export attributes go,
+    /// everything else stays.
+    #[test]
+    fn rs_export_strip_set() {
+        let mut attrs = base_attrs(vec![65001], Some(42));
+        attrs.push(PathAttribute::LocalPref(200));
+        attrs.push(PathAttribute::Otc(65001));
+        attrs.push(PathAttribute::Communities(vec![0x00_02_00_01]));
+        strip_rs_export_attrs(&mut attrs);
+        assert!(attrs.iter().any(|a| matches!(a, PathAttribute::Origin(_))));
+        assert!(attrs.iter().any(|a| matches!(a, PathAttribute::AsPath(_))));
+        assert!(attrs.iter().any(|a| matches!(a, PathAttribute::NextHop(_))));
+        assert!(attrs
+            .iter()
+            .any(|a| matches!(a, PathAttribute::Communities(_))));
+        assert!(!attrs
+            .iter()
+            .any(|a| a.attr_type() == attr_type::MULTI_EXIT_DISC));
+        assert!(!attrs.iter().any(|a| a.attr_type() == attr_type::LOCAL_PREF));
+        assert!(!attrs.iter().any(|a| a.attr_type() == attr_type::OTC));
     }
 
     /// The origin-peer floor survives RS mode (no reflect back), an

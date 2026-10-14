@@ -159,9 +159,11 @@ async fn two_speakers_over_tcp_reach_established_and_exchange_a_prefix() {
 // Two RS clients (AS 65001 at 192.0.2.101, AS 65002 at
 // 192.0.2.102) against the binary's own wiring (Loc-RIB with the
 // RS-client set, RibSink, LocRibOut): client A's route must reach
-// client B with A's own AS_PATH (no RS prepend), A's next hop
-// preserved, MED intact — FRR `route-server-client` transparent mode
-// (doc/user/routeserver.rst). The sessions are real PeerSessions
+// client B with A's own AS_PATH (no RS prepend) and A's next hop
+// preserved — FRR `route-server-client` transparent mode
+// (doc/user/routeserver.rst) — while the B-10 RS export set (MED /
+// LOCAL_PREF / OTC) is stripped per RFC 4271 §5.1.4/§5.1.5 and RFC
+// 9234. The sessions are real PeerSessions
 // over duplex pairs (the daemon's own session type); B establishes
 // after A announced, matching the v1 Adj-RIB-Out shape (initial
 // advertisement at Established).
@@ -233,8 +235,9 @@ async fn route_server_reflects_between_clients_transparently() {
         )
     }
 
-    // Client A: handshake + announce 203.0.113.0/24 with MED 77 and
-    // next hop 192.0.2.101.
+    // Client A: handshake + announce 203.0.113.0/24 with MED 77,
+    // LOCAL_PREF 200 (reset at import per B-3) and OTC 65001, next
+    // hop 192.0.2.101.
     let (a_ours, mut a_io) = tokio::io::duplex(8192);
     let mut a_sess = session(a_ours, "192.0.2.101", 65001, Arc::clone(&out_rib));
     let mut a_sink = sink.clone();
@@ -258,6 +261,8 @@ async fn route_server_reflects_between_clients_transparently() {
                 PathAttribute::AsPath(AsPath::sequence([65001])),
                 PathAttribute::NextHop("192.0.2.101".parse().unwrap()),
                 PathAttribute::Med(77),
+                PathAttribute::LocalPref(200),
+                PathAttribute::Otc(65001),
             ],
             nlri: vec!["203.0.113.0/24".parse().unwrap()],
         })
@@ -303,11 +308,14 @@ async fn route_server_reflects_between_clients_transparently() {
         Some(&PathAttribute::NextHop("192.0.2.101".parse().unwrap())),
         "client A's next hop preserved"
     );
-    assert_eq!(
-        update.attr(4),
-        Some(&PathAttribute::Med(77)),
-        "MED (IGP metric) preserved"
-    );
+    // B-10: the RS export attribute set — the origin client's MED
+    // ("MUST NOT be propagated to other neighboring ASes", §5.1.4),
+    // LOCAL_PREF ("MUST NOT include this attribute in UPDATE
+    // messages it sends to external peers", §5.1.5), and OTC (RFC
+    // 9234's never-re-attribute) are stripped from the reflection.
+    assert_eq!(update.attr(4), None, "MED stripped (B-10)");
+    assert_eq!(update.attr(5), None, "LOCAL_PREF stripped (B-10)");
+    assert_eq!(update.attr(35), None, "OTC stripped (B-10)");
 
     a_driver.abort();
     b_driver.abort();

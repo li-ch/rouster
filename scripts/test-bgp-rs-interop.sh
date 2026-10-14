@@ -13,11 +13,14 @@
 #   - REFLECTED-TRANSPARENT (FRR doc/user/routeserver.rst:
 #     `route-server-client` "enables the transparent mode ... some BGP
 #     attributes (as-path, next-hop and MED) of the routes announced
-#     to that peer are not modified"):
+#     to that peer are not modified"; B-10 overrides the MED leg —
+#     RFC 4271 §5.1.4: "The MULTI_EXIT_DISC attribute received from a
+#     neighboring AS MUST NOT be propagated to other neighboring
+#     ASes", and LOCAL_PREF/OTC go with it per §5.1.5/RFC 9234):
 #       * c2 holds 203.0.113.0/24,
 #       * its AS path is exactly 65001 — the RS's 65000 never appears,
 #       * the next hop is c1's address (not the RS's),
-#       * MED 77 preserved.
+#       * MED 77 stripped (c1 sends it, the RS never forwards it).
 #   - NO-CLIENT-TO-CLIENT-SESSION (S7-b): each client peers with the
 #     RS ONLY — no direct session between the clients; the exchange
 #     goes THROUGH the route server.
@@ -254,11 +257,12 @@ for side in "$C1" "$C2"; do
         || fail "$side has $N peers (expected exactly the RS — no client-to-client session)"
 done
 
-echo "==> REFLECTED-TRANSPARENT: $REFLECTED on c2, path exactly 65001, NH $C1_IP, MED 77"
+echo "==> REFLECTED-TRANSPARENT: $REFLECTED on c2, path exactly 65001, NH $C1_IP, MED stripped (B-10)"
 wait_in "$C2" "c2 holds the reflected route" 30 \
     "vtysh -c 'show bgp ipv4 unicast $REFLECTED' | grep -q 'BGP routing table entry for $REFLECTED'"
 # The single-prefix detail view: the path line must be exactly 65001
-# (indented, alone), next hop $C1_IP, metric 77, best.
+# (indented, alone), next hop $C1_IP, NO metric 77 (B-10 strips the
+# origin client's MED), best.
 DETAIL=$(docker exec "$C2" sh -c "vtysh -c 'show bgp ipv4 unicast $REFLECTED'")
 echo "$DETAIL" | grep -qE '^  65001$' \
     || fail "path is not exactly 65001: $(echo "$DETAIL" | sed -n '/^Paths:/,/^$/p' | head -8)"
@@ -267,7 +271,7 @@ echo "$DETAIL" | grep -qw 65000 \
 echo "$DETAIL" | grep -q "$C1_IP" \
     || fail "the origin client's next hop $C1_IP absent: $(echo "$DETAIL" | grep -A3 '65001')"
 echo "$DETAIL" | grep -q 'metric 77' \
-    || fail "MED 77 not preserved: $(echo "$DETAIL" | grep -i metric)"
+    && fail "MED 77 rode the reflection (B-10: RFC 4271 §5.1.4 strips it): $(echo "$DETAIL" | grep -i metric)"
 echo "$DETAIL" | grep -q 'best (' \
     || fail "the reflected route is not the best path"
 # JSON cross-check on the whole table.
@@ -277,7 +281,7 @@ echo "$ROUTE_JSON" | grep -q '"path":"65001"' \
 echo "$ROUTE_JSON" | grep -q "\"ip\":\"$C1_IP\"" \
     || fail "table json next hop is not $C1_IP: $(echo "$ROUTE_JSON" | grep -o '"ip":"[^"]*"')"
 echo "$ROUTE_JSON" | grep -q '"metric":77' \
-    || fail "table json MED is not 77: $(echo "$ROUTE_JSON" | grep -o '"metric":[0-9]*')"
+    && fail "table json still carries MED 77 (B-10 strips it): $(echo "$ROUTE_JSON" | grep -o '"metric":[0-9]*' | sort -u)"
 
 echo "==> EXCHANGE-BIDIRECTIONAL: c2's $EXCHANGED back to c1 (RFC 2918 soft-in pull)"
 # c1 established before c2 existed, so its initial dump predates c2's
