@@ -54,6 +54,16 @@ pub struct Interface {
     /// belongs to one and only one area).
     pub area: u32,
     pub cfg: InterfaceConfig,
+    /// The interface's CONCRETE send-side auth view (Appendix D) —
+    /// `cfg.auth.live_send_view(now)` at the last refresh (tick or
+    /// packet event; a chain-configured interface's rollover pick
+    /// advances within one tick, disclosed v1). Static modes are
+    /// always their own view. Every transmit site stamps THIS
+    /// (`packet_for`, the hello tick, retransmissions, the wire
+    /// flush); a chain with no live key degrades to
+    /// [`crate::auth::AuthConfig::None`] — the disclosed fail-closed
+    /// path (peers discard the AuType-0 packets by D.5).
+    pub live_auth: crate::auth::AuthConfig,
     pub addr: Ipv4Addr,
     pub mask: Ipv4Addr,
     pub p2p: bool,
@@ -100,7 +110,7 @@ impl Interface {
             // follows the area's ExternalRoutingCapability (§10.5's
             // agreement rule extends to the DD options check).
             options: area_options(kind),
-            auth: self.cfg.auth.clone(),
+            auth: self.live_auth.clone(),
             auth_seq: self.auth_tx_seq.clone(),
         }
     }
@@ -138,7 +148,9 @@ fn next_crypto_seq(
 ) -> u32 {
     use std::sync::atomic::Ordering;
     match auth {
-        crate::auth::AuthConfig::HmacSha256 { .. } => counter.fetch_add(1, Ordering::Relaxed) + 1,
+        crate::auth::AuthConfig::HmacSha256 { .. } | crate::auth::AuthConfig::KeyedMd5 { .. } => {
+            counter.fetch_add(1, Ordering::Relaxed) + 1
+        }
         _ => 0,
     }
 }
@@ -399,6 +411,9 @@ impl Ospfd {
                 interfaces.push(Interface {
                     name: name.clone(),
                     area: area.id,
+                    // The concrete send view at t=0 (the tick refreshes
+                    // it — chain rollover advances within one tick).
+                    live_auth: icfg.auth.live_send_view(0),
                     cfg: icfg.clone(),
                     addr,
                     mask,
@@ -437,6 +452,7 @@ impl Ospfd {
             interfaces.push(Interface {
                 name: format!("vl-{peer}"),
                 area: 0,
+                live_auth: crate::auth::AuthConfig::None,
                 cfg: InterfaceConfig::defaults(),
                 addr,
                 mask: Ipv4Addr::from(0xffff_ffff),
@@ -592,7 +608,9 @@ impl Ospfd {
     /// sequence bumped per send (D.4.3 step 5).
     fn packet_for(&mut self, iface_idx: usize, area: u32, body: PacketBody) -> Packet {
         let mut p = make_packet(self.router_id, area, body);
-        let auth = self.interfaces[iface_idx].cfg.auth.clone();
+        // The LIVE view — a chain-configured interface stamps the
+        // key the chain selects at the last refresh.
+        let auth = self.interfaces[iface_idx].live_auth.clone();
         let seq = next_crypto_seq(&self.interfaces[iface_idx].auth_tx_seq, &auth);
         p.header.au_type = auth.au_type();
         p.header.authentication = auth.auth_field(seq);
@@ -1398,10 +1416,15 @@ impl Ospfd {
     /// processing never starts, so no neighbor FSM event fires (the
     /// ONLY neighbor-state effect of sustained failure is the
     /// Inactivity Timer's eventual Down).
-    fn authenticate(&mut self, iface_idx: usize, received: &Received) -> Result<Packet, String> {
+    fn authenticate(
+        &mut self,
+        iface_idx: usize,
+        received: &Received,
+        now: u64,
+    ) -> Result<Packet, String> {
         let auth = self.interfaces[iface_idx].cfg.auth.clone();
-        match &auth {
-            crate::auth::AuthConfig::None => {
+        match auth.au_type() {
+            0 => {
                 // D.5 preamble: "the packet's AuType must match the
                 // receiving interface's".
                 let p = Packet::decode(&received.payload).map_err(|e| format!("decode: {e}"))?;
@@ -1410,31 +1433,49 @@ impl Ospfd {
                 }
                 Ok(p)
             }
-            crate::auth::AuthConfig::Simple { password } => {
+            1 => {
                 // D.5.2: (1) the normal checksum (decode verified
                 // it), (2) the Authentication field must equal the
                 // configured password.
                 let p = Packet::decode(&received.payload).map_err(|e| format!("decode: {e}"))?;
-                if p.header.au_type != 1 || p.header.authentication != u64::from_be_bytes(*password)
+                let password = match &auth {
+                    crate::auth::AuthConfig::Simple { password } => *password,
+                    _ => unreachable!("au_type 1 is Simple"),
+                };
+                if p.header.au_type != 1 || p.header.authentication != u64::from_be_bytes(password)
                 {
                     return Err("simple password mismatch (D.5.2 step 2)".into());
                 }
                 Ok(p)
             }
-            crate::auth::AuthConfig::HmacSha256 { key_id, key } => {
-                // D.5.3, in the RFC's order.
-                if key.is_empty() {
-                    return Err("no crypto key configured".into());
-                }
+            _ => {
+                // AuType 2 — D.5.3, in the RFC's order, over BOTH
+                // crypto engines (RFC 5709 HMAC-SHA-256 and the
+                // legacy D.4.3(6) keyed-MD5) and the key chains that
+                // feed them (RFC 8177).
                 let (p, trailer) =
                     Packet::decode_crypto(&received.payload).map_err(|e| format!("decode: {e}"))?;
-                // (1) Key lookup by Key ID on this interface.
+                // (1) Key lookup by Key ID — for a chain, any key
+                // whose ACCEPT lifetime is live at `now` (the
+                // rollover overlap); for a static key, its own ID.
                 let data = crate::auth::CryptoAuthData::from_u64(p.header.authentication);
-                if data.key_id != *key_id {
-                    return Err(format!(
-                        "Key ID {} not configured on this interface",
-                        data.key_id
-                    ));
+                let view = auth.accept_view(now, data.key_id).ok_or_else(|| {
+                    format!("Key ID {} not valid for reception here", data.key_id)
+                })?;
+                let (key, digest_len, engine) = match &view {
+                    crate::auth::AuthConfig::HmacSha256 { key, .. } => {
+                        (key.clone(), 32, "hmac-sha-256")
+                    }
+                    crate::auth::AuthConfig::KeyedMd5 { key, .. } => (key.clone(), 16, "md5"),
+                    other => {
+                        return Err(format!(
+                            "chain resolved to a non-crypto view ({:?})",
+                            other.au_type()
+                        ))
+                    }
+                };
+                if key.is_empty() {
+                    return Err("no crypto key configured".into());
                 }
                 // (2) The per-neighbor sequence: "discard if the
                 // packet's sequence number is less than the value
@@ -1452,19 +1493,30 @@ impl Ospfd {
                         data.seq
                     ));
                 }
-                // (3) The digest: MAC over packet ‖ Apad (RFC 5709
-                // §3.3), compared against the trailer.
-                if trailer.len() != 32 {
+                // (3) The digest with the KEY's algorithm (the
+                // engine follows the key, not the interface):
+                // packet ‖ Apad (RFC 5709 §3.3) for HMAC-SHA-256,
+                // MD5(packet ‖ key) (D.4.3 step 6) for MD5 —
+                // compared against the trailer.
+                if trailer.len() != digest_len {
                     return Err(format!(
                         "trailer length {} (Auth Data Len says {})",
                         trailer.len(),
                         data.data_len
                     ));
                 }
-                let packet_bytes = &received.payload[..received.payload.len() - 32];
-                let mac = crate::auth::packet_mac(packet_bytes, key);
-                if mac[..] != trailer[..] {
-                    return Err("HMAC-SHA-256 digest mismatch (D.5.3 step 3)".into());
+                let packet_bytes = &received.payload[..received.payload.len() - digest_len];
+                let mac_ok = match &view {
+                    crate::auth::AuthConfig::HmacSha256 { key, .. } => {
+                        crate::auth::packet_mac(packet_bytes, key)[..] == trailer[..]
+                    }
+                    crate::auth::AuthConfig::KeyedMd5 { key, .. } => {
+                        crate::auth::packet_mac_md5(packet_bytes, key)[..] == trailer[..]
+                    }
+                    _ => unreachable!("resolved above"),
+                };
+                if !mac_ok {
+                    return Err(format!("{engine} digest mismatch (D.5.3 step 3)"));
                 }
                 // Accept: record the sequence (D.3) when the
                 // neighbor structure exists.
@@ -1479,6 +1531,10 @@ impl Ospfd {
     /// Process one inbound datagram (already demultiplexed to its
     /// interface by the run loop's on-link test).
     pub fn on_packet(&mut self, iface_idx: usize, received: &Received, now: u64) -> Vec<WireOut> {
+        // Refresh the send view (chain rollover advances within one
+        // event; static modes are a no-op clone).
+        self.interfaces[iface_idx].live_auth =
+            self.interfaces[iface_idx].cfg.auth.live_send_view(now);
         let out = Vec::new();
         // The receive-side TTL check (night N1, closing the W2-e
         // fence): §A.1 mandates TTL 1 on EVERY OSPF send, so a
@@ -1505,7 +1561,7 @@ impl Ospfd {
         // Section 8.2, continues only if the packet is
         // authenticated") — a failed packet is silently discarded:
         // no neighbor events, no LSAs, nothing.
-        let packet = match self.authenticate(iface_idx, received) {
+        let packet = match self.authenticate(iface_idx, received, now) {
             Ok(p) => p,
             Err(e) => {
                 debug!(error = %e, src = %received.src, "ospfd: packet failed authentication (App D.5)");
@@ -2911,6 +2967,10 @@ impl Ospfd {
         // §C.3 Hellos.
         let router_id = self.router_id;
         for (idx, iface) in self.interfaces.iter_mut().enumerate() {
+            // The send-view refresh: a chain-configured interface
+            // advances to its current most-recent-live-start key
+            // (RFC 8177 rollover, one-tick granularity, disclosed).
+            iface.live_auth = iface.cfg.auth.live_send_view(now);
             // §15: a virtual link sends nothing until its other
             // endpoint's address is discovered by the routing table.
             if iface.virtual_link && iface.vlink_peer_ip.is_none() {
@@ -2931,10 +2991,11 @@ impl Ospfd {
                     .get(&iface.area)
                     .map(|a| a.kind)
                     .unwrap_or(AreaKind::Normal);
-                let seq = next_crypto_seq(&iface.auth_tx_seq, &iface.cfg.auth);
+                let auth = iface.live_auth.clone();
+                let seq = next_crypto_seq(&iface.auth_tx_seq, &auth);
                 let mut packet = make_hello(router_id, iface.area, iface, kind);
-                packet.header.au_type = iface.cfg.auth.au_type();
-                packet.header.authentication = iface.cfg.auth.auth_field(seq);
+                packet.header.au_type = auth.au_type();
+                packet.header.authentication = auth.auth_field(seq);
                 // §15: virtual-link packets are unicast to the other
                 // endpoint's (resolved) address.
                 let to = match iface.vlink_peer_ip {
@@ -3385,7 +3446,7 @@ async fn flush_wire(sockets: &[Arc<OspfRawSocket>], core: &Ospfd, out: Vec<WireO
         // Appendix D: crypto mode appends the digest trailer at the
         // wire boundary (RFC 2328 D.3 / RFC 5709 §3.3).
         let bytes =
-            crate::auth::encode_for_wire(&wire.packet, &core.interfaces[wire.iface].cfg.auth);
+            crate::auth::encode_for_wire(&wire.packet, &core.interfaces[wire.iface].live_auth);
         let result = match wire.to {
             WireTo::Multicast => sock.send_multicast(&bytes).await,
             WireTo::AllDRouters => sock.send_multicast_drouters(&bytes).await,
@@ -3461,7 +3522,10 @@ mod tests {
     fn pump(from: &mut Ospfd, to: &mut Ospfd, out: Vec<WireOut>, now: u64) -> Vec<WireOut> {
         let mut replies = Vec::new();
         for (_, packet) in bodies(&out) {
-            let payload = crate::auth::encode_for_wire(&packet, &from.interfaces[0].cfg.auth);
+            // The live send view — the flush_wire mirror (a
+            // chain-configured interface stamps the key its chain
+            // selects at the last refresh, not the raw chain config).
+            let payload = crate::auth::encode_for_wire(&packet, &from.interfaces[0].live_auth);
             let idx = 0;
             replies.extend(to.on_packet(
                 idx,
@@ -5633,6 +5697,170 @@ mod tests {
         assert_eq!(packet.header.au_type, 2);
         // The plain decoder rejects the trailer (strict framing).
         assert!(Packet::decode(&bytes).is_err());
+    }
+
+    /// The RFC 8177 key chain end to end (O-8): two chain-configured
+    /// cores reach Full signing with the chain's live key; the
+    /// rollover (key 1 → key 2 at t=600, different algorithms) rides
+    /// through the overlapping accept window with the adjacency
+    /// intact — accept-any-live/send-highest, RFC 2328 D.4.3/D.5.3;
+    /// and a packet stamped with a Key ID the chain does not hold is
+    /// discarded before any digest work (D.5.3 step 1).
+    #[test]
+    fn key_chain_signs_verifies_rejects_and_rolls_over() {
+        // The chain: key 1 (HMAC-SHA-256) always live; key 2 (MD5)
+        // becomes the send pick at t=600, accepted from t=600. The
+        // accept overlap (key 1 still accepted) is the graceful
+        // rollover's window.
+        let chain_conf = "\
+key chain kc1
+ key 1
+  key-string old-secret
+  cryptographic-algorithm hmac-sha-256
+  send-lifetime 0 infinite
+  accept-lifetime 0 infinite
+ key 2
+  key-string new-secret
+  cryptographic-algorithm md5
+  send-lifetime 600 infinite
+  accept-lifetime 600 infinite
+";
+        let core = |router_id: &str, addr: &str| -> Ospfd {
+            let text = format!(
+                "router ospf\n router-id {router_id}\n area 0.0.0.0\n  interface eth0\n   address {addr}/30\n   network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n   authentication key-chain kc1\n{chain_conf}"
+            );
+            Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+        };
+        let mut a = core("10.255.1.1", "10.77.0.1");
+        let mut b = core("10.255.2.1", "10.77.0.2");
+        // The construction resolved the chain to the live key-1 view.
+        assert_eq!(
+            a.interfaces[0].live_auth,
+            crate::auth::AuthConfig::HmacSha256 {
+                key_id: 1,
+                key: b"old-secret".to_vec()
+            }
+        );
+        let now = run_to_full(&mut a, &mut b, 0);
+        assert!(a
+            .neighbor_states()
+            .iter()
+            .any(|(_, _, s)| *s == NeighborState::Full));
+        // Keep the hellos flowing every second through the rollover
+        // boundary (RouterDeadInterval is 4 s — silence would flap
+        // the adjacency for reasons the chain did not cause).
+        let rollover = 600u64;
+        let mut saw_key2_field = false;
+        let mut zap = Vec::new();
+        for t in (now + 1)..=(rollover + 10) {
+            let mut oa = Vec::new();
+            a.tick(t, &mut oa, &mut zap);
+            if t > rollover {
+                // The send view advanced to key 2 (MD5 — the later
+                // start wins, RFC 2328 D.4.3) and the wire packet
+                // carries its Figure-18 field.
+                assert_eq!(
+                    a.interfaces[0].live_auth,
+                    crate::auth::AuthConfig::KeyedMd5 {
+                        key_id: 2,
+                        key: b"new-secret".to_vec()
+                    },
+                    "the send pick rolled over (t={t})"
+                );
+                for w in &oa {
+                    let f = crate::auth::CryptoAuthData::from_u64(w.packet.header.authentication);
+                    if w.packet.header.au_type == 2 && w.packet.header.packet_type == 1 {
+                        // Fresh Hellos stamp the rolled-over key;
+                        // RxmtInterval retransmissions replay the
+                        // stored packet they were built from (key 1,
+                        // still accepted in the overlap).
+                        assert_eq!(f.key_id, 2, "fresh sends stamp the rolled-over key");
+                        assert_eq!(f.data_len, 16, "MD5's Auth Data Len (D.4.3 step 4)");
+                        saw_key2_field = true;
+                    }
+                }
+            }
+            pump(&mut a, &mut b, oa, t);
+            let mut ob = Vec::new();
+            b.tick(t, &mut ob, &mut zap);
+            pump(&mut b, &mut a, ob, t);
+        }
+        assert!(saw_key2_field, "MD5-signed packets went on the wire");
+        assert!(
+            a.neighbor_states()
+                .iter()
+                .any(|(_, _, s)| *s == NeighborState::Full),
+            "the adjacency survives the rollover"
+        );
+        let after = rollover + 10;
+
+        // A packet stamped with a Key ID the chain does not hold is
+        // discarded before any digest work (D.5.3 step 1).
+        let hello = make_hello(b.router_id, 0, &b.interfaces[0], AreaKind::Normal);
+        let wrong = {
+            let mut p = hello.clone();
+            p.header.au_type = 2;
+            p.header.authentication = crate::auth::CryptoAuthData {
+                key_id: 9,
+                data_len: 32,
+                seq: 5000,
+            }
+            .to_u64();
+            let mut buf = p.encode();
+            let mac = crate::auth::packet_mac(&buf, b"whatever");
+            buf.extend_from_slice(&mac);
+            buf
+        };
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload: wrong,
+
+                ttl: 1,
+            },
+            after + 1,
+        );
+        assert!(replies.is_empty(), "unknown Key ID discarded");
+
+        // A validly-signed packet under a still-accepted key (key 1's
+        // accept window never closed) verifies during the overlap —
+        // the accept-any-live rule.
+        let overlap = {
+            let mut p = hello;
+            p.header.au_type = 2;
+            p.header.authentication = crate::auth::CryptoAuthData {
+                key_id: 1,
+                data_len: 32,
+                seq: 5001,
+            }
+            .to_u64();
+            let mut buf = p.encode();
+            let mac = crate::auth::packet_mac(&buf, b"old-secret");
+            buf.extend_from_slice(&mac);
+            buf
+        };
+        let replies = a.on_packet(
+            0,
+            &crate::transport::Received {
+                src: b.interfaces[0].addr,
+                dst: crate::packet::ALL_SPF_ROUTERS,
+                payload: overlap,
+
+                ttl: 1,
+            },
+            after + 2,
+        );
+        assert!(replies.is_empty(), "hellos need no reply");
+        assert_eq!(
+            a.interfaces[0]
+                .neighbors
+                .get(&b.router_id)
+                .map(|c| c.rx_crypto_seq),
+            Some(5001),
+            "key 1 still verifies during the accept overlap (8177 2.3)"
+        );
     }
 
     // ---- incremental SPF (§16.5/§16.6, N3 M4) -----------------------
