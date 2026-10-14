@@ -380,3 +380,15 @@ The phase text above is unchanged; this block is status only.
   dispatched as the S7-d policy wave; SAV-2/4/7/8 directions recorded;
   CI-3/4 closed moot under the mirror). Sheet fully closed; queues in
   away/2026-10-14/STATE.jsonl.
+
+- 2026-10-14 (round close) — S7 round GREEN: four parallel streams
+  landed + integration pass. OSPFv3 daemon LIVE (Full adjacency with
+  real FRR ospf6d, routes both directions via link-local advertisers;
+  a real N2B codec bug fixed en route — A.4.7's Referenced-LS-Type
+  placement); bgpd robustness (ADD-PATH tx, GR restarting-speaker
+  §4.1 with citation fix, §9.2/iBGP + RR clients, bidirectional RS
+  interop ×2); configd v1 (Phase 4 opens: canonical grammar,
+  transactional apply + rollback, CLI, real-daemon smoke); the
+  adjudication wave (POL-2/3/4/5 + SAV-3/4/7 doc pins). Gate
+  1383/0 ×3 stable, clippy clean, smoke suite 34/34 (after one +x
+  fix), CI green. Reports: away/2026-10-14/reports/S7-{a,b,c,d}.md.

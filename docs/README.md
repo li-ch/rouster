@@ -14,6 +14,7 @@
 | protocols/savnet.md | The `experimental-savnet` flag: the in-process SAVNET agent interface (SavAgent), the monitor-only default agent savd hosts, the savd enforcement-backends knob (`rp_filter` \| `nft`, with per-op monitor counters), the honest process-topology scoping, and what stays out until the IETF drafts stabilize. |
 | protocols/rpki.md | The `rpki` library: RTR PDU table, session diagram, RFC 6811 ROV + ASPA semantics with citations, and the real-cache interop runbook. |
 | protocols/vty.md | The `vtyd` server: the vtysh-compatible word-tree grammar, Cisco session modes, the B7-observed config subset (parse-only v1), the run-dir show commands (sav/bfd/rousterd dump), and the recorded config-apply design (K3: file+SIGHUP interim, config-manager target). |
+| protocols/config.md | The `configd` manager (Phase 4): the canonical `rouster.conf` grammar, the transactional compose/render/atomic-write/SIGHUP apply pipeline with generations + rollback, the `configd apply\|rollback\|status\|render` CLI, and the run-dir contract extension. |
 
 Repo-level entry points: [README.md](../README.md) (what runs today,
 quickstart) and [CONTRIBUTING.md](../CONTRIBUTING.md) (gates, commit and
