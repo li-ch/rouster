@@ -12,7 +12,11 @@ authentication, incremental SPF (§16.5/§16.6), virtual links
 (§15/§D.3), and the OSPFv3 codecs (N2B, RFC 5340). The S7-a round
 (2026-10-14) landed the OSPFv3 RUNTIME — the v6 transport, the
 AF-generic seams cashed as code, and the live FRR ospf6d interop
-(see the OSPFv3 runtime section).
+(see the OSPFv3 runtime section). The S8-b round (2026-10-14
+evening) closed the security lane: the v6 cmsg receive read-back
+(the audited recvmsg, AGENTS.md's named exception), the RFC 8177
+key chains feeding BOTH crypto engines, and the RFC1583Compatibility
+knob (O-2, default enabled per §C.1).
 
 ## Layout
 
@@ -28,14 +32,15 @@ AF-generic seams cashed as code, and the live FRR ospf6d interop
 | `neighbor` | The §10.3 neighbor state table, §10.5 Hello processing, §10.6-§10.8 DBD master/slave exchange, §13 flooding steps 1-8 as `flood_step` |
 | `iface` | The §9 interface state machine and the §9.4 DR election (broadcast networks), pure and AF-generic |
 | `origination` | The §12.4 LSA builders: router (§12.4.1), network (§12.4.2), summary incl. type-4 (§12.4.3/§A.4.4), AS-external (§12.4.4/§A.4.5) |
-| `auth` | OSPFv2 packet authentication: Appendix D AuTypes (null/password/crypto) + the RFC 5709 HMAC-SHA-256 trailer |
-| `transport` | The raw-socket transports: v4 (§A.1: proto 89, AllSPF/AllDR 224.0.0.5/6 joins, TTL 1) and v6 (RFC 5340 §A.1: the proto-89 v6 socket bound to the interface's link-local, ff02::5/6 joins by ifindex, multicast hop limit 1, the `IPV6_RECVHOPLIMIT` arming + the destination-trial decode) |
+| `auth` | OSPFv2 packet authentication: Appendix D AuTypes (null/password/crypto) + RFC 5709 HMAC-SHA-256 and the legacy keyed-MD5 (D.4.3 step 6, RFC 1321) digest trailers |
+| `keychain` | The RFC 8177 key chains: named chains of keys (id, algorithm, secret, send/accept lifetimes), the accept-any-live/send-highest rollover selection, and the resolution to Appendix-D engine views |
+| `transport` | The raw-socket transports: v4 (§A.1: proto 89, AllSPF/AllDR 224.0.0.5/6 joins, TTL 1) and v6 (RFC 5340 §A.1: the proto-89 v6 socket bound to the interface's link-local, ff02::5/6 joins by ifindex, multicast hop limit 1, the audited RFC 3542 cmsg read-back for hop limit + true destination — AGENTS.md's named exception) |
 | `exchange` | The §10.6-§10.9 adjacency conversation as daemon-side bookkeeping: DD drain, request lists, §13.3-§13.7 retransmissions |
 | `daemon` | The v2 run loop: per-interface sockets, §14 aging/hellos, the router-wide §16 walk (intra/inter/external), the ABR/ASBR duties |
 | `daemon_v3` | The OSPFv3 runtime (RFC 5340): the same run-loop shape over the v6 transport, Router-ID neighbors, Instance-ID dispatch, scope-aware flooding (link-LSAs in per-interface stores), v3 origination, §16.4-lite exports |
 | `zedge` | ospfd as a zebra client: HELLO attach, `redistribute static` → §12.4.4 origination/withdrawal, route export |
 | `wire` | Checked little helpers over byte slices — the house codec convention (A19: never trust counts) |
-| `config` | `ospfd.conf` grammar (A11/B7 conventions): router-id, area, interface stanzas, network bindings, redistribute static |
+| `config` | `ospfd.conf` grammar (A11/B7 conventions): router-id, area, interface stanzas, network bindings, redistribute static, the RFC 8177 `key chain` stanza + interface references, `rfc1583-compatibility` |
 | `bin/ospfd` | Thin shell (bgpd/savd shape): config → sockets → zedge → the daemon run loop |
 
 ## Pinned design decisions
@@ -439,15 +444,17 @@ follow-up below.
 
 - **Three modes per interface** (`auth.rs`): Null (D.1), simple
   password (D.2 — `authentication-key <1-8 chars>`, null-padded to
-  the 64-bit field per D.4.2 step 3), and cryptographic
-  HMAC-SHA-256 (D.3/D.4.3 with RFC 5709 §3.3's digest —
-  `authentication message-digest` +
-  `message-digest-key <id> hmac-sha-256 <key>`). FRR 10.2's
-  `message-digest-key` only accepts `md5`; its HMAC-SHA-256 rides
-  the key-chain path (frr-10.2 `lib/keychain.c`'s algo table:
-  internal-crypto builds resolve `md5` + `hmac-sha-256` only) — our
-  single-directive grammar is a disclosed deviation. Keyed-MD5 (the
-  legacy D.4.3(6) digest) is §Deferred.
+  the 64-bit field per D.4.2 step 3), and cryptographic (D.3/D.4.3
+  — `authentication message-digest` +
+  `message-digest-key <id> <md5|hmac-sha-256> <key>`, plus
+  `authentication key-chain <name>`; see the S8-b section below).
+  FRR 10.2's `message-digest-key` only accepts `md5`; its
+  HMAC-SHA-256 rides the key-chain path (frr-10.2 `lib/keychain.c`'s
+  algo table: internal-crypto builds resolve `md5` +
+  `hmac-sha-256` only) — our spelling of the RFC 5709 digest as an
+  explicit keyword was the disclosed N3 deviation, resolved S8-b
+  (both spellings parse; chains and static keys select either
+  engine).
 - **Verification order** (D.5, implemented in
   `Ospfd::authenticate`): authentication precedes ALL §8.2
   processing; a failed packet is silently discarded — no neighbor
@@ -483,6 +490,60 @@ follow-up below.
 - **No live FRR auth interop leg yet** (disclosed): the wire
   conventions are RFC/ADD-A2-pinned and vector-tested; an
   FRR-10.2.2 key-chain HMAC-SHA-256 leg is the natural next interop.
+
+## Key chains and both crypto engines (2026-10-14, the S8-b lane)
+
+- **The RFC 8177 key chain stanza (O-8)** lives in ospfd's own
+  config at FRR's frr.conf placement — depth-0 `key chain <name>`
+  beside `router ospf` (either order parses; a depth-0 stanza line
+  closes whatever is open), nesting `key <1-255>` (the Figure-18
+  octet — 8177's uint64 narrowed to what the v2 wire stamps) →
+  `key-string`, `cryptographic-algorithm <md5|hmac-sha-256>`,
+  `send-lifetime/accept-lifetime <start> <end|infinite>`. RFC 8177
+  §2.2's required key-string and crypto-algorithm are enforced at
+  the stanza close with line numbers; lifetimes default to ALWAYS
+  when absent. v1 disclosure: lifetime seconds live on the daemon's
+  INJECTED clock (wall-clock/NTP-anchored lifetimes — what
+  cross-router rollover actually needs, 8177 §2.4's
+  time-synchronization recommendation — swap in at the `now` seam
+  without touching the model).
+- **Interfaces reference a chain by name** — `authentication
+  key-chain <name>` (FRR's `ip ospf authentication key-chain` form);
+  references resolve at parse end so the stanza may precede or
+  follow the router stanza. Per-interface v1 (area-level auth is
+  not in the grammar at all).
+- **Both engines are first-class now**: keyed-MD5 (RFC 2328
+  D.4.3(6) — MD5(packet ‖ key), the 16-byte trailer; RFC 1321
+  vectors) joins HMAC-SHA-256, selectable per key in a chain AND in
+  the static `message-digest-key <id> md5 <key>` form (FRR's own
+  keyword — the N3-era grammar rejection is gone; the disclosed
+  N3 deviation flips to "both spellings parse"). MD5's collision
+  weaknesses are the known cost of interop with deployed peers;
+  `hmac-sha-256` stays the recommended configuration.
+- **Rollover semantics v1 (disclosed)**: accept-any-live /
+  send-highest — the receiver accepts any key whose accept lifetime
+  is live (RFC 2328 D.5.3 step 1), the sender stamps the live key
+  with the most recent send-lifetime start (D.4.3's
+  "most recent KeyStartGenerate"; 8177 §2.3's permission). Equal
+  starts break deterministically to the higher Key ID (8177 leaves
+  it unspecified). The daemon carries a per-interface LIVE send
+  view refreshed on every tick/packet — a rollover advances within
+  one tick. **Fail-closed**: a chain with no live send key degrades
+  to the Null view — the interface transmits AuType-0 packets any
+  crypto-configured peer discards by D.5, so the adjacency dies by
+  its own timers rather than by unsigned garbage passing anywhere.
+  Retransmitted conversation packets replay the field they were
+  built with (the accept overlap is what makes that safe).
+- **The knob (O-2)**: `rfc1583-compatibility <enabled|disabled>`
+  under `router ospf` — RFC 2328 §C.1's global item, **default
+  ENABLED per the RFC's letter** ("Set to 'enabled' by default";
+  FRR 10.2.2's probed default is disabled — the divergence is
+  deliberate and recorded here). Gates the §16.4 step-(3) ASBR-path
+  preference: disabled prunes per §16.4.1 (intra-area non-backbone
+  paths always most preferred), enabled applies no pruning — both
+  then least cost, largest area ID. Wired at the external
+  calculation and the §12.4.3 type-4 pick (the same preference
+  FRR's ospf_abr task applies).
 
 ## Incremental SPF (2026-10-11, the N3 M4 slice — §16.5/§16.6)
 
@@ -645,22 +706,26 @@ genuinely diverges on:
   hello ladder, codecs), mirrored where the rewrite would have put
   the v2 interop at risk in the same change.
 
-**The v6 transport walls, both disclosed (transport.rs module
-note):** a raw IPv6 socket delivers NO IPv6 header, and the received
-hop limit + true destination ride RFC 3542 cmsgs no safe API in the
-dependency set reads (every recvmsg wrapper needs `unsafe` — the
-bfdd audited-block precedent applies; NOTHING was added). The
-`IPV6_RECVHOPLIMIT` sockopt is armed through socket2's safe setter
-so the future cmsg walk finds it on; receive-side hop-limit
-ENFORCEMENT is therefore §Deferred (RFC 5340 §A.1 mandates hop
-limit 1 on the MULTICAST arm only — that transmit side is armed and
-read-back-verified; the unicast arm carries our local parity of 1).
-The **destination** has a deterministic workaround the RFC itself
-enumerates (§4.2's destination list): `decode_v3_dst` tries
-ff02::5/ff02::6/our-own-link-local and takes the pseudo-header-
-verifying candidate — needed because the v3 checksum covers the
-real (src, dst). The ifindex source is a pure `/proc/net/if_inet6`
-parse (no libc `if_nametoindex` — FFI is fenced).
+**The v6 transport walls — the cmsg wall is CLOSED (S8-b, the
+audited read-back):** a raw IPv6 socket delivers NO IPv6 header, and
+the received hop limit + true destination ride RFC 3542 cmsgs no
+safe API in the dependency set reads (every recvmsg wrapper needs
+`unsafe`). The owner's 2026-10-14 AGENTS.md exception names the v6
+cmsg read-back helper in `transport.rs` explicitly: `recvmsg_v6_ctl`
++ `arm_v6_recv_pktinfo` carry the bfdd audited-block treatment —
+mandatory audit comments, target-pinned cmsg constants, kernel
+round-trip tests on both families where the host permits, and the
+libc entry is the one audited `setsockopt` (socket2 0.6.5 exposes
+no `IPV6_RECVPKTINFO` setter). The v3 pump runs the read-back on its
+own blocking thread (nonblocking poll rhythm, weak-Arc Drop
+shutdown); the pseudo-header destination is the pktinfo cmsg's REAL
+address now, with §4.2's candidate trial (`decode_v3_dst`) as the
+fallback, and a unicast packet with a degraded hop limit is dropped
+and counted — the v2 N1 rule mirrored (RFC 5340 §A.1 mandates hop
+limit 1 on the multicast arm; our unicast transmit arm carries a
+local parity of 1). The ifindex source is a pure `/proc/net/if_inet6`
+parse (no libc `if_nametoindex` — FFI stays fenced outside the one
+audited call).
 
 **The interop evidence** (`scripts/test-ospfv3-frr-interop.sh`,
 exit 0 twice back-to-back; quarantine under
@@ -699,17 +764,14 @@ fresh netns interfaces with `disable_ipv6=1` and the sysctl write
 needs `/proc/sys` writable; the caps-only v2 rig shape cannot bring
 v6 up. Disclosed in the script header.
 
-## §Deferred (updated day-3 anchors)
+## §Deferred (updated S8-b, 2026-10-14)
 
 - §16.3 (transit areas' summary-LSAs — the V-bit now lands with the
   virtual links, the summary rules themselves remain); graceful
   restart (RFC 3623); DNA honoring.
 - **OSPFv3 runtime remainder** (S7-a landed the transport, the
-  daemon core and the live interop — see the section above; what
-  remains): the receive-side hop-limit/destination cmsg read-back
-  (RFC 3542 §6 — the arming is on, the walker needs the bfdd
-  audited-block treatment, owner-gated; the destination-trial
-  decode is the interim); full v3 SPF (link-LSA next hops, IAPR
+  daemon core and the live interop; S8-b closed the cmsg read-back —
+  see the sections above; what remains): full v3 SPF (link-LSA next hops, IAPR
   prefix attachment, transit networks keyed by (DR Interface ID,
   DR Router ID) — the §16.4-lite direct-ASBR form serves v1);
   multiple-router-LSA concatenation with lowest-LS-ID precedence
@@ -732,27 +794,27 @@ v6 up. Disclosed in the script header.
 - NSSA remainder: translator election (Nt bit, Candidate role,
   TranslatorStabilityInterval — RFC 3101 §3.1), Type-7 address
   ranges, §3.2 LS-ID remapping, the Appendix E P-bit-default
-  install technique, keyed-MD5 (AuType 2 legacy digest).
+  install technique.
 - `area range` configuration — §12.4.3's address-range
   coalescing/DoNotAdvertise (the per-network default is implemented);
   §16.2 step (3)'s own-active-range check rides with it.
-- RFC1583Compatibility is fixed at "disabled" (FRR parity) — no
-  configuration knob yet.
 - NBMA and Point-to-MultiPoint networks (§C.3) — the unicast-hello
   and per-neighbor-poll machinery; the §9.4 election's NBMA step
   (6) rides with it.
-- Receive-side TTL verification: **CLOSED for the v4 unicast class**
-  (night N1 — the raw-socket header read, no cmsg). The v6 arm
-  (S7-a): the `IPV6_RECVHOPLIMIT` sockopt is ARMED on the v6 raw
-  socket (socket2's safe setter), but the read-back itself remains
-  open — raw v6 sockets deliver no IPv6 header and the cmsg walk
-  needs recvmsg (`unsafe`; the bfdd audited-block treatment,
-  owner-gated). The interim v6 destination read is the deterministic
-  destination-trial decode (transport.rs); the hop-limit receive
-  check rides with the cmsg walker. Placement note (N1): the
-  walker stays bfdd-local until that owner gate opens — then hoist
-  into `common` and drop bfdd's copy. SO_BINDTODEVICE-style
-  interface scoping rides with it.
+- Receive-side TTL verification: **CLOSED on BOTH arms** — v4
+  unicast (night N1, the raw-socket header read, no cmsg) and v6
+  (S8-b: the audited recvmsg read-back named in AGENTS.md's
+  2026-10-14 exception — hop limit AND true destination off the
+  RFC 3542 cmsgs, the destination-trial decode demoted to the
+  fallback). Placement note (N1, still open): hoisting the walker
+  into `common` and dropping bfdd's copy is an owner decision away.
+  SO_BINDTODEVICE-style interface scoping rides with it.
+- Auth remainder: the live FRR key-chain interop leg (FRR 10.2.2's
+  `key chain` with hmac-sha-256/md5), wall-clock/NTP-anchored
+  lifetimes (v1 rides the injected clock — the `now` seam is the
+  swap point), RFC 8177's wider algorithm set / hex key-strings /
+  duration-based lifetimes, per-area auth surfaces, and the
+  `sha2`/`hmac` crate swap (owner decision; one-file change).
 - Interface link-state tracking ONGOING (the dump's startup snapshot
   landed with ADD-C2 above: a down/loopback interface stays Down at
   construction and sends no Hellos; what remains is reacting to
