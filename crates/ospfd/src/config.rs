@@ -51,6 +51,8 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use common::Ipv6Prefix;
+
 /// The address family the daemon runs (S7-a). v1: one family per
 /// process, selected under `router ospf` — `address-family
 /// ipv6-unicast` runs the OSPFv3 core (`daemon_v3`); the default
@@ -204,6 +206,13 @@ pub struct InterfaceConfig {
     /// join argument); `None` resolves from the interface name at
     /// daemon construction (`/proc/net/if_inet6`).
     pub ifindex: Option<u32>,
+    /// The OSPFv3 interface prefixes (`prefix <v6/len>`, RFC 5340
+    /// C.3's list): carried in the link-LSA (§4.4.3.8) and advertised
+    /// by the intra-area-prefix-LSAs (§4.4.3.9 — the p2p ones at the
+    /// interface cost in the router-referenced IAPR; the broadcast
+    /// ones by the link's DR at metric 0 in the network-referenced
+    /// IAPR).
+    pub prefixes_v6: Vec<Ipv6Prefix>,
 }
 
 impl InterfaceConfig {
@@ -224,6 +233,7 @@ impl InterfaceConfig {
             link_local: None,
             instance_id: 0,
             ifindex: None,
+            prefixes_v6: Vec::new(),
         }
     }
 }
@@ -851,7 +861,8 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                     }
                     "cost" | "hello-interval" | "dead-interval" | "priority" | "address"
                     | "network-type" | "mtu" | "authentication-key" | "authentication"
-                    | "message-digest-key" | "link-local" | "instance-id" | "ifindex" => {
+                    | "message-digest-key" | "link-local" | "instance-id" | "ifindex"
+                    | "prefix" => {
                         // Interface parameter inside the LAST interface
                         // stanza of the LAST area; BTreeMap order cannot
                         // express "last", so we require the parameter to
@@ -1038,6 +1049,23 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                     .ok_or_else(|| parse_error(line_no, "expected: ifindex <n>"))?;
                                 iface.ifindex = Some(value);
                             }
+                            // The OSPFv3 interface prefixes (RFC 5340
+                            // C.3): multiple lines allowed, each
+                            // carried in the link-LSA and advertised
+                            // by the IAPRs (§4.4.3.9).
+                            "prefix" => {
+                                let Some(p) =
+                                    words.get(1).and_then(|v| v.parse::<Ipv6Prefix>().ok())
+                                else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: prefix <x:x::x/len>",
+                                    ));
+                                };
+                                if !iface.prefixes_v6.contains(&p) {
+                                    iface.prefixes_v6.push(p);
+                                }
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -1141,6 +1169,31 @@ router ospf
         let cfg = parse("router ospf\n area 0.0.0.1\n  interface lo\n").unwrap();
         assert_eq!(cfg.area_id(), 1);
         assert_eq!(cfg.areas[0].interfaces["lo"], InterfaceConfig::defaults());
+    }
+
+    #[test]
+    fn v3_prefix_lines_parse_in_order_and_dedupe() {
+        // RFC 5340 C.3's interface prefix list: multiple `prefix`
+        // lines collect in declaration order; a duplicate is a no-op.
+        let cfg = parse(
+            "router ospf\n address-family ipv6-unicast\n router-id 1.1.1.1\n \
+             area 0.0.0.0\n  interface eth0\n   link-local fe80::1\n   ifindex 3\n \
+             prefix 2001:db8:1::/64\n   prefix 2001:db8:2::/64\n   prefix 2001:db8:1::/64\n",
+        )
+        .unwrap();
+        let eth0 = &cfg.areas[0].interfaces["eth0"];
+        assert_eq!(
+            eth0.prefixes_v6,
+            vec![
+                "2001:db8:1::/64".parse::<Ipv6Prefix>().unwrap(),
+                "2001:db8:2::/64".parse().unwrap()
+            ],
+            "declaration order, duplicates dropped"
+        );
+        // A malformed prefix errors at its line.
+        let err = parse("router ospf\n area 0.0.0.0\n  interface eth0\n   prefix 2001:db8::/129\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("prefix"), "{err}");
     }
 
     #[test]

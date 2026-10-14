@@ -784,6 +784,26 @@ pub struct InterfaceV3 {
     pub link_lsdb: Lsdb<LsaV3>,
     /// Whether the self-originated link-LSA needs (re-)origination.
     link_lsa_dirty: bool,
+    /// The §9 interface state machine (broadcast networks; the p2p
+    /// rows only ever use the PointToPoint state).
+    pub fsm: crate::iface::InterfaceFsm,
+    /// The elected DR/BDR on a broadcast link (§9.4's result, also
+    /// our Hello's claim fields — Router IDs in v3, §A.3.2; 0 = none).
+    pub dr: RouterId,
+    pub bdr: RouterId,
+    /// §9.3's WaitTimer deadline (monotonic seconds), broadcast only.
+    pub wait_deadline: Option<u64>,
+    /// Per-neighbor Hello claims on a broadcast link (§9.2/§9.4's
+    /// election inputs) — the v3 shape: DR/BDR claims are Router IDs,
+    /// mapped into the shared election's identity slot.
+    pub claims: HashMap<RouterId, crate::iface::ElectionNeighbor>,
+    /// The self-originated network-LSA (while DR), §4.4.3.3.
+    network_lsa: Option<LsaKey>,
+    /// Whether the network-LSA needs (re-)origination (DR only).
+    network_lsa_dirty: bool,
+    /// The DR's network-referenced IAPR (§4.4.3.9 part 1) + dirty.
+    network_iapr: Option<LsaKey>,
+    network_iapr_dirty: bool,
 }
 
 impl InterfaceV3 {
@@ -795,6 +815,33 @@ impl InterfaceV3 {
             instance_id: self.instance_id,
         }
     }
+
+    fn broadcast(&self) -> bool {
+        self.cfg.network_type == NetworkType::Broadcast
+    }
+
+    /// §10.4's adjacency answer: p2p always adjacent ("all router
+    /// pairs directly connected by a physical point-to-point link
+    /// become adjacent"); broadcast with/toward the DR and BDR only.
+    fn adjacency_ok(&self, rid: RouterId) -> bool {
+        if !self.broadcast() {
+            return true;
+        }
+        matches!(
+            self.fsm.state,
+            crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+        ) || rid == self.dr
+            || rid == self.bdr
+    }
+}
+
+/// The §9.4 identity mapping: v3's DR/BDR claims are ROUTER IDs
+/// (§A.3.2), the shared election's slots are address-typed — the
+/// election compares identities only, so Router IDs ride the u32
+/// identity slot unchanged (the AF-generic seam; documented, never
+/// interpreted as an address).
+fn rid_identity(rid: RouterId) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(rid.0)
 }
 
 /// The OSPFv3 daemon core. Clock-injected (`now` in seconds); `run`
@@ -823,6 +870,10 @@ pub struct OspfdV3 {
     /// de-multiplexer, A.4.7).
     next_external_lsid: u32,
     router_lsa_dirty: bool,
+    /// The router-referenced IAPR (§4.4.3.9 part 2: this router's
+    /// own prefixes, referenced LS type 0x2001) + dirty.
+    iapr_key: Option<LsaKey>,
+    iapr_dirty: bool,
     asbr: bool,
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     redistribute_static: bool,
@@ -860,9 +911,11 @@ impl OspfdV3 {
                     "interface {name}: link-local must be a fe80::/10 address (RFC 5340 2.5)"
                 ));
             }
-            if icfg.network_type != NetworkType::PointToPoint {
+            if icfg.network_type != NetworkType::PointToPoint
+                && icfg.network_type != NetworkType::Broadcast
+            {
                 return Err(format!(
-                    "interface {name}: OSPFv3 v1 supports network-type point-to-point only"
+                    "interface {name}: OSPFv3 v1 supports network-type point-to-point|broadcast"
                 ));
             }
             let ifindex = match icfg.ifindex {
@@ -870,6 +923,17 @@ impl OspfdV3 {
                 // Linux hosts resolve the name; tests pin the index.
                 None => crate::transport::ifindex_of(name)
                     .map_err(|e| format!("interface {name}: no ifindex ({e})"))?,
+            };
+            let p2p = icfg.network_type == NetworkType::PointToPoint;
+            let mut fsm = crate::iface::InterfaceFsm::new_with_priority(p2p, icfg.priority);
+            // §9.3 InterfaceUp fires at construction; broadcast arms
+            // the WaitTimer (the RouterDeadInterval startup form).
+            let (_, actions) = fsm.fire(crate::iface::InterfaceEvent::InterfaceUp);
+            let wait_deadline = if actions.contains(&crate::iface::InterfaceAction::StartWaitTimer)
+            {
+                Some(icfg.dead_interval as u64)
+            } else {
+                None
             };
             interfaces.push(InterfaceV3 {
                 name: name.clone(),
@@ -882,6 +946,15 @@ impl OspfdV3 {
                 hello_deadline: 0,
                 link_lsdb: Lsdb::new(),
                 link_lsa_dirty: true,
+                fsm,
+                dr: RouterId(0),
+                bdr: RouterId(0),
+                wait_deadline,
+                claims: HashMap::new(),
+                network_lsa: None,
+                network_lsa_dirty: false,
+                network_iapr: None,
+                network_iapr_dirty: false,
             });
         }
         if interfaces.is_empty() {
@@ -900,6 +973,8 @@ impl OspfdV3 {
             externals: BTreeMap::new(),
             next_external_lsid: 0,
             router_lsa_dirty: true,
+            iapr_key: None,
+            iapr_dirty: true,
             asbr: false,
             zapi: None,
             redistribute_static: cfg.redistribute_static,
@@ -938,6 +1013,13 @@ impl OspfdV3 {
             .filter(|(_, c)| c.in_hello())
             .map(|(rid, _)| *rid)
             .collect();
+        // §A.3.2: the DR/BDR claims (Router IDs on a broadcast link —
+        // "ignored on point-to-point links", 4.2.2.1).
+        let (dr, bdr) = if i.broadcast() {
+            (i.dr, i.bdr)
+        } else {
+            (RouterId(0), RouterId(0))
+        };
         self.packet(
             iface,
             PacketBodyV3::Hello(HelloV3 {
@@ -946,10 +1028,8 @@ impl OspfdV3 {
                 options: our_options(),
                 hello_interval: i.cfg.hello_interval,
                 router_dead_interval: i.cfg.dead_interval.min(u32::from(u16::MAX)) as u16,
-                // p2p: no DR election (§C.3); the claim fields are
-                // Router IDs and stay 0 (4.2.2.1 ignores them on p2p).
-                designated_router: RouterId(0),
-                backup_designated_router: RouterId(0),
+                designated_router: dr,
+                backup_designated_router: bdr,
                 neighbors,
             }),
         )
@@ -1056,10 +1136,18 @@ impl OspfdV3 {
             );
             return out;
         }
-        // §4.2: AllDRouters destinations are DR/BDR-only.
+        // §4.2/§A.1: AllDRouters (ff02::6) destinations are processed
+        // only by the link's DR and BDR ("routers not belonging to
+        // the Designated Router's network should drop").
         if dst == crate::transport::ALL_D_ROUTERS_V6 {
-            debug!(src = %received.src, "ospfv3: AllDRouters packet on a p2p interface — drop");
-            return out;
+            let role = self.interfaces[iface_idx].fsm.state;
+            if !matches!(
+                role,
+                crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+            ) {
+                debug!(src = %received.src, "ospfv3: AllDRouters packet while not DR/BDR — drop");
+                return out;
+            }
         }
         self.on_packet_on(iface_idx, packet, received.src, now)
     }
@@ -1096,6 +1184,10 @@ impl OspfdV3 {
                 });
                 conv.ip = src;
                 conv.peer_interface_id = Some(hello.interface_id);
+                let was_2way = self.interfaces[iface_idx]
+                    .neighbors
+                    .get(&peer)
+                    .is_some_and(|c| c.state().at_least(NeighborState::TwoWay));
                 // The databases ride as taken values (the conversation
                 // mutably borrows the interface while the link store
                 // lives in the same vector).
@@ -1105,12 +1197,21 @@ impl OspfdV3 {
                     let conv = self.interfaces[iface_idx].neighbors.get_mut(&peer).unwrap();
                     let (mut ev_sends, mut report) = conv.fire_and_map(event, area, &link, now);
                     if event == NeighborEvent::TwoWayReceived {
-                        // p2p: §10.4's answer is always yes.
+                        // §10.4's answer: p2p always adjacent;
+                        // broadcast only with/toward the DR/BDR.
+                        let answer = self.interfaces[iface_idx].adjacency_ok(peer);
                         let conv = self.interfaces[iface_idx].neighbors.get_mut(&peer).unwrap();
                         let (s, r) =
-                            conv.fire_and_map(NeighborEvent::AdjOk(true), area, &link, now);
+                            conv.fire_and_map(NeighborEvent::AdjOk(answer), area, &link, now);
                         ev_sends.extend(s);
                         report.merge(&r);
+                        if !answer {
+                            info!(
+                                iface = %self.interfaces[iface_idx].name,
+                                neighbor = %peer,
+                                "ospfv3: neighbor stays 2-Way (§10.4: neither side is DR/BDR)"
+                            );
+                        }
                     }
                     out.extend(self.sends_into(iface_idx, ev_sends));
                     let conv = self.interfaces[iface_idx].neighbors.get_mut(&peer).unwrap();
@@ -1118,6 +1219,39 @@ impl OspfdV3 {
                     self.after_report_v3(iface_idx, Some(peer), &report, now, &mut out);
                 }
                 self.interfaces[iface_idx].link_lsdb = link;
+                // ---- §9.2/§9.4 (broadcast): claims + election ----
+                if self.interfaces[iface_idx].broadcast() {
+                    let is_2way = self.interfaces[iface_idx]
+                        .neighbors
+                        .get(&peer)
+                        .is_some_and(|c| c.state().at_least(NeighborState::TwoWay));
+                    // The claim snapshot: v3's DR/BDR claims are
+                    // Router IDs, riding the shared election's
+                    // identity slot (`rid_identity`).
+                    let new_claims = crate::iface::ElectionNeighbor {
+                        router_id: peer,
+                        address: rid_identity(peer),
+                        priority: hello.router_priority,
+                        dr: rid_identity(hello.designated_router),
+                        bdr: rid_identity(hello.backup_designated_router),
+                    };
+                    let iface_state = self.interfaces[iface_idx].fsm.state;
+                    let prev_claims = self.interfaces[iface_idx].claims.get(&peer).copied();
+                    let ism_events = crate::iface::hello_interface_events(
+                        iface_state,
+                        prev_claims,
+                        new_claims,
+                        was_2way,
+                        is_2way,
+                    );
+                    self.interfaces[iface_idx].claims.insert(peer, new_claims);
+                    for ev in ism_events {
+                        let (_, actions) = self.interfaces[iface_idx].fsm.fire(ev);
+                        if actions.contains(&crate::iface::InterfaceAction::ElectDr) {
+                            self.run_election_v3(iface_idx, now, &mut out);
+                        }
+                    }
+                }
             }
             PacketBodyV3::DbDescription(_)
             | PacketBodyV3::LsRequest(_)
@@ -1216,17 +1350,34 @@ impl OspfdV3 {
                         })
                         .collect()
                 };
+                if ips.is_empty() {
+                    continue;
+                }
+                let packet = self.packet(
+                    idx,
+                    PacketBodyV3::LsUpdate(LsUpdateV3 {
+                        lsas: vec![lsa.clone()],
+                    }),
+                );
+                if self.interfaces[idx].broadcast() {
+                    // §13.3's broadcast rule (the flood_own shape).
+                    let to = if self.drouters_member(idx) {
+                        WireToV3::Multicast
+                    } else {
+                        WireToV3::AllDRouters
+                    };
+                    out.push(WireOutV3 {
+                        iface: idx,
+                        to,
+                        packet,
+                    });
+                    continue;
+                }
                 for ip in ips {
-                    let packet = self.packet(
-                        idx,
-                        PacketBodyV3::LsUpdate(LsUpdateV3 {
-                            lsas: vec![lsa.clone()],
-                        }),
-                    );
                     out.push(WireOutV3 {
                         iface: idx,
                         to: WireToV3::Unicast(ip),
-                        packet,
+                        packet: packet.clone(),
                     });
                 }
             }
@@ -1289,6 +1440,25 @@ impl OspfdV3 {
                 _ => self.table_dirty = true,
             }
         }
+        // The DR's §4.4.3.3/§4.4.3.9 duties: the attached set (and
+        // with it the network IAPR's prefix source) changed with any
+        // adjacency transition; a link-LSA change while DR re-offers
+        // the IAPR's inputs.
+        if self.interfaces[iface_idx].broadcast()
+            && self.interfaces[iface_idx].fsm.state == crate::iface::InterfaceState::Dr
+        {
+            if report.adjacency_up || report.adjacency_down {
+                self.interfaces[iface_idx].network_lsa_dirty = true;
+                self.interfaces[iface_idx].network_iapr_dirty = true;
+            }
+            if report
+                .changed_lsas
+                .iter()
+                .any(|l| l.header.ls_type == V3_LINK && l.header.adv_router != self.router_id)
+            {
+                self.interfaces[iface_idx].network_iapr_dirty = true;
+            }
+        }
         self.maybe_spf(now);
     }
 
@@ -1297,6 +1467,138 @@ impl OspfdV3 {
     fn mark_spf_dirty(&mut self, now: u64) {
         self.spf_dirty = true;
         self.spf_sched.on_change(now * 1000);
+    }
+
+    /// Run the §9.4 election on one broadcast interface and apply the
+    /// outcome — the v2 daemon's `run_election` shape over v3
+    /// identities: the claims are Router IDs (`rid_identity`), the
+    /// role drives the type-2 link, the network-LSA and the DR's IAPR
+    /// duties, and step (7)'s AdjOK? re-evaluation.
+    fn run_election_v3(&mut self, idx: usize, now: u64, out: &mut Vec<WireOutV3>) {
+        let (neighbors, prev) = {
+            let iface = &self.interfaces[idx];
+            // §9.4's inputs: the bidirectional neighbors' claims.
+            let neighbors: Vec<crate::iface::ElectionNeighbor> = iface
+                .neighbors
+                .iter()
+                .filter(|(_, c)| c.state().at_least(NeighborState::TwoWay))
+                .filter_map(|(rid, _)| iface.claims.get(rid).copied())
+                .collect();
+            (neighbors, (iface.dr, iface.bdr))
+        };
+        let own = crate::iface::ElectionNeighbor {
+            router_id: self.router_id,
+            address: rid_identity(self.router_id),
+            priority: self.interfaces[idx].cfg.priority,
+            // Our claims = what our Hellos carry (§9.4's repeat reads
+            // them back).
+            dr: rid_identity(prev.0),
+            bdr: rid_identity(prev.1),
+        };
+        let outcome = crate::iface::elect_dr(
+            own,
+            &neighbors,
+            (rid_identity(prev.0), rid_identity(prev.1)),
+        );
+        let was_role = self.interfaces[idx].fsm.state;
+        {
+            let iface = &mut self.interfaces[idx];
+            iface.dr = RouterId(u32::from(outcome.dr));
+            iface.bdr = RouterId(u32::from(outcome.bdr));
+            // §9.3's "New state: Depends upon action routine" — the
+            // election IS the action routine for the Waiting rows.
+            iface.fsm.state = outcome.role;
+            if outcome.role != crate::iface::InterfaceState::Waiting {
+                iface.wait_deadline = None;
+            }
+        }
+        if was_role != outcome.role || outcome.dr_changed || outcome.bdr_changed {
+            info!(
+                iface = %self.interfaces[idx].name,
+                dr = %self.interfaces[idx].dr,
+                bdr = %self.interfaces[idx].bdr,
+                role = outcome.role.name(),
+                "ospfv3: DR election (§9.4 over Router-ID claims)"
+            );
+        }
+        if was_role != outcome.role {
+            // The type-2 link description changed with the role.
+            self.router_lsa_dirty = true;
+            if was_role == crate::iface::InterfaceState::Dr
+                && outcome.role != crate::iface::InterfaceState::Dr
+            {
+                // §4.4.3.3: a former DR flushes its network-LSA and
+                // the DR's network-referenced IAPR.
+                let aged_net = self.interfaces[idx]
+                    .network_lsa
+                    .take()
+                    .and_then(|key| self.lsdb.premature_age(&key));
+                if let Some(maxage) = aged_net {
+                    self.flood_own(&maxage, now, out);
+                }
+                let aged_iapr = self.interfaces[idx]
+                    .network_iapr
+                    .take()
+                    .and_then(|key| self.lsdb.premature_age(&key));
+                if let Some(maxage) = aged_iapr {
+                    self.flood_own(&maxage, now, out);
+                }
+                info!(iface = %self.interfaces[idx].name, "ospfv3: DR duties flushed (no longer DR)");
+            }
+            if outcome.role == crate::iface::InterfaceState::Dr {
+                self.interfaces[idx].network_lsa_dirty = true;
+                self.interfaces[idx].network_iapr_dirty = true;
+            }
+        }
+        if outcome.dr_changed {
+            // The transit-link key follows the DR (its Interface ID +
+            // Router ID, §4.4.3.2).
+            self.router_lsa_dirty = true;
+        }
+        if outcome.dr_changed || outcome.bdr_changed {
+            // §9.4 step (7): AdjOK? on every neighbor ≥ 2-Way.
+            let keys: Vec<RouterId> = self.interfaces[idx]
+                .neighbors
+                .iter()
+                .filter(|(_, c)| c.state().at_least(NeighborState::TwoWay))
+                .map(|(rid, _)| *rid)
+                .collect();
+            for key in keys {
+                self.reevaluate_adjacency_v3(idx, key, now, out);
+            }
+        }
+    }
+
+    /// Fire AdjOK? with §10.4's broadcast answer for one neighbor.
+    fn reevaluate_adjacency_v3(
+        &mut self,
+        idx: usize,
+        peer: RouterId,
+        now: u64,
+        out: &mut Vec<WireOutV3>,
+    ) {
+        let answer = self.interfaces[idx].adjacency_ok(peer);
+        let link = std::mem::take(&mut self.interfaces[idx].link_lsdb);
+        let area = &self.lsdb;
+        let Some(conv) = self.interfaces[idx].neighbors.get_mut(&peer) else {
+            self.interfaces[idx].link_lsdb = link;
+            return;
+        };
+        let (sends, report) = conv.fire_and_map(NeighborEvent::AdjOk(answer), area, &link, now);
+        self.interfaces[idx].link_lsdb = link;
+        out.extend(self.sends_into(idx, sends));
+        self.after_report_v3(idx, Some(peer), &report, now, out);
+    }
+
+    /// Whether the run loop should hold the ff02::6 (AllDRouters)
+    /// membership on this interface (§A.1: joined while DR/BDR).
+    pub fn drouters_member(&self, idx: usize) -> bool {
+        let iface = &self.interfaces[idx];
+        iface.broadcast()
+            && matches!(
+                iface.fsm.state,
+                crate::iface::InterfaceState::Dr | crate::iface::InterfaceState::Backup
+            )
     }
 
     /// The §4.8 walk gate: topology-due areas recompute §16.1; the
@@ -1329,12 +1631,50 @@ impl OspfdV3 {
 
     // ---- LSA origination (§4.4.3) --------------------------------
 
-    /// §4.4.3.1: the router-LSA — one p2p link per fully-adjacent
-    /// neighbor, carrying Interface IDs (v3's replacement for Link
-    /// Data, §2.2).
+    /// §4.4.3.2: the router-LSA. p2p: one Type 1 link per fully
+    /// adjacent neighbor; broadcast: ONE Type 2 (transit) link — "If
+    /// the router is fully adjacent to the link's Designated Router
+    /// or if the router itself is the Designated Router and is fully
+    /// adjacent to at least one other router" — keyed by the DR's
+    /// (Interface ID, Router ID). Interface IDs replace v2's Link
+    /// Data (§2.2).
     fn build_router_lsa(&self) -> LsaV3 {
         let mut links = Vec::new();
         for iface in &self.interfaces {
+            if iface.broadcast() {
+                let we_are_dr = iface.dr == self.router_id;
+                let full_with_dr = iface
+                    .neighbors
+                    .get(&iface.dr)
+                    .is_some_and(|c| c.state() == NeighborState::Full);
+                let any_full = iface
+                    .neighbors
+                    .values()
+                    .any(|c| c.state() == NeighborState::Full);
+                let describe = full_with_dr || (we_are_dr && any_full);
+                if !describe {
+                    continue; // §4.4.3.2: not described without a Full DR adjacency
+                }
+                // The DR's Interface ID as advertised in its Hellos;
+                // ourselves as DR -> our own Interface ID.
+                let dr_iface = if we_are_dr {
+                    iface.ifindex
+                } else {
+                    iface
+                        .neighbors
+                        .get(&iface.dr)
+                        .and_then(|c| c.peer_interface_id)
+                        .unwrap_or(0)
+                };
+                links.push(RouterLinkV3 {
+                    link_type: LinkTypeV3::Transit,
+                    metric: iface.cfg.cost,
+                    interface_id: iface.ifindex,
+                    neighbor_interface_id: dr_iface,
+                    neighbor_router_id: iface.dr,
+                });
+                continue;
+            }
             for (rid, conv) in &iface.neighbors {
                 if conv.state() == NeighborState::Full {
                     links.push(RouterLinkV3 {
@@ -1352,7 +1692,9 @@ impl OspfdV3 {
                 ls_age: 0,
                 ls_type: V3_ROUTER,
                 // v1: one router-LSA (LS ID 0; the multiple-router-
-                // LSA concatenation of A.4.3 is §Deferred).
+                // LSA concatenation of A.4.3 is the SPF consumer's
+                // duty — done, spf_v3 — origination stays single-
+                // fragment while links fit, disclosed).
                 link_state_id: LinkStateId(0),
                 adv_router: self.router_id,
                 seq: 0,
@@ -1373,7 +1715,9 @@ impl OspfdV3 {
     /// §4.4.3.8: the link-LSA — our link-local address and the
     /// link's prefixes, link-local flooding scope. "Link-local
     /// addresses appear in OSPF link-LSAs and nowhere else" (§2.5) —
-    /// this is how a neighbor learns the next-hop address.
+    /// this is how a neighbor learns the next-hop address. The
+    /// configured prefixes (§C.3's `prefix` lines) ride here for the
+    /// DR's IAPR (§4.4.3.9).
     fn build_link_lsa(&self, iface: usize) -> LsaV3 {
         let iface = &self.interfaces[iface];
         LsaV3 {
@@ -1391,11 +1735,285 @@ impl OspfdV3 {
                 router_priority: iface.cfg.priority,
                 options: our_options(),
                 link_local_address: iface.link_local,
-                // v1: no configured link prefixes (§4.4.3.8's
-                // configured-prefix advertisement rides with prefix
-                // config).
-                prefixes: vec![],
+                prefixes: iface
+                    .cfg
+                    .prefixes_v6
+                    .iter()
+                    .map(|p| Prefix {
+                        len: p.prefix_len(),
+                        options: Default::default(),
+                        addr: prefix_bytes(p),
+                    })
+                    .collect(),
             }),
+        }
+    }
+
+    /// §4.4.3.3: the network-LSA while DR — "originated for every
+    /// broadcast or NBMA link with an elected Designated Router that
+    /// is fully adjacent with at least one other router on the link.
+    /// ... lists all routers on the link with which it is fully
+    /// adjacent." The LS ID is the DR's (our) Interface ID; the
+    /// Options field is the logical OR of the attached routers'
+    /// link-LSA Options.
+    fn build_network_lsa(&self, iface: usize) -> Option<LsaV3> {
+        let iface = &self.interfaces[iface];
+        if iface.dr != self.router_id {
+            return None;
+        }
+        let mut attached = vec![self.router_id];
+        let mut options = our_options();
+        for (rid, conv) in &iface.neighbors {
+            if conv.state() != NeighborState::Full {
+                continue;
+            }
+            attached.push(*rid);
+            // The OR contribution from this router's link-LSA.
+            if let Some(entry) = iface.link_lsdb.all().find(|e| {
+                e.lsa.header.adv_router == *rid
+                    && e.lsa.header.link_state_id.0 == conv.peer_interface_id.unwrap_or(0)
+            }) {
+                if let LsaBodyV3::Link(body) = &entry.lsa.body {
+                    options = Options24(options.0 | body.options.0);
+                }
+            }
+        }
+        if attached.len() < 2 {
+            return None; // not fully adjacent with anyone: no network-LSA
+        }
+        attached.sort();
+        Some(LsaV3 {
+            header: LsaHeaderV3 {
+                ls_age: 0,
+                ls_type: LsaType::V3_NETWORK,
+                link_state_id: LinkStateId(iface.ifindex),
+                adv_router: self.router_id,
+                seq: 0,
+                checksum: 0,
+                length: 0,
+            },
+            body: LsaBodyV3::Network(crate::lsa_v3::NetworkLsaV3 { options, attached }),
+        })
+    }
+
+    /// §4.4.3.9 part 1: the DR's network-referenced IAPR — "Each
+    /// link-LSA associated with Link L is examined ... If the
+    /// link-LSA's Advertising Router is fully adjacent to the
+    /// Designated Router and the Link State ID matches the neighbor's
+    /// interface ID, the list of prefixes in the link-LSA is copied
+    /// into the intra-area-prefix-LSA" (our own link-LSA included);
+    /// NU/LA-bit prefixes are not copied; duplicates OR their
+    /// PrefixOptions; the Metric is 0. The referenced triple names
+    /// the link's network-LSA (0x2002, the DR's Interface ID, the
+    /// DR's Router ID).
+    fn build_network_iapr(&self, idx: usize) -> Option<LsaV3> {
+        let iface = &self.interfaces[idx];
+        if iface.dr != self.router_id {
+            return None;
+        }
+        // The fully-adjacent routers' Interface IDs (ours = ifindex).
+        let mut eligible: Vec<(RouterId, u32)> = vec![(self.router_id, iface.ifindex)];
+        for (rid, conv) in &iface.neighbors {
+            if conv.state() == NeighborState::Full {
+                if let Some(id) = conv.peer_interface_id {
+                    eligible.push((*rid, id));
+                }
+            }
+        }
+        let mut prefixes: Vec<crate::lsa_v3::PrefixMetric> = Vec::new();
+        for entry in iface.link_lsdb.all() {
+            let ok = eligible.iter().any(|(rid, iface_id)| {
+                entry.lsa.header.adv_router == *rid && entry.lsa.header.link_state_id.0 == *iface_id
+            });
+            if !ok {
+                continue;
+            }
+            let LsaBodyV3::Link(body) = &entry.lsa.body else {
+                continue;
+            };
+            for p in &body.prefixes {
+                if p.options.nu_bit() || p.options.la_bit() {
+                    continue; // "SHOULD NOT be copied"
+                }
+                match prefixes
+                    .iter_mut()
+                    .find(|pm| pm.prefix.len == p.len && pm.prefix.addr == p.addr)
+                {
+                    // Duplicates: OR the PrefixOptions together.
+                    Some(pm) => {
+                        pm.prefix.options =
+                            crate::lsa_v3::PrefixOptions(pm.prefix.options.0 | p.options.0)
+                    }
+                    None => prefixes.push(crate::lsa_v3::PrefixMetric {
+                        metric: 0,
+                        prefix: p.clone(),
+                    }),
+                }
+            }
+        }
+        if prefixes.is_empty() {
+            return None;
+        }
+        Some(LsaV3 {
+            header: LsaHeaderV3 {
+                ls_age: 0,
+                ls_type: LsaType::V3_INTRA_AREA_PREFIX,
+                // The LS ID is a pure de-multiplexer — one per DR
+                // interface, allocated deterministically (1 + idx;
+                // 0 is the router-referenced IAPR's).
+                link_state_id: LinkStateId(1 + idx as u32),
+                adv_router: self.router_id,
+                seq: 0,
+                checksum: 0,
+                length: 0,
+            },
+            body: LsaBodyV3::IntraAreaPrefix(crate::lsa_v3::IntraAreaPrefixLsaV3 {
+                prefixes,
+                referenced_ls_type: LsaType::V3_NETWORK,
+                referenced_link_state_id: LinkStateId(iface.ifindex),
+                referenced_adv_router: self.router_id,
+            }),
+        })
+    }
+
+    /// §4.4.3.9 part 2: the router-referenced IAPR — this router's
+    /// own prefixes: the p2p interfaces' configured global prefixes
+    /// at the interface output cost (broadcast interfaces' prefixes
+    /// are skipped — they ride the DR's network-referenced IAPR once
+    /// the interface is a Type 2 link). Referenced (0x2001, 0, us).
+    fn build_router_iapr(&self) -> Option<LsaV3> {
+        let mut prefixes: Vec<crate::lsa_v3::PrefixMetric> = Vec::new();
+        for iface in &self.interfaces {
+            if iface.broadcast() {
+                continue; // the DR's IAPR carries the transit link's prefixes
+            }
+            for p in &iface.cfg.prefixes_v6 {
+                match prefixes
+                    .iter_mut()
+                    .find(|pm| pm.prefix.len == p.prefix_len() && pm.prefix.addr == prefix_bytes(p))
+                {
+                    Some(pm) => pm.metric = pm.metric.min(iface.cfg.cost),
+                    None => prefixes.push(crate::lsa_v3::PrefixMetric {
+                        metric: iface.cfg.cost,
+                        prefix: Prefix {
+                            len: p.prefix_len(),
+                            options: Default::default(),
+                            addr: prefix_bytes(p),
+                        },
+                    }),
+                }
+            }
+        }
+        if prefixes.is_empty() {
+            return None;
+        }
+        Some(LsaV3 {
+            header: LsaHeaderV3 {
+                ls_age: 0,
+                ls_type: LsaType::V3_INTRA_AREA_PREFIX,
+                link_state_id: LinkStateId(0),
+                adv_router: self.router_id,
+                seq: 0,
+                checksum: 0,
+                length: 0,
+            },
+            body: LsaBodyV3::IntraAreaPrefix(crate::lsa_v3::IntraAreaPrefixLsaV3 {
+                prefixes,
+                referenced_ls_type: V3_ROUTER,
+                referenced_link_state_id: LinkStateId(0),
+                referenced_adv_router: self.router_id,
+            }),
+        })
+    }
+
+    /// Originate (or refresh) the network-LSA and DR's IAPR on one
+    /// interface, and flush the pair when the justification left
+    /// (no longer DR, or the LSA would be empty).
+    fn originate_network_duties(&mut self, iface: usize, now: u64, out: &mut Vec<WireOutV3>) {
+        // The network-LSA. A MinLSInterval-rejected origination
+        // KEEPS the dirty flag (the content update must land at the
+        // next opportunity — clearing on rejection would strand a
+        // stale LSA forever).
+        match self.build_network_lsa(iface) {
+            Some(lsa) => {
+                let key = lsa.key();
+                if self.lsdb.originate(lsa, now).is_ok() {
+                    self.interfaces[iface].network_lsa = Some(key);
+                    self.interfaces[iface].network_lsa_dirty = false;
+                    if let Some(stored) = self.lsdb.get(&key).map(|e| e.lsa.clone()) {
+                        info!(
+                            iface = %self.interfaces[iface].name,
+                            "ospfv3: network-LSA originated (§4.4.3.3)"
+                        );
+                        self.flood_own(&stored, now, out);
+                        self.mark_spf_dirty(now);
+                    }
+                }
+            }
+            None => {
+                if let Some(key) = self.interfaces[iface].network_lsa.take() {
+                    self.interfaces[iface].network_lsa_dirty = false;
+                    if let Some(aged) = self.lsdb.premature_age(&key) {
+                        self.flood_own(&aged, now, out);
+                        self.mark_spf_dirty(now);
+                    }
+                }
+            }
+        }
+        // The DR's network-referenced IAPR (same keep-dirty rule).
+        match self.build_network_iapr(iface) {
+            Some(lsa) => {
+                let key = lsa.key();
+                if self.lsdb.originate(lsa, now).is_ok() {
+                    self.interfaces[iface].network_iapr = Some(key);
+                    self.interfaces[iface].network_iapr_dirty = false;
+                    if let Some(stored) = self.lsdb.get(&key).map(|e| e.lsa.clone()) {
+                        info!(
+                            iface = %self.interfaces[iface].name,
+                            "ospfv3: network IAPR originated (§4.4.3.9)"
+                        );
+                        self.flood_own(&stored, now, out);
+                        self.table_dirty = true;
+                    }
+                }
+            }
+            None => {
+                if let Some(key) = self.interfaces[iface].network_iapr.take() {
+                    self.interfaces[iface].network_iapr_dirty = false;
+                    if let Some(aged) = self.lsdb.premature_age(&key) {
+                        self.flood_own(&aged, now, out);
+                        self.table_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Originate (or flush) the router-referenced IAPR.
+    fn originate_router_iapr(&mut self, now: u64, out: &mut Vec<WireOutV3>) {
+        // The same keep-dirty-on-rejection rule as the DR duties.
+        match self.build_router_iapr() {
+            Some(lsa) => {
+                let key = lsa.key();
+                if self.lsdb.originate(lsa, now).is_ok() {
+                    self.iapr_key = Some(key);
+                    self.iapr_dirty = false;
+                    if let Some(stored) = self.lsdb.get(&key).map(|e| e.lsa.clone()) {
+                        info!("ospfv3: router IAPR originated (§4.4.3.9)");
+                        self.flood_own(&stored, now, out);
+                        self.table_dirty = true;
+                    }
+                }
+            }
+            None => {
+                if let Some(key) = self.iapr_key.take() {
+                    self.iapr_dirty = false;
+                    if let Some(aged) = self.lsdb.premature_age(&key) {
+                        self.flood_own(&aged, now, out);
+                        self.table_dirty = true;
+                    }
+                }
+            }
         }
     }
 
@@ -1460,9 +2078,12 @@ impl OspfdV3 {
         }
     }
 
-    /// §4.5.2: flood a self-originated LSA — LSU unicast to every
-    /// Full neighbor (the v2 p2p shape), queued for retransmission;
-    /// link-scope LSAs only on their own interface.
+    /// §4.5.2: flood a self-originated LSA. Broadcast links: ONE
+    /// multicast LSU — "to AllSPFRouters if the router is the DR or
+    /// Backup, AllDRouters otherwise" (§13.3's v2 rule, v3's
+    /// ff02::5/6 form) — queued for unicast retransmission per Full
+    /// neighbor. p2p links: LSU unicast to every Full neighbor (the
+    /// v2 p2p shape). Link-scope LSAs never leave their own link.
     fn flood_own(&mut self, lsa: &LsaV3, now: u64, out: &mut Vec<WireOutV3>) {
         let link_scope = lsa.header.ls_type.scope() == crate::lsa::Scope::Link;
         for idx in 0..self.interfaces.len() {
@@ -1493,6 +2114,21 @@ impl OspfdV3 {
                     lsas: vec![lsa.clone()],
                 }),
             );
+            if self.interfaces[idx].broadcast() && !ips.is_empty() {
+                // §13.3's broadcast rule: DR/BDR flood on AllSPFRouters,
+                // DR Others on AllDRouters (the DR/BDR relay).
+                let to = if self.drouters_member(idx) {
+                    WireToV3::Multicast
+                } else {
+                    WireToV3::AllDRouters
+                };
+                out.push(WireOutV3 {
+                    iface: idx,
+                    to,
+                    packet,
+                });
+                continue;
+            }
             for ip in ips {
                 out.push(WireOutV3 {
                     iface: idx,
@@ -1737,14 +2373,31 @@ impl OspfdV3 {
                     now + u64::from(self.interfaces[idx].cfg.hello_interval);
             }
         }
+        // §9.3's WaitTimer (broadcast): the deferral before the first
+        // election ends — fire it once and elect.
+        for idx in 0..self.interfaces.len() {
+            if self.interfaces[idx].wait_deadline.is_some_and(|d| now >= d) {
+                self.interfaces[idx].wait_deadline = None;
+                let (_, actions) = self.interfaces[idx]
+                    .fsm
+                    .fire(crate::iface::InterfaceEvent::WaitTimer);
+                if actions.contains(&crate::iface::InterfaceAction::ElectDr) {
+                    self.run_election_v3(idx, now, out);
+                }
+            }
+        }
         // Conversation ticks.
         for idx in 0..self.interfaces.len() {
             let area = std::mem::take(&mut self.lsdb);
             let link = std::mem::take(&mut self.interfaces[idx].link_lsdb);
             let iface = &mut self.interfaces[idx];
             let mut reports = Vec::new();
-            for conv in iface.neighbors.values_mut() {
+            let mut dead: Vec<RouterId> = Vec::new();
+            for (rid, conv) in iface.neighbors.iter_mut() {
                 let (sends, report) = conv.tick(now);
+                if report.adjacency_down {
+                    dead.push(*rid);
+                }
                 reports.push(report);
                 for s in sends {
                     out.push(WireOutV3 {
@@ -1763,6 +2416,14 @@ impl OspfdV3 {
             if merged.adjacency_up || merged.adjacency_down {
                 self.after_report_v3(idx, None, &merged, now, out);
             }
+            if !dead.is_empty() && self.interfaces[idx].broadcast() {
+                // §9.2's NeighborChange (a neighbor left the
+                // bidirectional set): drop its claims and re-elect.
+                for rid in dead {
+                    self.interfaces[idx].claims.remove(&rid);
+                }
+                self.run_election_v3(idx, now, out);
+            }
         }
         // §12.4 re-origination: the adjacency-driven LSAs.
         if self.router_lsa_dirty {
@@ -1772,6 +2433,15 @@ impl OspfdV3 {
             if self.interfaces[idx].link_lsa_dirty {
                 self.originate_link_lsa(idx, now, out);
             }
+        }
+        // §4.4.3.3/§4.4.3.9: the DR duties and the router IAPR.
+        for idx in 0..self.interfaces.len() {
+            if self.interfaces[idx].network_lsa_dirty || self.interfaces[idx].network_iapr_dirty {
+                self.originate_network_duties(idx, now, out);
+            }
+        }
+        if self.iapr_dirty {
+            self.originate_router_iapr(now, out);
         }
         // The §4.8 walk gate (topology-due recompute / table-only
         // rerun on the cached result).
@@ -2026,6 +2696,11 @@ pub async fn run(
     let mut out = Vec::new();
     core.tick(0, &mut out);
     flush_wire_v3(&sockets, &core, out).await;
+    // §A.1: the AllDRouters (ff02::6) membership follows the §9.4
+    // role — joined while DR/BDR, left otherwise. Reconciled after
+    // every core batch (the core's wanted state vs the sockets').
+    let mut drouters_joined: Vec<bool> = vec![false; sockets.len()];
+    reconcile_drouters(&sockets, &core, &mut drouters_joined);
 
     loop {
         tokio::select! {
@@ -2034,12 +2709,14 @@ pub async fn run(
                 let now = start.elapsed().as_secs();
                 let out = core.on_packet(idx, &received, dst, hop, now);
                 flush_wire_v3(&sockets, &core, out).await;
+                reconcile_drouters(&sockets, &core, &mut drouters_joined);
             }
             _ = tick_interval.tick() => {
                 let now = start.elapsed().as_secs();
                 let mut out = Vec::new();
                 core.tick(now, &mut out);
                 flush_wire_v3(&sockets, &core, out).await;
+                reconcile_drouters(&sockets, &core, &mut drouters_joined);
             }
             route = pushed.recv() => {
                 if let Some(route) = route {
@@ -2047,6 +2724,7 @@ pub async fn run(
                     let mut out = Vec::new();
                     core.on_redistribute_add(&route, now, &mut out);
                     flush_wire_v3(&sockets, &core, out).await;
+                    reconcile_drouters(&sockets, &core, &mut drouters_joined);
                 }
             }
             route = withdrawn.recv() => {
@@ -2055,6 +2733,7 @@ pub async fn run(
                     let mut out = Vec::new();
                     core.on_redistribute_del(&route, now, &mut out);
                     flush_wire_v3(&sockets, &core, out).await;
+                    reconcile_drouters(&sockets, &core, &mut drouters_joined);
                 }
             }
             _ = shutdown.changed() => {
@@ -2064,6 +2743,25 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// §A.1's ff02::6 membership reconcile: join when the core wants the
+/// DR/BDR role's AllDRouters feed, leave when it does not.
+fn reconcile_drouters(sockets: &[Arc<OspfV6RawSocket>], core: &OspfdV3, joined: &mut [bool]) {
+    for (idx, sock) in sockets.iter().enumerate() {
+        let want = core.drouters_member(idx);
+        if want && !joined[idx] {
+            if sock.join_all_drouters().is_ok() {
+                joined[idx] = true;
+                info!(
+                    iface = %core.interfaces[idx].name,
+                    "ospfv3: joined AllDRouters (ff02::6, DR/BDR role)"
+                );
+            }
+        } else if !want && joined[idx] && sock.leave_all_drouters().is_ok() {
+            joined[idx] = false;
+        }
+    }
 }
 
 async fn flush_wire_v3(sockets: &[Arc<OspfV6RawSocket>], core: &OspfdV3, out: Vec<WireOutV3>) {
@@ -2591,5 +3289,360 @@ mod tests {
             }
             other => panic!("wrong nexthop shape: {other:?}"),
         }
+    }
+
+    // ---- the broadcast arm + the IAPRs (S10-b M2) -------------------
+
+    fn bcast_core(rid: u32, ll: Ipv6Addr, ifindex: u32, priority: u8, prefix: &str) -> OspfdV3 {
+        let rid_s = RouterId(rid).to_ipv4().to_string();
+        let text = format!(
+            "router ospf\n address-family ipv6-unicast\n router-id {rid_s}\n area 0.0.0.0\n  \
+             interface eth0\n   link-local {ll}\n   ifindex {ifindex}\n   priority {priority}\n   \
+             network-type broadcast\n   hello-interval 2\n   dead-interval 8\n   prefix {prefix}\n"
+        );
+        OspfdV3::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// The broadcast pump: multicast wires reach EVERY other core on
+    /// the shared link; unicast wires only the addressed peer.
+    fn bcast_pump(
+        cores: &mut [OspfdV3],
+        from: usize,
+        out: Vec<WireOutV3>,
+        now: u64,
+    ) -> Vec<(usize, Vec<WireOutV3>)> {
+        let mut replies = Vec::new();
+        for wire in out {
+            let src_ll = cores[from].interfaces[0].link_local;
+            let bytes = wire.packet.encode(src_ll, wire.to.addr());
+            let received = ReceivedV6 {
+                src: src_ll,
+                payload: bytes,
+            };
+            for (to, core) in cores.iter_mut().enumerate() {
+                if to == from {
+                    continue;
+                }
+                let dst = wire.to.addr();
+                let unicast_ours =
+                    matches!(wire.to, WireToV3::Unicast(ip) if ip == core.interfaces[0].link_local);
+                if matches!(wire.to, WireToV3::Unicast(_)) && !unicast_ours {
+                    continue;
+                }
+                let back = core.on_packet(0, &received, dst, None, now);
+                if !back.is_empty() {
+                    replies.push((to, back));
+                }
+            }
+        }
+        replies
+    }
+
+    /// Run the broadcast mesh to a quiescent state (election held,
+    /// all DR/BDR adjacencies Full, LSDBs converged).
+    fn bcast_mesh_run(cores: &mut [OspfdV3], mut now: u64, rounds: usize) -> u64 {
+        for _ in 0..rounds {
+            let mut queue: Vec<(usize, Vec<WireOutV3>)> = Vec::new();
+            for (i, core) in cores.iter_mut().enumerate() {
+                let mut out = Vec::new();
+                core.tick(now, &mut out);
+                if !out.is_empty() {
+                    queue.push((i, out));
+                }
+            }
+            // The v2 run_mesh wave discipline: drain the whole queue
+            // per generation (FIFO), so no stale obligation is
+            // processed after the replies it provoked.
+            for _ in 0..64 {
+                if queue.is_empty() {
+                    break;
+                }
+                let batch = std::mem::take(&mut queue);
+                for (from, drained) in batch {
+                    for (to, back) in bcast_pump(cores, from, drained, now) {
+                        queue.push((to, back));
+                    }
+                }
+            }
+            now += 1;
+        }
+        now
+    }
+
+    #[test]
+    fn broadcast_elects_originate_network_lsa_and_iapr_and_route() {
+        // Three routers on one broadcast link: R1 (pri 3) DR, R2
+        // (pri 2) BDR, R3 (pri 1) DR Other — the §10.4 matrix holds
+        // (all pairs adjacent through DR/BDR), the DR originates the
+        // network-LSA (all three attached, LS ID = its Interface ID)
+        // and the network-referenced IAPR (every attached router's
+        // link-LSA prefixes at metric 0), and the DROther's SPF
+        // installs the other routers' prefixes as directly connected
+        // (4.8.2's no-address hop).
+        let ll1: Ipv6Addr = "fe80::1".parse().unwrap();
+        let ll2: Ipv6Addr = "fe80::2".parse().unwrap();
+        let ll3: Ipv6Addr = "fe80::3".parse().unwrap();
+        let rid1 = RouterId(0x0a00_0001);
+        let rid2 = RouterId(0x0a00_0002);
+        let rid3 = RouterId(0x0a00_0003);
+        let mut cores = [
+            bcast_core(0x0a00_0001, ll1, 11, 3, "2001:db8:1::/64"),
+            bcast_core(0x0a00_0002, ll2, 22, 2, "2001:db8:2::/64"),
+            bcast_core(0x0a00_0003, ll3, 33, 1, "2001:db8:3::/64"),
+        ];
+        bcast_mesh_run(&mut cores, 0, 40);
+        // The election: all agree on R1 DR / R2 BDR.
+        for (i, core) in cores.iter().enumerate() {
+            assert_eq!(
+                core.interfaces[0].dr, rid1,
+                "core {i}: R1 is DR (highest priority)"
+            );
+            assert_eq!(core.interfaces[0].bdr, rid2, "core {i}: R2 is BDR");
+        }
+        // §10.4's matrix: R1 Full with both; R2 Full with R1 and R3;
+        // R3 Full with R1 and R2 (DROther pairs with DR AND BDR).
+        let full_with = |core: &OspfdV3, peer: RouterId| {
+            core.interfaces[0]
+                .neighbors
+                .get(&peer)
+                .is_some_and(|c| c.state() == NeighborState::Full)
+        };
+        assert!(full_with(&cores[0], rid2) && full_with(&cores[0], rid3));
+        assert!(full_with(&cores[1], rid1) && full_with(&cores[1], rid3));
+        assert!(full_with(&cores[2], rid1) && full_with(&cores[2], rid2));
+        // The DR's network-LSA (LS ID = R1's Interface ID 11, adv R1)
+        // lists all three attached routers — in EVERY core's LSDB.
+        for (i, core) in cores.iter().enumerate() {
+            let key = LsaKey {
+                ls_type: LsaType::V3_NETWORK,
+                link_state_id: LinkStateId(11),
+                adv_router: rid1,
+            };
+            let entry = core
+                .lsdb
+                .get(&key)
+                .unwrap_or_else(|| panic!("core {i} holds the network-LSA"));
+            let LsaBodyV3::Network(body) = &entry.lsa.body else {
+                panic!("network body");
+            };
+            let mut attached = body.attached.clone();
+            attached.sort();
+            assert_eq!(attached, vec![rid1, rid2, rid3], "all three attached");
+        }
+        // The DROther's router-LSA: ONE type-2 link keyed by the DR
+        // pair (11, R1).
+        let r3_router = cores[2]
+            .lsdb
+            .get(&LsaKey {
+                ls_type: V3_ROUTER,
+                link_state_id: LinkStateId(0),
+                adv_router: rid3,
+            })
+            .map(|e| e.lsa.clone())
+            .expect("R3's own router-LSA");
+        let LsaBodyV3::Router(body) = r3_router.body else {
+            panic!("router body");
+        };
+        assert_eq!(body.links.len(), 1, "one transit link");
+        assert_eq!(body.links[0].link_type, LinkTypeV3::Transit);
+        assert_eq!(body.links[0].interface_id, 33, "R3's Interface ID");
+        assert_eq!(body.links[0].neighbor_interface_id, 11, "the DR's");
+        assert_eq!(body.links[0].neighbor_router_id, rid1);
+        // The DR's network-referenced IAPR: all three prefixes at
+        // metric 0, referenced (0x2002, 11, R1) — and it ROUTES: R3
+        // installs R2's prefix as directly connected (the root sits
+        // on the referenced transit link).
+        let iapr_key = LsaKey {
+            ls_type: LsaType::V3_INTRA_AREA_PREFIX,
+            link_state_id: LinkStateId(1),
+            adv_router: rid1,
+        };
+        let iapr = cores[2]
+            .lsdb
+            .get(&iapr_key)
+            .map(|e| e.lsa.clone())
+            .expect("the DR's network IAPR in R3's LSDB");
+        let LsaBodyV3::IntraAreaPrefix(body) = &iapr.body else {
+            panic!("iapr body");
+        };
+        assert_eq!(
+            body.referenced_ls_type,
+            LsaType::V3_NETWORK,
+            "network-referenced"
+        );
+        assert_eq!(body.referenced_link_state_id, LinkStateId(11));
+        assert_eq!(body.referenced_adv_router, rid1);
+        let mut prefixes: Vec<String> = body
+            .prefixes
+            .iter()
+            .filter_map(|pm| ipv6_prefix_of(&pm.prefix).map(|p| p.to_string()))
+            .collect();
+        prefixes.sort();
+        assert_eq!(
+            prefixes,
+            vec![
+                "2001:db8:1::/64".to_string(),
+                "2001:db8:2::/64".to_string(),
+                "2001:db8:3::/64".to_string()
+            ],
+            "every attached router's link-LSA prefixes, metric 0"
+        );
+        assert!(body.prefixes.iter().all(|pm| pm.metric == 0));
+        // R3's table: R2's prefix reachable through the network at
+        // R3's link cost (10) — the directly-connected no-address hop.
+        let want: Ipv6Prefix = "2001:db8:2::/64".parse().unwrap();
+        let routes: Vec<RouteEntry> = cores[2].installed_routes().into_iter().cloned().collect();
+        let entry = routes
+            .iter()
+            .find(|r| r.prefix == IpPrefix::V6(want))
+            .unwrap_or_else(|| panic!("R3 routes R2's prefix: {routes:?}"));
+        assert_eq!(entry.metric, 10, "link cost + metric 0");
+        match entry.nexthops.hops()[0].0 {
+            Nexthop::IfIndex(ifindex) => assert_eq!(ifindex, 33, "solely the outgoing link"),
+            other => panic!("wrong nexthop shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ff02_6_receive_gate_is_dr_bdr_only() {
+        // §4.2: an AllDRouters-destined LSU is processed by the DR/BDR
+        // only — the DROther drops it (no install, no ack).
+        let ll1: Ipv6Addr = "fe80::1".parse().unwrap();
+        let ll2: Ipv6Addr = "fe80::2".parse().unwrap();
+        let ll3: Ipv6Addr = "fe80::3".parse().unwrap();
+        let mut cores = [
+            bcast_core(0x0a00_0001, ll1, 11, 3, "2001:db8:1::/64"),
+            bcast_core(0x0a00_0002, ll2, 22, 2, "2001:db8:2::/64"),
+            bcast_core(0x0a00_0003, ll3, 33, 1, "2001:db8:3::/64"),
+        ];
+        bcast_mesh_run(&mut cores, 0, 40);
+        // An external originated on R2 floods; capture R2's LSU wire.
+        let route = RedistributedRoute {
+            prefix: IpPrefix::V6("2001:db8:99::/64".parse().unwrap()),
+            metric: 5,
+        };
+        let mut out = Vec::new();
+        cores[1].on_redistribute_add(&route, 100, &mut out);
+        let lsu_wire = out
+            .iter()
+            .find(|w| matches!(w.packet.body, PacketBodyV3::LsUpdate(_)))
+            .expect("an LSU obligation")
+            .clone();
+        let ext_key = LsaKey {
+            ls_type: V3_AS_EXTERNAL,
+            link_state_id: LinkStateId(0),
+            adv_router: RouterId(0x0a00_0002),
+        };
+        // Re-encode the same LSU for the ff02::6 destination (the
+        // pseudo-header checksum covers dst; encode() recomputes it).
+        let src_ll = cores[1].interfaces[0].link_local;
+        let bytes = lsu_wire
+            .packet
+            .encode(src_ll, crate::transport::ALL_D_ROUTERS_V6);
+        let received = ReceivedV6 {
+            src: src_ll,
+            payload: bytes,
+        };
+        // The DROther (R3) drops it.
+        let back = cores[2].on_packet(0, &received, crate::transport::ALL_D_ROUTERS_V6, None, 100);
+        assert!(back.is_empty(), "no ack from the DROther");
+        assert!(
+            !cores[2].lsdb.contains(&ext_key),
+            "the DROther did not process the AllDRouters LSU"
+        );
+        // The DR (R1) processes it (installs + acks).
+        let back = cores[0].on_packet(0, &received, crate::transport::ALL_D_ROUTERS_V6, None, 100);
+        assert!(
+            cores[0].lsdb.contains(&ext_key),
+            "the DR installed the AllDRouters LSU"
+        );
+        assert!(
+            back.iter()
+                .any(|w| matches!(w.packet.body, PacketBodyV3::LsAck(_))),
+            "the DR acknowledged"
+        );
+    }
+
+    #[test]
+    fn p2p_prefixes_advertise_via_the_router_iapr() {
+        // §4.4.3.9 part 2: p2p configured prefixes ride the
+        // router-referenced IAPR (0x2001) at the interface output
+        // cost — "the list of global prefixes configured in RTX for
+        // the link are copied ... The Metric field for each of these
+        // prefixes is set to the interface's output cost."
+        let ll_a: Ipv6Addr = "fe80::aa".parse().unwrap();
+        let ll_b: Ipv6Addr = "fe80::bb".parse().unwrap();
+        let mut cores = [
+            bcast_core(0x0a00_0001, ll_a, 11, 1, "2001:db8:a::/64"),
+            bcast_core(0x0a00_0002, ll_b, 22, 1, "2001:db8:b::/64"),
+        ];
+        // Reconfigure to p2p (the helper's shape is broadcast; p2p is
+        // the default v3 lab shape).
+        for core in cores.iter_mut() {
+            core.interfaces[0].cfg.network_type = NetworkType::PointToPoint;
+        }
+        // The helper already constructed broadcast FSMs; rebuild the
+        // FSMs the p2p way (InterfaceUp lands directly in
+        // PointToPoint).
+        for core in cores.iter_mut() {
+            core.interfaces[0].fsm = crate::iface::InterfaceFsm::new_with_priority(true, 1);
+            let _ = core.interfaces[0]
+                .fsm
+                .fire(crate::iface::InterfaceEvent::InterfaceUp);
+            core.interfaces[0].wait_deadline = None;
+        }
+        let mut now = bcast_mesh_run(&mut cores, 0, 40);
+        // Both Full.
+        for (i, core) in cores.iter().enumerate() {
+            assert!(
+                core.neighbor_states()
+                    .iter()
+                    .any(|(_, _, s)| *s == NeighborState::Full),
+                "core {i} Full"
+            );
+        }
+        // A's router IAPR: referenced (0x2001, 0, A), prefix at
+        // metric = the interface cost (10), in B's LSDB.
+        let key = LsaKey {
+            ls_type: LsaType::V3_INTRA_AREA_PREFIX,
+            link_state_id: LinkStateId(0),
+            adv_router: RouterId(0x0a00_0001),
+        };
+        let iapr = cores[1]
+            .lsdb
+            .get(&key)
+            .map(|e| e.lsa.clone())
+            .expect("A's router IAPR in B's LSDB");
+        let LsaBodyV3::IntraAreaPrefix(body) = &iapr.body else {
+            panic!("iapr body");
+        };
+        assert_eq!(body.referenced_ls_type, V3_ROUTER);
+        assert_eq!(body.referenced_link_state_id, LinkStateId(0));
+        assert_eq!(body.referenced_adv_router, RouterId(0x0a00_0001));
+        assert_eq!(body.prefixes.len(), 1);
+        assert_eq!(
+            ipv6_prefix_of(&body.prefixes[0].prefix)
+                .unwrap()
+                .to_string(),
+            "2001:db8:a::/64"
+        );
+        assert_eq!(body.prefixes[0].metric, 10, "the interface output cost");
+        // B installs A's prefix at 10 (to A) + 10 (A's cost) via A's
+        // link-local.
+        let want: Ipv6Prefix = "2001:db8:a::/64".parse().unwrap();
+        let routes: Vec<RouteEntry> = cores[1].installed_routes().into_iter().cloned().collect();
+        let entry = routes
+            .iter()
+            .find(|r| r.prefix == IpPrefix::V6(want))
+            .unwrap_or_else(|| panic!("B routes A's prefix: {routes:?}"));
+        assert_eq!(entry.metric, 20);
+        match entry.nexthops.hops()[0].0 {
+            Nexthop::Ipv6If(gw, ifindex) => {
+                assert_eq!(gw, ll_a);
+                assert_eq!(ifindex, 22, "B's interface");
+            }
+            other => panic!("wrong nexthop shape: {other:?}"),
+        }
+        let _ = &mut now;
     }
 }
