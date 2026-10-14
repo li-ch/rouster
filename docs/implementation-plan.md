@@ -372,3 +372,11 @@ The phase text above is unchanged; this block is status only.
   4-byte `cmsg_len`, and macOS's single-byte v4 / native-order v6
   cmsg data. P2-a's deviation 1 is gone; only the multihop
   minimum-hop threshold remains unenforced local policy.
+
+- 2026-10-14 — Batch adjudication (the 80 open sheet items): landed
+  behavior ratified; all open recommendations adopted (O-1 FA=0.0.0.0
+  + later knob; O-2 RFC1583 config-expose default-enabled; O-8 key
+  chain stanza adopted — queued with the OSPF follow-ups; POL-2/4/5
+  dispatched as the S7-d policy wave; SAV-2/4/7/8 directions recorded;
+  CI-3/4 closed moot under the mirror). Sheet fully closed; queues in
+  away/2026-10-14/STATE.jsonl.
