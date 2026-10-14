@@ -30,19 +30,19 @@ FRR's weaknesses are largely *age* (Zebra → Quagga → FRR lineage since ~1996
 ## 2. Consequence: compatibility at the edge, modern core inside
 
 ```
-            ┌───────────── Rouster (single binary, Tokio) ─────────────┐
-            │                                                           │
-  vtysh ───▶│  compat edge: vtysh CLI shim · frr.conf importer          │
-  FRR daemons─▶ compat edge: ZAPI server (zebra-equivalent endpoint)    │
-  gNMI/gRPC─▶│  native edge: YANG-modeled transactional northbound      │
-            │                                                           │
-            │  core: unified RIB (multi-table, nexthop tracking)        │
-            │        AF-generic protocol crates (OSPFv2/v3 one codebase)│
-            │        policy engine (route-map-like, compiled, typed)    │
-            │        SAV: SIB · validation-mode rules · table manager   │
-            │                                                           │
-            │  dataplane trait → netlink (now) · FPM/eBPF (later)       │
-            └───────────────────────────────────────────────────────────┘
+                ┌───────────── Rouster (single binary, Tokio) ──────────────┐
+                │                                                           │
+  vtysh ──────▶│  compat edge: vtysh CLI shim · frr.conf importer          │
+  FRR daemons─▶│ compat edge: ZAPI server (zebra-equivalent endpoint)      |
+  gNMI/gRPC───▶│  native edge: YANG-modeled transactional northbound       │
+                │                                                           │
+                │  core: unified RIB (multi-table, nexthop tracking)        │
+                │        AF-generic protocol crates (OSPFv2/v3 one codebase)│
+                │        policy engine (route-map-like, compiled, typed)    │
+                │        SAV: SIB · validation-mode rules · table manager   │
+                │                                                           │
+                │  dataplane trait → netlink (now) · FPM/eBPF (later)       │
+                └───────────────────────────────────────────────────────────┘
 ```
 
 Take from each:
