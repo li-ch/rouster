@@ -16,16 +16,22 @@ use tracing::{info, warn};
 
 use crate::protocol;
 use crate::session::{Outcome, ServerInfo, Session};
+use crate::writer::WriteBackend;
 
 /// Lines longer than this are refused (binary garbage guard).
 const MAX_LINE: usize = 8192;
 
-/// Serves until `shutdown` fires (SIGTERM/SIGINT wiring lives in
-/// the binary). The listener is bound by the caller-supplied info.
+/// Serves until `shutdown` fires (SIGTERM/SIGINT wiring lives in the
+/// binary). The listener is bound by the caller-supplied info; the
+/// `writer` is the write path's actuator (the configd backend), wired
+/// into every session alongside the canonical-file state seeded from
+/// `info.canonical` — the merge base for `show running-config` and
+/// `write`.
 pub async fn serve(
     listener: TcpListener,
     hostname: Arc<String>,
     info: ServerInfo,
+    writer: Arc<dyn WriteBackend>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     info!(
@@ -44,8 +50,9 @@ pub async fn serve(
                 };
                 let hostname = Arc::clone(&hostname);
                 let info = info.clone();
+                let writer = Arc::clone(&writer);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, hostname, info).await {
+                    if let Err(err) = handle_connection(stream, hostname, info, writer).await {
                         warn!(%peer, %err, "vtyd: connection ended with an IO error");
                     }
                 });
@@ -63,8 +70,16 @@ async fn handle_connection(
     stream: TcpStream,
     hostname: Arc<String>,
     info: ServerInfo,
+    writer: Arc<dyn WriteBackend>,
 ) -> std::io::Result<()> {
     let mut session = Session::new(hostname.as_ref().clone(), info);
+    // Seed the canonical merge state (S8-c M4): everything in the
+    // canonical file this grammar cannot speak rides verbatim; the
+    // modeled lines project into the session config. Read once per
+    // connection — a single-operator surface; concurrent edits from
+    // another session land on its next connect (disclosed).
+    session.doc = crate::writer::CanonState::load(&session.info.canonical, &mut session.config);
+    session.writer = Some(writer);
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();

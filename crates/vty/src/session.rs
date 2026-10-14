@@ -14,12 +14,14 @@
 //! (disclosed: one more thing nobody has designed yet).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::commands;
 use crate::config::{Af, AfLine, Nexthop, SessionConfig};
 use crate::protocol;
 use crate::render;
 use crate::tree::{Action, Help, WordTree};
+use crate::writer::{render_canonical, CanonState, WriteBackend};
 
 /// Server facts the session renders into `show version`.
 #[derive(Debug, Clone)]
@@ -30,6 +32,11 @@ pub struct ServerInfo {
     pub port: u16,
     /// The run dir every show command reads.
     pub run_dir: PathBuf,
+    /// The canonical config file the write path reads and writes
+    /// (S8-c M4; the merge seed for `show running-config`).
+    pub canonical: PathBuf,
+    /// The etc-dir forwarded to `configd apply`.
+    pub etc_dir: PathBuf,
     /// When the server started (for uptime).
     pub started: std::time::Instant,
     /// The server's own pid.
@@ -102,8 +109,17 @@ pub struct Session {
     pub hostname: String,
     /// The mode stack; the top is current.
     pub modes: Vec<Mode>,
-    /// The parse-only session config.
+    /// The session config (modeled canonical lines + display-only
+    /// directives).
     pub config: SessionConfig,
+    /// The canonical-file state the session merges onto (S8-c M4):
+    /// every line of the existing canonical the grammar does not
+    /// model, verbatim. Seeded by the server from the canonical
+    /// path; empty for a bare (test) session.
+    pub doc: CanonState,
+    /// The write path's actuator — `None` only in unwired sessions
+    /// (unit tests); the server always provides the configd backend.
+    pub writer: Option<Arc<dyn WriteBackend>>,
     /// Server facts for `show version`.
     pub info: ServerInfo,
 }
@@ -115,6 +131,8 @@ impl Session {
             hostname,
             modes: vec![Mode::User],
             config: SessionConfig::new(),
+            doc: CanonState::default(),
+            writer: None,
             info,
         }
     }
@@ -226,14 +244,12 @@ impl Session {
                 Outcome::Lines(render::show_rib_summary(&self.info.run_dir))
             }
             Action::ShowRunningConfig => {
-                let hostname = self.hostname.clone();
-                Outcome::Lines(
-                    self.config
-                        .render(&hostname)
-                        .lines()
-                        .map(String::from)
-                        .collect(),
-                )
+                // The merged canonical view (S8-c M4): exactly what
+                // `write` writes — the session's modeled lines plus
+                // everything the canonical file carries that this
+                // grammar cannot speak.
+                let text = render_canonical(&self.config, &self.doc);
+                Outcome::Lines(text.lines().map(String::from).collect())
             }
             Action::List => Outcome::Lines(self.tree().command_lines()),
             Action::Enable => {
@@ -266,12 +282,24 @@ impl Session {
                 }
                 Outcome::empty()
             }
-            Action::Write => Outcome::Lines(vec![
-                "% Configuration apply is deferred in vty v1 (parse-only).".into(),
-                "  The session config is kept for display via `show running-config`;".into(),
-                "  apply needs the owner's transactional-config design".into(),
-                "  (docs/protocols/vty.md, §Deferred).".into(),
-            ]),
+            Action::Write => match &self.writer {
+                Some(backend) => {
+                    let canonical = render_canonical(&self.config, &self.doc);
+                    let mut lines = vec![
+                        "write memory = write file here: the canonical config IS the \
+                         startup config (docs/protocols/vty.md)"
+                            .into(),
+                    ];
+                    lines.extend(backend.write(&canonical));
+                    Outcome::Lines(lines)
+                }
+                None => Outcome::Lines(vec![
+                    "% Write path not wired for this session (no backend).".into(),
+                    "  The server wires `write` to `configd apply`; a bare session".into(),
+                    "  (unit-test shape) has no writer. The session config is kept".into(),
+                    "  for display via `show running-config`.".into(),
+                ]),
+            },
             Action::Hostname => {
                 let name = params[0].clone();
                 self.hostname = name.clone();

@@ -8,6 +8,7 @@
 //!
 //! ```text
 //! vtyd [--config <PATH>] [--bind <IP>] [--port <N>] [--run-dir <PATH>] [--hostname <NAME>]
+//!      [--canonical <PATH>] [--etc-dir <PATH>]
 //! vtyd --command 'show ...' [--config <PATH> | --bind <IP> --port <N>]
 //! ```
 //!
@@ -19,14 +20,21 @@
 //! bind 127.0.0.1
 //! run-dir /run/rouster
 //! hostname rouster
+//! canonical /etc/rouster.conf
+//! etc-dir /etc
 //! ```
 //!
 //! Defaults: port 2626 (vtyd's own, in the 26xx VTY family —
 //! FRR's per-daemon ports end at 2621), bind loopback, run dir
-//! `/run/rouster`, hostname `rouster`. Flags beat the file; the
-//! file beats defaults. SIGTERM and SIGINT stop the listener and
+//! `/run/rouster`, hostname `rouster`, canonical `/etc/rouster.conf`
+//! (the configd convention), etc-dir `/etc`. Flags beat the file;
+//! the file beats defaults. SIGTERM and SIGINT stop the listener and
 //! exit 0. The one-shot mode exits 0 (ran), 1 (transport), 2 (not
-//! a command) — see `vty::client`.
+//! a command) — see `vty::client`. The write path (S8-c M4):
+//! `write file`/`write memory` merge the session's edits onto the
+//! canonical file, stage it atomically, and spawn `configd apply`
+//! over it (the CLI surface — no IPC invention); configd's report
+//! lines are the command's output.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,6 +47,7 @@ use tracing::{error, info, warn};
 use vty::client;
 use vty::server;
 use vty::session::ServerInfo;
+use vty::writer::ConfigdBackend;
 
 /// Default port (vtyd's own, disclosed in the doc header).
 const DEFAULT_PORT: u16 = 2626;
@@ -49,6 +58,11 @@ const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_RUN_DIR: &str = "/run/rouster";
 /// Default hostname (the prompt's name).
 const DEFAULT_HOSTNAME: &str = "rouster";
+/// Default canonical config file (the configd convention: the flat
+/// `/etc` shape every smoke uses).
+const DEFAULT_CANONICAL: &str = "/etc/rouster.conf";
+/// Default etc-dir (forwarded to `configd apply`).
+const DEFAULT_ETC_DIR: &str = "/etc";
 
 /// The resolved settings (flags over file over defaults).
 #[derive(Debug, Clone)]
@@ -57,6 +71,8 @@ struct Settings {
     port: Option<u16>,
     run_dir: PathBuf,
     hostname: String,
+    canonical: PathBuf,
+    etc_dir: PathBuf,
 }
 
 impl Default for Settings {
@@ -66,6 +82,8 @@ impl Default for Settings {
             port: None,
             run_dir: DEFAULT_RUN_DIR.into(),
             hostname: DEFAULT_HOSTNAME.into(),
+            canonical: DEFAULT_CANONICAL.into(),
+            etc_dir: DEFAULT_ETC_DIR.into(),
         }
     }
 }
@@ -100,6 +118,12 @@ fn parse_args() -> Result<Command, String> {
             }
             "--hostname" => {
                 settings.hostname = it.next().ok_or("--hostname requires a name")?;
+            }
+            "--canonical" => {
+                settings.canonical = PathBuf::from(it.next().ok_or("--canonical requires a path")?);
+            }
+            "--etc-dir" => {
+                settings.etc_dir = PathBuf::from(it.next().ok_or("--etc-dir requires a path")?);
             }
             "--command" | "-c" => {
                 command = Some(it.next().ok_or("--command requires a command string")?);
@@ -166,6 +190,18 @@ fn apply_config_file(settings: &mut Settings, path: &std::path::Path) -> Result<
                     .ok_or(format!("line {number}: hostname requires a name"))?;
                 settings.hostname = value.to_string();
             }
+            "canonical" => {
+                let value = words
+                    .next()
+                    .ok_or(format!("line {number}: canonical requires a path"))?;
+                settings.canonical = PathBuf::from(value);
+            }
+            "etc-dir" => {
+                let value = words
+                    .next()
+                    .ok_or(format!("line {number}: etc-dir requires a path"))?;
+                settings.etc_dir = PathBuf::from(value);
+            }
             other => return Err(format!("line {number}: unknown directive `{other}`")),
         }
         if let Some(extra) = words.next() {
@@ -189,8 +225,9 @@ USAGE:
 SERVER:
     Serves a plain TCP line protocol (v1 disclosure) with a Cisco-style
     command parser: `?` help anywhere, abbreviated commands, user/enable/
-    configure modes. Reads only the run-dir contract (savd.status,
-    savd.pid, bfdd.status, bfdd.pid) — never writes it.
+    configure modes. Reads the run-dir contract (savd.status, savd.pid,
+    bfdd.status, bfdd.pid); `write file`/`write memory` stage the merged
+    canonical config and spawn `configd apply` (S8-c).
 
 FLAGS:
     --config, -f <PATH>   vtyd.conf to read (flags beat the file)
@@ -198,6 +235,10 @@ FLAGS:
     --port, -p <N>        listen port (default {default_port})
     --run-dir <PATH>      run dir to read (default {default_run_dir})
     --hostname <NAME>     prompt hostname (default {default_hostname})
+    --canonical <PATH>    canonical config the write path reads/writes
+                          (default {default_canonical})
+    --etc-dir <PATH>      etc-dir forwarded to configd apply
+                          (default {default_etc_dir})
     --command, -c <CMD>   one-shot: run one command against a running vtyd
                           (the `vtysh -c` analog), print its output, exit
     --help, -h            this help
@@ -217,6 +258,8 @@ SIGNALS:
         default_port = DEFAULT_PORT,
         default_run_dir = DEFAULT_RUN_DIR,
         default_hostname = DEFAULT_HOSTNAME,
+        default_canonical = DEFAULT_CANONICAL,
+        default_etc_dir = DEFAULT_ETC_DIR,
     );
 }
 
@@ -285,9 +328,19 @@ async fn run_server(settings: Settings) -> u8 {
         bind: settings.bind.clone(),
         port,
         run_dir: settings.run_dir.clone(),
+        canonical: settings.canonical.clone(),
+        etc_dir: settings.etc_dir.clone(),
         started: std::time::Instant::now(),
         pid: std::process::id(),
     };
+    // The write path (S8-c M4): `write file`/`write memory` stage the
+    // merged canonical and spawn `configd apply` over it (process
+    // spawn of the CLI surface — no IPC invention).
+    let writer = Arc::new(ConfigdBackend::new(
+        settings.canonical.clone(),
+        settings.run_dir.clone(),
+        settings.etc_dir.clone(),
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
@@ -299,7 +352,7 @@ async fn run_server(settings: Settings) -> u8 {
         let _ = shutdown_tx.send(true);
     });
     let hostname = Arc::new(settings.hostname);
-    match server::serve(listener, hostname, info, shutdown_rx).await {
+    match server::serve(listener, hostname, info, writer, shutdown_rx).await {
         Ok(()) => 0,
         Err(err) => {
             warn!("vtyd: server ended with an IO error: {err}");

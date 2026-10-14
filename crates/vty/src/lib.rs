@@ -14,16 +14,20 @@
 //! tree, abbreviated unambiguous commands, `?` help, ambiguity
 //! errors); [`session`] is the per-connection state machine (mode
 //! stack user/enable/configure-family); [`commands`] registers the
-//! v1 command table per mode; [`config`] is the parse-only session
-//! config tree (the quarantine-B7 observed frr.conf grammar subset,
-//! echoed by `show running-config`); [`savparse`]/[`bfdparse`]/
-//! [`ribparse`]/[`liveness`] read the run dir through the ONE shared
-//! reader (`common::rundir`, the N8 consolidation — the first two
-//! are re-exports, the third is this crate's claim-less projection);
-//! [`render`] renders the `show` outputs;
-//! [`protocol`] pins the wire framing; [`server`]/[`client`] are the
-//! TCP halves; the `vtyd` binary wires config file, flags, and
-//! signals.
+//! v1 command table per mode; [`config`] is the session config tree
+//! (the quarantine-B7 observed frr.conf grammar subset, typed);
+//! [`writer`] is the write path (S8-c M4): the canonical merge —
+//! session edits accumulate into the `rouster.conf` shape, `write
+//! file`/`write memory` stage it atomically and spawn `configd
+//! apply` (the CLI surface, no IPC invention), and `show
+//! running-config` renders the merged canonical view;
+//! [`savparse`]/[`bfdparse`]/ [`ribparse`]/[`liveness`] read the run
+//! dir through the ONE shared reader (`common::rundir`, the N8
+//! consolidation — the first two are re-exports, the third is this
+//! crate's claim-less projection); [`render`] renders the `show`
+//! outputs; [`protocol`] pins the wire framing; [`server`]/
+//! [`client`] are the TCP halves; the `vtyd` binary wires config
+//! file, flags, and signals.
 
 pub mod bfdparse;
 pub mod client;
@@ -37,6 +41,7 @@ pub mod savparse;
 pub mod server;
 pub mod session;
 pub mod tree;
+pub mod writer;
 
 /// The daemon's own version (the crate version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

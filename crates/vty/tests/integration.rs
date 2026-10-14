@@ -16,6 +16,21 @@ use tokio::sync::watch;
 use vty::client;
 use vty::server;
 use vty::session::ServerInfo;
+use vty::writer::WriteBackend;
+
+/// A write backend that records what it was handed and answers with
+/// fixed lines — the configd contract in test form.
+struct RecordingBackend {
+    written: std::sync::Mutex<Vec<String>>,
+    reply: Vec<String>,
+}
+
+impl WriteBackend for RecordingBackend {
+    fn write(&self, canonical: &str) -> Vec<String> {
+        self.written.lock().unwrap().push(canonical.to_string());
+        self.reply.clone()
+    }
+}
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vty-int-{tag}-{}", std::process::id()));
@@ -41,10 +56,27 @@ fn free_port() -> u16 {
 
 /// Spawns an in-process server on its own thread; `(port, shutdown)`.
 /// Bind retries on `AddrInUse` — the free-port probe's teardown race
-/// (the same flake bfdd's daemon tests guard against).
+/// (the same flake bfdd's daemon tests guard against). The canonical
+/// path defaults to `<run-dir>/rouster.conf` and the write backend to
+/// a recorder, both overridable via [`spawn_server_with`].
 fn spawn_server(run_dir: &Path) -> (u16, watch::Sender<bool>) {
+    let canonical = run_dir.join("rouster.conf");
+    let writer: Arc<dyn WriteBackend> = Arc::new(RecordingBackend {
+        written: std::sync::Mutex::new(Vec::new()),
+        reply: vec!["configd: (recorder) applied".into()],
+    });
+    spawn_server_with(run_dir, &canonical, writer)
+}
+
+/// The full-control variant: canonical path and write backend.
+fn spawn_server_with(
+    run_dir: &Path,
+    canonical: &Path,
+    writer: Arc<dyn WriteBackend>,
+) -> (u16, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let run_dir = run_dir.to_path_buf();
+    let canonical = canonical.to_path_buf();
     let (bind_tx, bind_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -70,10 +102,12 @@ fn spawn_server(run_dir: &Path) -> (u16, watch::Sender<bool>) {
                 bind: "127.0.0.1".into(),
                 port,
                 run_dir,
+                canonical,
+                etc_dir: PathBuf::from("/nonexistent-etc"),
                 started: Instant::now(),
                 pid: std::process::id(),
             };
-            server::serve(listener, Arc::new("rouster".into()), info, rx)
+            server::serve(listener, Arc::new("rouster".into()), info, writer, rx)
                 .await
                 .expect("serve");
         });
@@ -431,5 +465,190 @@ fn config_file_errors_are_line_numbered() {
         "stderr: {}",
         err(&output)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The write path (S8-c M4): config edits over the real socket, the
+// merged canonical handed to the backend, configd's report relayed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn write_file_over_the_socket_merges_and_applies() {
+    let dir = scratch("write");
+    // A pre-existing canonical: an unmodeled savd section, one
+    // modeled static, and the configd-owned router-id.
+    let canonical = dir.join("rouster.conf");
+    std::fs::write(
+        &canonical,
+        concat!(
+            "router-id 198.51.100.1\n",
+            "daemon savd {\n",
+            "    mode strict\n",
+            "    poll 2\n",
+            "}\n",
+            "daemon rousterd {\n",
+            "    ip route 203.0.113.0/24 blackhole\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let recorder = Arc::new(RecordingBackend {
+        written: std::sync::Mutex::new(Vec::new()),
+        reply: vec![
+            // (No "-> " here: the PromptReader harness stops on any
+            // token ending `> ` — the real one-shot client strips
+            // only the exact trailing prompt and has no such issue.)
+            "configd: savd wrote /etc/savd.conf (18 bytes), not running".into(),
+            "configd: generation 4 recorded (hash 0000abc)".into(),
+        ],
+    });
+    let (port, shutdown) = spawn_server_with(&dir, &canonical, recorder.clone());
+    wait_listening(port);
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut vty = PromptReader::new(stream);
+    let _ = vty.until_prompt(); // banner + first prompt
+
+    vty.send("enable");
+    let _ = vty.until_prompt();
+    vty.send("conf t");
+    let _ = vty.until_prompt();
+    vty.send("ip route 198.51.100.0/24 192.0.2.1");
+    let _ = vty.until_prompt();
+    vty.send("end");
+    let _ = vty.until_prompt();
+
+    // write file: the naming disclosure plus the backend's report,
+    // relayed verbatim.
+    vty.send("write file");
+    let wrote = vty.until_prompt();
+    assert!(wrote.contains("write memory = write file here"), "{wrote}");
+    assert!(wrote.contains("configd: generation 4 recorded"), "{wrote}");
+
+    // show running-config: the merged canonical view — the new
+    // static AND the untouched savd section AND the router-id.
+    vty.send("show running-config");
+    let running = vty.until_prompt();
+    assert!(running.contains("router-id 198.51.100.1"), "{running}");
+    assert!(
+        running.contains("daemon savd {\r\n    mode strict\r\n    poll 2\r\n}"),
+        "{running}"
+    );
+    assert!(
+        running.contains("ip route 198.51.100.0/24 192.0.2.1"),
+        "{running}"
+    );
+    assert!(
+        running.contains("ip route 203.0.113.0/24 blackhole"),
+        "{running}"
+    );
+
+    // And what the backend was handed is the same merged document.
+    let written = recorder.written.lock().unwrap();
+    assert_eq!(written.len(), 1, "exactly one apply per write");
+    assert!(written[0].contains("daemon savd {"), "{}", written[0]);
+    assert!(
+        written[0].contains("ip route 198.51.100.0/24 192.0.2.1"),
+        "{}",
+        written[0]
+    );
+
+    shutdown.send(true).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stub configd: records its argv and the staged file's content to
+/// a log, answers with one report line, exits 0.
+fn stub_configd(dir: &Path) -> PathBuf {
+    let log = dir.join("configd.log");
+    let stub = dir.join("configd");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             apply) {{ echo \"APPLY $2\"; cat \"$2\"; }} >> '{log}'; \
+             echo 'configd: stub applied the canonical'; exit 0;;\n\
+             esac\n\
+             exit 2\n",
+            log = log.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).unwrap();
+    stub
+}
+
+#[test]
+fn binary_write_file_end_to_end_through_a_stub_configd() {
+    let dir = scratch("bin-write");
+    let canonical = dir.join("rouster.conf");
+    let seeded = "router-id 198.51.100.1\ndaemon savd {\nmode strict\n}\n";
+    std::fs::write(&canonical, seeded).unwrap();
+    let stub = stub_configd(&dir);
+
+    let port = free_port();
+    let config = dir.join("vtyd-write.conf");
+    std::fs::write(
+        &config,
+        format!(
+            "port {port}\nbind 127.0.0.1\nrun-dir {}\ncanonical {}\nhostname bin-w1\n",
+            dir.display(),
+            canonical.display()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vtyd"))
+        .arg("--config")
+        .arg(&config)
+        .env("ROUSTER_CONFIGD_BIN", &stub)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn vtyd server");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        assert!(child.try_wait().expect("child state").is_none());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // A one-shot write over the real binary pair: a fresh session
+    // seeds from the canonical, so this write is the idempotence leg
+    // (same document in, same document applied).
+    let output = Command::new(env!("CARGO_BIN_EXE_vtyd"))
+        .args(["--command", "write file", "--port", &port.to_string()])
+        .output()
+        .expect("one-shot write");
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", err(&output));
+    let text = out(&output);
+    assert!(
+        text.contains("configd: stub applied the canonical"),
+        "stdout: {text}"
+    );
+    assert!(
+        text.contains("write memory = write file here"),
+        "stdout: {text}"
+    );
+
+    // The stub saw the canonical path and its content, verbatim.
+    let log = std::fs::read_to_string(dir.join("configd.log")).unwrap();
+    assert!(
+        log.contains(&format!("APPLY {}", canonical.display())),
+        "{log}"
+    );
+    assert!(log.contains("daemon savd {\nmode strict\n}"), "{log}");
+    // And the staged canonical on disk is byte-stable.
+    assert_eq!(std::fs::read_to_string(&canonical).unwrap(), seeded);
+
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -25,8 +25,13 @@ use crate::protocol;
 /// How long the connect attempt may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long the whole exchange may take after connecting.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the whole exchange may take after connecting. Long by
+/// v1's show-command standards because a `write file` shells to
+/// `configd apply` — validation spawns, the apply, post-signal
+/// verification, possibly an auto-rollback pass, each internally
+/// bounded (a wedged server still trips this; a working one answers
+/// in well under a second).
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why a one-shot run failed.
 #[derive(Debug, thiserror::Error)]

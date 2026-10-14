@@ -13,6 +13,8 @@ fn session() -> Session {
             bind: "127.0.0.1".into(),
             port: 2626,
             run_dir: PathBuf::from("/nonexistent-run-dir"),
+            canonical: PathBuf::from("/nonexistent-canonical/rouster.conf"),
+            etc_dir: PathBuf::from("/nonexistent-etc"),
             started: std::time::Instant::now(),
             pid: 4242,
         },
@@ -266,7 +268,7 @@ fn static_routes_round_trip_through_no_forms() {
 }
 
 #[test]
-fn router_bgp_lines_nest_in_the_b7_shape() {
+fn router_bgp_lines_project_into_the_canonical_bgpd_section() {
     let mut s = session();
     feed(&mut s, "enable");
     feed(&mut s, "conf t");
@@ -287,31 +289,63 @@ fn router_bgp_lines_nest_in_the_b7_shape() {
     feed(&mut s, "end");
     let text = joined(&mut s, "show running-config");
     for needle in [
-        "frr version 10.2",
-        "frr defaults traditional",
-        "hostname rouster",
+        "! vtyd: frr version 10.2",
+        "! vtyd: frr defaults traditional",
+        "! vtyd: line vty",
+        "daemon bgpd {",
         "route-map RM-IN permit 10",
         "router bgp 65000",
-        " no bgp network import-check",
-        " bgp router-id 192.0.2.254",
-        " neighbor 192.0.2.2 remote-as 65000",
-        " address-family ipv4 unicast",
-        "  network 203.0.113.0/24",
-        "  redistribute static",
-        " exit-address-family",
-        "!\nline vty\nend",
+        // The two lines bgpd's grammar does not accept ride as
+        // comments (S8-c: preserved for display, poisonous to
+        // nothing); the rest is bgpd.conf's flat stanza shape.
+        "! no bgp network import-check",
+        "bgp router-id 192.0.2.254",
+        "neighbor 192.0.2.2 remote-as 65000",
+        "network 203.0.113.0/24",
+        "! redistribute static",
     ] {
         assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
     }
+    assert!(text.ends_with('}'), "section closed:\n{text}");
+    // And nothing leaked into a rousterd section (no statics).
+    assert!(!text.contains("daemon rousterd"));
 }
 
 #[test]
-fn write_discloses_the_deferral_honestly() {
+fn write_hands_the_merged_canonical_to_the_backend() {
+    // A recording backend: the configd contract in test form.
+    struct Recorder {
+        written: std::sync::Mutex<Vec<String>>,
+    }
+    impl vty::writer::WriteBackend for Recorder {
+        fn write(&self, canonical: &str) -> Vec<String> {
+            self.written.lock().unwrap().push(canonical.to_string());
+            vec!["configd: generation 9 recorded".into()]
+        }
+    }
+    let mut s = session();
+    s.writer = Some(std::sync::Arc::new(Recorder {
+        written: std::sync::Mutex::new(Vec::new()),
+    }));
+    feed(&mut s, "enable");
+    feed(&mut s, "conf t");
+    feed(&mut s, "ip route 203.0.113.0/24 blackhole");
+    feed(&mut s, "end");
+    let text = joined(&mut s, "write memory");
+    // The naming disclosure, then the backend's report verbatim.
+    assert!(text.contains("write memory = write file here"));
+    assert!(text.contains("configd: generation 9 recorded"));
+}
+
+#[test]
+fn an_unwired_write_says_so_honestly() {
     let mut s = session();
     feed(&mut s, "enable");
-    let text = joined(&mut s, "write memory");
-    assert!(text.contains("% Configuration apply is deferred"));
-    assert!(text.contains("§Deferred"));
+    let text = joined(&mut s, "wr");
+    assert!(text.contains("% Write path not wired"));
+    // And `write file` parses to the same action everywhere.
+    feed(&mut s, "conf t");
+    assert!(joined(&mut s, "write file").contains("% Write path not wired"));
 }
 
 #[test]

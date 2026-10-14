@@ -214,16 +214,30 @@ pub fn enable_tree() -> WordTree {
     });
     t.insert(Cmd {
         toks: vec![
-            lit("write", "Write the configuration (deferred in v1)"),
-            lit("memory", "Write to memory"),
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit("file", "Write to the canonical config file and apply"),
         ],
         action: Action::Write,
-        help: "Write the configuration (deferred in v1)",
+        help: "Write the canonical config and apply it through configd",
     });
     t.insert(Cmd {
-        toks: vec![lit("wr", "Write the configuration (deferred in v1)")],
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit(
+                "memory",
+                "Same as `write file` here (the canonical IS the startup config)",
+            ),
+        ],
         action: Action::Write,
-        help: "Write the configuration (deferred in v1)",
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![lit(
+            "wr",
+            "Write the canonical config (`write file` shorthand)",
+        )],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
     });
     t
 }
@@ -350,9 +364,31 @@ pub fn config_tree() -> WordTree {
         help: "Exit to enable mode",
     });
     t.insert(Cmd {
-        toks: vec![lit("write", "Write the configuration (deferred in v1)")],
+        toks: vec![lit(
+            "write",
+            "Write the canonical config (via configd apply)",
+        )],
         action: Action::Write,
-        help: "Write the configuration (deferred in v1)",
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit("file", "Write to the canonical config file and apply"),
+        ],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit(
+                "memory",
+                "Same as `write file` here (the canonical IS the startup config)",
+            ),
+        ],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
     });
     t
 }
@@ -424,9 +460,31 @@ pub fn config_router_tree() -> WordTree {
         help: "Exit to enable mode",
     });
     t.insert(Cmd {
-        toks: vec![lit("write", "Write the configuration (deferred in v1)")],
+        toks: vec![lit(
+            "write",
+            "Write the canonical config (via configd apply)",
+        )],
         action: Action::Write,
-        help: "Write the configuration (deferred in v1)",
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit("file", "Write to the canonical config file and apply"),
+        ],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit(
+                "memory",
+                "Same as `write file` here (the canonical IS the startup config)",
+            ),
+        ],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
     });
     t
 }
@@ -473,9 +531,31 @@ pub fn config_af_tree() -> WordTree {
         help: "Exit to enable mode",
     });
     t.insert(Cmd {
-        toks: vec![lit("write", "Write the configuration (deferred in v1)")],
+        toks: vec![lit(
+            "write",
+            "Write the canonical config (via configd apply)",
+        )],
         action: Action::Write,
-        help: "Write the configuration (deferred in v1)",
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit("file", "Write to the canonical config file and apply"),
+        ],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
+    });
+    t.insert(Cmd {
+        toks: vec![
+            lit("write", "Write the canonical config (via configd apply)"),
+            lit(
+                "memory",
+                "Same as `write file` here (the canonical IS the startup config)",
+            ),
+        ],
+        action: Action::Write,
+        help: "Write the canonical config and apply it through configd",
     });
     t
 }

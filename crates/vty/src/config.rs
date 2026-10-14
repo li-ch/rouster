@@ -1,12 +1,9 @@
-//! The parse-only session config tree — config mode in v1 accepts
-//! the quarantine-B7 observed frr.conf grammar subset and echoes it
-//! back via `show running-config`. Nothing is applied: apply needs
-//! the owner's transactional-config design (§Deferred in
-//! `docs/protocols/vty.md`), and this module records that anchor.
-//!
-//! Rendering follows the FRR shape observed in B7: router-bgp
-//! children get one leading space, address-family children two, `!`
-//! separates stanzas, `end` closes the file.
+//! The session config tree — config mode accepts the quarantine-B7
+//! observed frr.conf grammar subset into typed nodes; since S8-c M4
+//! the tree is the modeled half of the canonical merge: [`crate::
+//! writer`] projects these nodes into `daemon rousterd`/`daemon
+//! bgpd` sections of the canonical `rouster.conf` shape and renders
+//! the merged view for `show running-config` and `write`.
 
 /// The address family a static route belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,20 +52,10 @@ pub enum AfLine {
     RedistributeStatic,
 }
 
-impl AfLine {
-    fn text(&self) -> String {
-        match self {
-            AfLine::Network(prefix) => format!("network {prefix}"),
-            AfLine::RedistributeStatic => "redistribute static".into(),
-        }
-    }
-}
-
 /// One child line of a router-bgp node (B7 §3's observed set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BgpLine {
-    /// `bgp network import-check` on or off (off renders with the
-    /// `no` prefix — the form B7 observed).
+    /// `bgp network import-check` on or off.
     ImportCheck(bool),
     /// `bgp router-id <v4>`.
     RouterId(String),
@@ -86,28 +73,6 @@ pub enum BgpLine {
         /// The family's child lines.
         lines: Vec<AfLine>,
     },
-}
-
-impl BgpLine {
-    /// The line as `show running-config` renders it (one-space
-    /// indent; address-family children get their own two-space
-    /// lines inside).
-    fn render(&self) -> Vec<String> {
-        match self {
-            BgpLine::ImportCheck(true) => vec![" bgp network import-check".into()],
-            BgpLine::ImportCheck(false) => vec![" no bgp network import-check".into()],
-            BgpLine::RouterId(id) => vec![format!(" bgp router-id {id}")],
-            BgpLine::Neighbor { addr, remote_as } => {
-                vec![format!(" neighbor {addr} remote-as {remote_as}")]
-            }
-            BgpLine::AddressFamily { name, lines } => {
-                let mut out = vec![format!(" address-family {name}")];
-                out.extend(lines.iter().map(|line| format!("  {}", line.text())));
-                out.push(" exit-address-family".into());
-                out
-            }
-        }
-    }
 }
 
 /// One top-level config node.
@@ -185,7 +150,8 @@ impl BgpNode {
     }
 }
 
-/// The session's configuration — parse-only in v1.
+/// The session's configuration — the typed, editable half of the
+/// canonical merge (S8-c M4).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionConfig {
     /// Top-level nodes in entry order (headers first is a
@@ -296,71 +262,6 @@ impl SessionConfig {
         };
         node
     }
-
-    /// `show running-config` rendering: the FRR file shape — header
-    /// directives, the hostname, then `!`-separated stanzas in the
-    /// canonical order (statics, route-maps, router-bgp, `line vty`
-    /// last; entry order kept within a kind), bgp nesting at the
-    /// observed indentations, `end` closing. `!` separators are
-    /// regenerated, never stored.
-    pub fn render(&self, hostname: &str) -> String {
-        let mut out = String::new();
-        for node in &self.nodes {
-            match node {
-                CfgNode::FrrVersion(version) => {
-                    out.push_str(&format!("frr version {version}\n"));
-                }
-                CfgNode::FrrDefaults(defaults) => {
-                    out.push_str(&format!("frr defaults {defaults}\n"));
-                }
-                _ => {}
-            }
-        }
-        out.push_str(&format!("hostname {hostname}\n"));
-        let mut stanzas = self.nodes.clone();
-        stanzas.sort_by_key(stanza_order);
-        for node in &stanzas {
-            match node {
-                CfgNode::FrrVersion(_) | CfgNode::FrrDefaults(_) | CfgNode::Hostname(_) => {}
-                CfgNode::StaticRoute {
-                    af,
-                    prefix,
-                    nexthop,
-                } => {
-                    out.push_str(&format!(
-                        "!\n{} route {prefix} {}\n",
-                        af.keyword(),
-                        nexthop.text()
-                    ));
-                }
-                CfgNode::RouteMap(rest) => out.push_str(&format!("!\nroute-map {rest}\n")),
-                CfgNode::RouterBgp(bgp) => {
-                    out.push_str(&format!("!\nrouter bgp {}\n", bgp.asn));
-                    for line in &bgp.lines {
-                        for text in line.render() {
-                            out.push_str(&text);
-                            out.push('\n');
-                        }
-                    }
-                }
-                CfgNode::LineVty => out.push_str("!\nline vty\n"),
-            }
-        }
-        out.push_str("end\n");
-        out
-    }
-}
-
-/// The canonical stanza order for rendering (stable within a kind —
-/// `sort_by_key` is stable, so entry order survives).
-fn stanza_order(node: &CfgNode) -> u8 {
-    match node {
-        CfgNode::FrrVersion(_) | CfgNode::FrrDefaults(_) | CfgNode::Hostname(_) => 0,
-        CfgNode::StaticRoute { .. } => 1,
-        CfgNode::RouteMap(_) => 2,
-        CfgNode::RouterBgp(_) => 3,
-        CfgNode::LineVty => 4,
-    }
 }
 
 /// Retain predicate helper: does removal `nexthop` (None = any)
@@ -377,33 +278,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_config_renders_hostname_and_end() {
-        let config = SessionConfig::new();
-        assert_eq!(config.render("rouster"), "hostname rouster\nend\n");
-    }
-
-    #[test]
     fn hostname_replaces_rather_than_accumulates() {
         let mut config = SessionConfig::new();
         config.set_hostname("r1".into());
         config.set_hostname("r2".into());
-        assert_eq!(config.render("r2"), "hostname r2\nend\n");
-    }
-
-    #[test]
-    fn static_routes_render_in_family_order() {
-        let mut config = SessionConfig::new();
-        config.add_static(Af::V4, "203.0.113.0/24".into(), Nexthop::Blackhole);
-        config.add_static(
-            Af::V4,
-            "198.51.100.0/24".into(),
-            Nexthop::Addr("192.0.2.1".into()),
-        );
-        config.add_static(Af::V6, "2001:db8::/32".into(), Nexthop::Blackhole);
-        let text = config.render("r1");
-        assert!(text.contains("ip route 203.0.113.0/24 blackhole\n"));
-        assert!(text.contains("ip route 198.51.100.0/24 192.0.2.1\n"));
-        assert!(text.contains("ipv6 route 2001:db8::/32 blackhole\n"));
+        assert!(matches!(
+            config.nodes.as_slice(),
+            [CfgNode::Hostname(name)] if name == "r2"
+        ));
     }
 
     #[test]
@@ -453,51 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn bgp_node_renders_the_b7_observed_shape() {
-        let mut config = SessionConfig::new();
-        let bgp = config.bgp_mut("65000".into());
-        bgp.lines.push(BgpLine::ImportCheck(false));
-        bgp.lines.push(BgpLine::RouterId("192.0.2.254".into()));
-        bgp.lines.push(BgpLine::Neighbor {
-            addr: "192.0.2.2".into(),
-            remote_as: "65000".into(),
-        });
-        let af = bgp.af_mut("ipv4 unicast");
-        af.push(AfLine::Network("203.0.113.0/24".into()));
-        af.push(AfLine::RedistributeStatic);
-        let text = config.render("r1");
-        let expected = "\
-router bgp 65000
- no bgp network import-check
- bgp router-id 192.0.2.254
- neighbor 192.0.2.2 remote-as 65000
- address-family ipv4 unicast
-  network 203.0.113.0/24
-  redistribute static
- exit-address-family
-";
-        assert!(text.contains(expected), "rendered:\n{text}");
-    }
-
-    #[test]
     fn route_map_lines_are_kept_verbatim() {
         let mut config = SessionConfig::new();
         config.add_route_map("RM-IN permit 10".into());
-        let text = config.render("r1");
-        assert!(text.contains("route-map RM-IN permit 10\n"));
-    }
-
-    #[test]
-    fn full_file_renders_with_separators_and_end() {
-        let mut config = SessionConfig::new();
-        config.set_frr_version("10.2".into());
-        config.set_frr_defaults("traditional".into());
-        config.set_hostname("r1".into());
-        config.set_line_vty();
-        config.add_static(Af::V4, "203.0.113.0/24".into(), Nexthop::Blackhole);
-        let text = config.render("r1");
-        assert!(text.starts_with("frr version 10.2\nfrr defaults traditional\n"));
-        assert!(text.contains("!\nip route 203.0.113.0/24 blackhole\n"));
-        assert!(text.ends_with("!\nline vty\nend\n"));
+        assert!(matches!(
+            config.nodes.as_slice(),
+            [CfgNode::RouteMap(rest)] if rest == "RM-IN permit 10"
+        ));
     }
 }
