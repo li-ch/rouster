@@ -85,3 +85,34 @@ Integration evidence is container-based and lives in `scripts/`:
 Anything that changes how a real FRR daemon behaves when attached belongs
 in `docs/interop/frr-10.2-interop.md` too — future readers will want to
 know what was observed, not just what was intended.
+
+## CI: the two pipelines
+
+- **`ci.yml` (push/PR)** — the fast gate: `cargo fmt --check`,
+  `clippy -D warnings` (plus the musl leg that actually compiles the
+  netlink dataplane), unit tests, and a `bash -n` syntax pass over
+  the smoke scripts. It never starts a container.
+- **`smokes.yml` (nightly ~03:00 UTC + manual dispatch)** — the full
+  `scripts/run-smokes.sh` (34 scripts, ~20 min, 40-min budget). The
+  job builds the testbed image from `docker/frr-testbed.Dockerfile`
+  (the reversed recipe of the image the suite was developed against —
+  provenance and pins in `docker/README.md`), pre-seeds every other
+  image tag the scripts pin, pre-builds the musl binaries, and runs
+  the runner unmodified. Smoke logs upload as an artifact on failure.
+
+### Running the suite locally
+
+`scripts/run-smokes.sh` assumes docker works and the image tags exist
+(no pulls, ever): `frr-testbed:10.2.2`, `rouster-nft:local`,
+`gortr:local`, and the two alpine bases. From a clean checkout:
+
+```sh
+docker build -t frr-testbed:ci -f docker/frr-testbed.Dockerfile docker/
+docker tag frr-testbed:ci frr-testbed:10.2.2   # the tag the scripts pin
+docker build -t rouster-nft:local -f docker/nft-base.Dockerfile docker/
+scripts/run-smokes.sh          # or a subset: scripts/run-smokes.sh 'z5*'
+```
+
+Linux runners need the musl target (`rustup target add
+x86_64-unknown-linux-musl`); each script builds the binaries it
+needs. Logs land in `target/smoke-logs/`.

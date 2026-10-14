@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/li-ch/rouster/actions/workflows/ci.yml"><img src="https://github.com/li-ch/rouster/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/li-ch/rouster/actions/workflows/smokes.yml"><img src="https://github.com/li-ch/rouster/actions/workflows/smokes.yml/badge.svg" alt="smokes (nightly)"></a>
 </p>
 
 # Rouster
@@ -95,9 +96,12 @@ smoke suite (`scripts/run-smokes.sh`). What actually runs today:
     contract (`show sav` / `status` / the interface, neighbour and
     VRF views).
 
-The full suite runs as `scripts/run-smokes.sh` (34 scripts, all
-green in CI on Linux); the gate is `cargo fmt --check` + `clippy -D
-warnings` + 1400+ tests.
+The full suite runs as `scripts/run-smokes.sh` (34 scripts, green —
+proven against the testbed image rebuilt from the in-repo recipe
+`docker/frr-testbed.Dockerfile`); it runs nightly in CI
+(`smokes.yml`, ~03:00 UTC) and on demand via workflow dispatch. The
+push/PR gate is `cargo fmt --check` + `clippy -D warnings` + 1400+
+unit tests.
 
 Still ahead per the plan: IS-IS and the Phase-5 breadth, the YANG
 northbound, and BAR-SAV allowlist derivation on top of the BGP/RPKI
