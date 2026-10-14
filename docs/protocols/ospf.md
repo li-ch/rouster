@@ -9,8 +9,10 @@ networks (§9.4 election, §12.4.2, §13.3), multi-area inter-area
 routing — the router-wide §16.2/§16.4 walk and the §12.4.3 ABR
 duties — stub areas and NSSA (RFC 3101), Appendix D + RFC 5709
 authentication, incremental SPF (§16.5/§16.6), virtual links
-(§15/§D.3), and the OSPFv3 codecs (N2B, RFC 5340 — runtime
-remains §Deferred).
+(§15/§D.3), and the OSPFv3 codecs (N2B, RFC 5340). The S7-a round
+(2026-10-14) landed the OSPFv3 RUNTIME — the v6 transport, the
+AF-generic seams cashed as code, and the live FRR ospf6d interop
+(see the OSPFv3 runtime section).
 
 ## Layout
 
@@ -27,9 +29,10 @@ remains §Deferred).
 | `iface` | The §9 interface state machine and the §9.4 DR election (broadcast networks), pure and AF-generic |
 | `origination` | The §12.4 LSA builders: router (§12.4.1), network (§12.4.2), summary incl. type-4 (§12.4.3/§A.4.4), AS-external (§12.4.4/§A.4.5) |
 | `auth` | OSPFv2 packet authentication: Appendix D AuTypes (null/password/crypto) + the RFC 5709 HMAC-SHA-256 trailer |
-| `transport` | The raw-socket transport (§A.1): IP proto 89, AllSPF/AllDR multicast joins, TTL 1 (socket2) |
+| `transport` | The raw-socket transports: v4 (§A.1: proto 89, AllSPF/AllDR 224.0.0.5/6 joins, TTL 1) and v6 (RFC 5340 §A.1: the proto-89 v6 socket bound to the interface's link-local, ff02::5/6 joins by ifindex, multicast hop limit 1, the `IPV6_RECVHOPLIMIT` arming + the destination-trial decode) |
 | `exchange` | The §10.6-§10.9 adjacency conversation as daemon-side bookkeeping: DD drain, request lists, §13.3-§13.7 retransmissions |
-| `daemon` | The run loop: per-interface sockets, §14 aging/hellos, the router-wide §16 walk (intra/inter/external), the ABR/ASBR duties |
+| `daemon` | The v2 run loop: per-interface sockets, §14 aging/hellos, the router-wide §16 walk (intra/inter/external), the ABR/ASBR duties |
+| `daemon_v3` | The OSPFv3 runtime (RFC 5340): the same run-loop shape over the v6 transport, Router-ID neighbors, Instance-ID dispatch, scope-aware flooding (link-LSAs in per-interface stores), v3 origination, §16.4-lite exports |
 | `zedge` | ospfd as a zebra client: HELLO attach, `redistribute static` → §12.4.4 origination/withdrawal, route export |
 | `wire` | Checked little helpers over byte slices — the house codec convention (A19: never trust counts) |
 | `config` | `ospfd.conf` grammar (A11/B7 conventions): router-id, area, interface stanzas, network bindings, redistribute static |
@@ -596,23 +599,133 @@ follow-up below.
   `address` line — the dump feeds eth0 — with the dump log line
   machine-checked before the adjacency legs.
 
+## The OSPFv3 runtime (2026-10-14, S7-a — the AF-generic proof, live)
+
+The v3 daemon runs: `address-family ipv6-unicast` under `router
+ospf` selects the `daemon_v3` core in the same `ospfd` binary; the
+interface stanza carries the §2.5 `link-local` source, `instance-id`
+(A.3.1) and an optional `ifindex` pin. The AF-generic scorecard,
+honestly — what one codebase serves both families vs what RFC 5340
+genuinely diverges on:
+
+- **Shared, as the design promised (and now as CODE, not claims):**
+  - `Lsdb<T: LsaInstance>` — ONE implementation of §12.2/§13.1/
+    §13.2/§14 for both families (v2 is the default type parameter;
+    v3 instantiates `Lsdb<LsaV3>` through the new
+    `LsaHeaderInfo`/`LsaInstance` traits).
+  - The §10.3 neighbor FSM table AND the §10.6 master/slave core —
+    `NeighborFsm::process_dbd_view(DdView)` is family-neutral (v2's
+    DBD and v3's DBD both map onto the view; `neighbor_options`
+    widened u8→u32 for Options24).
+  - The §10.5 event ladder (`process_hello_v3` checks the v3
+    parameter set — intervals + E-bit, no mask — and fires the same
+    events).
+  - The checksums, the codec spines, the §12.4 constants, the zapi
+    edge (`zedge` learned the family: HELLO OSPF/OSPF6, redistribute
+    afi 1/2, the push filter), and the run-loop skeleton
+    (sockets → mpsc → clock-injected core → wire obligations).
+- **v3-specific, where the RFC diverges:** Router-ID neighbors with
+  link-local addresses learned as Hello sources (§4.2.2.1); the
+  Instance-ID discard; **flooding scope** (§3.2/§4.5.2 — link-LSAs
+  live in per-interface stores and never leave the link, area/AS
+  LSAs re-flood out other interfaces); the v3 origination set
+  (router-LSA with interface-ID p2p links §4.4.3.1, the link-LSA
+  carrying the link-local §2.5/A.4.9 with LS ID = Interface ID, and
+  0x4005 externals for redistributed v6 statics); the A.3.1 16-byte
+  packet header with its pseudo-header checksum inputs (src, dst);
+  and the destination-trial decode (below).
+- **The disclosed mirror:** the conversation bookkeeping
+  (§10.8/§10.9/§13.3-§13.7) in `daemon_v3.rs` is exchange.rs's shape
+  re-typed for v3, not a shared generic — the v2 `Conversation` is
+  v2-`Packet`-typed end to end, and generifying it means rewriting
+  the v2 daemon in the same breath. The FSM table and the LSDB it
+  drives ARE shared; the send-obligation plumbing is mirrored.
+  Recorded as the honest reading of "fix the seam, don't fork": the
+  seam was fixed where the claim was cheap to cash (LSDB, FSM,
+  hello ladder, codecs), mirrored where the rewrite would have put
+  the v2 interop at risk in the same change.
+
+**The v6 transport walls, both disclosed (transport.rs module
+note):** a raw IPv6 socket delivers NO IPv6 header, and the received
+hop limit + true destination ride RFC 3542 cmsgs no safe API in the
+dependency set reads (every recvmsg wrapper needs `unsafe` — the
+bfdd audited-block precedent applies; NOTHING was added). The
+`IPV6_RECVHOPLIMIT` sockopt is armed through socket2's safe setter
+so the future cmsg walk finds it on; receive-side hop-limit
+ENFORCEMENT is therefore §Deferred (RFC 5340 §A.1 mandates hop
+limit 1 on the MULTICAST arm only — that transmit side is armed and
+read-back-verified; the unicast arm carries our local parity of 1).
+The **destination** has a deterministic workaround the RFC itself
+enumerates (§4.2's destination list): `decode_v3_dst` tries
+ff02::5/ff02::6/our-own-link-local and takes the pseudo-header-
+verifying candidate — needed because the v3 checksum covers the
+real (src, dst). The ifindex source is a pure `/proc/net/if_inet6`
+parse (no libc `if_nametoindex` — FFI is fenced).
+
+**The interop evidence** (`scripts/test-ospfv3-frr-interop.sh`,
+exit 0 twice back-to-back; quarantine under
+`away/2026-10-14/quarantine/n3v6/`, env-overridable): Full adjacency
+with real FRR 10.2.2 ospf6d over a p2p v6 network (link-local
+sources only, ff02::5 hellos, instance ID 0 both sides); both LSDBs
+holding the other's router- AND link-LSAs (both flooding scopes);
+and a redistributed v6 static BOTH directions landing in the peer's
+kernel `proto ospf` **via the advertiser's link-local through
+rousterd** — ours (0x4005, E2) resolved by FRR's link-LSA next-hop
+lookup, FRR's installed by our §16.4-lite direct-ASBR calculation
+exported as `Nexthop::Ipv6If(gw, ifindex)`; 30 s soak stable, no
+zapi reconnects.
+
+**Two wire truths the live oracle pinned** (the N2B report's
+recorded test-oracle gap, closed):
+
+1. **The AS-external body's Referenced LS Type sits in the prefix
+   row's third halfword** (A.4.7's `PrefixLength | PrefixOptions |
+   Referenced LS Type` row — the slot the generic A.4.1 triple
+   reserves as zero), NOT after the address prefix. N2B's
+   hand-derived golden pinned the wrong placement (its symmetric
+   encode/decode round-tripped); FRR's `ospf6_lsa_examin` rejected
+   every type-5 with "anomaly in AS-External LSA" until the diagram
+   row layout landed. The golden test now pins the placement
+   byte-exactly.
+2. **Every `vtysh -b` re-apply flaps ospf6d's adjacencies** — the v2
+   interop's retry-until-visible config loop cannot be reused; the
+   script applies at most twice and waits for visibility by other
+   means. (Also benign and probed: FRR 10.2.2 ospf6d receives its
+   own multicast hellos via the kernel loop and drops them as
+   "Duplicate Router-ID" at hello cadence — upstream cosmetic.)
+
+Rig note: the containers run `--privileged` — docker-desktop ships
+fresh netns interfaces with `disable_ipv6=1` and the sysctl write
+needs `/proc/sys` writable; the caps-only v2 rig shape cannot bring
+v6 up. Disclosed in the script header.
+
 ## §Deferred (updated day-3 anchors)
 
 - §16.3 (transit areas' summary-LSAs — the V-bit now lands with the
   virtual links, the summary rules themselves remain); graceful
   restart (RFC 3623); DNA honoring.
-- **OSPFv3 runtime** (the N2B codecs landed; what remains): v6
-  transport (ff02::5/6 memberships, IPv6 sockopts), the live FRR
-  ospf6d interop leg to give the v3 codecs wire truth (the goldens
-  are RFC-diagram-derived, no real corpus yet), SPF v3 (link-LSA
-  next hops, IAPR prefix attachment, transit networks keyed by
-  (DR Interface ID, DR Router ID)), link-local-scope LSDB placement
-  in the interface structure (RFC 5340 §3.2), instance-ID dispatch,
+- **OSPFv3 runtime remainder** (S7-a landed the transport, the
+  daemon core and the live interop — see the section above; what
+  remains): the receive-side hop-limit/destination cmsg read-back
+  (RFC 3542 §6 — the arming is on, the walker needs the bfdd
+  audited-block treatment, owner-gated; the destination-trial
+  decode is the interim); full v3 SPF (link-LSA next hops, IAPR
+  prefix attachment, transit networks keyed by (DR Interface ID,
+  DR Router ID) — the §16.4-lite direct-ASBR form serves v1);
   multiple-router-LSA concatenation with lowest-LS-ID precedence
   (A.4.3 — any LSDB helper assuming one router-LSA per (router,
-  area) must not survive into that slice), RFC 5838 address-family
-  instances, RFC 8362 extended LSAs, v3 auth (IPsec/RFC 4552,
-  trailer/RFC 7166 — the auth.rs MAC skeleton is already v3-ready).
+  area) must not survive into that slice); the broadcast-network
+  arm (§9.4 election over v3 Router-ID claims + the ff02::6 receive
+  gate — the join/leave socket arm is implemented and armed);
+  multi-area v3; intra-area-prefix-LSA origination (nothing
+  advertises intra prefixes v1 — the externals carry the interop);
+  RFC 8362 E-LSAs (O-12: 5340 fixed layouts first — the live oracle
+  speaks legacy); RFC 5838 address-family instances; v3 auth
+  (IPsec/RFC 4552, trailer/RFC 7166 — the auth.rs MAC skeleton is
+  v3-ready); virtual links with v3 semantics (global-scope
+  sources); the ifdump v6 link-local merge (the static
+  `link-local` line is v1's source); NSSA-in-v3 (type-7 0x2007
+  rides the shared external codec; the §2.x v3 semantics do not).
 - Virtual-link remainder: multi-hop transit endpoint refinement,
   ifIndex Link Data, vlink auth (v1 rides the transit interface's
   auth), and the live FRR virtual-link interop leg.
@@ -629,14 +742,15 @@ follow-up below.
   and per-neighbor-poll machinery; the §9.4 election's NBMA step
   (6) rides with it.
 - Receive-side TTL verification: **CLOSED for the v4 unicast class**
-  (night N1 — the raw-socket header read, no cmsg). What remains:
-  the OSPFv3 runtime's v6 hop-limit read-back (RFC 3542 §6
-  `IPV6_RECVHOPLIMIT` — raw v6 sockets do not deliver the IPv6
-  header, so the cmsg walk is required there; same wall as bfdd's
-  v6 read-back). Placement note (N1): the cmsg walker stays
-  bfdd-local for now — ospfd's v4 read is header-based (no
-  duplication arose) and bfdd stays common-free (the P2-a dep
-  decision); the OSPFv3 runtime is the trigger to hoist the walker
+  (night N1 — the raw-socket header read, no cmsg). The v6 arm
+  (S7-a): the `IPV6_RECVHOPLIMIT` sockopt is ARMED on the v6 raw
+  socket (socket2's safe setter), but the read-back itself remains
+  open — raw v6 sockets deliver no IPv6 header and the cmsg walk
+  needs recvmsg (`unsafe`; the bfdd audited-block treatment,
+  owner-gated). The interim v6 destination read is the deterministic
+  destination-trial decode (transport.rs); the hop-limit receive
+  check rides with the cmsg walker. Placement note (N1): the
+  walker stays bfdd-local until that owner gate opens — then hoist
   into `common` and drop bfdd's copy. SO_BINDTODEVICE-style
   interface scoping rides with it.
 - Interface link-state tracking ONGOING (the dump's startup snapshot
