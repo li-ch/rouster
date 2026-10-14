@@ -1159,6 +1159,7 @@ mod tests {
                 v_bit: false,
                 e_bit: false,
                 b_bit: false,
+                nt_bit: false,
                 links: vec![RouterLink {
                     link_id: LinkStateId::from_ipv4(ip("10.0.0.0")),
                     link_data: 0xffff_ff00,

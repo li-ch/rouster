@@ -635,6 +635,7 @@ mod tests {
                 v_bit: false,
                 e_bit: false,
                 b_bit: false,
+                nt_bit: false,
                 links: vec![RouterLink {
                     link_id: LinkStateId::new(9),
                     link_data: 0xffff_ff00,
@@ -811,6 +812,7 @@ mod tests {
             v_bit: false,
             e_bit: false,
             b_bit: false,
+            nt_bit: false,
             links: vec![
                 RouterLink {
                     link_id: LinkStateId::new(9),

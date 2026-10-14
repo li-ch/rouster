@@ -117,7 +117,44 @@ pub struct AreaConfig {
     /// summary-LSA an ABR advertises into a stub area. FRR parity:
     /// default 1.
     pub default_cost: u32,
+    /// `area <id> range <a.b.c.d/m> [advertise|not-advertise]` — the
+    /// area's address ranges (§12.4.3's type-3 coalescing; RFC 3101
+    /// §3.2's Type-7 address ranges when the area is an NSSA — the
+    /// same configured list serves both).
+    pub ranges: Vec<AreaRange>,
+    /// The NSSA translator role (RFC 3101 §3.1, `area <id> nssa
+    /// translate-candidate|translate-always`): Candidate joins the
+    /// election; Always translates unconditionally. Default
+    /// Candidate (RFC 3101 Appendix D.1).
+    pub nssa_translator_role: NssaTranslatorRole,
+    /// The deposed translator's keep-translating interval (RFC 3101
+    /// §3.1, `area <id> nssa translate-stability-interval`; default
+    /// 40 s per the RFC).
+    pub translator_stability_interval: u64,
     pub interfaces: BTreeMap<String, InterfaceConfig>,
+}
+
+/// One configured address range (`area <id> range`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AreaRange {
+    pub prefix: common::Ipv4Prefix,
+    /// §12.4.3's Advertise/DoNotAdvertise status (`not-advertise`
+    /// suppresses the range's summary AND marks a Type-7 range
+    /// DoNotAdvertise, RFC 3101 §3.2 step (1)).
+    pub advertise: bool,
+    /// An explicit metric override for the advertised summary (FRR's
+    /// `area range <prefix> cost <n>`; None = the coalesced minimum).
+    pub cost: Option<u32>,
+}
+
+/// RFC 3101 §3.1's NSSATranslatorRole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NssaTranslatorRole {
+    /// Participate in the translator election (the RFC's default).
+    #[default]
+    Candidate,
+    /// Translate unconditionally regardless of other border routers.
+    Always,
 }
 
 /// The area type (§3.6 stub areas; RFC 3101 NSSA lands with the same
@@ -704,6 +741,146 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                         kind: AreaKind::Normal,
                                         default_cost: 1,
                                         virtual_links: vec![peer],
+                                        ranges: Vec::new(),
+                                        nssa_translator_role: NssaTranslatorRole::default(),
+                                        translator_stability_interval: 40,
+                                        interfaces: BTreeMap::new(),
+                                    }),
+                                }
+                                continue;
+                            }
+                            ["range", prefix] => {
+                                // §12.4.3 / RFC 3101 3.2: the area's
+                                // address ranges (one list serves the
+                                // type-3 summaries and the Type-7
+                                // translation).
+                                let Some((net, len)) = parse_prefix(prefix) else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: range <a.b.c.d/m> [advertise|not-advertise] [cost <n>]",
+                                    ));
+                                };
+                                let range = AreaRange {
+                                    prefix: common::Ipv4Prefix::new(
+                                        Ipv4Addr::from(net),
+                                        len,
+                                    )
+                                    .expect("range prefix"),
+                                    advertise: true,
+                                    cost: None,
+                                };
+                                match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                    Some(existing) => {
+                                        if !existing.ranges.contains(&range) {
+                                            existing.ranges.push(range);
+                                        }
+                                    }
+                                    None => cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Normal,
+                                        default_cost: 1,
+                                        virtual_links: Vec::new(),
+                                        ranges: vec![range],
+                                        nssa_translator_role: NssaTranslatorRole::default(),
+                                        translator_stability_interval: 40,
+                                        interfaces: BTreeMap::new(),
+                                    }),
+                                }
+                                continue;
+                            }
+                            ["range", prefix, "advertise" | "not-advertise"] => {
+                                let not = words[4] == "not-advertise";
+                                let Some((net, len)) = parse_prefix(prefix) else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: range <a.b.c.d/m> [advertise|not-advertise]",
+                                    ));
+                                };
+                                let range = AreaRange {
+                                    prefix: common::Ipv4Prefix::new(
+                                        Ipv4Addr::from(net),
+                                        len,
+                                    )
+                                    .expect("range prefix"),
+                                    advertise: !not,
+                                    cost: None,
+                                };
+                                match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                    Some(existing) => {
+                                        match existing
+                                            .ranges
+                                            .iter_mut()
+                                            .find(|r| r.prefix == range.prefix)
+                                        {
+                                            Some(r) => r.advertise = !not,
+                                            None => existing.ranges.push(range),
+                                        }
+                                    }
+                                    None => cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Normal,
+                                        default_cost: 1,
+                                        virtual_links: Vec::new(),
+                                        ranges: vec![range],
+                                        nssa_translator_role: NssaTranslatorRole::default(),
+                                        translator_stability_interval: 40,
+                                        interfaces: BTreeMap::new(),
+                                    }),
+                                }
+                                continue;
+                            }
+                            ["nssa", "translate-candidate" | "translate-always"] => {
+                                // RFC 3101 3.1's NSSATranslatorRole
+                                // (FRR's own spellings).
+                                let role = if words[3] == "translate-always" {
+                                    NssaTranslatorRole::Always
+                                } else {
+                                    NssaTranslatorRole::Candidate
+                                };
+                                match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                    Some(existing) => {
+                                        existing.nssa_translator_role = role;
+                                    }
+                                    None => cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Nssa {
+                                            no_summary: false,
+                                            default_information_originate: false,
+                                        },
+                                        default_cost: 1,
+                                        virtual_links: Vec::new(),
+                                        ranges: Vec::new(),
+                                        nssa_translator_role: role,
+                                        translator_stability_interval: 40,
+                                        interfaces: BTreeMap::new(),
+                                    }),
+                                }
+                                continue;
+                            }
+                            ["nssa", "translate-stability-interval", n] => {
+                                // RFC 3101 3.1's TranslatorStabilityInterval
+                                // (default 40 s).
+                                let interval: u64 = n.parse().ok().filter(|v| (1..=3600).contains(v)).ok_or_else(|| {
+                                    parse_error(
+                                        line_no,
+                                        "expected: nssa translate-stability-interval <1-3600>",
+                                    )
+                                })?;
+                                match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                    Some(existing) => {
+                                        existing.translator_stability_interval = interval;
+                                    }
+                                    None => cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Nssa {
+                                            no_summary: false,
+                                            default_information_originate: false,
+                                        },
+                                        default_cost: 1,
+                                        virtual_links: Vec::new(),
+                                        ranges: Vec::new(),
+                                        nssa_translator_role: NssaTranslatorRole::default(),
+                                        translator_stability_interval: interval,
                                         interfaces: BTreeMap::new(),
                                     }),
                                 }
@@ -728,6 +905,9 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                         kind: AreaKind::Normal,
                                         default_cost: cost,
                                         virtual_links: Vec::new(),
+                                        ranges: Vec::new(),
+                                        nssa_translator_role: NssaTranslatorRole::default(),
+                                        translator_stability_interval: 40,
                                         interfaces: BTreeMap::new(),
                                     });
                                 }
@@ -757,6 +937,9 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                     kind: set,
                                     default_cost: 1,
                                     virtual_links: Vec::new(),
+                                    ranges: Vec::new(),
+                                    nssa_translator_role: NssaTranslatorRole::default(),
+                                    translator_stability_interval: 40,
                                     interfaces: BTreeMap::new(),
                                 }),
                             }
@@ -770,6 +953,9 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                             kind: AreaKind::Normal,
                             default_cost: 1,
                             virtual_links: Vec::new(),
+                            ranges: Vec::new(),
+                            nssa_translator_role: NssaTranslatorRole::default(),
+                            translator_stability_interval: 40,
                             interfaces: BTreeMap::new(),
                         });
                     }

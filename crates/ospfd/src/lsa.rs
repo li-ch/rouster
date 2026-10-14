@@ -464,6 +464,12 @@ pub struct RouterLsa {
     pub e_bit: bool,
     /// B: area border router.
     pub b_bit: bool,
+    /// Nt: the NSSA translator state is enabled (RFC 3101 §3.1 /
+    /// Appendix B — "when an NSSA border router has its
+    /// NSSATranslatorState enabled, it sets bit Nt in the router-LSA
+    /// it originates into the NSSA"). Decode-carry into non-NSSA
+    /// areas too; the election only examines it in the NSSA's copy.
+    pub nt_bit: bool,
     pub links: Vec<RouterLink>,
 }
 
@@ -563,8 +569,11 @@ impl Lsa {
         match &self.body {
             LsaBody::Router(r) => {
                 // Bit placement per the §A.4.2 diagram (and FRR /
-                // Wireshark): V = 0x04, E = 0x02, B = 0x01.
+                // Wireshark): V = 0x04, E = 0x02, B = 0x01 — plus Nt
+                // = 0x10 (RFC 3101 Appendix B's `| 0 Nt W V E B |`
+                // row).
                 let mut flags = 0u8;
+                flags |= u8::from(r.nt_bit) << 4;
                 flags |= u8::from(r.v_bit) << 2;
                 flags |= u8::from(r.e_bit) << 1;
                 flags |= u8::from(r.b_bit);
@@ -682,12 +691,17 @@ impl Lsa {
             need: 1,
             have: 0,
         })?;
-        if flags & 0xf8 != 0 {
+        // Nt (0x10) is RFC 3101 Appendix B's translator bit; the
+        // multicast W bit (0x08, RFC 1584 lineage) and the top three
+        // reserved bits stay rejected (the house rule; RFC 3101
+        // deprecates W in this position and real senders zero it).
+        if flags & 0xe8 != 0 {
             return Err(OspfError::ReservedBits {
                 field: "router-LSA flags",
                 value: flags,
             });
         }
+        let nt_bit = flags & 0x10 != 0;
         let v_bit = flags & 0x04 != 0;
         let e_bit = flags & 0x02 != 0;
         let b_bit = flags & 0x01 != 0;
@@ -768,6 +782,7 @@ impl Lsa {
             v_bit,
             e_bit,
             b_bit,
+            nt_bit,
             links,
         }))
     }
@@ -980,6 +995,7 @@ mod tests {
                 v_bit: false,
                 e_bit: true,
                 b_bit: false,
+                nt_bit: false,
                 links: vec![RouterLink {
                     link_id: LinkStateId::from_ipv4("192.168.170.8".parse().unwrap()),
                     link_data: u32::from("192.168.170.8".parse::<Ipv4Addr>().unwrap()),
@@ -1084,6 +1100,7 @@ mod tests {
                 v_bit: false,
                 e_bit: true,
                 b_bit: true,
+                nt_bit: false,
                 links: vec![
                     RouterLink {
                         link_id: LinkStateId::from_ipv4("10.0.0.2".parse().unwrap()),
@@ -1533,6 +1550,7 @@ mod tests {
                 v_bit: rng.next() & 1 == 1,
                 e_bit: rng.next() & 1 == 1,
                 b_bit: rng.next() & 1 == 1,
+                nt_bit: false,
                 links,
             }),
         }

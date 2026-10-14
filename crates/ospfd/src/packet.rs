@@ -649,6 +649,7 @@ mod tests {
                 v_bit: false,
                 e_bit: true,
                 b_bit: false,
+                nt_bit: false,
                 links: vec![RouterLink {
                     link_id: LinkStateId::from_ipv4("10.0.0.2".parse().unwrap()),
                     link_data: u32::from("10.0.0.1".parse::<Ipv4Addr>().unwrap()),

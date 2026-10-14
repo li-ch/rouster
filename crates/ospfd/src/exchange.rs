@@ -688,6 +688,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &[InterfaceAdv {
                 state: InterfaceState::PointToPoint,
                 p2p: true,

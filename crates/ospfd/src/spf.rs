@@ -105,16 +105,27 @@ fn mask_prefix(mask: Ipv4Addr) -> u8 {
     u32::from(mask).count_ones() as u8
 }
 
+/// One router-LSA's capability bits (§A.4.2 + RFC 3101 Appendix B's
+/// Nt) — the ABR/ASBR classification §12.4.3/§16.4 and the NSSA
+/// translator election §3.1 read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouterFlags {
+    pub b: bool,
+    pub e: bool,
+    /// The NSSA translator bit (RFC 3101 §3.1 — meaningful in the
+    /// NSSA's own copy of the router-LSA).
+    pub nt: bool,
+}
+
 /// The result of one area calculation.
 #[derive(Debug, Clone, Default)]
 pub struct SpfResult {
     /// §16.1 step 2: TRUE when any router-LSA on the tree has the
     /// V-bit set (a virtual link uses this area as transit).
     pub transit_capability: bool,
-    /// Every seen router-LSA's (B, E) flags (§A.4.2) — the ABR/ASBR
-    /// classification §12.4.3 and §16.4 need. Present whether or not
+    /// Every seen router-LSA's B/E/Nt flags — present whether or not
     /// the router ended up on the tree.
-    pub router_flags: HashMap<RouterId, (bool, bool)>,
+    pub router_flags: HashMap<RouterId, RouterFlags>,
     /// Distance to every reachable transit vertex.
     pub distances: HashMap<Vertex, u32>,
     /// The intra-area routes, deterministically ordered.
@@ -166,14 +177,21 @@ pub fn calculate(root: RouterId, lsdb: &Lsdb) -> SpfResult {
     // LSAs are treated as absent.
     let mut router_lsas: HashMap<RouterId, &RouterLsa> = HashMap::new();
     let mut network_lsas: HashMap<u32, (Ipv4Addr, Vec<RouterId>)> = HashMap::new();
-    let mut router_flags: HashMap<RouterId, (bool, bool)> = HashMap::new();
+    let mut router_flags: HashMap<RouterId, RouterFlags> = HashMap::new();
     for entry in lsdb.all() {
         if entry.lsa.header.is_max_age() {
             continue;
         }
         match &entry.lsa.body {
             LsaBody::Router(r) => {
-                router_flags.insert(entry.lsa.header.adv_router, (r.b_bit, r.e_bit));
+                router_flags.insert(
+                    entry.lsa.header.adv_router,
+                    RouterFlags {
+                        b: r.b_bit,
+                        e: r.e_bit,
+                        nt: r.nt_bit,
+                    },
+                );
                 router_lsas.insert(entry.lsa.header.adv_router, r);
             }
             LsaBody::Network(n) => {
@@ -742,6 +760,7 @@ mod tests {
                 v_bit,
                 e_bit: false,
                 b_bit: false,
+                nt_bit: false,
                 links,
             }),
         }
@@ -873,12 +892,20 @@ mod tests {
         let result = calculate(own, &lsdb);
         assert_eq!(
             result.router_flags.get(&RouterId(u32::from(ip("2.2.2.2")))),
-            Some(&(true, false)),
+            Some(&RouterFlags {
+                b: true,
+                e: false,
+                nt: false
+            }),
             "the ABR's B-bit"
         );
         assert_eq!(
             result.router_flags.get(&RouterId(u32::from(ip("3.3.3.3")))),
-            Some(&(false, true)),
+            Some(&RouterFlags {
+                b: false,
+                e: true,
+                nt: false
+            }),
             "the ASBR's E-bit"
         );
     }

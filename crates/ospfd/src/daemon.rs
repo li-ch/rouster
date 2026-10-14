@@ -182,6 +182,17 @@ pub struct AreaState {
     /// `area <id> default-cost` — the metric of the default summary
     /// into a stub area (§C.2).
     pub default_cost: u32,
+    /// The configured `area <id> range` list (§12.4.3's type-3
+    /// coalescing; RFC 3101 §3.2's Type-7 address ranges in an NSSA).
+    pub ranges: Vec<crate::config::AreaRange>,
+    /// RFC 3101 §3.1's NSSATranslatorRole + the live
+    /// NSSATranslatorState (Candidate elections; Always enables) and
+    /// the deposed translator's keep-translating deadline
+    /// (TranslatorStabilityInterval, default 40 s).
+    pub translator_role: crate::config::NssaTranslatorRole,
+    pub translator_elected: bool,
+    pub stability_until: Option<u64>,
+    pub translator_stability_interval: u64,
     spf_sched: SpfScheduler,
     spf_dirty: bool,
     router_lsa_dirty: bool,
@@ -197,16 +208,44 @@ pub struct AreaState {
 }
 
 impl AreaState {
-    fn new(kind: crate::config::AreaKind, default_cost: u32) -> Self {
+    fn new(area: &crate::config::AreaConfig) -> Self {
         Self {
             lsdb: Lsdb::new(),
-            kind,
-            default_cost,
+            kind: area.kind,
+            default_cost: area.default_cost,
+            ranges: area.ranges.clone(),
+            translator_role: area.nssa_translator_role,
+            translator_elected: false,
+            stability_until: None,
+            translator_stability_interval: area.translator_stability_interval,
             spf_sched: SpfScheduler::new(0, 50, 5000),
             spf_dirty: false,
             router_lsa_dirty: true,
             last_result: None,
             spf_runs: 0,
+        }
+    }
+
+    /// Whether THIS area's translator duties run right now: an
+    /// elected Candidate, an enabled Always, or a deposed translator
+    /// still inside its TranslatorStabilityInterval (RFC 3101 §3.1:
+    /// "it continues to perform its translation duties for the
+    /// additional time interval").
+    fn translator_active(&self, now: u64) -> bool {
+        match self.translator_role {
+            crate::config::NssaTranslatorRole::Always => true,
+            crate::config::NssaTranslatorRole::Candidate => {
+                self.translator_elected || self.stability_until.is_some_and(|d| now < d)
+            }
+        }
+    }
+
+    /// The Nt-bit view for origination (the state's letter: enabled
+    /// or elected — a deposing translator no longer advertises Nt).
+    fn translator_advertises_nt(&self) -> bool {
+        match self.translator_role {
+            crate::config::NssaTranslatorRole::Always => true,
+            crate::config::NssaTranslatorRole::Candidate => self.translator_elected,
         }
     }
 }
@@ -384,7 +423,7 @@ impl Ospfd {
         let mut interfaces = Vec::new();
         let mut areas = BTreeMap::new();
         for area in &cfg.areas {
-            areas.insert(area.id, AreaState::new(area.kind, area.default_cost));
+            areas.insert(area.id, AreaState::new(area));
             for (name, icfg) in &area.interfaces {
                 let Some((addr, mask)) = icfg.address else {
                     return Err(format!(
@@ -902,7 +941,17 @@ impl Ospfd {
             .map(|a| a.kind)
             .unwrap_or(AreaKind::Normal);
         let e_bit = self.asbr || (kind.external_capable() && self.nssa_border());
-        let lsa = build_router_lsa(self.router_id, e_bit, self.is_abr(), v_bit, &advs);
+        // RFC 3101 §3.1: "when an NSSA border router has its
+        // NSSATranslatorState enabled, it sets bit Nt in the
+        // router-LSA it originates into the NSSA" — this area's copy
+        // only.
+        let nt_bit = matches!(kind, AreaKind::Nssa { .. })
+            && self.nssa_border()
+            && self
+                .areas
+                .get(&area)
+                .is_some_and(|a| a.translator_advertises_nt());
+        let lsa = build_router_lsa(self.router_id, e_bit, self.is_abr(), v_bit, nt_bit, &advs);
         let Some(area_state) = self.areas.get_mut(&area) else {
             return;
         };
@@ -2027,20 +2076,105 @@ impl Ospfd {
                         }
                     }
                     Destination::Router(id) => {
-                        let flags = result
-                            .router_flags
-                            .get(&id)
-                            .copied()
-                            .unwrap_or((false, false));
+                        let flags = result.router_flags.get(&id).copied().unwrap_or_default();
                         routers.entry(id).or_default().push(RouterPath {
                             area: *area,
                             inter_area: false,
                             cost: route.cost,
                             hops: dedup_hops(route.next_hops.clone()),
-                            b_bit: flags.0,
-                            e_bit: flags.1,
+                            b_bit: flags.b,
+                            e_bit: flags.e,
                         });
                     }
+                }
+            }
+        }
+
+        // ---- RFC 3101 §3.1: the NSSA translator election ----
+        // "An NSSA border router whose NSSA's NSSATranslatorRole is set
+        // to Candidate must maintain a list of the NSSA's border
+        // routers that are reachable both over the NSSA and as ASBRs
+        // over the AS's transit topology. Any change in this list, or
+        // to the Nt bit settings of members of this list, causes the
+        // NSSA border router to reevaluate its NSSATranslatorState."
+        // Reevaluated on every walk (the SPF results ARE the list's
+        // inputs); an Always role needs no election ("When
+        // NSSATranslatorRole is set to Always, Type-7 LSAs are always
+        // translated").
+        if self.is_abr() {
+            let nssa_areas: Vec<u32> = self
+                .areas
+                .iter()
+                .filter(|(_, a)| a.kind.nssa())
+                .map(|(id, _)| *id)
+                .collect();
+            for nssa in nssa_areas {
+                let Some(state) = self.areas.get_mut(&nssa) else {
+                    continue;
+                };
+                if state.translator_role != crate::config::NssaTranslatorRole::Candidate {
+                    continue;
+                }
+                // The list: other border routers with an intra-area
+                // path over the NSSA (B-bit set in the NSSA's own
+                // copy) AND reachability over the transit topology (a
+                // path in another attached area — the §3.1 E-bit rule
+                // makes that visibility the ASBR-status test).
+                let nssa_result = results
+                    .iter()
+                    .find(|(area, _)| *area == nssa)
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_default();
+                let mut outranked = false;
+                for (rid, flags) in &nssa_result.router_flags {
+                    if *rid == self.router_id || !flags.b {
+                        continue;
+                    }
+                    let over_nssa = routers
+                        .get(rid)
+                        .is_some_and(|paths| paths.iter().any(|p| p.area == nssa && !p.inter_area));
+                    let over_transit = routers
+                        .get(rid)
+                        .is_some_and(|paths| paths.iter().any(|p| p.area != nssa));
+                    if !over_nssa || !over_transit {
+                        continue;
+                    }
+                    // "If there exists another border router in this
+                    // list whose router-LSA has bit Nt set or who has
+                    // a higher router ID, then its
+                    // NSSATranslatorState is disabled."
+                    if flags.nt || rid.larger_than(self.router_id) {
+                        outranked = true;
+                        break;
+                    }
+                }
+                let was = state.translator_elected;
+                let stability_expired = state.stability_until.is_some_and(|d| now >= d);
+                state.translator_elected = !outranked;
+                if outranked && was {
+                    // "An elected translator will continue to perform
+                    // translation duties until supplanted ... it
+                    // continues to perform its translation duties for
+                    // the additional time interval defined by ...
+                    // TranslatorStabilityInterval" (default 40 s) —
+                    // arming only ever applies to a translator that
+                    // WAS active (a never-elected router translates
+                    // nothing and arms nothing).
+                    state.stability_until = Some(now + state.translator_stability_interval);
+                }
+                if stability_expired {
+                    // The window lapsed: retire it (a re-election in
+                    // the same walk makes the window moot anyway).
+                    state.stability_until = None;
+                }
+                if was != state.translator_elected {
+                    info!(
+                        nssa,
+                        elected = state.translator_elected,
+                        "ospfd: NSSA translator state changed (RFC 3101 3.1)"
+                    );
+                    // The Nt bit rides the NSSA's router-LSA.
+                    state.router_lsa_dirty = true;
                 }
             }
         }
@@ -2298,12 +2432,16 @@ impl Ospfd {
                 let is_default =
                     lsa.header.link_state_id.0 == 0 && ext.mask == Ipv4Addr::UNSPECIFIED;
                 if is_default {
-                    // §2.5 step (3): a border router skips P-clear
-                    // type-7 defaults ("Appendix E describes a
-                    // technique whereby an NSSA border router installs
-                    // a Type-7 default LSA without propagating it" —
-                    // not implemented, disclosed) and, when
-                    // suppressing summary import, skips all of them.
+                    // §2.5 step (3): a border router skips type-7
+                    // defaults when suppressing summary import; the
+                    // P-clear default rides Appendix E's technique —
+                    // "an NSSA border router installs a Type-7 default
+                    // LSA without propagating it" (§3.2 never
+                    // translates a P-clear default, so the install is
+                    // local-only). DISCLOSED divergence from FRR
+                    // 10.2.2, probed live in the N3 interop: FRR
+                    // stores the LSA but does not install the route —
+                    // the RFC appendix's technique wins here.
                     if self.is_abr() {
                         let no_summary = matches!(
                             state.kind,
@@ -2312,7 +2450,7 @@ impl Ospfd {
                                 ..
                             }
                         );
-                        if !p_bit || no_summary {
+                        if no_summary {
                             continue;
                         }
                     }
@@ -2758,18 +2896,97 @@ impl Ospfd {
         self.flush_summaries(&stale, now, out);
     }
 
+    /// The most specific configured range containing `prefix`, if
+    /// any (RFC 3101 §3.2's best-match: "there does not exist a more
+    /// specific Type-7 address range that contains the LSA's
+    /// network"; the same list serves §12.4.3's type-3 ranges).
+    fn covering_range<'a>(
+        ranges: &'a [crate::config::AreaRange],
+        prefix: &Ipv4Prefix,
+    ) -> Option<&'a crate::config::AreaRange> {
+        ranges
+            .iter()
+            .filter(|r| {
+                r.prefix.prefix_len() <= prefix.prefix_len() && r.prefix.contains(prefix.addr())
+            })
+            .max_by_key(|r| r.prefix.prefix_len())
+    }
+
+    /// A prefix's dotted-quad mask as a raw u32.
+    fn prefix_as_mask(prefix: &Ipv4Prefix) -> u32 {
+        if prefix.prefix_len() == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix.prefix_len())
+        }
+    }
+
+    /// §3.2's Link State ID remapping: "in the case of multiple
+    /// originations of Type-5 LSAs with the same network address but
+    /// different mask, the link-state ID can also have one or more
+    /// of the network's 'host' bits set" — when the natural ID (the
+    /// network address) is already taken by one of OUR type-5s
+    /// describing a different network, walk the host bits until a
+    /// free ID is found.
+    fn allocate_translated_lsid(&self, prefix: &Ipv4Prefix) -> u32 {
+        let master = self
+            .areas
+            .iter()
+            .find(|(_, a)| a.kind.external_capable())
+            .map(|(id, _)| *id);
+        let taken: std::collections::BTreeSet<u32> = self
+            .areas
+            .get(&master.unwrap_or(0))
+            .map(|a| {
+                a.lsdb
+                    .all()
+                    .filter(|e| {
+                        e.lsa.header.ls_type == LsaType::AS_EXTERNAL
+                            && e.lsa.header.adv_router == self.router_id
+                            && !e.lsa.header.is_max_age()
+                    })
+                    .map(|e| e.lsa.header.link_state_id.0)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mask = Self::prefix_as_mask(prefix);
+        let net = u32::from(prefix.addr()) & mask;
+        // Walk the host bits (§3.2: "one or more of the network's
+        // 'host' bits"), bounded at 2^24 to stay finite on tiny
+        // prefixes.
+        let host_bits = 32u32.saturating_sub(u32::from(prefix.prefix_len()));
+        let steps: u32 = if host_bits >= 24 {
+            1 << 24
+        } else {
+            1 << host_bits
+        };
+        for i in 0..steps {
+            let candidate = net + i;
+            if !taken.contains(&candidate) {
+                return candidate;
+            }
+        }
+        net
+    }
+
     /// RFC 3101 §3.2: translate the NSSA's translatable type-7 LSAs
-    /// into type-5 LSAs and flood them into the normal areas. v1
-    /// scope (disclosed): NSSATranslatorRole is effectively **Always**
-    /// (§3.1 — no Candidate election, no Nt bit; single-ABR lab
-    /// shape), no Type-7 address ranges (§3.2 steps (2)/(3)'s
-    /// aggregation), and the type-7 *default* is never translated
-    /// (the P-clear border default is not translatable by §3.2
-    /// step (1); an internal ASBR's P-set default rides Appendix E's
-    /// paradox — §Deferred with the election machinery).
+    /// into type-5 LSAs and flood them into the normal areas — the
+    /// full §3.2 walk: step (1)'s gates (P-bit, FA 0.0.0.0, the
+    /// best-matching range's DoNotAdvertise), step (2)'s plain
+    /// translation (with the highest-Router-ID equivalence rule),
+    /// step (3)'s Type-7 address-range aggregation (path type 2 if
+    /// any member is type 2, metric = highest type-1 cost / highest
+    /// type-2 cost + 1, FA 0.0.0.0, one type-5 per range), and the
+    /// LS-ID host-bit remapping on collisions. Gated on the §3.1
+    /// translator state (an elected Candidate, an enabled Always, or
+    /// a deposed translator inside its stability interval).
+    /// The type-7 *default* still never translates (the P-clear
+    /// border default is not translatable by step (1); an internal
+    /// ASBR's P-set default rides Appendix E — §Deferred).
     fn translate_nssa(&mut self, now: u64, out: &mut Vec<WireOut>) {
-        // The desired set: (nssa area, prefix) -> the type-5 shape.
-        let mut desired: BTreeMap<(u32, String), (u32, bool, Ipv4Addr)> = BTreeMap::new();
+        // The desired set: (nssa area, advertised prefix string) ->
+        // the type-5 shape (metric, e_bit, FA, aggregated?).
+        let mut desired: BTreeMap<(u32, String), (u32, bool, Ipv4Addr, bool)> = BTreeMap::new();
         let nssa_areas: Vec<u32> = self
             .areas
             .iter()
@@ -2777,9 +2994,23 @@ impl Ospfd {
             .map(|(id, _)| *id)
             .collect();
         for nssa in &nssa_areas {
+            // The §3.1 gate: only a border router with the translator
+            // state active translates (a deposed translator keeps
+            // going through its stability interval).
+            if !self.nssa_border() {
+                continue;
+            }
             let Some(state) = self.areas.get(nssa) else {
                 continue;
             };
+            if !state.translator_active(now) {
+                continue; // desired stays empty: the flush below retires ours
+            }
+            let ranges = state.ranges.clone();
+            // The translatable set (§3.2 step (1) gates), grouped by
+            // their best-matching ADVERTISING range.
+            // range-prefix-string -> members (metric, type-2?).
+            let mut by_range: BTreeMap<String, Vec<(u32, bool)>> = BTreeMap::new();
             for entry in state.lsdb.all() {
                 let lsa = &entry.lsa;
                 if lsa.header.ls_type != LsaType::NSSA || lsa.header.is_max_age() {
@@ -2803,14 +3034,98 @@ impl Ospfd {
                 )
                 .expect("type-7 mask");
                 if prefix.prefix_len() == 0 {
-                    continue; // the default never translates (v1 scope)
+                    continue; // the default never translates
                 }
                 if ext.metric >= crate::LS_INFINITY {
                     continue;
                 }
+                // Step (1)'s third gate: "the most specific Type-7
+                // address range that subsumes the LSA's network has
+                // DoNotAdvertise status".
+                if let Some(range) = Self::covering_range(&ranges, &prefix) {
+                    if !range.advertise {
+                        continue;
+                    }
+                }
+                // Steps (2)/(3) split: aggregated when an advertising
+                // range strictly contains the network, plain when no
+                // range matches or the range IS the network.
+                match Self::covering_range(&ranges, &prefix) {
+                    Some(range) if range.prefix.prefix_len() < prefix.prefix_len() => {
+                        by_range
+                            .entry(range.prefix.to_string())
+                            .or_default()
+                            .push((ext.metric, ext.e_bit));
+                        // The member's own plain translation is
+                        // suppressed ("at most a single Type-5 LSA is
+                        // originated for each Type-7 address range").
+                        continue;
+                    }
+                    _ => {
+                        desired.insert(
+                            (*nssa, prefix.to_string()),
+                            (ext.metric, ext.e_bit, ext.forwarding_address, false),
+                        );
+                    }
+                }
+            }
+            // Step (3): the aggregated type-5 per range.
+            for (range_str, members) in by_range {
+                let range: Ipv4Prefix = range_str.parse().expect("range prefix");
+                // "plus any locally sourced Type-5 LSAs whose network
+                // has the same [address,mask] pair" join the metric
+                // computation.
+                let mut members = members;
+                if let Some(master) = self
+                    .areas
+                    .iter()
+                    .find(|(_, a)| a.kind.external_capable())
+                    .map(|(id, _)| *id)
+                {
+                    if let Some(a) = self.areas.get(&master) {
+                        for e in a.lsdb.all() {
+                            if e.lsa.header.ls_type == LsaType::AS_EXTERNAL
+                                && e.lsa.header.adv_router == self.router_id
+                                && !e.lsa.header.is_max_age()
+                            {
+                                if let crate::lsa::LsaBody::AsExternal(ext) = &e.lsa.body {
+                                    let p = Ipv4Prefix::new(
+                                        e.lsa.header.link_state_id.to_ipv4(),
+                                        u32::from(ext.mask).count_ones() as u8,
+                                    );
+                                    if p.is_ok_and(|p| p == range) {
+                                        members.push((ext.metric, ext.e_bit));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // "If any of these LSAs have a path type of 2, the
+                // range's path type is 2, otherwise it is 1. If the
+                // range's path type is 1 its metric is the highest
+                // cost amongst these LSAs; if the range's path type is
+                // 2 its metric is the highest Type-2 cost + 1 ... to
+                // ensure that the translated Type-5 LSA does not
+                // appear closer on the NSSA border than a translatable
+                // Type-7 LSA whose network has the same [address,mask]
+                // pair and Type-2 cost."
+                let type2 = members.iter().any(|(_, e)| *e);
+                let metric = if type2 {
+                    members
+                        .iter()
+                        .filter(|(_, e)| *e)
+                        .map(|(m, _)| *m)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                } else {
+                    members.iter().map(|(m, _)| *m).max().unwrap_or(0)
+                };
+                // "The forwarding address is set to 0.0.0.0."
                 desired.insert(
-                    (*nssa, prefix.to_string()),
-                    (ext.metric, ext.e_bit, ext.forwarding_address),
+                    (*nssa, range.to_string()),
+                    (metric, type2, Ipv4Addr::UNSPECIFIED, true),
                 );
             }
         }
@@ -2825,7 +3140,39 @@ impl Ospfd {
             .iter()
             .find(|(_, a)| a.kind.external_capable())
             .map(|(id, _)| *id);
-        for ((nssa, prefix_str), (metric, e_bit, fa)) in &desired {
+        for ((nssa, prefix_str), (metric, e_bit, fa, aggregated)) in &desired {
+            let prefix: Ipv4Prefix = prefix_str.parse().expect("prefix round-trip");
+            // §3.2 step (2)'s equivalence rule: "the calculating
+            // router has the highest router ID amongst NSSA
+            // translators that have originated a functionally
+            // equivalent Type-5 LSA (i.e. same destination, cost and
+            // non-zero forwarding address)" — a higher-ID foreign
+            // translator's equivalent type-5 wins; stand down.
+            if !*aggregated && *fa != Ipv4Addr::UNSPECIFIED {
+                let equivalent_from_higher = self
+                    .areas
+                    .get(&master.unwrap_or(0))
+                    .map(|a| {
+                        a.lsdb.all().any(|e| {
+                            e.lsa.header.ls_type == LsaType::AS_EXTERNAL
+                                && !e.lsa.header.is_max_age()
+                                && e.lsa.header.adv_router != self.router_id
+                                && e.lsa.header.adv_router.larger_than(self.router_id)
+                                && matches!(&e.lsa.body, crate::lsa::LsaBody::AsExternal(ext)
+                                    if ext.metric == *metric
+                                        && ext.e_bit == *e_bit
+                                        && ext.forwarding_address == *fa
+                                        && Ipv4Prefix::new(
+                                            e.lsa.header.link_state_id.to_ipv4(),
+                                            u32::from(ext.mask).count_ones() as u8
+                                        ).map(|p| p == prefix).unwrap_or(false))
+                        })
+                    })
+                    .unwrap_or(false);
+                if equivalent_from_higher {
+                    continue;
+                }
+            }
             let current_ok = self
                 .translations
                 .get(&(*nssa, prefix_str.clone()))
@@ -2847,23 +3194,19 @@ impl Ospfd {
             let Some(master) = master else {
                 continue; // no type-5-capable area: nothing to translate into
             };
+            // §3.2's LS-ID remapping on collisions.
+            let lsid = self.allocate_translated_lsid(&prefix);
             let mut lsa = crate::origination::build_external_lsa(
                 self.router_id,
-                prefix_str
-                    .parse::<Ipv4Prefix>()
-                    .expect("prefix round-trip")
-                    .addr(),
-                Ipv4Addr::from(
-                    u32::MAX
-                        << (32
-                            - prefix_str
-                                .parse::<Ipv4Prefix>()
-                                .expect("prefix round-trip")
-                                .prefix_len()),
-                ),
+                Ipv4Addr::from(lsid & Self::prefix_as_mask(&prefix)),
+                Ipv4Addr::from(u32::MAX << (32 - prefix.prefix_len())),
                 *metric,
                 *e_bit,
             );
+            // The allocated ID must survive into the header (the
+            // builder derives it from the address; the remap may have
+            // walked host bits).
+            lsa.header.link_state_id = crate::lsa::LinkStateId(lsid);
             if let crate::lsa::LsaBody::AsExternal(ext) = &mut lsa.body {
                 ext.forwarding_address = *fa;
             }
@@ -3208,6 +3551,16 @@ impl Ospfd {
         let dirty_networks: Vec<usize> = std::mem::take(&mut self.network_lsa_dirty);
         for idx in dirty_networks {
             self.originate_network_lsa(idx, now, out);
+        }
+        // RFC 3101 §3.1's TranslatorStabilityInterval deadline: a
+        // deposed translator's keep-translating window lapsing must
+        // force a walk (the retirement flush runs in the walk).
+        if self
+            .areas
+            .values()
+            .any(|a| a.stability_until.is_some_and(|d| now >= d))
+        {
+            self.mark_table_dirty();
         }
         // SPF when due.
         self.maybe_spf(now, out, zapi_out);
@@ -5550,7 +5903,401 @@ router ospf\n router-id 10.255.3.1\n area 0.0.0.0\n  interface eth0\n   address 
         assert_eq!(sm.metric, 1, "default-cost");
     }
 
-    // ---- authentication (Appendix D / RFC 5709, N3 M3) -----------
+    // ---- the NSSA translator remainder (RFC 3101 3.1/3.2/E) -------
+
+    /// The ABR config with extra area-parameter lines (ranges, the
+    /// translator role) and an explicit router id / addresses.
+    fn nssa_abr_core_rid(
+        router_id: &str,
+        a0_addr: &str,
+        a1_addr: &str,
+        nssa_flags: &str,
+        extra: &str,
+    ) -> Ospfd {
+        let text = format!(
+            concat!(
+                "router ospf\n",
+                " router-id {router_id}\n",
+                " area 0.0.0.0\n",
+                "  interface eth0\n",
+                "   address {a0_addr}/30\n",
+                "   network-type point-to-point\n",
+                "   hello-interval 1\n",
+                "   dead-interval 4\n",
+                " area 0.0.0.1 nssa{nssa_flags}\n",
+                "  interface eth1\n",
+                "   address {a1_addr}/30\n",
+                "   network-type point-to-point\n",
+                "   hello-interval 1\n",
+                "   dead-interval 4\n",
+                "{extra}",
+            ),
+            router_id = router_id,
+            a0_addr = a0_addr,
+            a1_addr = a1_addr,
+            nssa_flags = nssa_flags,
+            extra = extra,
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// RFC 3101 3.1: a Candidate border router stands down when a
+    /// higher-ID border router is reachable over both the NSSA and
+    /// the transit topology; the elected translator sets Nt in its
+    /// NSSA router-LSA; a deposed translator keeps translating
+    /// through the stability interval, then flushes. Appendix E: the
+    /// FOREIGN border P-clear type-7 default installs locally and
+    /// never propagates.
+    #[test]
+    fn nssa_translator_election_stands_down_for_the_higher_id() {
+        let mk = |role: &str| {
+            vec![
+                // Us: the Candidate (or Always) ABR, rid 10.255.2.1.
+                nssa_abr_core_rid(
+                    "10.255.2.1",
+                    "10.10.0.1",
+                    "10.20.0.1",
+                    "",
+                    &format!(" area 0.0.0.1 nssa translate-{role}\n"),
+                ),
+                // The peer ABR — HIGHER router ID, adjacent in both
+                // areas (reachable over the NSSA AND the transit
+                // topology: the 3.1 election list).
+                nssa_abr_core_rid(
+                    "10.255.9.1",
+                    "10.10.0.2",
+                    "10.20.0.9",
+                    "",
+                    " area 0.0.0.1 nssa translate-candidate\n",
+                ),
+                // The NSSA-internal ASBR (the type-7 source).
+                nssa_core("10.255.3.1", "10.20.0.2", true, false),
+            ]
+        };
+        let redistribute = |cores: &mut [Ospfd], now: u64| {
+            let mut out: Vec<WireOut> = Vec::new();
+            cores[2].on_redistribute_add(
+                crate::zedge::RedistributedRoute {
+                    prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 24).unwrap()),
+                    metric: 20,
+                },
+                now,
+                &mut out,
+            );
+            deliver_multi(cores, 2, &out, now, &mut Vec::new());
+        };
+        // ---- Candidate: outranked by the higher ID ----
+        let mut cores = mk("candidate");
+        let now = run_multi(&mut cores, 0, 10);
+        redistribute(&mut cores, now + 1);
+        let now2 = run_multi(&mut cores, now + 2, 12);
+        let _ = now2;
+        // The election: we stood down; the peer (no one higher) was
+        // elected and advertises Nt in its NSSA router-LSA.
+        let ours = cores[0].areas.get(&1).unwrap();
+        assert!(
+            !ours.translator_elected,
+            "outranked by the higher-ID border router (3.1)"
+        );
+        let our_router = ours
+            .lsdb
+            .get(&LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("10.255.2.1"))),
+                adv_router: cores[0].router_id,
+            })
+            .map(|e| e.lsa.clone())
+            .expect("our NSSA router-LSA");
+        let crate::lsa::LsaBody::Router(r) = &our_router.body else {
+            panic!()
+        };
+        assert!(!r.nt_bit, "a disabled translator clears Nt (3.1)");
+        let peer_router = ours
+            .lsdb
+            .get(&LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("10.255.9.1"))),
+                adv_router: cores[1].router_id,
+            })
+            .map(|e| e.lsa.clone())
+            .expect("the peer's NSSA router-LSA");
+        let crate::lsa::LsaBody::Router(r) = &peer_router.body else {
+            panic!()
+        };
+        assert!(r.nt_bit, "the elected translator sets Nt (3.1)");
+        // Bring-up nuance (the RFC's own sequencing): we were
+        // elected before the peer's adjacency made it into the
+        // election list, so our deposition arms the stability
+        // interval — "an elected translator will continue to perform
+        // translation duties until supplanted" (3.1). The interval
+        // must be armed and our translations still held.
+        let until = cores[0].areas.get(&1).unwrap().stability_until;
+        assert!(until.is_some(), "the deposition armed the interval");
+        // Past the interval: the deposed translator stands down for
+        // real — its translations flush. The WHOLE mesh keeps ticking
+        // (a lone-core tick would expire the adjacencies and re-elect
+        // us — a harness artifact, not a protocol event).
+        let mut t = now2;
+        while t < until.unwrap() + 2 {
+            t += 1;
+            let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+            let mut zaps: Vec<Vec<ZedgeCommand>> = cores.iter_mut().map(|_| Vec::new()).collect();
+            for (i, core) in cores.iter_mut().enumerate() {
+                core.tick(t, &mut outs[i], &mut zaps[i]);
+            }
+            let mut queue: Vec<(usize, Vec<WireOut>)> = Vec::new();
+            for (i, o) in outs.iter().enumerate() {
+                if !o.is_empty() {
+                    deliver_multi(&mut cores, i, o, t, &mut queue);
+                }
+            }
+            while !queue.is_empty() {
+                let batch = std::mem::take(&mut queue);
+                for (from, o) in batch {
+                    deliver_multi(&mut cores, from, &o, t, &mut queue);
+                }
+            }
+        }
+        // The PEER translated (adv = peer), not us.
+        let peer_t5 = LsaKey {
+            ls_type: LsaType::AS_EXTERNAL,
+            link_state_id: crate::lsa::LinkStateId(u32::from(ip("203.0.113.0"))),
+            adv_router: cores[1].router_id,
+        };
+        let our_t5 = LsaKey {
+            ls_type: LsaType::AS_EXTERNAL,
+            link_state_id: crate::lsa::LinkStateId(u32::from(ip("203.0.113.0"))),
+            adv_router: cores[0].router_id,
+        };
+        assert!(
+            cores[0].areas.get(&0).unwrap().lsdb.contains(&peer_t5),
+            "the elected translator's type-5 is in the backbone"
+        );
+        assert!(
+            !cores[0]
+                .areas
+                .get(&0)
+                .unwrap()
+                .lsdb
+                .get(&our_t5)
+                .is_some_and(|e| !e.lsa.header.is_max_age()),
+            "we did not keep translating past the stability interval"
+        );
+        assert!(cores[0].translations.is_empty(), "no translations held");
+        // Appendix E: the PEER's border type-7 default (P clear) is
+        // foreign to us — we INSTALL it locally (never propagating).
+        assert!(
+            cores[0].routes.contains_key("0.0.0.0/0"),
+            "Appendix E: the foreign P-clear type-7 default installs on the border (locally)"
+        );
+        // And nothing translated the default anywhere.
+        let default_t5 = LsaKey {
+            ls_type: LsaType::AS_EXTERNAL,
+            link_state_id: crate::lsa::LinkStateId(0),
+            adv_router: cores[1].router_id,
+        };
+        assert!(
+            !cores[0].areas.get(&0).unwrap().lsdb.contains(&default_t5),
+            "the type-7 default never becomes a type-5"
+        );
+        let _ = now2;
+
+        // ---- Always: enabled regardless of the higher ID ----
+        let mut cores = mk("always");
+        let now = run_multi(&mut cores, 0, 10);
+        redistribute(&mut cores, now + 1);
+        let _now2 = run_multi(&mut cores, now + 2, 12);
+        assert!(
+            cores[0].areas.get(&1).unwrap().translator_role
+                == crate::config::NssaTranslatorRole::Always
+        );
+        assert!(
+            cores[0].areas.get(&0).unwrap().lsdb.contains(&LsaKey {
+                ls_type: LsaType::AS_EXTERNAL,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("203.0.113.0"))),
+                adv_router: cores[0].router_id,
+            }),
+            "Always translates unconditionally (3.1)"
+        );
+    }
+
+    /// RFC 3101 3.2 step (3): the Type-7 address-range aggregation —
+    /// one type-5 per range, path type 2 when any member is type 2
+    /// with metric = highest type-2 cost + 1, FA 0.0.0.0 — and step
+    /// (1)'s DoNotAdvertise suppression.
+    #[test]
+    fn nssa_type7_range_aggregates_and_suppresses() {
+        let mk = |range: &str| {
+            vec![
+                nssa_abr_core_rid(
+                    "10.255.2.1",
+                    "10.10.0.1",
+                    "10.20.0.1",
+                    "",
+                    &format!(" area 0.0.0.1 range {range}\n"),
+                ),
+                area0_core(),
+                nssa_core("10.255.3.1", "10.20.0.2", true, false),
+            ]
+        };
+        let mut cores = mk("203.0.0.0/16");
+        let now = run_multi(&mut cores, 0, 10);
+        // Two type-7 members inside the range: an E2 (metric 20) and
+        // an E1 (metric 10).
+        for (net, metric) in [("203.0.113.0", 20u32), ("203.0.114.0", 10)] {
+            let mut out: Vec<WireOut> = Vec::new();
+            cores[2].on_redistribute_add(
+                crate::zedge::RedistributedRoute {
+                    prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip(net), 24).unwrap()),
+                    metric,
+                },
+                now + 1,
+                &mut out,
+            );
+            deliver_multi(&mut cores, 2, &out, now + 1, &mut Vec::new());
+        }
+        let _now2 = run_multi(&mut cores, now + 2, 12);
+        // ONE aggregated type-5 for the range: 203.0.0.0/16, type 2
+        // (a member is type 2), metric 21 (20 + 1), FA 0.0.0.0.
+        let agg = cores[0]
+            .areas
+            .get(&0)
+            .unwrap()
+            .lsdb
+            .get(&LsaKey {
+                ls_type: LsaType::AS_EXTERNAL,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("203.0.0.0"))),
+                adv_router: cores[0].router_id,
+            })
+            .map(|e| e.lsa.clone())
+            .expect("the aggregated type-5 for the range");
+        let crate::lsa::LsaBody::AsExternal(ext) = &agg.body else {
+            panic!()
+        };
+        assert_eq!(u32::from(ext.mask).count_ones(), 16, "the range's /16 mask");
+        assert!(ext.e_bit, "path type 2 (a member is type 2)");
+        assert_eq!(ext.metric, 21, "the highest Type-2 cost + 1");
+        assert_eq!(
+            ext.forwarding_address,
+            Ipv4Addr::UNSPECIFIED,
+            "the aggregated type-5's FA is 0.0.0.0"
+        );
+        // The members' plain translations are suppressed.
+        for net in ["203.0.113.0", "203.0.114.0"] {
+            assert!(
+                !cores[0].areas.get(&0).unwrap().lsdb.contains(&LsaKey {
+                    ls_type: LsaType::AS_EXTERNAL,
+                    link_state_id: crate::lsa::LinkStateId(u32::from(ip(net))),
+                    adv_router: cores[0].router_id,
+                }),
+                "no plain type-5 for the range member {net} (3.2 step 3)"
+            );
+        }
+        // DoNotAdvertise: nothing leaves the NSSA.
+        let mut cores = mk("203.0.0.0/16 not-advertise");
+        let now = run_multi(&mut cores, 0, 10);
+        let mut out: Vec<WireOut> = Vec::new();
+        cores[2].on_redistribute_add(
+            crate::zedge::RedistributedRoute {
+                prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 24).unwrap()),
+                metric: 20,
+            },
+            now + 1,
+            &mut out,
+        );
+        deliver_multi(&mut cores, 2, &out, now + 1, &mut Vec::new());
+        let _now2 = run_multi(&mut cores, now + 2, 12);
+        let ours: Vec<LsaKey> = cores[0]
+            .areas
+            .get(&0)
+            .unwrap()
+            .lsdb
+            .all()
+            .filter(|e| {
+                e.lsa.header.ls_type == LsaType::AS_EXTERNAL
+                    && e.lsa.header.adv_router == cores[0].router_id
+                    && !e.lsa.header.is_max_age()
+            })
+            .map(|e| e.lsa.key())
+            .collect();
+        assert!(
+            ours.iter()
+                .all(|k| k.link_state_id.0 == u32::from(ip("198.51.100.0"))),
+            "a DoNotAdvertise range suppresses everything but the lab's own external: {ours:?}"
+        );
+    }
+
+    /// RFC 3101 3.2's LS-ID remapping: a translated type-5 whose
+    /// natural Link State ID is already taken by one of OUR type-5s
+    /// describing a different network walks the host bits.
+    #[test]
+    fn translated_ls_id_remaps_on_collision() {
+        let mut cores = vec![
+            // Us: the ABR AND an ASBR — our own /24 external occupies
+            // the natural LS ID 203.0.113.0.
+            {
+                let mut core = nssa_abr_core_rid("10.255.2.1", "10.10.0.1", "10.20.0.1", "", "");
+                core.redistribute_static = true;
+                core
+            },
+            area0_core(),
+            nssa_core("10.255.3.1", "10.20.0.2", true, false),
+        ];
+        let now = run_multi(&mut cores, 0, 10);
+        // Our own /24 type-5 (LS ID = 203.0.113.0).
+        let mut out: Vec<WireOut> = Vec::new();
+        cores[0].on_redistribute_add(
+            crate::zedge::RedistributedRoute {
+                prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 24).unwrap()),
+                metric: 5,
+            },
+            now + 1,
+            &mut out,
+        );
+        // The ASBR's type-7 for the SAME address with a DIFFERENT
+        // mask (/25) — the collision case.
+        let mut out2: Vec<WireOut> = Vec::new();
+        cores[2].on_redistribute_add(
+            crate::zedge::RedistributedRoute {
+                prefix: common::IpPrefix::V4(Ipv4Prefix::new(ip("203.0.113.0"), 25).unwrap()),
+                metric: 20,
+            },
+            now + 1,
+            &mut out2,
+        );
+        deliver_multi(&mut cores, 2, &out2, now + 1, &mut Vec::new());
+        let _now2 = run_multi(&mut cores, now + 2, 14);
+        // The translation took a host-bit LS ID.
+        let translated: Vec<(u32, u8)> = cores[0]
+            .areas
+            .get(&0)
+            .unwrap()
+            .lsdb
+            .all()
+            .filter(|e| {
+                e.lsa.header.ls_type == LsaType::AS_EXTERNAL
+                    && e.lsa.header.adv_router == cores[0].router_id
+                    && !e.lsa.header.is_max_age()
+            })
+            .filter_map(|e| {
+                let crate::lsa::LsaBody::AsExternal(ext) = &e.lsa.body else {
+                    return None;
+                };
+                Some((
+                    e.lsa.header.link_state_id.0,
+                    u32::from(ext.mask).count_ones() as u8,
+                ))
+            })
+            .collect();
+        assert!(
+            translated.contains(&(u32::from(ip("203.0.113.0")), 24)),
+            "our own /24 keeps the natural LS ID"
+        );
+        assert!(
+            translated.contains(&(u32::from(ip("203.0.113.1")), 25)),
+            "the /25 translation walked the host bits to .1 (3.2): {translated:?}"
+        );
+    }
 
     /// A core with simple-password auth on its interface.
     fn simple_auth_core(router_id: &str, addr: &str, password: &str) -> Ospfd {
@@ -5567,11 +6314,6 @@ router ospf\n router-id 10.255.3.1\n area 0.0.0.0\n  interface eth0\n   address 
         Ospfd::new(&parse_config(&text).unwrap()).unwrap()
     }
 
-    /// D.5.2: the simple password guards adjacency formation. A
-    /// mismatched Hello is silently discarded — no neighbor forms,
-    /// no neighbor FSM event ever fires; an established adjacency
-    /// dies through the Inactivity Timer (the Down transition), the
-    /// only neighbor-state effect auth failure is allowed to have.
     #[test]
     fn simple_password_matches_form_adjacency_and_mismatches_do_not() {
         // Matching passwords: Full adjacency through the signed wire.
@@ -6050,6 +6792,7 @@ key chain kc1
                 v_bit: false,
                 e_bit: rng() % 4 == 0,
                 b_bit: rng() % 4 == 0,
+                nt_bit: false,
                 links,
             }),
         }

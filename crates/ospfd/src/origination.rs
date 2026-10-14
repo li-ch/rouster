@@ -70,13 +70,16 @@ pub struct InterfaceAdv {
 
 /// Build the router-LSA (§12.4.1). `e_bit` mirrors §12.4.4: set when
 /// redistributing external routes (an ASBR); `b_bit` when the router
-/// is an area border router (§A.4.2). The Link State ID of a
+/// is an area border router (§A.4.2); `nt_bit` when this NSSA border
+/// router's translator state is enabled (RFC 3101 §3.1 — set only in
+/// the router-LSA originated INTO the NSSA). The Link State ID of a
 /// router-LSA is the router's own ID (§12.4.1).
 pub fn build_router_lsa(
     own: RouterId,
     e_bit: bool,
     b_bit: bool,
     v_bit: bool,
+    nt_bit: bool,
     interfaces: &[InterfaceAdv],
 ) -> Lsa {
     let mut links = Vec::new();
@@ -162,6 +165,7 @@ pub fn build_router_lsa(
             v_bit,
             e_bit,
             b_bit,
+            nt_bit,
             links,
         }),
     }
@@ -336,7 +340,7 @@ mod tests {
         // numbered-subnet type-3 stub.
         let mut adv = iface(true, "10.77.0.1", "255.255.255.252", 10);
         adv.p2p_neighbors_full = vec![rid("10.255.2.1")];
-        let lsa = build_router_lsa(rid("10.255.1.1"), false, false, false, &[adv]);
+        let lsa = build_router_lsa(rid("10.255.1.1"), false, false, false, false, &[adv]);
         assert_eq!(lsa.header.ls_type, LsaType::ROUTER);
         assert_eq!(lsa.header.link_state_id.0, u32::from(ip("10.255.1.1")));
         let LsaBody::Router(body) = &lsa.body else {
@@ -361,7 +365,7 @@ mod tests {
         let mut adv = iface(true, "10.77.0.1", "255.255.255.252", 10);
         adv.state = Down;
         adv.p2p_neighbors_full = vec![rid("10.255.2.1")];
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -410,7 +414,7 @@ mod tests {
     fn asbr_bit_is_carried() {
         // §12.4.4: originating type-5s makes the router an ASBR —
         // the E-bit lands in the router-LSA.
-        let lsa = build_router_lsa(rid("1.1.1.1"), true, false, false, &[]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), true, false, false, false, &[]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -425,7 +429,7 @@ mod tests {
         let mut adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
         adv.dr_address = Some(ip("10.0.0.9"));
         adv.transit_adjacent = true;
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -438,7 +442,7 @@ mod tests {
         let mut adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
         adv.dr_address = Some(ip("10.0.0.9"));
         adv.transit_adjacent = false;
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
@@ -448,7 +452,7 @@ mod tests {
         assert_eq!(body.links[0].link_data, u32::from(ip("255.255.255.0")));
         // 3. Still Waiting (no DR): the same stub form.
         let adv = iface(false, "10.0.0.5", "255.255.255.0", 10);
-        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, &[adv]);
+        let lsa = build_router_lsa(rid("1.1.1.1"), false, false, false, false, &[adv]);
         let LsaBody::Router(body) = &lsa.body else {
             panic!()
         };
