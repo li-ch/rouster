@@ -1,0 +1,101 @@
+name: smokes
+
+# The nightly docker smoke suite: the full scripts/run-smokes.sh
+# (34 container-based interop tests) against the in-repo testbed
+# image. Complements ci.yml (push/PR gate: fmt + clippy + unit tests
+# + script syntax) — the smokes are too heavy for the push path and
+# run on a schedule instead, plus manual dispatch.
+#
+# Network use is the point of this job (disclosed): the runner pulls
+# the alpine base images and cloudflare/gortr (pinned by digest),
+# builds frr-testbed from docker/frr-testbed.Dockerfile (fetching the
+# pinned apk packages from Alpine's CDN), and runs the suite. The
+# smoke scripts themselves never pull anything — every image they use
+# is pre-seeded by the steps below under the tags they pin.
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # nightly, 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: smokes
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  docker-smokes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40 # observed ~20 min locally; cold cache margin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-smokes
+
+      # Pre-seed every image tag the suite pins. The smoke scripts
+      # hardcode these names locally (mirror-tag names + gortr:local);
+      # pulling the canonical registries here and re-tagging keeps the
+      # scripts untouched. gortr is pinned by digest (linux/amd64).
+      - name: Pre-seed docker images
+        run: |
+          docker pull alpine:3.22
+          docker pull alpine:3.20
+          docker tag alpine:3.22 docker.m.daocloud.io/library/alpine:3.22
+          docker tag alpine:3.20 docker.m.daocloud.io/library/alpine:3.20
+          docker pull cloudflare/gortr@sha256:0de53fef38978311cf599dc9779804424bc9ceca7a9dede3a3c2d18f19154e41
+          docker tag cloudflare/gortr@sha256:0de53fef38978311cf599dc9779804424bc9ceca7a9dede3a3c2d18f19154e41 gortr:local
+
+      # The testbed image from the in-repo reversed recipe, published
+      # under BOTH tags: frr-testbed:ci (the built artifact) and
+      # frr-testbed:10.2.2 (the tag every smoke script pins).
+      - name: Build frr-testbed
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/
+          file: docker/frr-testbed.Dockerfile
+          tags: |
+            frr-testbed:ci
+            frr-testbed:10.2.2
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build the nft base image
+        run: docker build -f docker/nft-base.Dockerfile -t rouster-nft:local docker/
+
+      # Pre-build every binary the suite builds, with the same target
+      # and flags the scripts use, so each script's own cargo build is
+      # a warm no-op and the suite spends its time on the tests.
+      - name: Pre-build workspace binaries (x86_64 musl)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl \
+            --bin rousterd --bin staticd --bin bgpd --bin ospfd --bin bfdd \
+            --bin zapi-sniff --bin zapi-bfd-probe --bin zapi-neigh-probe
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p sav --bin savd --example w7-sav-smoke
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p configd --bin configd
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p vty --bin vtyd
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p rousterctl --bin rousterctl
+          cargo build -p rpki --bin rtr-check # host-native debug, like the gortr smoke
+
+      - name: Run the smoke suite
+        run: scripts/run-smokes.sh
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: target/smoke-logs/
+          if-no-files-found: warn
