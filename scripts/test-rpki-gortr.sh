@@ -76,6 +76,15 @@ cat > "$DATA/rpki-b.json" <<'EOF'
 {"metadata":{"counts":3,"generated":1760000600,"valid":1900000600,"serial":2},"roas":[{"prefix":"192.0.2.0/24","maxLength":24,"asn":"AS64512","ta":"n7"},{"prefix":"203.0.113.0/24","maxLength":24,"asn":"AS0","ta":"n7"},{"prefix":"2001:db8::/32","maxLength":48,"asn":"AS64512","ta":"n7"}]}
 EOF
 cp "$DATA/rpki-a.json" "$DATA/rpki.json"
+# The gortr image runs unprivileged (user rtr, uid 100). mktemp -d
+# hands back a 0700 dir owned by the invoking user; on real-Linux
+# docker the bind mount keeps those perms, so gortr cannot even
+# traverse /data and the first data load never happens (CI run
+# 38647649951's 90 s timeout). Mac docker VMs remap bind-mount
+# ownership, which is why local runs never saw it. World-readable
+# fixture, unprivileged cache: the explicit, CI-portable data source.
+chmod 755 "$DATA"
+chmod 644 "$DATA"/rpki*.json
 
 log "docker probe + rtr-check build"
 docker image inspect "$IMAGE" >/dev/null
