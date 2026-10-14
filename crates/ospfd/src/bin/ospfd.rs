@@ -141,7 +141,9 @@ fn main() {
                 }
             }
             if let Some(client) = zapi_client {
-                match zedge::spawn_with_client(
+                // No interface dump ran on this session (v3): the
+                // HELLO as OSPF6 is explicit here.
+                match zedge::start_with_client(
                     client,
                     config.redistribute_static,
                     AddressFamily::Ipv6,

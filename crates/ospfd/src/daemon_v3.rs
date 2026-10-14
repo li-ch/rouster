@@ -967,6 +967,16 @@ impl OspfdV3 {
                     return out;
                 }
             };
+        if std::env::var_os("ROUSTER_OSPFV3_TRACE").is_some() {
+            info!(
+                src = %received.src,
+                dst = %dst,
+                rid = %packet.header.router_id,
+                packet_type = packet.header.packet_type,
+                instance = packet.header.instance_id,
+                "ospfv3: packet received"
+            );
+        }
         // §4.2's header verification ladder.
         if packet.header.router_id == self.router_id {
             return out;
@@ -1197,6 +1207,20 @@ impl OspfdV3 {
             self.router_lsa_dirty = true;
             self.originate_router_lsa(now, out);
             table_dirty = true;
+        }
+        // The interop machine-check surface: a FOREIGN router- or
+        // link-LSA landed (the LSDB-convergence proof).
+        for lsa in &report.changed_lsas {
+            if lsa.header.adv_router != self.router_id
+                && matches!(lsa.header.ls_type, V3_ROUTER | V3_LINK)
+            {
+                info!(
+                    lsa = lsa.header.ls_type.name(),
+                    adv = %lsa.header.adv_router,
+                    seq = lsa.header.seq,
+                    "ospfv3: peer LSA installed"
+                );
+            }
         }
         if report.changed.iter().any(|k| k.ls_type == V3_AS_EXTERNAL) {
             table_dirty = true;

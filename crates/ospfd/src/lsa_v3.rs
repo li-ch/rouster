@@ -591,8 +591,19 @@ impl LsaV3 {
                 flags |= u8::from(e.t_bit);
                 put_u8(buf, flags);
                 put_u24(buf, e.metric);
-                e.prefix.encode(buf);
+                // The prefix triple's third halfword is the
+                // Referenced LS Type in THIS body (A.4.7's row:
+                // PrefixLength | PrefixOptions | Referenced LS Type —
+                // the slot the generic A.4.1 triple reserves as
+                // zero). The S7-a FRR-interop wire truth: the old
+                // after-the-prefix placement failed FRR 10.2.2's
+                // ospf6_lsa_examin (the hand-derived N2B golden was
+                // wrong; the RFC diagram + the live oracle agree).
+                debug_assert_eq!(e.prefix.addr.len(), Prefix::words(e.prefix.len));
+                put_u8(buf, e.prefix.len);
+                put_u8(buf, e.prefix.options.0);
                 put_u16(buf, e.referenced_ls_type);
+                buf.extend_from_slice(&e.prefix.addr);
                 if let Some(fa) = e.forwarding_address {
                     buf.extend_from_slice(&fa.octets());
                 }
@@ -869,12 +880,44 @@ impl LsaV3 {
             need: 3,
             have: 0,
         })?;
-        let prefix = Prefix::decode(r, field)?;
+        // The prefix triple with the Referenced LS Type in the third
+        // halfword (A.4.7's row — see the encode note).
+        let prefix_len = r.u8().ok_or(OspfError::Truncated {
+            field,
+            need: 1,
+            have: 0,
+        })?;
+        if prefix_len > 128 {
+            return Err(OspfError::BadLength {
+                field: "prefix length",
+                declared: prefix_len as usize,
+                actual: 128,
+            });
+        }
+        let prefix_options = PrefixOptions(r.u8().ok_or(OspfError::Truncated {
+            field,
+            need: 1,
+            have: 0,
+        })?);
         let referenced_ls_type = r.u16().ok_or(OspfError::Truncated {
             field,
             need: 2,
             have: 0,
         })?;
+        let want = Prefix::words(prefix_len);
+        let addr = r
+            .take(want)
+            .ok_or(OspfError::Truncated {
+                field,
+                need: want,
+                have: r.remaining(),
+            })?
+            .to_vec();
+        let prefix = Prefix {
+            len: prefix_len,
+            options: prefix_options,
+            addr,
+        };
         // Fixed option order: forwarding address, then tag, then the
         // referenced LS ID (A.4.7) — each present iff its gate is set.
         let forwarding_address = if f_bit {
@@ -1492,20 +1535,30 @@ mod tests {
                 body: LsaBodyV3::AsExternal(body),
             };
             let bytes = lsa.encode();
-            // 20 header + 4 flags/metric + 12 prefix + 2 ref type
-            // + 16 FA? + 4 tag? + 4 ref LS ID?
+            // 20 header + 4 flags/metric + the prefix row (len +
+            // options + Referenced LS Type + the address bytes —
+            // A.4.7's row; /48 occupies 8 address bytes) + 16 FA? +
+            // 4 tag? + 4 ref LS ID?
             let expect = 20
                 + 4
-                + 12
-                + 2
+                + 4
+                + 8
                 + if f { 16 } else { 0 }
                 + if t { 4 } else { 0 }
                 + if ref_ty != 0 { 4 } else { 0 };
             assert_eq!(bytes.len(), expect, "f={f} t={t} ref={ref_ty}");
             // Flags octet: E only (0x04) + F/T as set.
             assert_eq!(bytes[20], 0x04 | u8::from(f) << 1 | u8::from(t));
-            // The option order on the wire: FA, tag, ref LS ID.
-            let mut off = 38; // after the 2-byte Referenced LS Type
+            // The Referenced LS Type in the prefix row's third
+            // halfword (A.4.7 — the FRR-10.2.2-verified placement).
+            assert_eq!(
+                u16::from_be_bytes([bytes[26], bytes[27]]),
+                ref_ty,
+                "f={f} t={t} ref={ref_ty}"
+            );
+            // The option order after the address prefix: FA, tag,
+            // ref LS ID.
+            let mut off = 20 + 4 + 4 + 8;
             if f {
                 assert_eq!(&bytes[off..off + 16], &global_fa.octets());
                 off += 16;

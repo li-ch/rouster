@@ -239,6 +239,27 @@ pub async fn spawn_with_client(
     Ok(tx)
 }
 
+/// Spawn the zedge task on an established session that has NOT yet
+/// handshaked (the v3 path: no interface dump runs first — S7-a):
+/// HELLO as the family's route type, then the registrations.
+pub async fn start_with_client(
+    client: zapi::ZapiClient<tokio::net::UnixStream>,
+    redistribute_static: bool,
+    family: crate::config::AddressFamily,
+    pushed: mpsc::UnboundedSender<RedistributedRoute>,
+    withdrawn: mpsc::UnboundedSender<RedistributedRoute>,
+) -> io::Result<mpsc::UnboundedSender<ZedgeCommand>> {
+    let mut zedge = Zedge::new(client, redistribute_static, family, pushed, withdrawn);
+    zedge.start().await?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        if let Err(e) = zedge.run(rx).await {
+            warn!(error = %e, "ospfd: zedge task exited");
+        }
+    });
+    Ok(tx)
+}
+
 /// Spawn the zedge task against the real socket (connect-with-retry,
 /// HELLO, then the resident loop). Returns the command sender.
 pub async fn spawn(
