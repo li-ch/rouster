@@ -63,7 +63,13 @@ trust rc):
 `rousterctl` never writes it. (The recorded vtyd apply design
 ([protocols/vty.md](protocols/vty.md), K3) will amend this when it
 lands: vtyd becomes the one sanctioned writer of *candidate* config
-files there; `rousterctl` stays read-only.)
+files there; `rousterctl` stays read-only.) **Amendment (Phase 4,
+2026-10-14): the first sanctioned writer landed, and it is configd,
+not vtyd** — the config-manager's apply path writes
+`configd/generations/…`, `configd/current`, `configd/previous`, and
+`configd.status` (rows below). `rousterctl` stays read-only; vtyd's
+eventual write path goes *through* configd
+([protocols/config.md](protocols/config.md) §4.2).
 
 **Reader note (N8)**: all three status files are parsed by ONE
 implementation — `common::rundir` (std-only), one parser table per
@@ -83,6 +89,8 @@ the mirrors is a separate owner call).
 | `savd.status` | savd (`--status-file`, default `/run/rouster/savd.status`) | refreshed after every evaluate; removed on the clean-exit clear; survives SIGKILL as the last-known-installed record | `show sav` (content), `status` |
 | `rousterd.status` | rousterd (A21 dump, `crates/rousterd/src/status.rs`) | refreshed on the main loop's reconcile tick (10 s; first tick at startup); **not** written on the `--once` path; **not** removed on clean exit (the header pid makes the stale file detectable — see §2.3) | `show interface/neighbour/vrf/rib summary` (content + header-pid liveness), `status`, the vty views |
 | `*.sock` | rousterd (only when its config has a `zapi socket <PATH>` line — no canonical name yet) | while the ZAPI server runs | `status` (fallback candidates when no dump exists) |
+| `configd/generations/<seq>-<hash>/rouster.conf`, `configd/current`, `configd/previous` | configd apply ([protocols/config.md](protocols/config.md) §4.2 — the run-dir contract extension) | written per apply (the canonical bytes, the current pointer, the prior one); history pruned to the newest 8; `previous` appears from the second apply on | `configd rollback` (reads `previous`); `configd status` renders the applied generation |
+| `configd.status` | configd apply (the last step of every apply, rollback applies included) | refreshed per apply: generation, hash, per-daemon actuation results | `configd status` (prints it verbatim, the `savd --show` shape) |
 
 Consequences the consumers rely on:
 
