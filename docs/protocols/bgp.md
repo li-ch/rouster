@@ -309,6 +309,11 @@ announced to that peer are not modified"). v1 semantics:
   hub (`addpath-tx-best-selected 2`, two leaf ASes announcing the
   same prefix) sends two paths; asserted on our side: two distinct
   path ids logged, session clean, exactly one kernel route.
+- **RFC 7911 errata status (B-20, re-checked 2026-10-14)**: none
+  recorded — the errata database's entry for 7911 reads "No matching
+  errata found" and the RFC info page carries no "Errata Exist"
+  badge. ADD-A8's caution ("errata status unverifiable tonight") is
+  closed: the RFC can be cited without an errata qualifier.
 
 ### iBGP dissemination (S7-b: RFC 4271 §9.2 + RFC 4456 clients)
 
@@ -377,7 +382,14 @@ The send side of N5B's receive leg (B-19/B-21 per the sheet):
   advertises the single best per prefix), §5's "SHOULD include the
   best route" beyond that shape, per-family knob granularity
   (`addpath` covers both unicast families), and the pre-RFC
-  PATHS-LIMIT / dynamic-capability IDR drafts (explicitly out).
+  extensions FRR already ships knobs for (B-25, named so the scope
+  creep stays visible): `draft-abraitis-idr-addpath-paths-limit`
+  (-04, the PATHS-LIMIT capability bounding received paths — ADD-A8
+  recorded it under an `ietf-idr` prefix; it is an individual draft)
+  with its Cease companion
+  `draft-abraitis-idr-maximum-paths-subcode`, and
+  `draft-ietf-idr-dynamic-cap` (-19, the DYNAMIC-CAP message —
+  mid-session capability revision without a session reset).
 
 ### RPKI (W2-d)
 
@@ -471,20 +483,26 @@ content as a session reset · full two-connection §6.8 daemon
 integration test (the verdict table, replay adapter, and session
 observability are tested; the accept-path dance is smoke-covered by
 its dormancy) · route-server: per-client Loc-RIBs + route-server-maps
-(FRR's dedicated-RIB model), client→normal-peer policy mediation ·
-graceful restart: per-family F-bit granularity (and the deferral's
+(FRR's dedicated-RIB model), client→normal-peer policy mediation,
+the RFC 9234 §5 egress synthesis OTC := local AS toward RS-Clients
+(the B-10 strip handles the never-re-attribute half) · graceful
+restart: per-family F-bit granularity (and the deferral's
 first-EOR coarseness), RFC 8542 long-lived stale, BFD early flush,
 cross-process restart persistence (the §4.1 in-process duties landed
-S7-b) · route next-hop resolution (v1: single-hop peers only; the
-§9.1.3 floor checks next-hop presence, not §9.1.2.1 resolvability)
-· RFC 4456: ORIGINATOR_ID/CLUSTER_LIST loop prevention and cluster-id
-config (the client-config reflection table landed S7-b) · v6 listener
-side · ADD-PATH (RFC 7911): the selection modes (all-paths /
-best-per-AS / best-selected N, FRR's knob semantics — v1 transmits
-the single best per prefix under its own ids), per-family knob
-granularity, and the pre-RFC PATHS-LIMIT / dynamic-capability IDR
-drafts (explicitly out) — both directions landed (receive N5B,
-transmit S7-b) · interface up/down mirror tracking.
+S7-b; RFC 8538's N bit + Hard Reset landed S8-a — the subcode-4
+user-control knob remains) · route next-hop resolution (v1:
+single-hop peers only; the §9.1.3 floor checks next-hop presence,
+not §9.1.2.1 resolvability) · RFC 4456: ORIGINATOR_ID/CLUSTER_LIST
+loop prevention and cluster-id config (the client-config reflection
+table landed S7-b) · v6 listener side · ADD-PATH (RFC 7911): the
+selection modes (all-paths / best-per-AS / best-selected N, FRR's
+knob semantics — v1 transmits the single best per prefix under its
+own ids), per-family knob granularity, and the pre-RFC extensions
+FRR ships knobs for — `draft-abraitis-idr-addpath-paths-limit` +
+`draft-abraitis-idr-maximum-paths-subcode`,
+`draft-ietf-idr-dynamic-cap` (B-25, named) — both directions landed
+(receive N5B, transmit S7-b; errata status verified clean S8-a) ·
+interface up/down mirror tracking.
 
 The `experimental-savnet` hook LANDED (2026-10-11) behind the flag,
 in-process only: `peer.rs` `on_message`'s UPDATE arm reports
