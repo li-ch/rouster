@@ -193,11 +193,11 @@ pub fn enable_tree() -> WordTree {
             lit("show", "Show running system information"),
             lit(
                 "running-config",
-                "The session's current configuration (parse-only in v1)",
+                "The merged canonical view (session edits + the canonical file)",
             ),
         ],
         action: Action::ShowRunningConfig,
-        help: "The session's current configuration (parse-only in v1)",
+        help: "The merged canonical view (what `write` writes)",
     });
     t.insert(Cmd {
         toks: vec![
@@ -243,7 +243,7 @@ pub fn enable_tree() -> WordTree {
 }
 
 /// The config-mode tree: the quarantine-B7 observed frr.conf grammar
-/// subset, parse-only. `do <exec command>` is handled before the
+/// subset. `do <exec command>` is handled before the
 /// tree (see [`crate::session`]).
 pub fn config_tree() -> WordTree {
     let mut t = WordTree::new();

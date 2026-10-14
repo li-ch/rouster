@@ -2,13 +2,17 @@
 
 Status: weekend-program stream W1-c, delivered 2026-10-11 (commits
 `62413df` parser/session core → `420e5fb` vtyd binary → `19ff65e`
-test suites). Positioning: the interactive Cisco-style operator
+test suites); **the write path landed S8-c (2026-10-14 evening)** —
+`write file`/`write memory` ride `configd apply` (below).
+Positioning: the interactive Cisco-style operator
 surface at the compatibility edge (architecture invariant 1) —
 FRR-compatible grammar and habits, Rouster-native underneath. It is
 the sibling of `rousterctl` (the file-based reader): command naming
 stays consistent (`show sav` on both), rousterctl stays daemonless,
 vty is the interactive surface. v1 reads only the run-dir contract
-and invents no IPC — the run-dir files ARE the interface.
+and invents no IPC — the run-dir files ARE the interface — and the
+write path is a process spawn of the configd CLI, not a new
+channel.
 
 ## Process model
 
@@ -52,10 +56,10 @@ pins it. Rules:
 |---|---|---|
 | `show sav [rules]` | `<run-dir>/savd.status` + `savd.pid` | re-rendered (aligned rule table); `rules` prints only the table |
 | `show bfd [summary]` | `<run-dir>/bfdd.status` + `bfdd.pid` | per-peer sessions with `last-transition` children; `summary` prints state counts |
-| `show running-config` | the session's config tree | parse-only v1 (below) |
+| `show running-config` | the canonical file + session edits | the merged canonical view (below) |
 | `configure terminal` | — | enters config mode |
 | `disable` | — | drops to user mode |
-| `write memory` / `wr` | — | **deferred** (below) — honest disclosure, not a silent no-op |
+| `write file`, `write memory`, `wr` | → `configd apply` | **landed (S8-c)**: stages the merged canonical, spawns the configd CLI, relays its report (below) |
 
 **config family** (`host(config)#` and the router/af submodes):
 the B7 observed grammar subset (below), `exit` (pop one mode),
@@ -83,13 +87,13 @@ the B7 observed grammar subset (below), `exit` (pop one mode),
 - No enable password in v1 (disclosed: nobody has designed
   aaa/enable-secret integration; the one-shot client relies on it).
 
-## Config mode, parse-only v1
+## Config mode — the B7 grammar, the canonical merge (S8-c)
 
 `configure terminal` accepts the **quarantine-B7 observed frr.conf
-grammar subset** into a session config tree; `show running-config`
-echoes it back in the FRR file shape (headers, `hostname`, `!`
-separated stanzas, bgp children one-space indented, address-family
-children two-space, `end` closing):
+grammar subset** into a session config tree; the tree is the
+modeled half of the canonical merge — the other half is everything
+in the canonical `rouster.conf` the grammar cannot speak, loaded
+verbatim at connection start (`vty::writer`):
 
 - `frr version <s>` · `frr defaults <s>` · `line vty` (B7 §1)
 - `hostname <word>` — also changes the prompt
@@ -98,110 +102,103 @@ children two-space, `end` closing):
 - `ipv6 route <v6/m> blackhole` — B7 §7's Rouster-side grammar, not
   FRR-observed (B7 §6); included for frr.conf-import parity with
   rousterd's native config
-- `route-map <rest-of-line>` — kept verbatim for display (the
-  typed policy engine is W1-a's `policy` crate; a route-map
-  compatibility layer over it is its §Deferred, not vty's)
+- `route-map <rest-of-line>` — kept verbatim (bgpd's policy grammar
+  eats them through its section)
 - `router bgp <asn>` → `(config-router)`: `bgp network
   import-check` / `no bgp network import-check`, `bgp router-id
   <v4>`, `neighbor <v4> remote-as <asn>`; `address-family ipv4
   unicast` → `(config-router-af)`: `network <v4/m>`,
   `redistribute static`, `exit-address-family` (B7 §3)
-- `!` accepted as a no-op (separators are regenerated at render)
+- `!` accepted as a no-op
 
 Anything else in config mode is rejected with the B7 error shape
 (`% Unknown command: router static` — the §4.1-observed rejection).
 
-**`write` is §Deferred, disclosed at point of use**: applying a
-session config needs the owner's transactional-config design
-(YANG-native northbound is the primary model, architecture
-invariant 5; vtysh-as-translator never the source of truth). The
-command prints the deferral instead of pretending. Anchor: the
-session tree (`vty::config`) is the parse layer a future apply
-path would hand to that transactional store.
+**`show running-config` renders the merged canonical view** —
+exactly what `write` writes, in the canonical `rouster.conf` shape
+([protocols/config.md](config.md) §1): the session's modeled lines
+project into `daemon rousterd` (statics) and `daemon bgpd` (the
+flattened router-bgp stanza + route-maps), everything the canonical
+file carries that the grammar cannot model rides verbatim (whole
+savd/bfdd/ospfd sections, `zapi socket`, `table <N>` static forms,
+policy stanzas, the `router-id` line), and the display-only
+directives round-trip as `! vtyd:` comments (legal canonical
+comments; no daemon consumes them). `write` never destroys config
+the vty grammar cannot speak.
 
-## Config apply — the recorded design (K3)
+**`write file` / `write memory` (S8-c, landed)**: stages the merged
+canonical atomically at the configured canonical path (default
+`/etc/rouster.conf`), spawns `configd apply <canonical> --run-dir
+… --etc-dir …` (process spawn of the CLI surface — no IPC
+invention), and relays configd's report lines verbatim — per-daemon
+outcomes, ack verdicts, the generation, and on refusal the
+configd-side story (a failed apply prefixes `% Configuration apply
+FAILED`, which is deliberately NOT a one-shot exit-2 error: verify
+state, never trust rc). `write memory` = `write file` here — the
+canonical file IS the startup config — disclosed at point of use in
+the command's own output. Binary discovery for configd:
+`$ROUSTER_CONFIGD_BIN`, vtyd's own dir, then `PATH`.
+
+## Config apply — the recorded design (K3), LANDED as the interim
 
 Owner decision (2026-10-11, all-options-adopted round; recorded in
 the plan's Appendix C status log): **the config-manager is the
 target, file+SIGHUP is the interim** (`docs/implementation-plan.md`,
-2026-10-11 "later" entry). This section pins the design so the
-Phase-4 build follows it; v1 behavior is unchanged — `write` keeps
-printing its deferral until the interim lands.
+2026-10-11 "later" entry). S8-c (2026-10-14 evening) landed the
+interim's second half: the write path through configd, exactly the
+shape this section recorded. What shipped:
 
-### The seams that exist today
+1. **Merge, never clobber**: the session's edits project into the
+   canonical `rouster.conf` shape over everything the file already
+   carries that the vty grammar cannot speak (verbatim
+   ride-through; the modeled/unmodeled table in the config-mode
+   section above). The projection follows the recorded design:
+   `ip`/`ipv6 route` → the rousterd section (the same FRR cut as
+   rousterd's grammar), the `router bgp` subtree → the bgpd section
+   with the address-family nesting flattened to router-level
+   `network` lines (bgpd.conf has no address-family stanza), and
+   the two modeled lines bgpd's grammar does not accept
+   (`bgp network import-check`, `redistribute static`) ride as
+   canonical comments — preserved for display, poisonous to
+   nothing. `hostname`/`frr version`/`frr defaults`/`line vty` stay
+   display-only (`! vtyd:` comments), the recorded rule: no daemon
+   consumes them from a file.
+2. **Stage atomically** — temp + fsync + rename at the canonical
+   path (default `/etc/rouster.conf`, relocatable `--canonical`);
+   configd (and any daemon) never re-reads a half-written file.
+3. **Apply through configd** — `configd apply <canonical>
+   --run-dir <vtyd's> --etc-dir <vtyd's>`; configd owns the render,
+   the per-daemon atomic writes, the SIGHUPs, the generations, the
+   deep validation, and (S8-c) the post-signal verification and
+   auto-rollback. vtyd is a translator, never a second source of
+   truth.
+4. **Verify, never trust rc** — configd's report (per-daemon
+   outcomes, ack verdicts, generation, or the refusal story) is
+   relayed verbatim as the command's output; the one-shot exit
+   codes stay 0/1/2 (a failed apply is OUTPUT, not exit 2).
 
-Every daemon parses its own file at startup (`--config`/`-f`); four
-of the six reload it on SIGHUP:
+The interim's recorded fences, as landed: the run-dir contract
+gained configd (not vtyd) as its writer — vtyd itself still writes
+nothing in the run dir, staging only the canonical file in the etc
+dir — and the file race stays accepted and disclosed (K1): the
+canonical is vtyd's write surface, operator edits to it race a
+`write` exactly as they race any configd apply.
+
+### The seams (still the source of truth for what reloads)
 
 | Daemon | Config file | Grammar owner | SIGHUP today |
 |---|---|---|---|
-| `rousterd` | `rouster.conf` (its `--config`; the README quickstart shape) | `crates/rousterd/src/config.rs` — FRR-flavored strict subset: `ip`/`ipv6 route <prefix> {gw…\|blackhole} [table <N>]`, `zapi socket <PATH>` | **yes** — `crates/rousterd/src/main.rs` re-parses and the driver swaps the static routes through the RIB as a diff (`crates/rousterd/src/driver.rs`); a changed `zapi socket` path is refused with a warning |
-| `staticd` | the same static-route shape (`--config`) | `crates/rousterd/src/staticd.rs` | **yes** — `StaticDaemon::reload` diffs onto the server (`crates/rousterd/src/bin/staticd.rs`) |
-| `savd` | `savd.conf` (`--config`) | `crates/sav/src/savd.rs` (`parse_savd_config`) | **yes** — re-parses and swaps the config, i.e. the SIB's Config origin (`crates/sav/src/bin/savd.rs`) |
-| `bfdd` | `bfd.conf`-shaped (`--config`) — bfdd owns its own file; there is **no** `bfd` stanza in `rouster.conf` | `crates/bfdd/src/daemon.rs` (the savd line grammar) | **yes, diff-based: unchanged peers keep their sessions** (`crates/bfdd/src/daemon.rs`) — the soft-reconfig seam invariant 2 demands |
-| `ospfd` | `ospfd.conf` | `crates/ospfd/src/config.rs` (A11/B7 strict) | **no** — the run loop wires SIGTERM/SIGINT only (`crates/ospfd/src/bin/ospfd.rs`) |
-| `bgpd` | `bgpd.conf` | `crates/bgpd/src/config.rs` (A11/B7 strict; `router bgp` stanza, `route-map`/`rpki` stanzas) | **no** — signals are SIGTERM/SIGINT → ManualStop → Cease (`crates/bgpd/src/bin/bgpd.rs`) |
+| `rousterd` | `rouster.conf` (its `--config`; the README quickstart shape) | `crates/rousterd/src/config.rs` — FRR-flavored strict subset: `ip`/`ipv6 route <prefix> {gw…\|blackhole} [table <N>]`, `zapi socket <PATH>` | **yes** — re-parses and the driver diffs the static routes through the RIB; a changed `zapi socket` path is refused with a warning |
+| `staticd` | the same static-route shape (`--config`) | `crates/rousterd/src/staticd.rs` | **yes** — `StaticDaemon::reload` diffs onto the server |
+| `savd` | `savd.conf` (`--config`) | `crates/sav/src/savd.rs` (`parse_savd_config`) | **yes** — re-parses and swaps the config, i.e. the SIB's Config origin |
+| `bfdd` | `bfd.conf`-shaped (`--config`) — bfdd owns its own file; there is **no `bfd` stanza in `rouster.conf`** | `crates/bfdd/src/daemon.rs` (the savd line grammar) | **yes, diff-based: unchanged peers keep their sessions** — the soft-reconfig seam invariant 2 demands |
+| `ospfd` | `ospfd.conf` | `crates/ospfd/src/config.rs` (A11/B7 strict) | **no** — the run loop wires SIGTERM/SIGINT only |
+| `bgpd` | `bgpd.conf` | `crates/bgpd/src/config.rs` (A11/B7 strict; `router bgp` stanza, `route-map`/`rpki` stanzas) | **no** — signals are SIGTERM/SIGINT → ManualStop → Cease |
 
 Pid sources for the signal step: `savd.pid` and `bfdd.pid` exist;
 rousterd has no pidfile but the `rousterd.status` header pid is its
 live word (operator-surfaces §2.3); staticd/ospfd/bgpd publish
 neither pid nor status yet (the operator-surfaces §3 PENDING row).
-
-### The interim: file + SIGHUP
-
-`write memory` renders the session tree (`vty::config`, the B7
-subset above) into per-daemon file shapes and hands each to its
-owning daemon:
-
-1. **Project** the frr.conf-shaped tree onto the per-daemon
-   grammars: `ip`/`ipv6 route` → the `rouster.conf` static lines
-   (shapes identical by construction — the vty subset and
-   rousterd's grammar are the same FRR cut; `table <N>` is not in
-   the vty subset, disclosed); the `router bgp` subtree → the
-   `bgpd.conf` `router bgp` stanza — a strict subset of bgpd's
-   neighbor surface, with the `address-family` nesting flattened to
-   bgpd.conf's router-level `network` lines (bgpd.conf has no
-   address-family stanza today); verbatim `route-map` lines →
-   bgpd.conf's route-map stanzas (the compiled engine is
-   `policy`'s, consumed via bgpd.conf — `crates/policy/src/routemap.rs`).
-   `hostname` (vtyd has its own line in `vtyd.conf`), `frr
-   version/defaults`, `line vty` stay display-only in the interim —
-   no daemon consumes them from a file.
-2. **Write atomically** — temp file + rename in the destination
-   directory; a daemon must never re-parse a half-written file.
-3. **Signal** each owning daemon with SIGHUP (pid per the sources
-   above).
-4. **Verify, never trust rc** — the B7 §4.2 `vtysh -b` lesson
-   already discipline for the one-shot client: apply output
-   re-reads the run-dir status files (`savd.status`, `bfdd.status`,
-   `rousterd.status`) and reports what took; a signaled daemon with
-   no status writer answers "signaled, unverifiable".
-
-Two fences, amended or accepted deliberately:
-
-- **The read-only run-dir contract gains one writer.** v1 says vty
-  never writes the run dir (Signals, below; operator-surfaces §2
-  "v1 reads only"). The interim makes vtyd the sanctioned writer of
-  *candidate* config files there
-  (`<run-dir>/candidate/<daemon>.conf`) — symmetric with the
-  daemons publishing status files outward; `rousterctl` stays
-  read-only. Today's SIGHUP arms re-read the startup `--config`
-  path, so each reload-capable daemon grows one small arm: on
-  SIGHUP prefer the run-dir candidate when present, else the
-  startup path. That per-daemon extension is Phase-4 code, not a
-  new IPC contract — the point of keeping the interim small.
-- **The file race is accepted, disclosed** (the recorded K1
-  downside): operator edits to a daemon's `--config` file race the
-  apply path. The candidate-file form contains it — vtyd owns only
-  the run-dir candidates, never the operator's files — but a
-  daemon started pointing elsewhere ignores them; deployment pins
-  one convention per daemon.
-
-Named prerequisites: SIGHUP arms for ospfd and bgpd (diff-based and
-session-preserving — bfdd's reload is the pattern; invariant 2:
-config changes must not bounce sessions), and pid/status
-publication for staticd/ospfd/bgpd (the publish → tolerant parse →
-fixture corpus pattern, operator-surfaces §3).
 
 ### The target: a config-manager owning transactional apply
 
@@ -246,12 +243,15 @@ port 2626          # default: vtyd's own, in the 26xx VTY family
 bind 127.0.0.1     # loopback unless the operator says otherwise
 run-dir /run/rouster
 hostname rouster
+canonical /etc/rouster.conf   # the write path's file (S8-c)
+etc-dir /etc                  # forwarded to configd apply
 ```
 
 Line conventions per savd (blank/`!`/`#` ignored, line-numbered
 errors). Flags: `--config/-f`, `--bind`, `--port/-p`, `--run-dir`,
-`--hostname`, `--command/-c`, `--help/-h`, `--version/-V`; flags
-beat the file, the file beats defaults.
+`--hostname`, `--canonical`, `--etc-dir`, `--command/-c`,
+`--help/-h`, `--version/-V`; flags beat the file, the file beats
+defaults.
 
 ## One-shot mode (`--command`)
 
@@ -269,9 +269,10 @@ when apply fails — verify state, never trust rc):
 ## Signals
 
 SIGTERM/SIGINT stop the listener and exit 0; open connections
-close with their sessions. No run-dir files are written by vtyd —
-the run dir stays the daemons' publication medium (vty never
-writes it).
+close with their sessions. vtyd writes no run-dir file, ever —
+the run dir stays the daemons' (and configd's) publication medium;
+the write path stages only the canonical config file in the etc
+dir and spawns configd, which owns every run-dir write.
 
 ## Deviations (fences, disclosed)
 
@@ -279,9 +280,12 @@ writes it).
    per-daemon unix sockets and ptys; v1 is a line protocol that
    says so in its banner. Wiring a genuine vtysh is §Deferred
    behind an interop capture.
-2. **`show running-config` shows the *session's* tree**, not a
-   daemon's running config — there is no YANG store to read yet
-   (Phase 4). The session tree seeds the future translator.
+2. **`show running-config` shows the merged canonical view** (since
+   S8-c), not an frr.conf-shaped echo of the session's edits alone:
+   there is no YANG store to read (Phase 4), so the canonical file
+   plus the session's modeled edits IS the truth — one view, the
+   one `write` writes. The W1-c frr-shaped display (bgp children
+   indented, `!` separators, `end`) was replaced by it.
 3. **No TAB completion** (v1 is `?`-only), no telnet IAC handling,
    no per-user AAA, no enable password.
 4. **Rest-of-line params are canonicalized** to single-space joins
@@ -302,12 +306,14 @@ writes it).
 
 ## §Deferred
 
-- **Config apply / `write`** — the *design is recorded* ("Config
-  apply — the recorded design (K3)", above): file+SIGHUP interim,
-  config-manager target; the build is Phase-4 work. vty's parse
-  tree + B7 grammar remains the import layer that feeds it, and
-  soft-reconfiguration semantics (invariant 2) are pinned in the
-  design's prerequisites (bfdd's diff-based reload is the pattern).
+- **Config apply / `write`** — **DONE (S8-c)**: the recorded K3
+  interim landed (`write file`/`write memory` stage the merged
+  canonical and spawn `configd apply`; the design section above is
+  the as-built record). The remaining climb is the target itself:
+  the YANG-native transactional store (Phase 4), where vtyd's
+  session tree maps to datastore edits and `write` becomes commit —
+  until then the canonical file through configd is the one truth
+  path, and nothing here survives as a second one.
 - **Real vtysh attach** — capture FRR 10.2 vtysh's socket/pty
   behavior against a live daemon (the z5b raw-marker pattern),
   then decide unix-socket endpoints per daemon vs one endpoint.

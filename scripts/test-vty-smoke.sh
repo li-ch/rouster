@@ -17,6 +17,11 @@
 #     summary` against the sibling daemons
 #   - rousterctl's dump consumers (show interface / vrf / rib
 #     summary / neighbour / status) over the same live run dir
+#   - the write path (S8-c): `vtyd --command 'write file'` merges
+#     the seeded canonical, spawns `configd apply`, and the REAL
+#     savd reloads (poll 1 -> 2) with its ack confirmed in the
+#     relayed configd report; `show running-config` renders the
+#     merged canonical view
 #
 # Topology: two veth pairs; one enslaved to a VRF device (table
 # 1001); a ping seeds the ARP neighbour. Caps: NET_ADMIN+NET_RAW
@@ -39,6 +44,8 @@ SAVD_LOG=/var/log/savd.log
 BFDD_LOG=/var/log/bfdd.log
 VTYD_LOG=/var/log/vtyd.log
 VTYD_ADDR=127.0.0.1:2626
+CANONICAL=/root/rouster.conf
+CONFIGD_STATUS=/run/rouster/configd.status
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;
@@ -87,7 +94,7 @@ ctl_must_contain() {
     echo "    ctl: \`$args\` -> contains \`$pattern\`"
 }
 
-echo "==> building rousterd, savd, bfdd, vtyd, rousterctl ($MUSL_TARGET, release)"
+echo "==> building rousterd, savd, bfdd, vtyd, rousterctl, configd ($MUSL_TARGET, release)"
 if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
     rustup target add "$MUSL_TARGET"
 fi
@@ -96,11 +103,12 @@ cargo build --release --target "$MUSL_TARGET" -p sav --bin savd
 cargo build --release --target "$MUSL_TARGET" -p bfdd --bin bfdd
 cargo build --release --target "$MUSL_TARGET" -p vty --bin vtyd
 cargo build --release --target "$MUSL_TARGET" -p rousterctl --bin rousterctl
+cargo build --release --target "$MUSL_TARGET" -p configd --bin configd
 
 echo "==> assembling test image from $BASE_IMAGE"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"; docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
-for bin in rousterd savd bfdd vtyd rousterctl; do
+for bin in rousterd savd bfdd vtyd rousterctl configd; do
     cp "target/$MUSL_TARGET/release/$bin" "$BUILD_DIR/$bin"
 done
 cat > "$BUILD_DIR/Dockerfile" <<EOF
@@ -110,6 +118,7 @@ COPY savd /usr/local/bin/savd
 COPY bfdd /usr/local/bin/bfdd
 COPY vtyd /usr/local/bin/vtyd
 COPY rousterctl /usr/local/bin/rousterctl
+COPY configd /usr/local/bin/configd
 EOF
 docker build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 
@@ -170,9 +179,24 @@ docker exec "$NAME" sh -c "printf '%s\n' 'peer 203.0.113.1' > /etc/bfdd.conf"
 docker exec -d "$NAME" sh -c "bfdd --config /etc/bfdd.conf > $BFDD_LOG 2>&1"
 wait_in_container "bfdd published its status" 30 "test -s $RUN_DIR/bfdd.status"
 
-echo "==> starting vtyd"
+echo "==> starting vtyd (canonical at $CANONICAL; the write path's file)"
+docker exec "$NAME" sh -c "printf '%s\n' \
+  'router-id 198.51.100.1' \
+  'daemon rousterd {' \
+  '    zapi socket $RUN_DIR/zserv.api' \
+  '}' \
+  'daemon savd {' \
+  '    interface veth0' \
+  '      mode strict' \
+  '    poll 2' \
+  '}' \
+  'daemon bfdd {' \
+  '    peer 203.0.113.1' \
+  '}' \
+  > $CANONICAL"
 docker exec -d "$NAME" sh -c \
-    "vtyd --run-dir $RUN_DIR --bind 127.0.0.1 --port 2626 > $VTYD_LOG 2>&1"
+    "vtyd --run-dir $RUN_DIR --bind 127.0.0.1 --port 2626 \
+     --canonical $CANONICAL > $VTYD_LOG 2>&1"
 wait_in_container "vtyd answering one-shots" 30 \
     "vtyd --command 'show version' | grep -q 'Rouster vtyd'"
 
@@ -200,6 +224,20 @@ ctl_must_contain "show neighbour"      "192.0.2.9"
 ctl_must_contain "show vrf"            "vrf-blue"
 ctl_must_contain "show rib summary"    "1001"
 ctl_must_contain "status"              "dump published"
+
+# The write path (S8-c): `write file` stages the merged canonical
+# and spawns `configd apply`. The seeded canonical carries savd
+# `poll 2` while the live savd runs `poll 1` — the write must flip
+# the daemon's own published word (content, not exit codes).
+echo "==> the write path: vtyd 'write file' -> configd apply -> live reload"
+vty_must_contain "write file" "configd: generation 1 recorded"
+vty_must_contain "write file" "load confirmed"
+vty_must_contain "show running-config" "daemon savd"
+vty_must_contain "show running-config" "poll 2"
+wait_in_container "savd reloaded via the vty write (poll 2s)" 30 \
+    "grep -q 'poll 2s interfaces 1' $RUN_DIR/savd.status"
+docker exec "$NAME" sh -c "grep -q 'ack confirmed' $CONFIGD_STATUS"
+echo "    savd poll 1 -> 2 through the socket; ack confirmed in configd.status"
 
 # Liveness honesty: killing rousterd flips the views to the
 # last-known-record footer and rousterctl's exit 4.

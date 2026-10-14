@@ -25,6 +25,19 @@
 #   ROLLBACK  `configd rollback` re-applies the previous generation:
 #             savd back to `poll 2s` / 1 rule, bfdd back to 1 peer,
 #             generation 3 recorded (history never rewritten).
+#   VALIDATE  (S8-c) a semantically-BAD canonical (savd `mode
+#             nosuch`) is refused by savd's OWN --validate-config
+#             before anything is written: `configd validate` and
+#             `configd apply` both exit 1 with savd's line-numbered
+#             complaint; /etc/savd.conf and the generation store are
+#             untouched.
+#   AUTO-     (S8-c) a reload the daemon REFUSES (a stand-in savd
+#   ROLLBACK  stands in for the load-refusal window the real daemons
+#             cannot produce — their validate and load parsers are
+#             the same fn, disclosed): configd catches the
+#             status-file disagreement, auto-reverts to the last
+#             confirmed generation (recorded as a NEW generation),
+#             and the apply exits 1 with the honest story.
 #
 # Topology: one veth pair (veths1/veths2) — savd's rule count is
 # stanza-driven (only configured interfaces generate rules), so
@@ -54,6 +67,8 @@ CANONICAL=/root/rouster.conf
 STATUS_FILE=/run/rouster/savd.status
 BFDD_STATUS=/run/rouster/bfdd.status
 CONFIGD_STATUS=/run/rouster/configd.status
+CANONICAL_BAD=/root/rouster-bad.conf
+CANONICAL_POISON=/root/rouster-poison.conf
 # away/<program>/quarantine sits next to the rouster repo's parent.
 QUARANTINE="${ROUSTER_CONFIGD_QUARANTINE:-$SCRIPT_DIR/../../away/2026-10-14/quarantine/configd}"
 
@@ -73,7 +88,14 @@ wait_in_container() { # <desc> <attempts> <body>
         sleep 0.5
     done
     echo "FAIL: $desc (waited $((attempts / 2))s)" >&2
-    docker exec "$NAME" sh -c "cat $SAVD_LOG $BFDD_LOG $CONFIGD_STATUS" 1>&2 || true
+    docker exec "$NAME" sh -c \
+        "cat $SAVD_LOG $BFDD_LOG $CONFIGD_STATUS; \
+         echo '--- stand-in evidence ---'; \
+         cat /var/log/standin-savd.log 2>/dev/null; \
+         ls -la /root/standin-savd.sh 2>/dev/null; \
+         head -5 /root/standin-savd.sh 2>/dev/null; \
+         cat /run/rouster/savd.pid 2>/dev/null; \
+         cat $STATUS_FILE 2>/dev/null" 1>&2 || true
     exit 1
 }
 
@@ -116,6 +138,31 @@ write_canonical_v2() {
       '    peer 198.51.100.9' \
       '}' \
       > $CANONICAL"
+}
+
+# The canonical BAD: a savd section the daemon's own parser refuses
+# (`mode nosuch` — structurally fine for configd, semantically dead).
+write_canonical_bad() {
+    docker exec "$NAME" sh -c "printf '%s\n' \
+      'daemon savd {' \
+      '    interface veths1' \
+      '      mode nosuch' \
+      '}' \
+      > $CANONICAL_BAD"
+}
+
+# The canonical POISON: parses + validates fine (poll 9 is legal) but
+# carries the `refused-load` marker the stand-in daemon refuses at
+# SIGHUP — the load-refusal window.
+write_canonical_poison() {
+    docker exec "$NAME" sh -c "printf '%s\n' \
+      'daemon savd {' \
+      '    interface veths1' \
+      '      mode strict' \
+      '    poll 9' \
+      '    ! refused-load' \
+      '}' \
+      > $CANONICAL_POISON"
 }
 
 capture() {
@@ -236,5 +283,85 @@ wait_in_container "bfdd rolled back: 1 peer" 30 "grep -q '^peers 1$' $BFDD_STATU
 [ "$(docker exec "$NAME" cat /run/rouster/savd.pid)" = "$SAVD_PID_BEFORE" ]
 echo "    rolled back to v1 behavior, generation 3, still no restart"
 
+echo "==> [VALIDATE] a semantically-bad canonical refused pre-apply"
+write_canonical_bad
+# The validate verb: exit 1, savd's own line-numbered complaint.
+set +e
+VALIDATE_OUT="$(docker exec "$NAME" configd validate "$CANONICAL_BAD" 2>&1)"
+VALIDATE_RC=$?
+set -e
+[ "$VALIDATE_RC" -ne 0 ] || { echo "FAIL: validate accepted the bad canonical"; exit 1; }
+echo "$VALIDATE_OUT" | grep -q 'line 2: bad mode `nosuch`' || {
+    echo "FAIL: refusal missing savd's line-numbered word: $VALIDATE_OUT"; exit 1; }
+# The apply runs the same gate first and refuses: nothing changes.
+set +e
+APPLY_OUT="$(docker exec "$NAME" configd apply "$CANONICAL_BAD" 2>&1)"
+APPLY_RC=$?
+set -e
+[ "$APPLY_RC" -ne 0 ] || { echo "FAIL: apply accepted the bad canonical"; exit 1; }
+echo "$APPLY_OUT" | grep -q 'semantic validation refused' || {
+    echo "FAIL: apply refusal not surfaced: $APPLY_OUT"; exit 1; }
+docker exec "$NAME" sh -c "grep -q 'poll 2' /etc/savd.conf"   # file untouched
+docker exec "$NAME" sh -c "grep -q '^generation 3 ' $CONFIGD_STATUS"  # store untouched
+echo "    refused by savd's own parser, nothing written, nothing advanced"
+
+echo "==> [AUTO-ROLLBACK] a refused reload reverts to the last confirmed config"
+# The real savd cannot refuse a validated config (its validate and
+# load parsers are the same fn), so a stand-in daemon provides the
+# load-refusal window: it owns savd.pid, publishes the same
+# `config ... poll Ns interfaces N bindings N` projection the real
+# savd does, and refuses any config carrying `refused-load`
+# (keeps its running word, republishes it).
+# Kill the real savd FIRST and wait for it to be FULLY gone — its
+# clean-exit path clears its rules and REMOVES savd.status, which
+# would race (and erase) the stand-in's startup publish.
+docker exec "$NAME" sh -c 'kill -TERM "$(pidof savd)" 2>/dev/null'
+wait_in_container "real savd fully exited (status cleared)" 20 '! pidof savd >/dev/null'
+docker exec "$NAME" sh -c "cat > /root/standin-savd.sh <<'EOS'
+#!/bin/sh
+echo \$\$ > /run/rouster/savd.pid
+CONF=/etc/savd.conf
+STATUS=/run/rouster/savd.status
+publish() {
+  poll=\$(grep -E '(^|[[:space:]])poll ' \"\$CONF\" | head -1 | awk '{print \$NF}'); poll=\${poll:-5}
+  ifc=\$(grep -cE '(^|[[:space:]])interface ' \"\$CONF\" 2>/dev/null); ifc=\${ifc:-0}
+  bind=\$(grep -cE '(^|[[:space:]])binding ' \"\$CONF\" 2>/dev/null); bind=\${bind:-0}
+  printf 'savd 0.0.0 pid %s\nconfig mode strict-uRPF action monitor poll %ss interfaces %s bindings %s collision ignore hysteresis 3s backend rp_filter\n' \$\$ \"\$poll\" \"\$ifc\" \"\$bind\" > \"\$STATUS\"
+}
+onhup() {
+  if grep -q refused-load \"\$CONF\" 2>/dev/null; then
+    sleep 0.3; touch \"\$STATUS\"   # refused: republish the running word
+  else
+    publish
+  fi
+}
+trap onhup HUP
+publish
+while :; do sleep 0.2; done
+EOS
+chmod +x /root/standin-savd.sh"
+docker exec -d "$NAME" sh -c "/root/standin-savd.sh > /var/log/standin-savd.log 2>&1"
+wait_in_container "stand-in savd published its word" 20 \
+    "grep -q 'poll 2s interfaces 1' $STATUS_FILE"
+# The poison canonical validates (poll 9 is legal) but the daemon
+# refuses the reload: configd must catch it, auto-revert, and fail.
+write_canonical_poison
+set +e
+ROLLBACK_OUT="$(docker exec "$NAME" configd apply "$CANONICAL_POISON" 2>&1)"
+ROLLBACK_RC=$?
+set -e
+[ "$ROLLBACK_RC" -ne 0 ] || { echo "FAIL: refused load must fail the apply"; exit 1; }
+echo "$ROLLBACK_OUT" | grep -q 'refused the reload' || {
+    echo "FAIL: refusal not surfaced: $ROLLBACK_OUT"; exit 1; }
+echo "$ROLLBACK_OUT" | grep -q 'auto-rolled back to generation 3' || {
+    echo "FAIL: auto-rollback story missing: $ROLLBACK_OUT"; exit 1; }
+# The system is back on generation 3's content, as generation 4.
+docker exec "$NAME" sh -c "grep -q '^generation 4 ' $CONFIGD_STATUS"
+docker exec "$NAME" sh -c "grep -q 'auto-rollback to generation 3' $CONFIGD_STATUS"
+docker exec "$NAME" sh -c "grep -q 'poll 2' /etc/savd.conf"
+wait_in_container "stand-in savd still on its confirmed word" 20 \
+    "grep -q 'poll 2s interfaces 1' $STATUS_FILE"
+echo "    caught via the status projection, reverted as generation 4, apply failed honestly"
+
 capture
-echo "configd smoke: PASS (apply x2 + rollback, status-file asserted)"
+echo "configd smoke: PASS (apply x2 + rollback + validate-refusal + auto-rollback, status-file asserted)"
