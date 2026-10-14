@@ -9,6 +9,12 @@ workstream rules). This note records what the flag gates, what the
 interface promises, and — load-bearing — what deliberately stays out
 until the drafts stabilize.
 
+**BAR-SAV is NOT behind the flag** — see the [BAR-SAV](#bar-sav-the-per-interface-allowlist-module)
+section below: it derives from chartered-RFC data (ROA/ASPA) plus the
+local BGP speaker's Adj-RIBs-In, no draft-dependent wire protocol, so
+it ships in the default build as the complement SAVNET will absorb
+later (priority unchanged: SAVNET first, BAR-SAV second).
+
 ## Enforcement backends (savd `backend` knob)
 
 SAV programs install through the `Dataplane` trait ops on either of
@@ -175,3 +181,128 @@ protocol to mirror. Consequently:
   branches; flag-gated calls).
 - `crates/sav/tests/agent_contract.rs` — the contract tests
   (mock anchor; compile to nothing in the default build).
+
+## BAR-SAV: the per-interface allowlist module
+
+BAR-SAV derives per-interface permissible source-prefix allowlists
+from BGP UPDATE AS_PATHs + ASPA + ROA. Implemented against
+**draft-ietf-sidrops-bar-sav-10** (Sriram/Lubashev/Montgomery,
+published 2026-07-19, expires 2027-01-20 — the pinned revision; local
+copy: `away/2026-10-14/quarantine/barsav/bar-sav-10.txt`). The
+implementation plan's §Phase 5+ pre-registered scope, landed as the
+SAVNET complement: priority order unchanged (SAVNET above BAR-SAV,
+owner decision), and nothing here is behind `experimental-savnet` —
+the module consumes only chartered-RFC data (ROA/ASPA) plus the local
+BGP speaker's own Adj-RIBs-In; there is no draft wire protocol in it.
+
+### The algorithm (S9-a M1)
+
+`crates/sav/src/barsav.rs` — pure, deterministic (BTree-backed),
+every rule step-cited to -10. Inputs: per-adjacency BGP paths
+(prefix, wire-order AS_PATH, receiving interface), the VRP set, the
+ASPA set, the local AS, per-interface neighbor roles, and the two
+per-interface ACLs.
+
+**§4, customer and lateral-peer interfaces** (§2: the same procedure —
+"the CC includes the AS belonging to the customer or lateral peer"):
+
+| Draft step | Rule implemented |
+|---|---|
+| §4 Step 2-3 | Z(1) = {AS-k} ∪ the interface's ASN ACL |
+| §4 Step 5 | A(i) = ASNs whose ASPA names a frontier member as provider |
+| §4 Step 6 | AS 0 and the IANA special-purpose ASNs leave A(i) |
+| §4 Step 7 | B(i) = customers of frontier members per the unique AS_PATHs in Adj-RIBs-In of ALL interfaces (wire-order pairs: the AS toward the origin is the customer) |
+| §4 Step 8-9 | Z(i) = (A(i) ∪ B(i)) − seen, until a round adds nothing (the draft's preamble: ASPA and AS_PATH interleave ROUND BY ROUND, never merge) |
+| §4 Step 10 | D = ∪ Z(i) — the customer cone |
+| §4 Step 11 | Q1 = prefixes of ROAs whose origin ASN ∈ D |
+| §4 Step 12 | Q2 = prefixes the Adj-RIBs-In show cone ASes originating |
+| §4 Step 13 | Q = Q1 ∪ Q2 ∪ the Prefix ACL — the permissible list |
+
+**§8, provider interfaces (BAR-SAV-PI)**: per customer interface
+compute D and Q (§8 Step 1-2, unions Du/Qu); keep only prefixes whose
+customer-interface routes are all ROV-Valid and ASPA-Valid (Step 3),
+whose covering ROAs' origins all lie in Du (Step 4), and whose every
+path AS has all its ASPA providers inside Du (Step 5) — that set S is
+subtracted from the loose-uRPF allowed set (Step 6), the local
+exemptions leave (Step 7), and G applies at every provider interface
+(Step 8).
+
+**§4's security preamble**: paths that are RPKI-ROV Invalid
+(RFC 6811 §2), AS_PATH-verification Invalid
+(draft-ietf-sidrops-aspa-verification §5.5/§5.6, the procedure
+selected by the receiving role), or AS_SET-carrying never feed the
+derivation.
+
+The derivation's output is typed IBA rules (GSC -03 §2.1 — BAR-SAV is
+one of the mechanisms GSC names as needing exactly that shape) with
+provenance `RuleOrigin::BarSav` (a NEW origin, deliberately not
+`SavnetAgent`), compiled through the SAME SAV table manager as every
+other rule source. 19 unit tests + 5 table tests
+(`crates/sav/tests/barsav_table.rs`).
+
+### The feed (M3) and the knobs (M2)
+
+bgpd exposes its Adj-RIB-In as a **read-only snapshot file** (the
+disclosed choice — a direct query surface, not the agent interface,
+which is flag-gated): `barsav feed <path>` in bgpd.conf makes a
+writer task publish `LocRib::barsav_feed_text` atomically on change
+(one line per prefix/peer/path, wire-order AS_PATHs, `as-set`
+marked). savd joins it: `barsav feed <path>` reads the snapshot each
+evaluate, resolving each peer address to an interface through the
+mirror's CONNECT table (single-hop eBGP; multi-hop/iBGP feeds
+§Deferred). RPKI data comes from a `barsav vrp-file <path>` snapshot
+in bgpd's vrp-file format — one file can serve both daemons.
+
+savd.conf grammar (monitor-default per the house rules; drop needs
+the same `action drop` + `i-understand-drop-mode yes` friction gate
+as every other generator):
+
+```text
+barsav feed <path>                  ! bgpd's Adj-RIB-In snapshot
+barsav vrp-file <path>              ! ROA+ASPA snapshot (vrp-file format)
+barsav local-as <asn>               ! cone guard (0 = unset, guard inert)
+barsav provider-exempt <prefix>     ! -10 §8 Step 7 exemption (repeatable)
+interface <name>
+ mode barsav                        ! the derivation gates this interface
+ role <customer|peer|provider>      ! required (the neighbor's role)
+ remote-as <asn>                    ! required (AS-k, §4 Step 1)
+```
+
+A missing or unparseable input file derives NOTHING and enables
+NOTHING — every BAR-SAV interface stays unjudged (unknown ≠ invalid;
+the -10 §7.5.1 fail-open posture), never a seeded deny-all. The
+program-level uRPF hint for BAR-SAV allowlists is Loose — the
+approximation a content-blind rp_filter backend would install
+(disclosed); the nft backend enforces the allowlist content, which is
+the only faithful rendering.
+
+Evidence: `scripts/test-sav-barsav.sh` (exit 0 ×2) — real FRR peers
+in four bridge networks, bgpd learns the four paths (feed lines
+asserted byte-exact), savd derives, and the spoof-differential proves
+it: monitor-default passes everything while the kernel counters
+record the loose-equivalent improper permit on the provider interface
+(`urpf-baseline.txt` in the stage quarantine); in drop mode the cone
+prefix still passes on the customer interface (improper block 0) and
+is 100% blocked on the provider and peer interfaces — the
+directionality loose uRPF cannot express. The savd/sav-nft smokes
+stay green untouched.
+
+### §Deferred (BAR-SAV)
+
+- **The draft's open ASPA edges** (named by -10 itself): §8 Step 5's
+  "all its Provider ASes (per ASPAs) contained within AS-set Du" is
+  implemented as the literal vacuous truth for an unattested AS —
+  which makes the top-of-cone customer (whose provider is the local
+  AS, never in Du) pass on no-attestation but fail when attested to
+  us. Whether the local AS belongs in Du for Step 5 is the draft's
+  open edge; the smoke's snapshot simply leaves the top AS
+  unattested. Same class: §8 Step 3's "all RPKI-ROV Valid" over
+  zero customer routes (we require ≥1).
+- **§8 Step 1's wording** computes Du over CUSTOMER interfaces only —
+  whether lateral peers join the provider subtraction is unaddressed
+  by the draft; we follow the letter.
+- §4 Step 3/13's per-interface ASN/Prefix ACLs exist in the pure
+  model (`BarNeighbor`) but have no savd.conf lines yet.
+- The §8 Step 8 per-provider-interface extension of G, iBGP and
+  multi-hop feeds, RTR-sourced (live, non-file) VRP/ASPA input, and
+  §5's special-purpose denylist.
