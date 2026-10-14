@@ -31,6 +31,7 @@
 
 pub mod checksum;
 pub mod error;
+pub mod lspdb;
 pub mod pdu;
 pub mod system;
 pub mod tlv;

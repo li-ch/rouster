@@ -11,3 +11,8 @@ zapi = { workspace = true }
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Property suite (the W5B/W1-a convention; a pre-existing workspace dep —
+# no new crate enters the lockfile).
+proptest.workspace = true
