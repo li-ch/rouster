@@ -69,6 +69,8 @@ use crate::packet_v3::{
     DbDescriptionV3, HelloV3, LsAckV3, LsRequestV3, LsRequestV3Entry, LsUpdateV3, PacketBodyV3,
     PacketHeaderV3, PacketV3,
 };
+use crate::spf::SpfScheduler;
+use crate::spf_v3::{NextHopV3, SpfLinkV3, SpfResultV3};
 use crate::transport::{OspfV6RawSocket, ReceivedV6};
 use crate::zedge::{RedistributedRoute, ZedgeCommand};
 
@@ -805,6 +807,15 @@ pub struct OspfdV3 {
     /// The area/AS-scope database (§3.2's area + AS scopes in one
     /// store, v1).
     pub lsdb: Lsdb<LsaV3>,
+    /// The §4.8.1 throttle (the v2 area's FRR-parity 0/50/5000 ms
+    /// shape): topology changes (router-/network-LSAs) recompute the
+    /// SPT on their own schedule; the table-only classes
+    /// (IAPR/external installs) rerun the walk on the cached result
+    /// (§16.5's discipline).
+    spf_sched: SpfScheduler,
+    spf_dirty: bool,
+    last_spf: Option<SpfResultV3>,
+    table_dirty: bool,
     routes: BTreeMap<String, RouteEntry>,
     /// Self-originated externals (prefix string -> (key, LS ID)).
     externals: BTreeMap<String, (LsaKey, u32)>,
@@ -881,6 +892,10 @@ impl OspfdV3 {
             area: area_cfg.id,
             interfaces,
             lsdb: Lsdb::new(),
+            spf_sched: SpfScheduler::new(0, 50, 5000),
+            spf_dirty: true,
+            last_spf: None,
+            table_dirty: true,
             routes: BTreeMap::new(),
             externals: BTreeMap::new(),
             next_external_lsid: 0,
@@ -1219,7 +1234,8 @@ impl OspfdV3 {
     }
 
     /// The post-input bookkeeping: adjacency transitions dirty the
-    /// router-LSA; changed LSAs rerun the route table.
+    /// router-LSA; changed LSAs mark their §16.5 class and rerun the
+    /// walk when due.
     fn after_report_v3(
         &mut self,
         iface_idx: usize,
@@ -1228,7 +1244,6 @@ impl OspfdV3 {
         now: u64,
         out: &mut Vec<WireOutV3>,
     ) {
-        let mut table_dirty = false;
         if report.adjacency_up {
             info!(
                 iface = %self.interfaces[iface_idx].name,
@@ -1239,7 +1254,7 @@ impl OspfdV3 {
             // peer's SPF needs it before it can route via us).
             self.router_lsa_dirty = true;
             self.originate_router_lsa(now, out);
-            table_dirty = true;
+            self.mark_spf_dirty(now);
         }
         if report.adjacency_down {
             info!(
@@ -1249,7 +1264,7 @@ impl OspfdV3 {
             );
             self.router_lsa_dirty = true;
             self.originate_router_lsa(now, out);
-            table_dirty = true;
+            self.mark_spf_dirty(now);
         }
         // The interop machine-check surface: a FOREIGN router- or
         // link-LSA landed (the LSDB-convergence proof).
@@ -1265,16 +1280,51 @@ impl OspfdV3 {
                 );
             }
         }
-        if report.changed.iter().any(|k| k.ls_type == V3_AS_EXTERNAL) {
-            table_dirty = true;
+        // §16.5's classes (the v3 mapping): router-/network-LSAs are
+        // area-topology changes (§16.1 recompute); the IAPR and
+        // external classes touch only the routing table walk.
+        for key in &report.changed {
+            match key.ls_type {
+                V3_ROUTER | LsaType::V3_NETWORK => self.mark_spf_dirty(now),
+                _ => self.table_dirty = true,
+            }
         }
-        // Refresh-due self-originated LSAs re-originate now (the
-        // aging tick reports them through here on the periodic path).
-        let _ = now;
-        if table_dirty {
+        self.maybe_spf(now);
+    }
+
+    /// A topology change: the SPT recomputes on the throttle schedule
+    /// (§16.5's incremental classes at the v3 seam).
+    fn mark_spf_dirty(&mut self, now: u64) {
+        self.spf_dirty = true;
+        self.spf_sched.on_change(now * 1000);
+    }
+
+    /// The §4.8 walk gate: topology-due areas recompute §16.1; the
+    /// table-only classes rerun on the cached result.
+    fn maybe_spf(&mut self, now: u64) {
+        let recompute =
+            self.last_spf.is_none() || (self.spf_dirty && self.spf_sched.is_due(now * 1000));
+        if recompute {
+            self.spf_sched.mark_run(now * 1000);
+            self.spf_dirty = false;
+            let links: Vec<SpfLinkV3> = self
+                .interfaces
+                .iter()
+                .map(|i| SpfLinkV3 {
+                    interface_id: i.ifindex,
+                    lsdb: &i.link_lsdb,
+                })
+                .collect();
+            self.last_spf = Some(crate::spf_v3::calculate_v3(
+                self.router_id,
+                &self.lsdb,
+                &links,
+            ));
+        }
+        if recompute || self.table_dirty {
+            self.table_dirty = false;
             self.recompute_table(now);
         }
-        let _ = out;
     }
 
     // ---- LSA origination (§4.4.3) --------------------------------
@@ -1486,7 +1536,8 @@ impl OspfdV3 {
                 self.flood_own(&aged, now, out);
                 self.asbr = !self.externals.is_empty();
                 self.router_lsa_dirty = true;
-                self.recompute_table(now);
+                self.mark_spf_dirty(now);
+                self.maybe_spf(now);
             }
         }
     }
@@ -1512,25 +1563,77 @@ impl OspfdV3 {
         self.withdraw_external(&route.prefix.to_string(), now, out);
     }
 
-    // ---- Route calculation (§16.4-lite, direct ASBR) --------------
+    // ---- Route calculation (§4.8 over the cached §4.8.1 SPF) -------
 
-    /// The v1 OSPFv3 route table: every AS-external-LSA whose
-    /// advertising router is a directly-attached Full neighbor
-    /// installs through that adjacency (the p2p seam: the gateway is
-    /// the adjacency's link-local, the v2 daemon's shape). Full v3
-    /// SPF (link-LSA next hops, IAPR attachment) is §Deferred.
-    fn recompute_table(&mut self, now: u64) {
-        let mut want: BTreeMap<String, RouteEntry> = BTreeMap::new();
-        let mut gateways: HashMap<RouterId, (Ipv6Addr, u32, u16)> = HashMap::new();
-        for iface in &self.interfaces {
-            for (rid, conv) in &iface.neighbors {
+    /// Decorate one §4.8.2 hop into a kernel nexthop: the SPF's
+    /// link-local when the link-LSA provided it; else the adjacency's
+    /// Hello source (§4.8.2's "next-hop address may be determined via
+    /// the IPv6 source address in the neighbor's Hello packet"); the
+    /// directly-connected form (no address, no via) is the interface
+    /// alone.
+    fn decorate_hop(&self, hop: &NextHopV3) -> Option<Nexthop> {
+        match (hop.address, hop.via) {
+            (Some(ll), _) => Some(Nexthop::Ipv6If(ll, hop.interface_id)),
+            (None, Some(via)) => {
+                // The Hello-source fallback: the adjacency on the
+                // outgoing interface.
+                let iface = self
+                    .interfaces
+                    .iter()
+                    .find(|i| i.ifindex == hop.interface_id)?;
+                let conv = iface.neighbors.get(&via)?;
                 if conv.state() == NeighborState::Full {
-                    gateways.insert(*rid, (conv.ip, iface.ifindex, iface.cfg.cost));
+                    Some(Nexthop::Ipv6If(conv.ip, hop.interface_id))
+                } else {
+                    None
                 }
             }
+            (None, None) => Some(Nexthop::IfIndex(hop.interface_id)),
         }
+    }
+
+    fn hops_to_group(&self, hops: &[NextHopV3]) -> NexthopGroup {
+        let mut group = NexthopGroup::new();
+        for hop in hops {
+            if let Some(nexthop) = self.decorate_hop(hop) {
+                group.add(nexthop, 1);
+            }
+        }
+        group
+    }
+
+    /// The route-table walk over the cached SPF result: the §4.8.1
+    /// stage-two prefix routes (IAPR) plus the §4.8.5 external
+    /// calculation (the §16.4 shape: the ASBR distance from the SPF's
+    /// router entries, the F-bit forwarding-address resolution, type-1
+    /// = X + Y / type-2 = Y). The §16.4-lite direct-ASBR form (S7-a's
+    /// interim) is gone — a multi-hop ASBR resolves through the tree.
+    fn recompute_table(&mut self, now: u64) {
+        let Some(spf) = self.last_spf.clone() else {
+            return;
+        };
+        let mut want: BTreeMap<String, RouteEntry> = BTreeMap::new();
+        // ---- the intra-area prefix routes (4.8.1 stage two) ----
+        for route in &spf.routes {
+            let group = self.hops_to_group(&route.next_hops);
+            if group.is_empty() {
+                continue;
+            }
+            let entry = RouteEntry::new(
+                IpPrefix::V6(route.prefix),
+                RouteProtocol::Ospf,
+                group,
+                route.cost,
+            );
+            want.insert(route.prefix.to_string(), entry);
+        }
+        // ---- the external routes (4.8.5 = 16.4) ----
         for entry in self.lsdb.all() {
             if entry.lsa.header.ls_type != V3_AS_EXTERNAL || entry.lsa.header.is_max_age() {
+                continue;
+            }
+            // §16.4 (1)/(2): MaxAge above; self-originated skipped.
+            if entry.lsa.header.adv_router == self.router_id {
                 continue;
             }
             let LsaBodyV3::AsExternal(body) = &entry.lsa.body else {
@@ -1539,24 +1642,53 @@ impl OspfdV3 {
             if body.metric >= crate::LS_INFINITY {
                 continue; // §16.4 step (5): unreachable
             }
-            let Some((gw, ifindex, cost)) = gateways.get(&entry.lsa.header.adv_router) else {
-                continue;
+            // (3) the ASBR distance from the SPF's router entries.
+            // §4.8.5: "AS Boundary Router and forwarding address
+            // selection will proceed the same as if RFC1583Compatibility
+            // is disabled" — single-area v1, so the plain least-cost
+            // pick is exact here.
+            let Some(asbr) = spf
+                .routers
+                .iter()
+                .find(|r| r.router == entry.lsa.header.adv_router)
+            else {
+                continue; // ASBR unreachable
+            };
+            // (3b) the forwarding address: the F bit (4.8.5's rule —
+            // "A forwarding address is in use if and only if bit F is
+            // set"), resolved by a longest-prefix match in the intra
+            // table.
+            let (x, hops) = if let Some(fa) = body.forwarding_address {
+                let fa_path = spf
+                    .routes
+                    .iter()
+                    .filter(|r| r.prefix.prefix_len() > 0 && r.prefix.contains(fa))
+                    .max_by_key(|r| r.prefix.prefix_len());
+                let Some(fa_path) = fa_path else {
+                    continue; // FA must have an intra-area path
+                };
+                (fa_path.cost, fa_path.next_hops.clone())
+            } else {
+                (asbr.cost, asbr.next_hops.clone())
+            };
+            // (4)/(5): X (the intra-AS distance) + Y (the LSA metric).
+            let cost = if body.e_bit {
+                body.metric.min(crate::LS_INFINITY)
+            } else {
+                x.saturating_add(body.metric)
             };
             let prefix = match ipv6_prefix_of(&body.prefix) {
                 Some(p) => p,
                 None => continue,
             };
-            let metric = if body.e_bit {
-                body.metric // type-2: the external metric as-is
-            } else {
-                body.metric.saturating_add(u32::from(*cost))
-            };
-            let route = RouteEntry::new(
-                IpPrefix::V6(prefix),
-                RouteProtocol::Ospf,
-                NexthopGroup::single(Nexthop::Ipv6If(*gw, *ifindex)),
-                metric,
-            );
+            if body.prefix.options.nu_bit() {
+                continue; // 4.8.5: NU prefixes are ignored
+            }
+            let group = self.hops_to_group(&hops);
+            if group.is_empty() {
+                continue;
+            }
+            let route = RouteEntry::new(IpPrefix::V6(prefix), RouteProtocol::Ospf, group, cost);
             want.insert(prefix.to_string(), route);
         }
         // Diff against the installed table (the v2 export shape).
@@ -1641,6 +1773,9 @@ impl OspfdV3 {
                 self.originate_link_lsa(idx, now, out);
             }
         }
+        // The §4.8 walk gate (topology-due recompute / table-only
+        // rerun on the cached result).
+        self.maybe_spf(now);
         // §14 aging: the area/AS database and every link store.
         let syncing = self.any_syncing();
         let mut area = std::mem::take(&mut self.lsdb);
@@ -1803,16 +1938,9 @@ fn prefix_bytes(prefix: &Ipv6Prefix) -> Vec<u8> {
     prefix.addr().octets()[..take].to_vec()
 }
 
-/// The inverse: an LSA prefix triple back to a route prefix.
-fn ipv6_prefix_of(prefix: &Prefix) -> Option<Ipv6Prefix> {
-    let mut bytes = [0u8; 16];
-    let take = Prefix::words(prefix.len).min(16);
-    if prefix.addr.len() != take {
-        return None;
-    }
-    bytes[..take].copy_from_slice(&prefix.addr);
-    Ipv6Prefix::new(std::net::Ipv6Addr::from(bytes), prefix.len).ok()
-}
+/// The inverse: an LSA prefix triple back to a route prefix (the
+/// spf_v3 helper, shared).
+use crate::spf_v3::ipv6_prefix_of;
 
 /// The inbound event type: (interface index, datagram, the resolved
 /// destination, the cmsg hop limit when the kernel attached one).
@@ -2219,5 +2347,249 @@ mod tests {
         // Wire round-trip: encode/decode agrees byte-for-byte.
         let bytes = entry.lsa.encode();
         assert_eq!(LsaV3::decode(&bytes).unwrap(), entry.lsa);
+    }
+
+    // ---- the full §4.8 walk (S10-b M1) ------------------------------
+
+    /// A two-interface chain core: eth0/eth1 p2p with pinned ifindexes.
+    fn chain_core(rid: u32, ll0: Ipv6Addr, if0: u32, ll1: Ipv6Addr, if1: u32) -> OspfdV3 {
+        let rid_s = RouterId(rid).to_ipv4().to_string();
+        let text = format!(
+            "router ospf\n address-family ipv6-unicast\n router-id {rid_s}\n area 0.0.0.0\n  \
+             interface eth0\n   link-local {ll0}\n   ifindex {if0}\n   network-type \
+             point-to-point\n   hello-interval 2\n   dead-interval 8\n  interface eth1\n   \
+             link-local {ll1}\n   ifindex {if1}\n   network-type point-to-point\n   \
+             hello-interval 2\n   dead-interval 8\n"
+        );
+        OspfdV3::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// The chain mesh pump: wires from (core, iface) deliver to the
+    /// wired peer's matching interface. `links` maps (core, iface) ->
+    /// (peer core, peer iface).
+    fn pump_chain(
+        cores: &mut [OspfdV3],
+        links: &HashMap<(usize, usize), (usize, usize)>,
+        out: (usize, Vec<WireOutV3>),
+        now: u64,
+    ) -> Vec<((usize, usize), Vec<WireOutV3>)> {
+        let (from, wires) = out;
+        let mut replies = Vec::new();
+        for wire in wires {
+            let Some((to, to_iface)) = links.get(&(from, wire.iface)).copied() else {
+                continue;
+            };
+            let src_ll = cores[from].interfaces[wire.iface].link_local;
+            let bytes = wire.packet.encode(src_ll, wire.to.addr());
+            let received = ReceivedV6 {
+                src: src_ll,
+                payload: bytes,
+            };
+            let back = cores[to].on_packet(to_iface, &received, wire.to.addr(), None, now);
+            if !back.is_empty() {
+                replies.push(((to, to_iface), back));
+            }
+        }
+        replies
+    }
+
+    /// Run the chain until every wired pair reaches Full, then settle
+    /// (the run_to_full discipline, three-core form).
+    fn chain_to_full(
+        cores: &mut [OspfdV3],
+        links: &HashMap<(usize, usize), (usize, usize)>,
+        mut now: u64,
+    ) -> u64 {
+        let all_full = |cores: &[OspfdV3]| {
+            cores.iter().all(|c| {
+                let n_full = c
+                    .neighbor_states()
+                    .iter()
+                    .filter(|(_, _, s)| *s == NeighborState::Full)
+                    .count();
+                let wired = c.interfaces.len();
+                n_full >= wired
+            })
+        };
+        for _ in 0..40 {
+            let mut queue: Vec<(usize, Vec<WireOutV3>)> = Vec::new();
+            for (i, core) in cores.iter_mut().enumerate() {
+                let mut out = Vec::new();
+                core.tick(now, &mut out);
+                if !out.is_empty() {
+                    queue.push((i, out));
+                }
+            }
+            for _ in 0..256 {
+                match queue.pop() {
+                    Some((_, drained)) if drained.is_empty() => continue,
+                    Some((from, drained)) => {
+                        for ((to, _), back) in pump_chain(cores, links, (from, drained), now) {
+                            queue.push((to, back));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            if all_full(cores) {
+                // Settle: re-originations land (MinLSInterval).
+                for _ in 0..10 {
+                    now += 1;
+                    let mut queue: Vec<(usize, Vec<WireOutV3>)> = Vec::new();
+                    for (i, core) in cores.iter_mut().enumerate() {
+                        let mut out = Vec::new();
+                        core.tick(now, &mut out);
+                        if !out.is_empty() {
+                            queue.push((i, out));
+                        }
+                    }
+                    for _ in 0..256 {
+                        match queue.pop() {
+                            Some((_, drained)) if drained.is_empty() => continue,
+                            Some((from, drained)) => {
+                                for ((to, _), back) in
+                                    pump_chain(cores, links, (from, drained), now)
+                                {
+                                    queue.push((to, back));
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                return now;
+            }
+            now += 1;
+        }
+        now
+    }
+
+    #[test]
+    fn spf_resolves_a_multihop_asbr_through_the_tree() {
+        // A -- B -- C (two p2p links). C redistributes a v6 static.
+        // A's §4.8.5 calculation must resolve the ASBR C THROUGH the
+        // tree (cost 2 hops) and forward via B's link-local — the
+        // §16.4-lite direct-ASBR form could not do this.
+        let ll_a: Ipv6Addr = "fe80::1".parse().unwrap();
+        let ll_b0: Ipv6Addr = "fe80::2".parse().unwrap();
+        let ll_b1: Ipv6Addr = "fe80::3".parse().unwrap();
+        let ll_c: Ipv6Addr = "fe80::4".parse().unwrap();
+        let mut cores = [
+            chain_core(0x0a00_0001, ll_a, 11, ll_a, 99), // A: iface 11 (99 unwired)
+            chain_core(0x0a00_0002, ll_b0, 22, ll_b1, 33), // B: 22 to A, 33 to C
+            chain_core(0x0a00_0003, ll_c, 44, ll_c, 99), // C: iface 44
+        ];
+        // A.eth0 - B.eth0; B.eth1 - C.eth0.
+        let links: HashMap<(usize, usize), (usize, usize)> = HashMap::from([
+            ((0, 0), (1, 0)),
+            ((1, 0), (0, 0)),
+            ((1, 1), (2, 0)),
+            ((2, 0), (1, 1)),
+        ]);
+        chain_to_full(&mut cores, &links, 0);
+        for (i, core) in cores.iter().enumerate() {
+            let states: Vec<NeighborState> = core
+                .neighbor_states()
+                .into_iter()
+                .map(|(_, _, s)| s)
+                .collect();
+            assert!(
+                states.contains(&NeighborState::Full),
+                "core {i} reached Full (states: {states:?})"
+            );
+        }
+        // C redistributes.
+        let prefix: Ipv6Prefix = "2001:db8:99::/64".parse().unwrap();
+        let route = RedistributedRoute {
+            prefix: IpPrefix::V6(prefix),
+            metric: 5,
+        };
+        let mut out = Vec::new();
+        cores[2].on_redistribute_add(&route, 100, &mut out);
+        let mut queue = vec![((2usize, 0usize), out)];
+        for _ in 0..64 {
+            match queue.pop() {
+                Some((_, drained)) if drained.is_empty() => continue,
+                Some(((from, _), drained)) => {
+                    // Re-pump with the chain helper shape.
+                    for ((to, _), back) in pump_chain(&mut cores, &links, (from, drained), 100) {
+                        queue.push(((to, 0), back));
+                    }
+                }
+                None => break,
+            }
+        }
+        // A installs the external via B's link-local (the SPF's
+        // inherited first hop), NOT C's.
+        let routes = cores[0].installed_routes();
+        let entry = routes
+            .iter()
+            .find(|r| r.prefix == IpPrefix::V6(prefix))
+            .unwrap_or_else(|| panic!("A installs the multihop external: {routes:?}"));
+        assert_eq!(entry.metric, 5, "type-2 metric as-is (16.4 (4))");
+        match entry.nexthops.hops()[0].0 {
+            Nexthop::Ipv6If(gw, ifindex) => {
+                assert_eq!(
+                    gw, ll_b0,
+                    "the gateway is B's link-local (the inherited hop)"
+                );
+                assert_eq!(ifindex, 11, "A's own interface");
+            }
+            other => panic!("wrong nexthop shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iapr_prefix_routes_install_with_spf_next_hops() {
+        // After A-B Full, inject into A's LSDB an intra-area-prefix-LSA
+        // referencing B's router-LSA (what B would originate): A's
+        // stage-two walk installs the prefix via B's link-local at
+        // dist(B) + metric (4.8.1's second stage / 4.8.2's hops).
+        let ll_a: Ipv6Addr = "fe80::aa".parse().unwrap();
+        let ll_b: Ipv6Addr = "fe80::bb".parse().unwrap();
+        let mut a = core_v3(0x0a00_0001, ll_a, 11, 0);
+        let mut b = core_v3(0x0a00_0002, ll_b, 22, 0);
+        run_to_full(&mut a, &mut b, 0, 30);
+        let prefix: Ipv6Prefix = "2001:db8:42::/64".parse().unwrap();
+        let lsa = LsaV3 {
+            header: LsaHeaderV3 {
+                ls_age: 1,
+                ls_type: LsaType::V3_INTRA_AREA_PREFIX,
+                link_state_id: LinkStateId(0),
+                adv_router: RouterId(0x0a00_0002),
+                seq: 0x8000_0001,
+                checksum: 0x9999,
+                length: 0,
+            },
+            body: LsaBodyV3::IntraAreaPrefix(crate::lsa_v3::IntraAreaPrefixLsaV3 {
+                prefixes: vec![crate::lsa_v3::PrefixMetric {
+                    metric: 3,
+                    prefix: crate::lsa_v3::Prefix {
+                        len: 64,
+                        options: Default::default(),
+                        addr: prefix.addr().octets()[..8].to_vec(),
+                    },
+                }],
+                referenced_ls_type: V3_ROUTER,
+                referenced_link_state_id: LinkStateId(0),
+                referenced_adv_router: RouterId(0x0a00_0002),
+            }),
+        };
+        let _ = a.lsdb.install(lsa, true, 40);
+        a.mark_spf_dirty(40);
+        a.maybe_spf(40);
+        let routes = a.installed_routes();
+        let entry = routes
+            .iter()
+            .find(|r| r.prefix == IpPrefix::V6(prefix))
+            .unwrap_or_else(|| panic!("the IAPR prefix installs: {routes:?}"));
+        assert_eq!(entry.metric, 13, "dist(B)=10 + prefix metric 3");
+        match entry.nexthops.hops()[0].0 {
+            Nexthop::Ipv6If(gw, ifindex) => {
+                assert_eq!(gw, ll_b, "B's link-local (4.8.2)");
+                assert_eq!(ifindex, 11, "A's interface");
+            }
+            other => panic!("wrong nexthop shape: {other:?}"),
+        }
     }
 }

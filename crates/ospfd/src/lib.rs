@@ -53,6 +53,7 @@ pub mod origination;
 pub mod packet;
 pub mod packet_v3;
 pub mod spf;
+pub mod spf_v3;
 pub mod transport;
 pub mod wire;
 pub mod zedge;
