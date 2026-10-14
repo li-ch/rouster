@@ -55,7 +55,11 @@ jobs:
 
       # The testbed image from the in-repo reversed recipe, published
       # under BOTH tags: frr-testbed:ci (the built artifact) and
-      # frr-testbed:10.2.2 (the tag every smoke script pins).
+      # frr-testbed:10.2.2 (the tag every smoke script pins). The
+      # buildx docker-container driver is what makes the gha cache
+      # export work (the default docker driver rejects cache-to).
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
       - name: Build frr-testbed
         uses: docker/build-push-action@v6
         with:
