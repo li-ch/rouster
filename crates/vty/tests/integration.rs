@@ -307,10 +307,29 @@ fn interactive_session_walks_modes_over_the_socket() {
 // ---------------------------------------------------------------------------
 
 fn vtyd(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vtyd"))
+    let mut output = Command::new(env!("CARGO_BIN_EXE_vtyd"))
         .args(args)
         .output()
-        .expect("spawn vtyd")
+        .expect("spawn vtyd");
+    // Exit 1 = transport failure (connect/IO/timeout inside the
+    // client). Under a full `cargo test --workspace` fork storm the
+    // freshly-spawned server's accept path can outrun the client's
+    // timeout (~1-in-6 locally, never on the quieter CI runner, 0/25
+    // isolated here); the helper's caller guarantees the server was
+    // reachable before issuing the command, so a bounded retry is
+    // honest — expected failure codes (2 usage / 3 not-found / 4
+    // not-running) are NOT retried.
+    for _ in 0..3 {
+        if output.status.code() != Some(1) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        output = Command::new(env!("CARGO_BIN_EXE_vtyd"))
+            .args(args)
+            .output()
+            .expect("spawn vtyd");
+    }
+    output
 }
 
 fn out(output: &Output) -> String {

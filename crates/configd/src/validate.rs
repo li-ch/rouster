@@ -328,6 +328,13 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
+    /// Serializes every validate_rendered/validate_canonical-calling
+    /// test: the staging filename derives from the module's shared
+    /// seq counter, so a concurrent same-daemon test can otherwise
+    /// take the seq this test reserved (observed as a 1-in-N flake
+    /// under `cargo test --workspace`).
+    static VALIDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "configd-validate-{tag}-{}-{:?}",
@@ -339,37 +346,33 @@ mod tests {
         dir
     }
 
-    /// Counts the validator temp files in the shared tmpdir (other
-    /// test processes create theirs concurrently, so only the DELTA
-    /// around this test's own call is meaningful).
-    fn temp_leftovers() -> usize {
-        std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("configd-validate-")
-            })
-            .count()
-    }
-
     #[test]
     fn validated_when_the_daemon_accepts() {
+        let _validate_guard = VALIDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("ok");
         standin_daemon(&dir, "savd");
-        let before = temp_leftovers();
+        // The exact temp file THIS call will create: seq comes from
+        // the module counter, so the assertion is immune to sibling
+        // tests holding their own conf files (the hang-timeout test
+        // legitimately keeps its for the full bounded-run window).
+        let seq = TEMP_SEQ.fetch_add(0, std::sync::atomic::Ordering::Relaxed);
+        let own = std::env::temp_dir().join(format!(
+            "configd-validate-{}-{seq}-savd.conf",
+            std::process::id()
+        ));
         let verdict = validate_rendered(Daemon::Savd, "mode strict\n", std::slice::from_ref(&dir));
         assert_eq!(verdict, Validation::Validated);
         assert!(
-            temp_leftovers() <= before,
-            "this call's validator temp file was cleaned up"
+            !own.exists(),
+            "this call's validator temp file was cleaned up: {}",
+            own.display()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn refused_carries_the_daemon_stderr_verbatim() {
+        let _validate_guard = VALIDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("refuse");
         standin_daemon(&dir, "bfdd");
         let verdict =
@@ -386,6 +389,7 @@ mod tests {
 
     #[test]
     fn absent_binary_and_flagless_binary_are_skips_not_failures() {
+        let _validate_guard = VALIDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("skips");
         // No binaries at all.
         assert_eq!(
@@ -435,6 +439,7 @@ mod tests {
 
     #[test]
     fn validate_canonical_walks_sections_in_apply_order() {
+        let _validate_guard = VALIDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("canonical");
         standin_daemon(&dir, "savd");
         standin_daemon(&dir, "bgpd");
@@ -453,6 +458,7 @@ mod tests {
 
     #[test]
     fn a_wedged_validator_times_out_as_a_skip() {
+        let _validate_guard = VALIDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("wedge");
         // Probes --help honestly (so the flag check passes fast), then
         // wedges on the validate arm — the bound must kill it.
