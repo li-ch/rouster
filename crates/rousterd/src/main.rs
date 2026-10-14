@@ -20,6 +20,11 @@
 //! `staticd` binary (config → ZAPI client of this daemon — the FRR shape).
 //! rousterd's direct config load is LEGACY: `--once` (CI smoke) and resident
 //! mode without a `zapi socket` line keep it for now.
+//!
+//! `--validate-config <PATH>` (S8-c): parse a candidate config file and
+//! exit 0 (one-line OK on stderr) or 1 (the parser's line-numbered error
+//! verbatim) — the daemon half of configd's pre-apply semantic-validation
+//! gate (docs/protocols/config.md §Deferred-1, landed).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,14 +47,22 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// queue growth.
 const ZAPI_COMMAND_QUEUE: usize = 256;
 
-struct Args {
-    config: PathBuf,
-    once: bool,
+enum Args {
+    Run {
+        config: PathBuf,
+        once: bool,
+    },
+    /// `--validate-config <PATH>` (S8-c): parse a candidate config
+    /// file and exit 0/1 — the configd pre-apply gate's daemon half.
+    Validate {
+        path: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut config = None;
     let mut once = false;
+    let mut validate = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -57,17 +70,59 @@ fn parse_args() -> Result<Args, String> {
                 config = Some(PathBuf::from(it.next().ok_or("--config requires a path")?));
             }
             "--once" => once = true,
+            "--validate-config" => {
+                validate = Some(PathBuf::from(
+                    it.next().ok_or("--validate-config requires a path")?,
+                ));
+            }
             "--help" | "-h" => {
                 println!("usage: rousterd --config <PATH> [--once]");
+                println!("       rousterd --validate-config <PATH>");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    Ok(Args {
+    if let Some(path) = validate {
+        return Ok(Args::Validate { path });
+    }
+    Ok(Args::Run {
         config: config.ok_or("missing --config <PATH>")?,
         once,
     })
+}
+
+/// The `--validate-config` arm: parse the candidate file with the
+/// daemon's own parser and report. Exit 0 with a one-line OK on
+/// stderr, or exit 1 with the parser's line-numbered error verbatim
+/// (configd surfaces it as the apply's refusal reason). Runs before
+/// any dataplane construction, so it works on any host.
+fn validate_config(path: &std::path::Path) -> i32 {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match rousterd::config::parse_config(&text) {
+            Ok(config) => {
+                eprintln!(
+                    "rousterd: {}: OK ({} static routes, zapi socket {})",
+                    path.display(),
+                    config.static_routes.len(),
+                    if config.zapi_socket.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("rousterd: {}: {err}", path.display());
+                1
+            }
+        },
+        Err(err) => {
+            eprintln!("rousterd: cannot read {}: {err}", path.display());
+            1
+        }
+    }
 }
 
 /// Re-reads and re-parses the config file. Errors keep the running config
@@ -115,19 +170,33 @@ async fn main() -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
     })?;
 
+    // The validate arm is config-only: it must never need netlink, so
+    // it exits before the dataplane construction below (host-runnable
+    // anywhere — the configd pre-apply gate depends on that).
+    if let Args::Validate { path } = &args {
+        std::process::exit(validate_config(path));
+    }
+    let Args::Run {
+        config: args_config,
+        once: args_once,
+    } = &args
+    else {
+        unreachable!("the validate arm exited above");
+    };
+
     // Dataplane (Linux only; stub errors out on other platforms).
     let (dp, conn) = NetlinkDataplane::new()?;
     tokio::spawn(conn);
 
     // Static routes → RIB → kernel. Legacy path (see module docs): the
     // canonical static-route source is the staticd binary speaking ZAPI.
-    let text = std::fs::read_to_string(&args.config)?;
+    let text = std::fs::read_to_string(args_config)?;
     let config = rousterd::config::parse_config(&text).map_err(|e| {
         error!(%e, "config parse failed");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
     let routes = &config.static_routes;
-    info!(count = routes.len(), path = %args.config.display(), "loaded static routes");
+    info!(count = routes.len(), path = %args_config.display(), "loaded static routes");
 
     let mut driver = RibDriver::new();
     for route in routes {
@@ -199,7 +268,7 @@ async fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     info!(kernel_routes, "kernel route mirror check");
 
-    if args.once {
+    if *args_once {
         info!("--once: routes installed, exiting");
         return Ok(());
     }
@@ -264,7 +333,7 @@ async fn main() -> std::io::Result<()> {
             }
             _ = hangup.recv() => {
                 info!("SIGHUP: reloading config");
-                match reload_config(&args.config) {
+                match reload_config(args_config) {
                     Ok(new_config) => {
                         if new_config.zapi_socket != config.zapi_socket {
                             warn!("zapi socket change requires a restart; keeping running socket");
