@@ -101,14 +101,32 @@ jobs:
       # lacks CAP_SYS_MODULE and /lib/modules (run 38647649951: vty,
       # w4, w4b, m4 all failed exactly there, while veth — loaded by
       # docker's own bridge networking — worked). Ubuntu's azure
-      # kernels ship vrf/dummy as modules; loading them on the host
-      # once makes the link kinds available to every container.
-      # `|| true` keeps kernels with them built-in green.
+      # kernels ship vrf/dummy as modules — and the runner image's
+      # /lib/modules does NOT carry them (run 38653788986:
+      # "modprobe: FATAL: Module vrf not found"), so pull the matching
+      # modules-extra package first. The final probe states plainly
+      # whether the link kinds are available; if not, the vrf legs
+      # fail honestly rather than silently.
       - name: Load vrf and dummy kernel modules
         run: |
-          sudo modprobe vrf || true
-          sudo modprobe dummy || true
-          lsmod | grep -E '^vrf|^dummy' || true
+          sudo modprobe vrf 2>/dev/null || true
+          sudo modprobe dummy 2>/dev/null || true
+          if ! sudo modprobe vrf 2>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" \
+              || sudo apt-get install -y -qq linux-modules-extra-azure \
+              || echo "::warning::no linux-modules-extra package for $(uname -r)"
+            sudo modprobe vrf || true
+            sudo modprobe dummy || true
+          fi
+          sudo ip link add vrf-ci-probe type vrf table 4294967295 2>/dev/null \
+            && sudo ip link del vrf-ci-probe \
+            && echo "vrf link kind: available" \
+            || echo "::warning::vrf link kind NOT available on this kernel — the vrf smoke legs will fail"
+          sudo ip link add dummy-ci-probe type dummy 2>/dev/null \
+            && sudo ip link del dummy-ci-probe \
+            && echo "dummy link kind: available" \
+            || echo "::warning::dummy link kind NOT available on this kernel — the dummy smoke legs will fail"
 
       - name: Run the smoke suite
         shell: bash
