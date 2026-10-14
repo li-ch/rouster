@@ -2220,8 +2220,26 @@ impl Ospfd {
             if lsa.header.adv_router == self.router_id {
                 continue;
             }
-            // (3) The own-range check needs configured area ranges —
-            // v1 has none (disclosed); every summary is examined.
+            // (3) The own-active-range check: a summary-LSA whose
+            // network falls inside one of OUR configured ranges that
+            // we are ACTIVELY advertising (at least one contributing
+            // intra-area route in the range's area) is not installed
+            // — the inter-area view of a range we own is suppressed.
+            let own_active_range = |prefix: &Ipv4Prefix| {
+                self.areas.iter().any(|(area_id, a)| {
+                    a.ranges.iter().any(|r| {
+                        r.advertise
+                            && r.prefix.prefix_len() <= prefix.prefix_len()
+                            && r.prefix.contains(prefix.addr())
+                            && ribs.values().any(|m| {
+                                m.area == *area_id
+                                    && !m.inter_area
+                                    && r.prefix.prefix_len() <= m.prefix.prefix_len()
+                                    && r.prefix.contains(m.prefix.addr())
+                            })
+                    })
+                })
+            };
             // (4) BR must be reachable in the examined area.
             let Some(br) = routers.get(&lsa.header.adv_router).and_then(|paths| {
                 paths
@@ -2240,6 +2258,9 @@ impl Ospfd {
                     let key = (u32::from(addr), u32::from(body.mask));
                     let prefix =
                         Ipv4Prefix::new(addr, mask_prefix(body.mask)).expect("summary mask");
+                    if own_active_range(&prefix) {
+                        continue; // (3): our own active range owns this network
+                    }
                     match ribs.get_mut(&key) {
                         // (5) no entry: install.
                         None => {
@@ -2700,6 +2721,68 @@ impl Ospfd {
                 }
                 AreaKind::Normal => {}
             }
+            // ---- §12.4.3's address ranges: one summary per ACTIVE
+            // range (its metric the minimum of the contributing
+            // routes' costs, or the configured `cost` override), the
+            // member networks' own summaries suppressed (a
+            // DoNotAdvertise range suppresses them outright).
+            // Ranges are configured on the range-OWNING area and
+            // aggregate ITS intra-area routes advertised out.
+            for area_s in &area_ids {
+                if area_s == area_a {
+                    continue; // never back into the range's own area
+                }
+                let Some(src) = self.areas.get(area_s) else {
+                    continue;
+                };
+                for range in &src.ranges {
+                    // "Active": at least one contributing intra-area
+                    // route of the range's area (§12.4.3).
+                    let members: Vec<u32> = ribs
+                        .values()
+                        .filter(|p| {
+                            p.area == *area_s
+                                && !p.inter_area
+                                && range.prefix.prefix_len() <= p.prefix.prefix_len()
+                                && range.prefix.contains(p.prefix.addr())
+                        })
+                        .map(|p| p.cost)
+                        .collect();
+                    if members.is_empty() {
+                        continue; // inactive: no range summary, members individual
+                    }
+                    if !range.advertise {
+                        continue; // DoNotAdvertise: members suppressed below
+                    }
+                    // The split-horizon gate on the contributing set:
+                    // a range whose members' paths all leave through
+                    // Area A itself is not advertised into A.
+                    let via_target = ribs.values().any(|p| {
+                        p.area == *area_s
+                            && !p.inter_area
+                            && range.prefix.prefix_len() <= p.prefix.prefix_len()
+                            && range.prefix.contains(p.prefix.addr())
+                            && self.hops_in_area(&p.hops) == Some(*area_a)
+                    });
+                    if via_target {
+                        continue;
+                    }
+                    let metric = range
+                        .cost
+                        .unwrap_or_else(|| members.iter().copied().min().unwrap_or(0));
+                    if metric >= crate::LS_INFINITY {
+                        continue;
+                    }
+                    let key = LsaKey {
+                        ls_type: LsaType::SUMMARY_NETWORK,
+                        link_state_id: crate::lsa::LinkStateId(
+                            u32::from(range.prefix.addr()) & Self::prefix_as_mask(&range.prefix),
+                        ),
+                        adv_router: self.router_id,
+                    };
+                    desired.insert((*area_a, key), metric);
+                }
+            }
             for path in ribs.values() {
                 // §12.4.3's gating, in the RFC's order:
                 // - Destination Type network (yes — ribs holds
@@ -2708,6 +2791,25 @@ impl Ospfd {
                 //   the Area A itself": skip.
                 if path.area == *area_a {
                     continue;
+                }
+                // - The range-owning area's ACTIVE ranges claim their
+                //   members (§12.4.3: "Instead ... a single
+                //   summary-LSA is advertised for each range").
+                if let Some(src) = self.areas.get(&path.area) {
+                    if !path.inter_area
+                        && src.ranges.iter().any(|r| {
+                            r.prefix.prefix_len() <= path.prefix.prefix_len()
+                                && r.prefix.contains(path.prefix.addr())
+                                && ribs.values().any(|m| {
+                                    m.area == path.area
+                                        && !m.inter_area
+                                        && r.prefix.prefix_len() <= m.prefix.prefix_len()
+                                        && r.prefix.contains(m.prefix.addr())
+                                })
+                        })
+                    {
+                        continue;
+                    }
                 }
                 // - "the next hops ... belong to Area A itself"
                 //   (split horizon): skip.
@@ -2851,13 +2953,28 @@ impl Ospfd {
                 // 0.0.0.0 (§12.4.3.1/§A.4.4).
                 Ipv4Addr::UNSPECIFIED
             } else {
-                match ribs
-                    .values()
-                    .find(|r| u32::from(r.prefix.addr()) == key.link_state_id.0)
-                    .map(|r| r.prefix)
-                {
-                    Some(prefix) => Ipv4Addr::from(u32::MAX << (32 - prefix.prefix_len())),
-                    None => continue,
+                // §12.4.3's range summaries FIRST: the LS ID is the
+                // range network — a member network sharing the range's
+                // address would otherwise shadow the range's mask.
+                let range_mask = self.areas.values().find_map(|a| {
+                    a.ranges
+                        .iter()
+                        .find(|r| {
+                            u32::from(r.prefix.addr()) & Self::prefix_as_mask(&r.prefix)
+                                == key.link_state_id.0
+                        })
+                        .map(|r| Ipv4Addr::from(u32::MAX << (32 - r.prefix.prefix_len())))
+                });
+                match range_mask {
+                    Some(mask) => mask,
+                    None => match ribs
+                        .values()
+                        .find(|r| u32::from(r.prefix.addr()) == key.link_state_id.0)
+                        .map(|r| r.prefix)
+                    {
+                        Some(prefix) => Ipv4Addr::from(u32::MAX << (32 - prefix.prefix_len())),
+                        None => continue,
+                    },
                 }
             };
             let lsa = crate::origination::build_summary_lsa(
@@ -5294,6 +5411,173 @@ router ospf\n router-id 10.255.3.1\n area 0.0.0.0\n  interface eth0\n   address 
         assert!(
             !lsdb_of(&a).contains(&sum.key()),
             "type-3 not admitted into a totally stubby area (no-summary)"
+        );
+    }
+
+    /// The ABR with a second area-1 interface (two intra networks:
+    /// 10.20.0.0/30 and 10.20.4.0/30) and an optional area-1 range.
+    fn abr_core_ranged(range: &str) -> Ospfd {
+        let text = format!(
+            concat!(
+                "router ospf\n",
+                " router-id 10.255.2.1\n",
+                " area 0.0.0.0\n",
+                "  interface eth0\n",
+                "   address 10.10.0.1/30\n",
+                "   network-type point-to-point\n",
+                "   hello-interval 1\n",
+                "   dead-interval 4\n",
+                " area 0.0.0.1\n",
+                "  interface eth1\n",
+                "   address 10.20.0.1/30\n",
+                "   network-type point-to-point\n",
+                "   hello-interval 1\n",
+                "   dead-interval 4\n",
+                "  interface eth2\n",
+                "   address 10.20.4.1/30\n",
+                "   hello-interval 1\n",
+                "   dead-interval 4\n",
+                "{range}",
+            ),
+            range = range,
+        );
+        Ospfd::new(&parse_config(&text).unwrap()).unwrap()
+    }
+
+    /// §12.4.3's address ranges: the range-owning area's two intra
+    /// networks coalesce into ONE range summary in the other areas
+    /// (metric = the members' minimum), the per-network summaries
+    /// suppressed; a configured `cost` overrides the metric;
+    /// DoNotAdvertise suppresses everything.
+    #[test]
+    fn area_ranges_coalesce_summaries() {
+        let run = |range: &str| {
+            let mut cores = vec![abr_core_ranged(range), area0_core()];
+            let now = run_multi(&mut cores, 0, 10);
+            let abr = &cores[0];
+            let a0 = abr.areas.get(&0).unwrap();
+            let summaries: Vec<(u32, u8, u32)> = a0
+                .lsdb
+                .all()
+                .filter(|e| {
+                    e.lsa.header.ls_type == LsaType::SUMMARY_NETWORK
+                        && e.lsa.header.adv_router == abr.router_id
+                        && !e.lsa.header.is_max_age()
+                })
+                .filter_map(|e| {
+                    let crate::lsa::LsaBody::Summary(sm) = &e.lsa.body else {
+                        return None;
+                    };
+                    Some((
+                        e.lsa.header.link_state_id.0 & u32::from(sm.mask),
+                        u32::from(sm.mask).count_ones() as u8,
+                        sm.metric,
+                    ))
+                })
+                .collect();
+            (summaries, now)
+        };
+        // The plain range: ONE /16 summary (metric = the members'
+        // minimum = the interface cost 10), no per-network /30s.
+        let (summaries, _now) = run(" area 0.0.0.1 range 10.20.0.0/16\n");
+        assert_eq!(
+            summaries,
+            vec![(u32::from(ip("10.20.0.0")), 16, 10)],
+            "one coalesced /16 at the members' minimum (12.4.3): {summaries:?}"
+        );
+        // The cost override.
+        let (summaries, _) = run(" area 0.0.0.1 range 10.20.0.0/16 advertise cost 5\n");
+        assert_eq!(
+            summaries,
+            vec![(u32::from(ip("10.20.0.0")), 16, 5)],
+            "the configured cost overrides: {summaries:?}"
+        );
+        // DoNotAdvertise: nothing for the members.
+        let (summaries, _) = run(" area 0.0.0.1 range 10.20.0.0/16 not-advertise\n");
+        assert!(
+            summaries.is_empty(),
+            "a DoNotAdvertise range suppresses the members (12.4.3): {summaries:?}"
+        );
+    }
+
+    /// §16.2 step (3): a foreign summary-LSA describing a network
+    /// inside one of OUR actively-advertised ranges is not installed
+    /// as an inter-area route (the range is ours).
+    #[test]
+    fn own_active_range_shields_foreign_summaries() {
+        let mut cores = vec![
+            abr_core_ranged(" area 0.0.0.1 range 10.20.0.0/16\n"),
+            area0_core(),
+        ];
+        let now = run_multi(&mut cores, 0, 10);
+        // The range is ACTIVE (two contributing intra routes).
+        let abr = &mut cores[0];
+        assert!(
+            abr.areas.get(&0).unwrap().lsdb.contains(&LsaKey {
+                ls_type: LsaType::SUMMARY_NETWORK,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("10.20.0.0"))),
+                adv_router: abr.router_id,
+            }),
+            "our range summary is advertised (the range is active)"
+        );
+        // A FOREIGN summary-LSA for a network inside the range,
+        // injected into the backbone (a foreign ABR's view).
+        let foreign = crate::lsa::Lsa {
+            header: crate::lsa::LsaHeader {
+                ls_age: 1,
+                options: Options(0x02),
+                ls_type: LsaType::SUMMARY_NETWORK,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("10.20.4.0"))),
+                // Advertised by the ADJACENT area-0 peer (16.2 (4):
+                // the BR must be reachable in the examined area).
+                adv_router: RouterId(u32::from(ip("10.255.1.1"))),
+                seq: 0x8000_0001,
+                checksum: 0,
+                length: 0,
+            },
+            body: crate::lsa::LsaBody::Summary(crate::lsa::SummaryLsa {
+                mask: ip("255.255.255.0"),
+                metric: 3,
+                tos: vec![],
+            }),
+        };
+        // And a control: a foreign summary OUTSIDE our ranges still
+        // installs (the shield is range-scoped, not a blanket drop).
+        let control = crate::lsa::Lsa {
+            header: crate::lsa::LsaHeader {
+                ls_age: 1,
+                options: Options(0x02),
+                ls_type: LsaType::SUMMARY_NETWORK,
+                link_state_id: crate::lsa::LinkStateId(u32::from(ip("10.99.0.0"))),
+                adv_router: RouterId(u32::from(ip("10.255.1.1"))),
+                seq: 0x8000_0001,
+                checksum: 0,
+                length: 0,
+            },
+            body: crate::lsa::LsaBody::Summary(crate::lsa::SummaryLsa {
+                mask: ip("255.255.255.0"),
+                metric: 3,
+                tos: vec![],
+            }),
+        };
+        let a0 = abr.areas.get_mut(&0).unwrap();
+        let _ = a0.lsdb.install(foreign.with_computed_header(), true, now);
+        let _ = a0.lsdb.install(control.with_computed_header(), true, now);
+        // The direct install bypasses the change-class marking —
+        // mark the AS-scope class and run the walk.
+        cores[0].table_dirty = true;
+        let mut out = Vec::new();
+        let mut zap = Vec::new();
+        cores[0].maybe_spf(now + 1, &mut out, &mut zap);
+        // The foreign 10.20.4.0/24 inter-area route is NOT installed
+        // (16.2 (3)); the control outside the range IS.
+        assert!(
+            !cores[0].routes.contains_key("10.20.4.0/24"),
+            "the foreign summary inside our active range is not installed (16.2 (3))"
+        );
+        assert!(
+            cores[0].routes.contains_key("10.99.0.0/24"),
+            "a foreign summary outside our ranges installs normally"
         );
     }
 

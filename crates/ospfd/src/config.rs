@@ -788,6 +788,56 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                 }
                                 continue;
                             }
+                            ["range", prefix, "advertise" | "not-advertise", "cost", n] => {
+                                // The full FRR form: advertise status +
+                                // an explicit metric override.
+                                let not = words[4] == "not-advertise";
+                                let cost: u32 =
+                                    n.parse().ok().filter(|v| *v <= 0x00ff_ffff).ok_or_else(
+                                        || {
+                                            parse_error(
+                                                line_no,
+                                                "expected: range <a.b.c.d/m> [advertise|not-advertise] cost <0-16777215>",
+                                            )
+                                        },
+                                    )?;
+                                let Some((net, len)) = parse_prefix(prefix) else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: range <a.b.c.d/m> [advertise|not-advertise] [cost <n>]",
+                                    ));
+                                };
+                                let range = AreaRange {
+                                    prefix: common::Ipv4Prefix::new(Ipv4Addr::from(net), len)
+                                        .expect("range prefix"),
+                                    advertise: !not,
+                                    cost: Some(cost),
+                                };
+                                match cfg.areas.iter_mut().find(|a| a.id == raw) {
+                                    Some(existing) => match existing
+                                        .ranges
+                                        .iter_mut()
+                                        .find(|r| r.prefix == range.prefix)
+                                    {
+                                        Some(r) => {
+                                            r.advertise = !not;
+                                            r.cost = Some(cost);
+                                        }
+                                        None => existing.ranges.push(range),
+                                    },
+                                    None => cfg.areas.push(AreaConfig {
+                                        id: raw,
+                                        kind: AreaKind::Normal,
+                                        default_cost: 1,
+                                        virtual_links: Vec::new(),
+                                        ranges: vec![range],
+                                        nssa_translator_role: NssaTranslatorRole::default(),
+                                        translator_stability_interval: 40,
+                                        interfaces: BTreeMap::new(),
+                                    }),
+                                }
+                                continue;
+                            }
                             ["range", prefix, "advertise" | "not-advertise"] => {
                                 let not = words[4] == "not-advertise";
                                 let Some((net, len)) = parse_prefix(prefix) else {
