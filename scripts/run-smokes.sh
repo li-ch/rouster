@@ -127,6 +127,14 @@ for script in "${scripts[@]}"; do
 done
 total=$((SECONDS - suite_start))
 
+# The runner exits with the failure count (0 = green); the summary
+# line carries it too so CI's job log states the exit code at a
+# glance (the S10-d guard).
+if [ "$failures" -gt 125 ]; then
+    # Keep the exit status well away from 256-wraparound territory.
+    failures=125
+fi
+
 printf '\n==================== smoke summary ====================\n'
 printf '%-28s %-5s %7s  %s\n' SCRIPT RESULT TIME EXIT
 printf -- '-----------------------------------------------------\n'
@@ -135,12 +143,6 @@ for row in "${rows[@]}"; do
     printf '%-28s %-5s %7s  %s\n' $row
 done
 printf -- '-----------------------------------------------------\n'
-printf '%d run, %d pass, %d fail — %ds total\n' \
-    "${#rows[@]}" "$(( ${#rows[@]} - failures ))" "$failures" "$total"
-
-if [ "$failures" -gt 0 ]; then
-    # Keep the exit status well away from 256-wraparound territory.
-    [ "$failures" -gt 125 ] && failures=125
-    exit "$failures"
-fi
-exit 0
+printf '%d run, %d pass, %d fail (exit=%d) — %ds total\n' \
+    "${#rows[@]}" "$(( ${#rows[@]} - failures ))" "$failures" "$failures" "$total"
+exit "$failures"

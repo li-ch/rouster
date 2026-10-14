@@ -93,8 +93,41 @@ jobs:
             -p rousterctl --bin rousterctl
           cargo build -p rpki --bin rtr-check # host-native debug, like the gortr smoke
 
+      # Kernel-module parity for the runner. The suite's VRF/dummy
+      # legs (`ip link add ... type vrf|dummy` inside unprivileged
+      # containers) print "Error: Unknown device type." when the host
+      # kernel's vrf/dummy modules are not loaded: the kernel's
+      # request_module() cannot fire from inside a container that
+      # lacks CAP_SYS_MODULE and /lib/modules (run 38647649951: vty,
+      # w4, w4b, m4 all failed exactly there, while veth — loaded by
+      # docker's own bridge networking — worked). Ubuntu's azure
+      # kernels ship vrf/dummy as modules; loading them on the host
+      # once makes the link kinds available to every container.
+      # `|| true` keeps kernels with them built-in green.
+      - name: Load vrf and dummy kernel modules
+        run: |
+          sudo modprobe vrf || true
+          sudo modprobe dummy || true
+          lsmod | grep -E '^vrf|^dummy' || true
+
       - name: Run the smoke suite
-        run: scripts/run-smokes.sh
+        shell: bash
+        run: |
+          # Actions' bash runs with -e; lift it so a failing suite
+          # still reaches the exit-code capture + summary below.
+          set +e
+          scripts/run-smokes.sh 2>&1 | tee /tmp/smokes-suite.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "## smoke suite"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 40 /tmp/smokes-suite.log >> "$GITHUB_STEP_SUMMARY" || true
+          {
+            echo '```'
+            echo "run-smokes exit code: $rc"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
       - name: Upload smoke logs
         if: failure()
