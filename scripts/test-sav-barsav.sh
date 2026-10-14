@@ -309,6 +309,20 @@ docker exec "$CUST" ip addr add 198.18.100.9/32 dev lo
 docker exec "$PEER" ip addr add 198.19.100.9/32 dev lo
 docker exec "$PROV" ip addr add 198.19.0.9/32 dev lo
 
+# Probe legs on the peer/provider bridges (CUST, the sender of the
+# spoof probes, gets one veth on each target bridge). Without these,
+# the §8/peer-spoof probes route CUST -> docker gw -> host -> the
+# other bridge — cross-bridge container traffic that stock docker
+# DROPS by default (DOCKER-ISOLATION; docs.docker.com: "containers on
+# different bridge networks cannot communicate"). The dev docker VM
+# used locally permits it, which is why the smokes never noticed
+# (run 38653788986: exactly the two cross-bridge probes 100% loss,
+# every same-bridge probe 0%). With the legs the probes are same-
+# bridge L2 and still arrive on eth3/eth2 with the cone source —
+# the SAV premise unchanged; no BGP peering happens over them.
+docker network connect --ip 172.27.0.9 "$NET_PEER" "$CUST"
+docker network connect --ip 172.28.0.9 "$NET_PROV" "$CUST"
+
 echo "==> configs: rpki snapshot shared by bgpd and savd"
 docker exec "$ROUSTER" sh -c "printf '%s\n' \
   'vrp $CUST_NET_PFX max 24 as 201' \
