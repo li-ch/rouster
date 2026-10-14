@@ -3,24 +3,38 @@
 //! file+SIGHUP the interim it orchestrates).
 //!
 //! One canonical `rouster.conf` superset composes every daemon's
-//! config. The pipeline (milestones land in order):
+//! config. The pipeline:
 //!
 //! 1. **Parse** the canonical file into a section tree with line
 //!    numbers ([`tree`]) — structural validation only; semantic
 //!    validation stays with each daemon at reload time.
-//! 2. **Render** each daemon's file from its section, byte-stable.
-//! 3. **Apply** transactionally: atomic temp+rename writes to each
-//!    daemon's config path, SIGHUP to every armed daemon in
-//!    dependency order (rousterd first, protocols after), a
-//!    generation recorded under `<run-dir>/configd/` (current +
-//!    previous), and a status file at `<run-dir>/configd.status`.
-//!    Rollback v1 is explicit: `configd rollback` re-applies the
-//!    previous generation.
+//! 2. **Render** each daemon's file from its section, byte-stable
+//!    ([`render`]).
+//! 3. **Apply** transactionally ([`apply`]): atomic temp+rename
+//!    writes to each daemon's config path, SIGHUP to every armed
+//!    daemon in dependency order (rousterd first, protocols after),
+//!    a generation recorded under `<run-dir>/configd/` (current +
+//!    previous), and the status file published at
+//!    `<run-dir>/configd.status` ([`status`]). Rollback v1 is
+//!    explicit: `rollback` re-applies the previous generation.
+//!    Automatic rollback on daemon error is §Deferred (it needs
+//!    daemon status-file semantics beyond v1).
 //!
 //! Canonical grammar owner: `docs/protocols/config.md` (the apply
 //! pipeline diagram, the run-dir contract extension, and §Deferred
 //! live there).
 
+pub mod apply;
+pub mod atomic;
+pub mod render;
+pub mod signal;
+pub mod status;
 pub mod tree;
 
+pub use apply::{
+    apply, apply_file, rollback, ApplyError, ApplyOptions, ApplyReport, DaemonOutcome,
+    RollbackSource, KEEP_GENERATIONS,
+};
+pub use render::{render_all, render_daemon};
+pub use status::{parse_status, read as read_status, ConfigdStatus};
 pub use tree::{parse, BodyLine, Canonical, Daemon, ParseError, Section};
