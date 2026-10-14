@@ -6,8 +6,11 @@
 //! signal wiring (SIGTERM/SIGINT → ManualStop → Cease per §6.7;
 //! SIGUSR1 → ROUTE-REFRESH per RFC 2918).
 //!
-//! Usage: `bgpd --config <PATH>`.
+//! Usage: `bgpd --config <PATH>`, or `bgpd --validate-config <PATH>`
+//! to parse a candidate config and exit 0/1 (the configd pre-apply
+//! gate's daemon half, S8-c).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,18 +22,27 @@ use tracing::{error, info, warn};
 
 fn main() {
     let mut config_path = None;
+    let mut validate_path = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" | "-f" => {
                 config_path = Some(
                     it.next()
-                        .map(std::path::PathBuf::from)
+                        .map(PathBuf::from)
                         .expect("--config requires a path"),
+                );
+            }
+            "--validate-config" => {
+                validate_path = Some(
+                    it.next()
+                        .map(PathBuf::from)
+                        .expect("--validate-config requires a path"),
                 );
             }
             "--help" | "-h" => {
                 println!("usage: bgpd --config <PATH>");
+                println!("       bgpd --validate-config <PATH>");
                 std::process::exit(0);
             }
             other => {
@@ -38,6 +50,11 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    // The validate arm is config-only: it exits before the runtime,
+    // sockets, or sessions, so it runs on any host.
+    if let Some(path) = validate_path {
+        std::process::exit(validate_config(&path));
     }
     let config_path = config_path.expect("missing --config <PATH>");
 
@@ -218,4 +235,69 @@ fn main() {
             std::process::exit(1);
         }
     });
+}
+
+/// `--validate-config` (the S8-a rider; configd's pre-apply gate's
+/// daemon half): parse the candidate file with the daemon's own
+/// parser and run every synchronous startup refusal — the named
+/// policy compile (a bad route-map is a config error, not a warning)
+/// and the RPKI static legs (the cache address syntax, the vrp-file
+/// content). Exit 0 with a one-line OK on stderr, or exit 1 with the
+/// line-numbered error verbatim (configd surfaces it as the apply's
+/// refusal reason). What it deliberately does NOT do: dial the RTR
+/// cache, open the ZAPI socket, or bind :179 — those are runtime
+/// concerns, not config validity.
+fn validate_config(path: &Path) -> i32 {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("bgpd: cannot read {}: {e}", path.display());
+            return 1;
+        }
+    };
+    let config = match bgpd::config::parse_config(&text) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("bgpd: {}: {e}", path.display());
+            return 1;
+        }
+    };
+    if let Err(e) = bgpd::policy_engine::compile_named_policy(&config) {
+        eprintln!("bgpd: {}: {e}", path.display());
+        return 1;
+    }
+    if let Some((host, _port)) = &config.rpki.cache {
+        if host.parse::<std::net::IpAddr>().is_err() {
+            eprintln!(
+                "bgpd: {}: rpki cache `{host}` is not an address",
+                path.display()
+            );
+            return 1;
+        }
+    }
+    if let Some(vrp) = &config.rpki.vrp_file {
+        let text = match std::fs::read_to_string(vrp) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!(
+                    "bgpd: {}: cannot read vrp-file {}: {e}",
+                    path.display(),
+                    vrp.display()
+                );
+                return 1;
+            }
+        };
+        if let Err(e) = bgpd::rov::parse_vrp_file(&text) {
+            eprintln!("bgpd: {}: vrp-file {}: {e}", path.display(), vrp.display());
+            return 1;
+        }
+    }
+    eprintln!(
+        "bgpd: {}: OK (local AS {}, {} neighbors, {} networks)",
+        path.display(),
+        config.local_as,
+        config.neighbors.len(),
+        config.networks.len()
+    );
+    0
 }
