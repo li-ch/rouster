@@ -6,7 +6,9 @@
 //! files, and the logging surface.
 //!
 //! Usage: `bfdd --config <PATH> [--pidfile <PATH>] [--status-file
-//! <PATH>]`, or `bfdd --show` to print the published status.
+//! <PATH>]`, or `bfdd --show` to print the published status, or
+//! `bfdd --validate-config <PATH>` to parse a candidate config and
+//! exit 0/1 (the configd pre-apply gate's daemon half, S8-c).
 //!
 //! Operator surface (A21), run-dir files only — no IPC: a pidfile
 //! (`/run/rouster/bfdd.pid`) written at start and removed on clean
@@ -38,7 +40,10 @@ const DEFAULT_STATUS_FILE: &str = "/run/rouster/bfdd.status";
 /// values even when no transition fires).
 const STATUS_REFRESH: Duration = Duration::from_secs(1);
 
-/// What the operator asked bfdd to do.
+/// What the operator asked bfdd to do: run the daemon, print the
+/// published status, or validate a candidate config file
+/// (`--validate-config` — the configd pre-apply gate's daemon half,
+/// S8-c; no sockets, no sessions, exits before any daemon setup).
 enum Command {
     Run {
         config: PathBuf,
@@ -53,6 +58,9 @@ enum Command {
     Show {
         status_file: PathBuf,
     },
+    Validate {
+        path: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<Command, String> {
@@ -61,6 +69,7 @@ fn parse_args() -> Result<Command, String> {
     let mut status_file = None;
     let mut zapi_socket = None;
     let mut show = false;
+    let mut validate = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -80,15 +89,24 @@ fn parse_args() -> Result<Command, String> {
                     it.next().ok_or("--zapi requires a socket path")?,
                 ));
             }
+            "--validate-config" => {
+                validate = Some(PathBuf::from(
+                    it.next().ok_or("--validate-config requires a path")?,
+                ));
+            }
             "--show" => show = true,
             "--help" | "-h" => {
                 println!("usage: bfdd --config <PATH> [--pidfile <PATH>] [--status-file <PATH>]");
                 println!("                [--zapi <SOCKET>]");
                 println!("       bfdd --show [--status-file <PATH>]");
+                println!("       bfdd --validate-config <PATH>");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+    if let Some(path) = validate {
+        return Ok(Command::Validate { path });
     }
     let status_file = status_file.unwrap_or_else(|| PathBuf::from(DEFAULT_STATUS_FILE));
     if show {
@@ -100,6 +118,33 @@ fn parse_args() -> Result<Command, String> {
         status_file,
         zapi_socket,
     })
+}
+
+/// `--validate-config` (S8-c): parse the candidate file with the
+/// daemon's own parser and report. Exit 0 with a one-line OK on
+/// stderr, or exit 1 with the parser's line-numbered error verbatim
+/// (configd surfaces it as the apply's refusal reason).
+fn validate_config(path: &Path) -> i32 {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match parse_bfdd_config(&text) {
+            Ok(config) => {
+                eprintln!(
+                    "bfdd: {}: OK ({} peers)",
+                    path.display(),
+                    config.peers.len()
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("bfdd: {}: {err}", path.display());
+                1
+            }
+        },
+        Err(err) => {
+            eprintln!("bfdd: cannot read {}: {err}", path.display());
+            1
+        }
+    }
 }
 
 /// The daemon's pidfile (A21): written at start, removed on every
@@ -166,6 +211,9 @@ async fn main() -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, e)
     })?;
     match command {
+        // The validate arm is config-only: it exits before any
+        // socket/session setup, so it runs on any host.
+        Command::Validate { path } => std::process::exit(validate_config(&path)),
         Command::Show { status_file } => match std::fs::read_to_string(&status_file) {
             Ok(text) => {
                 print!("{text}");
