@@ -406,6 +406,10 @@ impl LocRib {
             route.rs_client = rs_client;
             route.rr_client = rr_client;
             route.path_id = nlri.path_id;
+            // B-3 (RFC 4271 §5.1.5): an external peer's LOCAL_PREF is
+            // "MUST be ignored" — reset to the local default before the
+            // route (or the import policy) sees it.
+            reset_external_local_pref(&mut route.attrs, internal);
             match self.import.import(route) {
                 Some(route) => {
                     rib.insert(nlri, route);
@@ -668,6 +672,26 @@ pub fn forwardable(route: &Route) -> bool {
     route.attrs.iter().any(|attr| {
         matches!(attr, PathAttribute::MpReach(mp) if !matches!(mp.next_hop, crate::attr::MpNextHop::Raw(_)))
     })
+}
+
+/// RFC 4271 §5.1.5 (LOCAL_PREF), verified wording: "If it is contained
+/// in an UPDATE message that is received from an external peer, then
+/// this attribute MUST be ignored by the receiving speaker, except in
+/// the case of BGP Confederations". Materialized as the FRR convention
+/// (the adjudicated B-3 "reset-at-import"): the received value never
+/// reaches the stored route — external imports carry the local default
+/// degree of preference (100, §9.1.1: the local speaker computes it
+/// from local policy, not from the peer). Applied BEFORE the import
+/// policy so a route-map `set local-preference` still overrides.
+/// (Sheet citation note: the LOCAL_PREF eBGP wording lives in §5.1.5;
+/// §5.1.4 is MULTI_EXIT_DISC — its "MUST NOT be propagated to other
+/// neighboring ASes" rule is the B-10 MED strip's citation.)
+pub fn reset_external_local_pref(attrs: &mut Vec<PathAttribute>, internal: bool) {
+    if internal {
+        return;
+    }
+    attrs.retain(|a| a.attr_type() != attr_type::LOCAL_PREF);
+    attrs.push(PathAttribute::LocalPref(100));
 }
 
 /// RFC 4271 §5.1.5's LOCAL_PREF shape for one exported UPDATE:
@@ -1210,7 +1234,9 @@ mod tests {
     #[test]
     fn add_path_siblings_coexist_and_replace_by_key() {
         let mut rib = LocRib::new(65000);
-        let p = peer("192.0.2.1", 65001, 1);
+        // Internal peer: the raise below rides LOCAL_PREF 200, which
+        // B-3 (§5.1.5) now ignores from external peers.
+        let p = peer("192.0.2.1", 65000, 1);
         rib.announce(&p, &path_update("203.0.113.0/24", 1, None));
         rib.announce(&p, &path_update("203.0.113.0/24", 2, None));
         assert_eq!(rib.route_count(), 2, "two sibling paths coexist");
@@ -1885,6 +1911,104 @@ mod tests {
             attrs.iter().all(|a| a.attr_type() != attr_type::LOCAL_PREF),
             "stripped toward external peers (MUST NOT)"
         );
+    }
+
+    /// B-3 (RFC 4271 §5.1.5, verified): a LOCAL_PREF received from an
+    /// external peer "MUST be ignored by the receiving speaker" —
+    /// reset-to-100 at import (FRR convention), never stored, never
+    /// compared. Internal peers keep theirs; a later route-map
+    /// `set local-preference` (the import policy) still overrides.
+    #[test]
+    fn external_local_pref_reset_at_import() {
+        let mut attrs = vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::sequence([65001])),
+            PathAttribute::LocalPref(999),
+        ];
+        reset_external_local_pref(&mut attrs, false);
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a.attr_type() == attr_type::LOCAL_PREF),
+            Some(&PathAttribute::LocalPref(100)),
+            "external value replaced by the local default"
+        );
+
+        // Internal: untouched.
+        let mut attrs = vec![PathAttribute::LocalPref(200)];
+        reset_external_local_pref(&mut attrs, true);
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a.attr_type() == attr_type::LOCAL_PREF),
+            Some(&PathAttribute::LocalPref(200))
+        );
+    }
+
+    /// B-3 end to end at the Adj-RIB-In: an eBGP UPDATE carrying
+    /// LOCAL_PREF 999 stores 100 — the peer cannot manipulate the
+    /// §9.1.2.2 a) ladder (degree of preference is local policy,
+    /// §9.1.1); the same UPDATE over iBGP keeps 200.
+    #[test]
+    fn announce_resets_external_local_pref_in_adj_rib_in() {
+        let update = |pref: u32| BgpUpdate {
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence([65001])),
+                PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+                PathAttribute::LocalPref(pref),
+            ],
+            nlri: vec![Nlri::from("203.0.113.0/24".parse::<IpPrefix>().unwrap())],
+            ..Default::default()
+        };
+        let mut rib = LocRib::new(65000);
+        let external = peer("192.0.2.1", 65001, 1);
+        rib.announce(&external, &update(999));
+        let stored = rib
+            .adj_in
+            .get(&external.address)
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(stored.local_pref(), 100, "external 999 ignored");
+
+        let internal = peer("10.0.0.1", 65000, 2);
+        rib.announce(&internal, &update(200));
+        let stored = rib
+            .adj_in
+            .get(&internal.address)
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(stored.local_pref(), 200, "internal kept");
+    }
+
+    /// The ladder consequence: two eBGP peers fighting with inflated
+    /// LOCAL_PREFs cannot outrank each other (both read 100); the
+    /// AS_PATH tiebreak decides — the B-3 posture pinned.
+    #[test]
+    fn external_local_pref_cannot_rig_the_ladder() {
+        let p1 = peer("192.0.2.1", 65001, 1);
+        let p2 = peer("192.0.2.2", 65002, 2);
+        let mut rigging = route(
+            "203.0.113.0/24",
+            &p1,
+            false,
+            base_attrs(vec![65001, 65002], None),
+        );
+        rigging.attrs.push(PathAttribute::LocalPref(999));
+        let honest = route("203.0.113.0/24", &p2, false, base_attrs(vec![65001], None));
+        // Route::new bypasses announce (no reset) — apply the import
+        // rule the way announce does, then compare.
+        let mut attrs = rigging.attrs.clone();
+        reset_external_local_pref(&mut attrs, false);
+        let rigging = Route {
+            attrs,
+            ..rigging.clone()
+        };
+        assert_eq!(best_path(&[rigging, honest]).unwrap().as_path_len(), 1);
     }
 
     /// The RS RIB stays out of the kernel (FRR's view semantics): an

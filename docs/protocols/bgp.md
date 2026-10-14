@@ -264,6 +264,17 @@ announced to that peer are not modified"). v1 semantics:
   preference materialized) toward internal peers when missing,
   stripped toward external peers, applied to learned AND
   locally-originated exports.
+- **eBGP LOCAL_PREF reset-at-import (B-3, §5.1.5's receive side)**:
+  "If it is contained in an UPDATE message that is received from an
+  external peer, then this attribute MUST be ignored by the receiving
+  speaker" — `rib::reset_external_local_pref` replaces any external
+  LOCAL_PREF with the local default (100, FRR convention) at
+  Adj-RIB-In insertion, before the import policy (a route-map `set
+  local-preference` still overrides). An external peer can therefore
+  never rig the §9.1.2.2 a) ladder; iBGP values are kept. (Citation
+  note: the sheet's "§5.1.4 check" lands here as §5.1.5 — §5.1.4 is
+  MULTI_EXIT_DISC, whose "MUST NOT be propagated to other neighboring
+  ASes" is the B-10 RS MED strip's rule.)
 
 ### ADD-PATH transmit (S7-b, RFC 7911)
 
