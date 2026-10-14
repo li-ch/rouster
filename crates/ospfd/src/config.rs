@@ -1175,12 +1175,7 @@ router ospf
     fn v3_prefix_lines_parse_in_order_and_dedupe() {
         // RFC 5340 C.3's interface prefix list: multiple `prefix`
         // lines collect in declaration order; a duplicate is a no-op.
-        let cfg = parse(
-            "router ospf\n address-family ipv6-unicast\n router-id 1.1.1.1\n \
-             area 0.0.0.0\n  interface eth0\n   link-local fe80::1\n   ifindex 3\n \
-             prefix 2001:db8:1::/64\n   prefix 2001:db8:2::/64\n   prefix 2001:db8:1::/64\n",
-        )
-        .unwrap();
+        let cfg = parse("router ospf\n address-family ipv6-unicast\n router-id 1.1.1.1\n area 0.0.0.0\n  interface eth0\n   link-local fe80::1\n   ifindex 3\n   prefix 2001:db8:1::/64\n   prefix 2001:db8:2::/64\n   prefix 2001:db8:1::/64\n").unwrap();
         let eth0 = &cfg.areas[0].interfaces["eth0"];
         assert_eq!(
             eth0.prefixes_v6,
