@@ -62,7 +62,11 @@
 //! collisions at compile time ([`CollisionPolicy`]): `ignore` (the
 //! default — colliding block-mode rules are dropped with a warning) or
 //! `subtract` (the merge-by-subtraction variant GSC §5 prefers when
-//! data-plane memory allows, landed in A6 unwired). The uRPF
+//! data-plane memory allows, landed in A6 unwired). (GSC =
+//! `draft-ietf-savnet-general-sav-capabilities-03`, published
+//! 2026-06-21 — the pinned revision the mode taxonomy and collision
+//! model are implemented against; SAV-3, owner-adjudicated 2026-10-14.)
+//! The uRPF
 //! generators emit only IBA rules, which cannot collide — the knob is
 //! wiring for the first IBB/PBB rule source (W6 §Deferred 1's operator
 //! builder, a SAVNET agent); both policies compile today's rule sets
@@ -113,6 +117,15 @@
 //! anchor's process (tests compose them; the architecture's
 //! single-binary default deployment makes the composition
 //! production-real); savd's own feed is the production-visible half.
+//!
+//! The hosting model is pinned (SAV-4, owner-adjudicated 2026-10-14):
+//! **anchor-local no-op agents + savd-as-reference**. Each protocol
+//! anchor registers its own (no-op/logger) agent in-process — savd
+//! cannot receive another daemon's hook calls, and none are invented —
+//! and savd's hosted MonitorAgent is the *reference implementation*
+//! visible in tests, which the single-binary default deployment later
+//! promotes to the production default host. Multi-process interim:
+//! anchors without a registered agent simply no-op their hooks.
 //!
 //! # Config (`/etc/savd.conf`-shaped)
 //!

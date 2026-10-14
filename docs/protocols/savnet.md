@@ -61,9 +61,13 @@ Two things, one behind the flag and one not:
    the recursive resolver (`Rib::resolve_nexthop_recursive`; the S1
    deviations carry over: no fall-through on an unusable candidate,
    the /0 default never answers, the kernel mirror participates in the
-   walk as a resolution source but never as a binding source). When
-   both new surfaces are empty the derivation is byte-identical to the
-   pre-fold-in one (property-pinned, `crates/sav/tests/sib_props.rs`).
+   walk as a resolution source but never as a binding source). The
+   kernel-mirror participation is pinned as **intended semantics**
+   (SAV-7, owner-adjudicated 2026-10-14: allow + pin — "the walk reads
+   observed state"; the W5 "kernel-mirror routes never ingested" rule
+   governs *bindings*, not the resolution lineage of the egress walk).
+   When both new surfaces are empty the derivation is byte-identical
+   to the pre-fold-in one (property-pinned, `crates/sav/tests/sib_props.rs`).
 
 2. **The agent interface (behind `experimental-savnet`).**
    `crates/sav/src/agent.rs`: the [`SavAgent`] trait protocol anchors
@@ -100,28 +104,40 @@ Two things, one behind the flag and one not:
   (1024; oldest half drops) — observations, never authoritative
   state.
 
-## Process-topology scoping (honest disclosure)
+## Process-topology scoping (honest disclosure, pinned SAV-4)
 
 bgpd, ospfd, and savd are separate processes in today's interim
 multi-process shape, and this interface is in-process by design — so
 an anchor's hook calls reach an agent instance inside the **anchor's**
-process. Tests compose anchor + agent in-process today; the
-architecture's single-binary default deployment (architecture.md §2)
-makes that composition production-real without changing a line. savd's
-hosted agent additionally observes savd's own ZAPI RIB view (the
-`RibView` events, no peer granularity) so the default host has a real
-production feed — but the adjacency-derived suggestion path needs
-anchor-side events and therefore produces suggestions only where the
-composition is in-process. No transport is added to bridge the
-processes: that would be a wire protocol by another name, and the
-wire is exactly what the flag exists to gate.
+process. The hosting model is pinned (SAV-4, owner-adjudicated
+2026-10-14): **anchor-local no-op agents + savd-as-reference** — each
+anchor registers its own no-op/logger agent in-process, and savd's
+hosted `MonitorAgent` is the reference implementation visible in
+tests, which the architecture's single-binary default deployment
+(architecture.md §2) promotes to the production default host without
+changing a line. Anchors without a registered agent simply no-op
+their hooks. savd's hosted agent additionally observes savd's own
+ZAPI RIB view (the `RibView` events, no peer granularity) so the
+default host has a real production feed — but the adjacency-derived
+suggestion path needs anchor-side events and therefore produces
+suggestions only where the composition is in-process. No transport is
+added to bridge the processes: that would be a wire protocol by
+another name, and the wire is exactly what the flag exists to gate.
 
 ## What the flag is for, and what stays out
 
 Repo AGENTS.md SAVNET rules: *"Draft-dependent wire protocols
 (intra-domain IGP/BGP signaling, inter-domain) go behind the
 `experimental-savnet` feature flag; pin implemented draft versions in
-docs; isolate wire codecs."* The drafts this workstream tracks
+docs; isolate wire codecs."* Implemented-draft version pin (SAV-3,
+owner-adjudicated 2026-10-14: pin at next sav doc touch): the four-mode
+validation taxonomy — the only draft-derived *semantics* implemented —
+follows `draft-ietf-savnet-general-sav-capabilities` **-03** (published
+2026-06-21, an active WG document at pin time; savd's `collision-policy`
+resolves that draft's §3/§5 collision cases), and the SIB / SAV-Agent
+vocabulary aligns with the WG-adopted
+`draft-ietf-savnet-intra-domain-architecture-05`. No wire codec exists
+yet, so no codec revision is pinned. The drafts this workstream tracks
 (`draft-ietf-savnet-intra-domain-sav-igp` / `-bgp`, the
 `-architecture` documents, GSC
 `draft-ietf-savnet-general-sav-capabilities`) were all expired or

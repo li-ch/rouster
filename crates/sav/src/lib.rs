@@ -15,7 +15,13 @@
 //! the C2-ratified fold-in onto the S1 explicit rib surfaces, 2026-10-11
 //! — with egress interfaces resolved through the recursive resolver)
 //! and from operator config (the `binding` lines [`savd`] parses, fed
-//! through [`Sib::replace_origin`] as the Config origin). Everything
+//! through [`Sib::replace_origin`] as the Config origin). The
+//! resolver's walk reads **observed** state: the kernel mirror of
+//! `RT_TABLE_MAIN` participates as an *egress resolution source* but
+//! never as a *binding source* — pinned as intended semantics (SAV-7,
+//! owner-adjudicated 2026-10-14: allow + record; the W5 rule
+//! "kernel-mirror routes never ingested" governs bindings, not the
+//! resolution lineage of a gateway's egress walk). Everything
 //! here is in-process, synchronous, and side-effect-free on the
 //! dataplane: no IPC, no wire formats. The one draft-dependent surface
 //! — the SAVNET agent interface — lives behind the crate's
@@ -39,7 +45,15 @@
 //! equivalence rule generation from a (Sib, Rib) view), and [`table`]
 //! (the SAV Table Manager compile step: rules → `SavOp`s with their
 //! Monitor/Drop action as data, plus the reference evaluation
-//! semantics). Slice 3 bridged enforcement: [`program`] converts
+//! semantics). Version pin (SAV-3, owner-adjudicated 2026-10-14: pin
+//! at next sav doc touch): the four-mode taxonomy — the only
+//! draft-derived semantics implemented — is pinned to
+//! `draft-ietf-savnet-general-sav-capabilities` **-03** (published
+//! 2026-06-21, an active WG document at pin time), and the SIB /
+//! agent vocabulary aligns with
+//! `draft-ietf-savnet-intra-domain-architecture-05` (WG-adopted; the
+//! SAV Agent + SAV Information Base terms come from there). Slice 3
+//! bridged enforcement: [`program`] converts
 //! compiled ops into the backend-neutral [`common::SavProgram`] the
 //! `Dataplane` trait installs, and [`monitor`] is the route-lookup
 //! counting surface monitor mode falls back to when the backend
