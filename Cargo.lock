@@ -370,6 +370,7 @@ name = "ospfd"
 version = "0.0.0"
 dependencies = [
  "common",
+ "libc",
  "sav",
  "socket2",
  "thiserror 2.0.21",

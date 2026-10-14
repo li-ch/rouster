@@ -817,6 +817,15 @@ pub struct OspfdV3 {
     redistribute_static: bool,
     /// §A.3.1's discard counter (Instance ID mismatches).
     pub dropped_instance_mismatch: u64,
+    /// Receive-side hop-limit enforcement counter (S8-b, the v6
+    /// mirror of the v2 N1 rule): UNICAST v3 packets (DD/LSR/LSU/
+    /// LSAck — not ff02::5/6) dropped because their received hop
+    /// limit is not 1, read back through the audited cmsg path
+    /// (`transport::recvmsg_v6_ctl`). Keyed on our own documented
+    /// unicast hops-1 parity (RFC 5340 §A.1 mandates the multicast
+    /// arm only; v3 virtual links are §Deferred). Multicast packets
+    /// are not checked (the kernel's rule).
+    pub dropped_degraded_hop_limit: u64,
 }
 
 impl OspfdV3 {
@@ -880,6 +889,7 @@ impl OspfdV3 {
             zapi: None,
             redistribute_static: cfg.redistribute_static,
             dropped_instance_mismatch: 0,
+            dropped_degraded_hop_limit: 0,
         })
     }
 
@@ -941,13 +951,15 @@ impl OspfdV3 {
             .collect()
     }
 
-    /// Process one inbound datagram (already decoded with its
-    /// verified destination by the run loop / the test pump).
+    /// Process one inbound datagram (already attributed its verified
+    /// destination by the run loop / the test pump; `hop_limit` is
+    /// the cmsg read-back's value when the kernel attached one).
     pub fn on_packet(
         &mut self,
         iface_idx: usize,
         received: &ReceivedV6,
         dst: Ipv6Addr,
+        hop_limit: Option<u32>,
         now: u64,
     ) -> Vec<WireOutV3> {
         let out = Vec::new();
@@ -956,17 +968,48 @@ impl OspfdV3 {
         if self.interfaces.iter().any(|i| i.link_local == received.src) {
             return out;
         }
-        let (packet, _dst) =
-            match crate::transport::decode_v3_dst(&received.payload, received.src, dst) {
-                Some(p) => p,
-                None => {
-                    debug!(
-                        src = %received.src,
-                        "ospfv3: packet failed the destination-trial checksum"
-                    );
-                    return out;
-                }
-            };
+        // The receive-side hop-limit check (S8-b): a UNICAST packet
+        // with a degraded hop limit cannot have come from an on-link
+        // peer (our own unicast arm carries hop 1 — the documented
+        // local parity; RFC 5340 §A.1 mandates the multicast arm
+        // only). Dropped and counted before any §4.2 processing —
+        // the v2 daemon's N1 rule, mirrored. `None` (no cmsg) is
+        // fail-open, disclosed at the transport's audited block.
+        if !crate::transport::is_multicast_dst_v6(dst)
+            && !hop_limit
+                .map(crate::transport::unicast_hop_limit_ok)
+                .unwrap_or(true)
+        {
+            self.dropped_degraded_hop_limit += 1;
+            info!(
+                src = %received.src,
+                dst = %dst,
+                hop_limit = ?hop_limit,
+                "ospfv3: unicast packet dropped: hop limit != 1 (our unicast parity; see transport.rs)"
+            );
+            return out;
+        }
+        // The pseudo-header checksum verifies against the REAL
+        // destination when the run loop resolved it from the
+        // `in6_pktinfo` cmsg; the destination-trial decode remains
+        // as the fallback for the no-cmsg path (S7-a's interim,
+        // now the secondary).
+        let decoded = crate::packet_v3::PacketV3::decode(&received.payload, received.src, dst)
+            .ok()
+            .or_else(|| {
+                crate::transport::decode_v3_dst(&received.payload, received.src, dst)
+                    .map(|(packet, _)| packet)
+            });
+        let packet = match decoded {
+            Some(p) => p,
+            None => {
+                debug!(
+                    src = %received.src,
+                    "ospfv3: packet failed the pseudo-header checksum"
+                );
+                return out;
+            }
+        };
         if std::env::var_os("ROUSTER_OSPFV3_TRACE").is_some() {
             info!(
                 src = %received.src,
@@ -1771,8 +1814,9 @@ fn ipv6_prefix_of(prefix: &Prefix) -> Option<Ipv6Prefix> {
     Ipv6Prefix::new(std::net::Ipv6Addr::from(bytes), prefix.len).ok()
 }
 
-/// The inbound event type: (interface index, datagram, verified dst).
-pub type InboundV3 = (usize, ReceivedV6, Ipv6Addr);
+/// The inbound event type: (interface index, datagram, the resolved
+/// destination, the cmsg hop limit when the kernel attached one).
+pub type InboundV3 = (usize, ReceivedV6, Ipv6Addr, Option<u32>);
 
 /// The run loop (the v2 daemon's shape, sockets → mpsc → core).
 pub async fn run(
@@ -1783,34 +1827,58 @@ pub async fn run(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let (tx, mut rx) = mpsc::channel::<InboundV3>(1024);
+    // The receive pumps: the AUDITED recvmsg read-back per socket
+    // (`transport::recvmsg_v6_ctl`) — the true destination and the
+    // received hop limit come off the kernel's cmsgs, replacing
+    // S7-a's destination-trial interim at the loop's edge (the trial
+    // remains the fallback when the kernel attaches no cmsg).
+    // bfdd's discipline: nonblocking recvmsg on its own blocking
+    // thread with a 10 ms poll rhythm (a parked BLOCKING recvmsg
+    // cannot be woken portably, which would wedge the runtime's
+    // blocking-task join), the pump holding only a WEAK socket
+    // reference so the daemon's Drop (the last strong Arc) closes
+    // the socket and ends the pump at the next poll.
     for (idx, sock) in sockets.iter().enumerate() {
-        let sock = Arc::clone(sock);
+        let sock = Arc::downgrade(sock);
         let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
+        tokio::task::spawn_blocking(move || {
+            let mut payload = [std::mem::MaybeUninit::<u8>::uninit(); 65535];
+            let mut ctrl = [std::mem::MaybeUninit::<u8>::uninit(); crate::transport::CTL_BUFSZ_V6];
             loop {
-                match sock.recv(&mut buf).await {
-                    Ok(Some(received)) => {
-                        // The destination trial at the loop's edge:
-                        // the packet's own checksum picks the dst.
-                        if let Some((_, dst)) = crate::transport::decode_v3_dst(
-                            &received.payload,
-                            received.src,
-                            sock.link_local,
-                        ) {
-                            let datagram = ReceivedV6 {
-                                src: received.src,
-                                payload: received.payload,
-                            };
-                            if tx.send((idx, datagram, dst)).await.is_err() {
-                                return;
-                            }
+                let Some(sock) = sock.upgrade() else { return };
+                match sock.recv_ctl(&mut payload, &mut ctrl) {
+                    Ok(read) => {
+                        // The REAL verdict when the cmsg attached the
+                        // destination; the §4.2 candidate trial as the
+                        // no-cmsg fallback (disclosed at the transport).
+                        let own = sock.link_local;
+                        let dst = read.dst.unwrap_or(own);
+                        if read.dst.is_none()
+                            && crate::transport::decode_v3_dst(read.payload, read.src, own)
+                                .is_none()
+                        {
+                            continue; // verifies against no candidate — drop
+                        }
+                        let datagram = ReceivedV6 {
+                            src: read.src,
+                            payload: read.payload.to_vec(),
+                        };
+                        if tx
+                            .blocking_send((idx, datagram, dst, read.hop_limit))
+                            .is_err()
+                        {
+                            return; // run loop gone
                         }
                     }
-                    Ok(None) => unreachable!("async recv blocks until ready"),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                     Err(e) => {
-                        warn!(error = %e, "ospfv3: recv error");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        warn!(error = %e, "ospfv3: read-back pump failed; stopping");
+                        return;
                     }
                 }
             }
@@ -1834,9 +1902,9 @@ pub async fn run(
     loop {
         tokio::select! {
             inbound = rx.recv() => {
-                let Some((idx, received, dst)) = inbound else { break };
+                let Some((idx, received, dst, hop)) = inbound else { break };
                 let now = start.elapsed().as_secs();
-                let out = core.on_packet(idx, &received, dst, now);
+                let out = core.on_packet(idx, &received, dst, hop, now);
                 flush_wire_v3(&sockets, &core, out).await;
             }
             _ = tick_interval.tick() => {
@@ -1932,7 +2000,7 @@ mod tests {
             // Every obligation destination is one of ff02::5/6 or
             // the peer's link-local — the trial's candidate set.
             let dst = wire.to.addr();
-            next.extend(to.on_packet(0, &received, dst, now));
+            next.extend(to.on_packet(0, &received, dst, None, now));
         }
         next
     }

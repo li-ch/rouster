@@ -31,8 +31,10 @@
 //! cannot be from an on-link peer); multicast Hellos keep the
 //! kernel's rule — no receive check (RFC 2328 places none; §A.1's
 //! TTL-1 is a transmit mandate). The OSPFv3 runtime's v6 raw socket
-//! WILL need the cmsg walk (RFC 3542 §6 `IPV6_RECVHOPLIMIT`: raw v6
-//! sockets do NOT deliver the IPv6 header) — recorded in ospf.md.
+//! needed the cmsg walk (RFC 3542 §6: raw v6 sockets do NOT deliver
+//! the IPv6 header) — it has one now, the audited read-back block in
+//! the v6 section below (S8-b, 2026-10-14; the AGENTS.md owner-named
+//! exception, the bfdd audited-block discipline).
 //!
 //! One disclosed fence remains, inherited from the bfdd W1-b M6
 //! precedent:
@@ -51,6 +53,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::fd::AsRawFd;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -279,26 +282,29 @@ impl OspfRawSocket {
 //   the interface is DR or BDR** ("Both the Designated Router and
 //   Backup Designated Router must be prepared to receive packets
 //   destined to this address").
-// - **No receive-side hop-limit enforcement is possible yet**: a raw
-//   IPv6 socket does NOT deliver the IPv6 header in the buffer
-//   (ipv6(7)/RFC 3542 §6 — the v4 raw trick does not port), so the
-//   hop limit is only readable through the `IPV6_RECVHOPLIMIT` cmsg —
-//   and every cmsg reader needs `recvmsg`, which no safe API in our
-//   dependency set wraps. The socketopt IS armed here through
-//   socket2's safe setter (so a future cmsg walker finds it enabled);
-//   the read-back itself is §Deferred with the bfdd audited-block
-//   precedent (arm_v4_recv_ttl / recvmsg_ctl in crates/bfdd — the
-//   owner-exception treatment). No unsafe was added.
-// - **The received IPv6 destination address has the same wall** (it
-//   rides the IPV6_RECVPKTINFO cmsg), but the v3 checksum needs it
-//   (the RFC 8200 §8.1 pseudo-header). Deterministic workaround, same
-//   shape the RFC itself enumerates (§4.2: the destination "MUST be
-//   one of the IPv6 unicast addresses associated with the receiving
-//   interface ..., AllSPFRouters or AllDRouters"): [`decode_v3_dst`]
-//   tries the small candidate set and takes the one whose pseudo-
-//   header verifies. Disclosed: a packet that verifies against NONE
-//   of the candidates is dropped (a checksum collision across
-//   candidates is the only false-accept path).
+// - **The receive-side hop limit and the true destination are READ
+//   BACK now** (S8-b, 2026-10-14 — the audited cmsg block, AGENTS.md's
+//   owner-named exception): a raw IPv6 socket does NOT deliver the
+//   IPv6 header in the buffer (ipv6(7)/RFC 3542 §6 — the v4 raw
+//   trick does not port), so both ride control messages —
+//   `IPV6_RECVHOPLIMIT` (socket2's safe setter) and
+//   `IPV6_RECVPKTINFO` ([`arm_v6_recv_pktinfo`], the audited
+//   `libc::setsockopt` — socket2 0.6.5 has no setter) — read by
+//   [`recvmsg_v6_ctl`], the audited recvmsg (the bfdd
+//   `recvmsg_ctl` treatment: audit comments, target-pinned cmsg
+//   constants, kernel round-trip tests). Enforcement: a UNICAST v3
+//   packet (DD/LSR/LSU/LSAck — not ff02::5/6) arriving with a
+//   degraded hop limit is dropped and counted, the v6 mirror of the
+//   v2 N1 rule — keyed on our own documented unicast hops-1 parity
+//   (RFC 5340 §A.1 mandates the multicast arm only; v3 virtual
+//   links, the legitimate multi-hop unicast, are §Deferred). The
+//   `None` cmsg path is fail-open, disclosed (bfdd's rule).
+// - **The pseudo-header destination is the REAL address now**: the
+//   v3 checksum covers the real (src, dst), and the dst comes from
+//   the `IPV6_PKTINFO` cmsg (the first 16 bytes of the
+//   `in6_pktinfo`). [`decode_v3_dst`]'s candidate trial remains as
+//   the FALLBACK for the no-cmsg path (§4.2's destination list is
+//   still the spec's own enumeration of what the address can be).
 //
 // The v6 socket is BOUND to the interface's link-local address (the
 // RFC's source-address rule, §2.5: "OSPF packets are sent using the
@@ -384,10 +390,237 @@ pub fn decode_v3_dst(
     None
 }
 
+// ---------------------------------------------------------------------------
+// The audited v6 cmsg read-back (S8-b, 2026-10-14). AGENTS.md's
+// no-unsafe invariant carries a NAMED exception for exactly this
+// block (owner decisions 2026-10-12 and 2026-10-14): the receive-side
+// hop-limit + destination read-back on the OSPFv3 raw socket — the
+// bfdd `arm_v4_recv_ttl`/`recvmsg_ctl` treatment, same pattern, same
+// audit discipline: the two unsafe lines below each carry their audit
+// comment, the kernel cmsg layouts are target-pinned empirically (the
+// kernel round-trip tests), and the parsers themselves are pure safe
+// byte-walks. Everything else in this crate stays unsafe-free.
+// ---------------------------------------------------------------------------
+
+/// cmsg constants for the v6 walk: `IPPROTO_IPV6` (41) as the level,
+/// and the cmsg KINDS the target's kernel actually delivers.
+/// Hop limit: RFC 3542's type is 51; Linux delivers 52 (the modern
+/// `IPV6_HOPLIMIT`; 51 is the 2292-era constant), macOS/BSD deliver
+/// 47 — all pinned empirically (the bfdd UDP round-trips first, the
+/// raw-socket round-trip below re-pins the same values on proto 89).
+const IPPROTO_IPV6_CMSG: u32 = 41;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const IPV6_HOPLIMIT_CMSG_KINDS: [u32; 2] = [51, 52];
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const IPV6_HOPLIMIT_CMSG_KINDS: [u32; 2] = [51, 47];
+/// Destination: the `in6_pktinfo` cmsg — RFC 3542's type is
+/// `IPV6_PKTINFO`; Linux delivers 50, macOS/BSD 46 (pinned by the
+/// same round-trip tests). The payload is the `struct in6_pktinfo`:
+/// the 16-byte destination address followed by a native-order u32
+/// ifindex.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const IPV6_PKTINFO_CMSG_KINDS: [u32; 2] = [50, 2]; // 2 = IPV6_2292PKTINFO
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const IPV6_PKTINFO_CMSG_KINDS: [u32; 1] = [46];
+
+/// One parsed control message: level, type, and the data bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCmsg<'a> {
+    pub level: u32,
+    pub kind: u32,
+    pub data: &'a [u8],
+}
+
+/// Walks a recvmsg control buffer, safely: the `cmsghdr` fields are
+/// read bytewise (`from_ne_bytes` — no pointer casts, no unsafe).
+/// Layout on the unix targets (the bfdd walker's pinned shapes, host
+/// cfg'd): `cmsg_len` — `size_t` (8 bytes) on Linux, `socklen_t`
+/// (4 bytes) on macOS/the BSDs — then `cmsg_level` and `cmsg_type`
+/// u32 (4+4), then the data; the next header starts at `cmsg_len`
+/// rounded up to the `cmsg_len` alignment. Malformed tails stop the
+/// walk.
+pub fn parse_cmsgs(mut ctrl: &[u8]) -> Vec<RawCmsg<'_>> {
+    let mut out = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LEN_SIZE: usize = std::mem::size_of::<usize>(); // size_t, 8
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LEN_SIZE: usize = 4; // socklen_t is u32 on macOS/BSD
+    const ALIGN: usize = LEN_SIZE;
+    loop {
+        if ctrl.len() < LEN_SIZE + 4 + 4 {
+            break;
+        }
+        let mut len_buf = [0u8; 8];
+        len_buf[..LEN_SIZE].copy_from_slice(&ctrl[..LEN_SIZE]);
+        let cmsg_len = usize::from_ne_bytes(len_buf);
+        let level_at = LEN_SIZE;
+        let kind_at = LEN_SIZE + 4;
+        if cmsg_len < LEN_SIZE + 8 || cmsg_len > ctrl.len() {
+            break; // malformed tail: stop walking
+        }
+        let level = u32::from_ne_bytes(ctrl[level_at..level_at + 4].try_into().expect("4 bytes"));
+        let kind = u32::from_ne_bytes(ctrl[kind_at..kind_at + 4].try_into().expect("4 bytes"));
+        out.push(RawCmsg {
+            level,
+            kind,
+            data: &ctrl[LEN_SIZE + 8..cmsg_len],
+        });
+        let step = cmsg_len.div_ceil(ALIGN) * ALIGN;
+        if step >= ctrl.len() {
+            break;
+        }
+        ctrl = &ctrl[step..];
+    }
+    out
+}
+
+/// Extracts the received IPv6 hop limit from a control buffer — a
+/// native-order u32 (both targets; pinned empirically). `None` when
+/// the buffer carries no hop-limit cmsg (the unarmed path).
+pub fn received_hop_limit_v6(ctrl: &[u8]) -> Option<u32> {
+    parse_cmsgs(ctrl)
+        .into_iter()
+        .find(|c| c.level == IPPROTO_IPV6_CMSG && IPV6_HOPLIMIT_CMSG_KINDS.contains(&c.kind))
+        .and_then(|c| {
+            let raw: [u8; 4] = c.data.try_into().ok()?;
+            Some(u32::from_ne_bytes(raw))
+        })
+}
+
+/// Extracts the received IPv6 destination address from a control
+/// buffer — the first 16 bytes of the `in6_pktinfo`. `None` when the
+/// buffer carries no pktinfo cmsg.
+pub fn received_dst_v6(ctrl: &[u8]) -> Option<Ipv6Addr> {
+    parse_cmsgs(ctrl)
+        .into_iter()
+        .find(|c| c.level == IPPROTO_IPV6_CMSG && IPV6_PKTINFO_CMSG_KINDS.contains(&c.kind))
+        .and_then(|c| {
+            let addr: [u8; 16] = c.data.get(..16)?.try_into().ok()?;
+            Some(Ipv6Addr::from(addr))
+        })
+}
+
+/// The unicast receive-side hop-limit policy — the v6 mirror of
+/// [`unicast_ttl_ok`]: our own unicast arm carries hop 1 (the
+/// documented local parity; RFC 5340 §A.1 mandates the multicast arm
+/// only), so a unicast exchange packet with a degraded hop limit
+/// cannot have come from an on-link peer. `None` (no cmsg — the
+/// unarmed path) is fail-open, disclosed. v3 virtual links are
+/// §Deferred; they legitimately cross hops and will need this
+/// relaxed.
+pub fn unicast_hop_limit_ok(hop_limit: u32) -> bool {
+    hop_limit == OSPF_HOP_LIMIT
+}
+
+/// Control-buffer size for the read-back: one hop-limit cmsg
+/// (header + 4) + one pktinfo cmsg (header + 20) plus alignment
+/// margin.
+pub const CTL_BUFSZ_V6: usize = 96;
+
+/// Arms the destination read-back (`IPV6_RECVPKTINFO`) on a v6
+/// socket so the kernel attaches the `in6_pktinfo` control message.
+/// socket2 0.6.5 has no setter for it — this is the audited
+/// `libc::setsockopt` (AGENTS.md's owner-named exception,
+/// 2026-10-14; the bfdd `arm_v4_recv_ttl` precedent):
+///
+/// SAFETY: `optval` is a pointer to a live `c_int` of value 1 for the
+/// duration of the call; `optlen` is exactly `size_of::<c_int>()`;
+/// the level/optname pair is the RFC 3542 §6-documented
+/// `IPPROTO_IPV6`/`IPV6_RECVPKTINFO` (libc constants match every
+/// target we build: Linux 49, macOS 61). The call cannot observe the
+/// pointer after it returns.
+pub fn arm_v6_recv_pktinfo(sock: &Socket) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVPKTINFO,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// One received datagram through the audited read-back: the payload
+/// slice borrows the caller's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadbackV6<'a> {
+    /// The sender (the kernel-filled address).
+    pub src: Ipv6Addr,
+    /// The TRUE destination from the `in6_pktinfo` cmsg (`None` when
+    /// the kernel attached none — the fail-open path).
+    pub dst: Option<Ipv6Addr>,
+    /// The received hop limit from its cmsg (`None` likewise).
+    pub hop_limit: Option<u32>,
+    /// The OSPF packet bytes (no IPv6 header — the raw v6 rule).
+    pub payload: &'a [u8],
+}
+
+/// One `recvmsg` with a control buffer on a NONBLOCKING v6 raw
+/// socket — the audited read-back (AGENTS.md's owner-named exception;
+/// `WouldBlock` when idle, which is what makes the poll-loop +
+/// Drop-shutdown discipline in the daemon's pump work). The audited
+/// unsafe lines (owner-approved 2026-10-14):
+///
+/// SAFETY (control read): after `recvmsg`, `msg.control_len()` is the
+/// kernel-reported count of INITIALIZED bytes in `ctrl`; the kernel
+/// never writes past the buffer it was handed (truncation sets
+/// MSG_CTRUNC, it never overflows), and `from_raw_parts` reads
+/// exactly that prefix within this function's scope.
+///
+/// SAFETY (payload read): `recvmsg` returns the count of initialized
+/// bytes in the iovec; `slice_assume_init_ref` re-interprets exactly
+/// that prefix. Both slices are consumed only by the safe byte-wise
+/// parsers (`parse_cmsgs` and friends) or copied out before the
+/// buffers are reused.
+pub fn recvmsg_v6_ctl<'a>(
+    sock: &Socket,
+    buf: &'a mut [std::mem::MaybeUninit<u8>],
+    ctrl: &mut [std::mem::MaybeUninit<u8>],
+) -> io::Result<ReadbackV6<'a>> {
+    // A per-family dummy address the kernel fills in: a bound v6 raw
+    // socket only ever sees v6 senders, so the storage always fits.
+    let mut addr: socket2::SockAddr =
+        std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0).into();
+    let mut iov = [socket2::MaybeUninitSlice::new(buf)];
+    let mut msg = socket2::MsgHdrMut::new()
+        .with_addr(&mut addr)
+        .with_buffers(&mut iov)
+        .with_control(ctrl);
+    let len = sock.recvmsg(&mut msg, 0)?;
+    let clen = msg.control_len();
+    let ctl = unsafe { std::slice::from_raw_parts(ctrl.as_ptr() as *const u8, clen) };
+    let dst = received_dst_v6(ctl);
+    let hop_limit = received_hop_limit_v6(ctl);
+    let src = match addr.as_socket() {
+        Some(SocketAddr::V6(v6)) => *v6.ip(),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-v6 sender on v6 socket",
+            ))
+        }
+    };
+    let payload = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
+    Ok(ReadbackV6 {
+        src,
+        dst,
+        hop_limit,
+        payload,
+    })
+}
+
 /// One per-interface OSPFv3 raw socket: bound to the interface's
 /// link-local address (the §2.5 source rule), AllSPFRouters joined at
 /// open, multicast hop limit 1 (§A.1), unicast hops 1 (local parity),
-/// hop-limit receive arming on (the cmsg read-back is §Deferred).
+/// hop-limit + pktinfo receive read-back armed (the audited cmsg
+/// block above — [`recv_ctl`] is the reader).
 pub struct OspfV6RawSocket {
     /// The socket2 handle: the sockopt surface (multicast joins,
     /// hops) shared by both handles (see the v2 struct's note).
@@ -427,10 +660,11 @@ impl OspfV6RawSocket {
         socket.set_multicast_hops_v6(OSPF_HOP_LIMIT)?;
         socket.set_unicast_hops_v6(OSPF_HOP_LIMIT)?;
         socket.set_multicast_loop_v6(false)?;
-        // The receive-side arming (RFC 3542 §6): on, so the future
-        // cmsg read-back finds it — the wall is the reader, not the
-        // setter (see the module note).
+        // The receive-side read-back arming (RFC 3542 §6): both
+        // cmsgs on, so [`recv_ctl`] finds them attached — the walls
+        // were the reader, not the setters (see the audited block).
         socket.set_recv_hoplimit_v6(true)?;
+        arm_v6_recv_pktinfo(&socket)?;
         socket.set_nonblocking(true)?;
         // The safe-I/O seam (the v2 module note), v6 flavor.
         use std::os::fd::AsFd;
@@ -523,6 +757,23 @@ impl OspfV6RawSocket {
             src,
             payload: buf[..n].to_vec(),
         }))
+    }
+
+    /// One NONBLOCKING audited read-back receive ([`recvmsg_v6_ctl`])
+    /// on the kernel socket: the payload plus the TRUE destination
+    /// and the received hop limit from their cmsgs. `WouldBlock` when
+    /// idle — the production pump polls (10 ms rhythm, the bfdd
+    /// discipline; a parked blocking recvmsg cannot be woken portably
+    /// and would wedge a same-process restart). The sockopt mutex is
+    /// held only for the syscall's (immediate) duration, so the §9.4
+    /// role join/leave stays responsive.
+    pub fn recv_ctl<'a>(
+        &self,
+        buf: &'a mut [std::mem::MaybeUninit<u8>],
+        ctrl: &mut [std::mem::MaybeUninit<u8>],
+    ) -> io::Result<ReadbackV6<'a>> {
+        let guard = self.socket.lock().expect("ospf v6 socket lock");
+        recvmsg_v6_ctl(&guard, buf, ctrl)
     }
 }
 
@@ -969,5 +1220,275 @@ mod tests {
         let (_, dst) =
             decode_v3_dst(&received.payload, received.src, receiver.link_local).expect("");
         assert_eq!(dst, Ipv6Addr::LOCALHOST, "the unicast candidate verified");
+    }
+
+    // ----- The audited v6 cmsg read-back (S8-b, RFC 3542 §6) ------
+
+    /// Synthetic-cmsg goldens build the HOST's native `cmsg_len`
+    /// width (the kernel round-trips below pin the real ones).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const GOLDEN_LEN_SIZE: usize = std::mem::size_of::<usize>();
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const GOLDEN_LEN_SIZE: usize = 4;
+
+    fn put_cmsg_len(buf: &mut Vec<u8>, len: u32) {
+        let raw = (len as usize).to_ne_bytes();
+        buf.extend_from_slice(&raw[..GOLDEN_LEN_SIZE]);
+    }
+
+    fn hoplimit_cmsg(hl: u32) -> Vec<u8> {
+        let mut ctrl = Vec::new();
+        put_cmsg_len(&mut ctrl, (GOLDEN_LEN_SIZE + 8 + 4) as u32);
+        ctrl.extend_from_slice(&IPPROTO_IPV6_CMSG.to_ne_bytes());
+        ctrl.extend_from_slice(&IPV6_HOPLIMIT_CMSG_KINDS[0].to_ne_bytes());
+        ctrl.extend_from_slice(&hl.to_ne_bytes()); // native order, both targets
+        ctrl
+    }
+
+    fn pktinfo_cmsg(dst: Ipv6Addr, ifindex: u32) -> Vec<u8> {
+        let mut ctrl = Vec::new();
+        put_cmsg_len(&mut ctrl, (GOLDEN_LEN_SIZE + 8 + 20) as u32);
+        ctrl.extend_from_slice(&IPPROTO_IPV6_CMSG.to_ne_bytes());
+        ctrl.extend_from_slice(&IPV6_PKTINFO_CMSG_KINDS[0].to_ne_bytes());
+        ctrl.extend_from_slice(&dst.octets()); // the in6_pktinfo address
+        ctrl.extend_from_slice(&ifindex.to_ne_bytes());
+        ctrl
+    }
+
+    /// The safe half of the read-back: the hop-limit cmsg parses with
+    /// its native-order u32, the pktinfo cmsg yields the destination,
+    /// and the alignment walk survives a two-message buffer with
+    /// padding (the shapes the kernel round-trips pin for real).
+    #[test]
+    fn v6_cmsg_parser_goldens() {
+        assert_eq!(received_hop_limit_v6(&hoplimit_cmsg(1)), Some(1));
+        assert_eq!(received_hop_limit_v6(&hoplimit_cmsg(63)), Some(63));
+        let dst: Ipv6Addr = "fe80::a1".parse().unwrap();
+        assert_eq!(received_dst_v6(&pktinfo_cmsg(dst, 3)), Some(dst));
+
+        // Both cmsgs in one control buffer, hoplimit first with
+        // padding to the alignment boundary: the walk finds both.
+        let mut both = hoplimit_cmsg(1);
+        let first = GOLDEN_LEN_SIZE + 8 + 4;
+        both.resize(first.div_ceil(GOLDEN_LEN_SIZE) * GOLDEN_LEN_SIZE, 0);
+        both.extend_from_slice(&pktinfo_cmsg(ALL_SPF_ROUTERS_V6, 7));
+        assert_eq!(received_hop_limit_v6(&both), Some(1));
+        assert_eq!(received_dst_v6(&both), Some(ALL_SPF_ROUTERS_V6));
+        assert_eq!(parse_cmsgs(&both).len(), 2);
+    }
+
+    /// The parsers' edges: truncated pktinfo data, foreign cmsgs,
+    /// empty buffers, and malformed tails all degrade to None/stop
+    /// (never a wrong answer).
+    #[test]
+    fn v6_cmsg_extraction_edges() {
+        // A pktinfo header promising 20 bytes but carrying 10.
+        let mut short = Vec::new();
+        put_cmsg_len(&mut short, (GOLDEN_LEN_SIZE + 8 + 20) as u32);
+        short.extend_from_slice(&IPPROTO_IPV6_CMSG.to_ne_bytes());
+        short.extend_from_slice(&IPV6_PKTINFO_CMSG_KINDS[0].to_ne_bytes());
+        short.extend_from_slice(&[0u8; 10]);
+        assert_eq!(received_dst_v6(&short), None, "truncated pktinfo");
+        // A foreign cmsg (level 0 = SOL_IP) is ignored by both.
+        let mut foreign = Vec::new();
+        put_cmsg_len(&mut foreign, (GOLDEN_LEN_SIZE + 8 + 4) as u32);
+        foreign.extend_from_slice(&0u32.to_ne_bytes()); // level SOL_IP
+        foreign.extend_from_slice(&2u32.to_ne_bytes()); // type 2
+        foreign.extend_from_slice(&255u32.to_ne_bytes());
+        assert_eq!(received_hop_limit_v6(&foreign), None, "v4 cmsg ignored");
+        assert_eq!(received_dst_v6(&foreign), None);
+        // Empty and truncated buffers.
+        assert_eq!(received_hop_limit_v6(&[]), None);
+        assert_eq!(received_dst_v6(&[]), None);
+        assert!(parse_cmsgs(&hoplimit_cmsg(1)[..GOLDEN_LEN_SIZE + 4]).is_empty());
+        // A hop-limit cmsg with short data (len says 4, data says 2).
+        let mut skinny = Vec::new();
+        put_cmsg_len(&mut skinny, (GOLDEN_LEN_SIZE + 8 + 4) as u32);
+        skinny.extend_from_slice(&IPPROTO_IPV6_CMSG.to_ne_bytes());
+        skinny.extend_from_slice(&IPV6_HOPLIMIT_CMSG_KINDS[0].to_ne_bytes());
+        skinny.extend_from_slice(&[1u8, 0]);
+        assert_eq!(received_hop_limit_v6(&skinny), None, "data under 4 bytes");
+    }
+
+    /// The unicast receive-side hop policy (the v6 mirror of the N1
+    /// v4 rule): our unicast arm sends hop 1, so 1 is the only pass
+    /// value; `None` (no cmsg) is fail-open, disclosed.
+    #[test]
+    fn unicast_hop_policy() {
+        assert!(unicast_hop_limit_ok(1), "the on-link pass value");
+        assert!(!unicast_hop_limit_ok(63), "relayed — drop");
+        assert!(!unicast_hop_limit_ok(255), "far end — drop");
+        // The fail-open composition the daemon applies (None = no
+        // cmsg — the unarmed path, disclosed).
+        assert!(Option::<u32>::None
+            .map(unicast_hop_limit_ok)
+            .unwrap_or(true));
+    }
+
+    /// The kernel round-trip on UDP loopback (unprivileged — the
+    /// arming, the audited recvmsg, and the parsers against the REAL
+    /// kernel cmsgs): the sent hop limit and the true destination
+    /// read back through [`recvmsg_v6_ctl`]; WouldBlock when idle.
+    #[test]
+    fn udp_v6_roundtrip_reads_back_hop_and_dst() {
+        let sender = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        sender
+            .bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let receiver = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        receiver
+            .bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        receiver.set_recv_hoplimit_v6(true).unwrap();
+        arm_v6_recv_pktinfo(&receiver).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let dst = receiver.local_addr().unwrap().as_socket().unwrap();
+
+        // Idle socket: the nonblocking recvmsg returns WouldBlock.
+        let mut payload = [std::mem::MaybeUninit::<u8>::uninit(); 64];
+        let mut ctrl = [std::mem::MaybeUninit::<u8>::uninit(); CTL_BUFSZ_V6];
+        assert_eq!(
+            recvmsg_v6_ctl(&receiver, &mut payload, &mut ctrl)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        for sent in [1u32, 64] {
+            sender.set_unicast_hops_v6(sent).unwrap();
+            sender.send_to(b"probe", &dst.into()).unwrap();
+            let read = loop {
+                match recvmsg_v6_ctl(&receiver, &mut payload, &mut ctrl) {
+                    Ok(read) => break read,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("recvmsg failed: {e}"),
+                }
+            };
+            assert_eq!(read.payload, b"probe");
+            assert_eq!(read.src, Ipv6Addr::LOCALHOST);
+            assert_eq!(read.hop_limit, Some(sent), "sent hop {sent} reads back");
+            assert_eq!(read.dst, Some(Ipv6Addr::LOCALHOST), "the true dst");
+            assert_eq!(unicast_hop_limit_ok(sent), sent == 1);
+        }
+    }
+
+    /// The wire proof on the REAL transport: raw proto-89 v6 sockets
+    /// on loopback — a multicast send to ff02::5 and unicast sends at
+    /// hops 1 and 63 — all read back through the audited [`recv_ctl`]
+    /// (hop limit AND true destination, the read-backs the S7-a
+    /// interim stood in for). Privileged-gated like the other raw
+    /// tests (root opens raw sockets; the interop leg is the proof
+    /// elsewhere).
+    #[tokio::test]
+    async fn raw_v6_readback_roundtrips_the_real_wire() {
+        let ifindex = ifindex_of("lo0").or_else(|_| ifindex_of("lo")).unwrap_or(1);
+        let mk = || match OspfV6RawSocket::open(Ipv6Addr::LOCALHOST, ifindex) {
+            Ok(s) => Ok(s),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: raw v6 sockets need root here ({err})");
+                Err(())
+            }
+            Err(err) => panic!("unexpected v6 open error: {err}"),
+        };
+        let sender = match mk() {
+            Ok(s) => s,
+            Err(()) => return,
+        };
+        let receiver = match mk() {
+            Ok(s) => s,
+            Err(()) => return,
+        };
+        let mut payload = [std::mem::MaybeUninit::<u8>::uninit(); 65535];
+        let mut ctrl = [std::mem::MaybeUninit::<u8>::uninit(); CTL_BUFSZ_V6];
+        // Bounded poll: a platform whose loopback does not deliver
+        // raw v6 skips the leg (the interop rig is the wire proof
+        // there).
+        #[derive(Debug, Default)]
+        struct Readback {
+            src: Option<Ipv6Addr>,
+            dst: Option<Ipv6Addr>,
+            hop_limit: Option<u32>,
+            #[allow(dead_code)] // symmetry: the legs assert src/dst/hop
+            payload: Vec<u8>,
+        }
+
+        fn read_one(
+            receiver: &OspfV6RawSocket,
+            payload: &mut [std::mem::MaybeUninit<u8>],
+            ctrl: &mut [std::mem::MaybeUninit<u8>],
+        ) -> Option<Readback> {
+            for _ in 0..400 {
+                match receiver.recv_ctl(payload, ctrl) {
+                    Ok(read) => {
+                        return Some(Readback {
+                            src: Some(read.src),
+                            dst: read.dst,
+                            hop_limit: read.hop_limit,
+                            payload: read.payload.to_vec(),
+                        });
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("recvmsg failed: {e}"),
+                }
+            }
+            None
+        }
+
+        // Multicast leg: ff02::5, hop 1 (the §A.1-mandated arm).
+        sender
+            .send_multicast(&[0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        let Some(read) = read_one(&receiver, &mut payload, &mut ctrl) else {
+            eprintln!("skipping: no loopback v6 multicast delivery here");
+            return;
+        };
+        assert_eq!(
+            read.hop_limit,
+            Some(1),
+            "ff02::5 carries hop 1 (§A.1's mandate)"
+        );
+        assert_eq!(read.dst, Some(ALL_SPF_ROUTERS_V6), "the true multicast dst");
+        assert_eq!(read.src, Some(Ipv6Addr::LOCALHOST));
+
+        // Unicast leg at our parity hop 1: passes the verdict.
+        sender
+            .send_unicast(&[0x04, 0x00, 0x00, 0x00], Ipv6Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let Some(read) = read_one(&receiver, &mut payload, &mut ctrl) else {
+            eprintln!("skipping: no loopback v6 unicast delivery here");
+            return;
+        };
+        assert_eq!(read.hop_limit, Some(1));
+        assert_eq!(read.dst, Some(Ipv6Addr::LOCALHOST));
+        assert!(unicast_hop_limit_ok(read.hop_limit.unwrap()));
+
+        // Degraded unicast (hops 63): the read-back still works — and
+        // the verdict drops it, the receive-side rule the read-back
+        // feeds.
+        sender
+            .socket
+            .lock()
+            .expect("socket lock")
+            .set_unicast_hops_v6(63)
+            .unwrap();
+        sender
+            .send_unicast(&[0x05, 0x00, 0x00, 0x00], Ipv6Addr::LOCALHOST)
+            .await
+            .unwrap();
+        let Some(read) = read_one(&receiver, &mut payload, &mut ctrl) else {
+            eprintln!("skipping: no loopback v6 unicast delivery here");
+            return;
+        };
+        assert_eq!(read.hop_limit, Some(63), "the degraded value reads back");
+        assert!(
+            !unicast_hop_limit_ok(read.hop_limit.unwrap()),
+            "relayed — drop"
+        );
     }
 }

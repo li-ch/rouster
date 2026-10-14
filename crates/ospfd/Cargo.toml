@@ -13,6 +13,12 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+# The audited v6 cmsg read-back (AGENTS.md's owner-named exception,
+# 2026-10-14): socket2 0.6.5 exposes no IPV6_RECVPKTINFO setter, so
+# transport::arm_v6_recv_pktinfo makes the one audited libc::setsockopt
+# call (the bfdd arm_v4_recv_ttl precedent). Pre-existing workspace
+# member dep (bfdd, netlink-dp) — no new crate enters the lockfile.
+libc.workspace = true
 # The SAVNET agent hooks (experimental-savnet, default OFF): in-process
 # reporting of SAV-relevant events (changed LSAs from the
 # InstallAndFlood products, adjacency transitions) to a
