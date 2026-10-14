@@ -556,12 +556,44 @@ impl BgpUpdate {
         Ok(())
     }
 
+    /// RFC 7606 §5.1's sender-side MUST NOT, verified wording: "An
+    /// UPDATE message MUST NOT contain more than one of the following:
+    /// non-empty Withdrawn Routes field, non-empty Network Layer
+    /// Reachability Information field, MP_REACH_NLRI attribute, and
+    /// MP_UNREACH_NLRI attribute." bgpd never emits a mixed UPDATE
+    /// (B-4: the encode hard-reject — "we must not send what §5.1
+    /// forbids"); the receive side stays tolerant per the same
+    /// section ("an implementation MUST still be prepared to receive
+    /// these fields in any position or combination"), pinned by the
+    /// merge-decode test. The End-of-RIB shapes pass: the v4 marker
+    /// carries none of the four; a family's MP marker exactly one.
+    pub fn validate_single_route_container(&self) -> BgpResult<()> {
+        let containers = [
+            !self.withdrawn.is_empty(),
+            !self.nlri.is_empty(),
+            self.attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::MpReach(_))),
+            self.attrs
+                .iter()
+                .any(|a| matches!(a, PathAttribute::MpUnreach(_))),
+        ];
+        if containers.iter().filter(|c| **c).count() > 1 {
+            return Err(BgpError::local(
+                "mixed UPDATE: more than one of withdrawn routes / NLRI / \
+                 MP_REACH_NLRI / MP_UNREACH_NLRI (RFC 7606 §5.1 MUST NOT)",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode(
         &self,
         out: &mut Vec<u8>,
         asn4: bool,
         addpath: AddPathCtx,
     ) -> BgpResult<()> {
+        self.validate_single_route_container()?;
         let mut withdrawn = Vec::new();
         for nlri in &self.withdrawn {
             encode_nlri(&mut withdrawn, nlri, addpath.v4)?;
@@ -1180,6 +1212,15 @@ mod tests {
         );
     }
 
+    /// B-4's receive-side pin: RFC 7606 §5.1's sender-side MUST NOT
+    /// ("An UPDATE message MUST NOT contain more than one of the
+    /// following: non-empty Withdrawn Routes field, non-empty ...
+    /// NLRI field, MP_REACH_NLRI attribute, and MP_UNREACH_NLRI
+    /// attribute") makes this a frame bgpd refuses to SEND — but the
+    /// same section's receiver duty ("an implementation MUST still be
+    /// prepared to receive these fields in any position or
+    /// combination") keeps the decode tolerant. The mixed frame is
+    /// built by hand (the codec will not produce it).
     #[test]
     fn update_mp_and_v4_fields_merge() {
         let update = BgpUpdate {
@@ -1207,19 +1248,35 @@ mod tests {
             ],
             nlri: vec!["203.0.113.0/24".parse().unwrap()],
         };
-        let frame = BgpMessage::Update(update.clone()).encode(true).unwrap();
-        assert!(frame.len() <= 4096);
-        assert_eq!(
-            BgpMessage::decode(&frame, true).unwrap(),
-            BgpMessage::Update(update.clone())
-        );
-        assert_eq!(update.announced().len(), 2);
-        assert_eq!(update.withdrawn_all().len(), 2);
+        // B-4: the encode hard-reject — we must not send what §5.1
+        // forbids (four route containers in one UPDATE here).
+        let err = BgpMessage::Update(update.clone()).encode(true).unwrap_err();
+        assert!(err.message.contains("§5.1"));
+
+        // The receiver still merges every family: hand-built frame.
+        let mut attr_bytes = Vec::new();
+        crate::attr::encode_attributes(&update.attrs, &mut attr_bytes, true, AddPathCtx::default())
+            .unwrap();
+        let mut body = vec![0x00, 0x04, 24, 198, 51, 100]; // withdrawn
+        body.extend_from_slice(&(attr_bytes.len() as u16).to_be_bytes());
+        body.extend_from_slice(&attr_bytes);
+        body.extend_from_slice(&[24, 203, 0, 113]); // NLRI
+        let (decoded, _) = BgpUpdate::decode_with_handling(
+            &body,
+            true,
+            UpdateHandling::StrictRfc4271,
+            AddPathCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded, update);
+        assert_eq!(decoded.announced().len(), 2);
+        assert_eq!(decoded.withdrawn_all().len(), 2);
     }
 
-    /// RFC 7911 §3 golden: an UPDATE whose NLRI and withdrawn fields
-    /// carry the extended encoding — the 4-octet Path Identifier
-    /// before each prefix. Path ID 1, 203.0.113.0/24 is
+    /// RFC 7911 §3 golden: the extended encoding — the 4-octet Path
+    /// Identifier before each prefix — in one announce frame and one
+    /// withdrawal frame (RFC 7606 §5.1 forbids sending both fields in
+    /// one UPDATE). Path ID 1, 203.0.113.0/24 is
     /// `00000001 18 cb0071` on the wire, the RFC's own example shape.
     #[test]
     fn update_add_path_golden_bytes() {
@@ -1227,29 +1284,27 @@ mod tests {
             v4: true,
             v6: false,
         };
-        let update = BgpUpdate {
-            withdrawn: vec![Nlri {
-                prefix: "198.51.100.0/24".parse().unwrap(),
-                path_id: 0x0102_0304,
-            }],
-            attrs: vec![
-                PathAttribute::Origin(Origin::Igp),
-                PathAttribute::AsPath(AsPath::sequence([65002])),
-                PathAttribute::NextHop(id(2)),
-            ],
+        let attrs = vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::sequence([65002])),
+            PathAttribute::NextHop(id(2)),
+        ];
+        let announce = BgpUpdate {
+            withdrawn: vec![],
+            attrs: attrs.clone(),
             nlri: vec![Nlri {
                 prefix: "203.0.113.0/24".parse().unwrap(),
                 path_id: 1,
             }],
         };
-        let frame = BgpMessage::Update(update.clone())
+        // frame = 19 header + 2+0 withdrawn + 2+18 attrs + 8 NLRI
+        // (4 id + 1 length + 3 address octets) = 49 (0x31).
+        let frame = BgpMessage::Update(announce.clone())
             .encode_with(false, ctx)
             .unwrap();
-        // frame = 19 header + 2+8 withdrawn + 2+18 attrs + 8 NLRI
-        // (4 id + 1 length + 3 address octets) = 57 (0x39).
         let expected = unhex(
-            "ffffffffffffffffffffffffffffffff 0039 02 \
-             0008 01020304 18 c63364 \
+            "ffffffffffffffffffffffffffffffff 0031 02 \
+             0000 \
              0012 \
              40 01 01 00 \
              40 02 04 02 01 fdea \
@@ -1260,7 +1315,33 @@ mod tests {
         let (back, _) =
             BgpMessage::decode_with_handling(&frame, false, UpdateHandling::StrictRfc4271, ctx)
                 .unwrap();
-        assert_eq!(back, BgpMessage::Update(update));
+        assert_eq!(back, BgpMessage::Update(announce));
+
+        let withdraw = BgpUpdate {
+            withdrawn: vec![Nlri {
+                prefix: "198.51.100.0/24".parse().unwrap(),
+                path_id: 0x0102_0304,
+            }],
+            attrs,
+            nlri: vec![],
+        };
+        // frame = 19 header + 2+8 withdrawn + 2+18 attrs = 49 (0x31).
+        let frame = BgpMessage::Update(withdraw.clone())
+            .encode_with(false, ctx)
+            .unwrap();
+        let expected = unhex(
+            "ffffffffffffffffffffffffffffffff 0031 02 \
+             0008 01020304 18 c63364 \
+             0012 \
+             40 01 01 00 \
+             40 02 04 02 01 fdea \
+             40 03 04 0a000002",
+        );
+        assert_eq!(frame, expected);
+        let (back, _) =
+            BgpMessage::decode_with_handling(&frame, false, UpdateHandling::StrictRfc4271, ctx)
+                .unwrap();
+        assert_eq!(back, BgpMessage::Update(withdraw));
         // Mixed path IDs on one prefix coexist as separate entries —
         // the §5 replacement key.
         let update = BgpUpdate {
@@ -1299,71 +1380,86 @@ mod tests {
             v4: false,
             v6: true,
         };
-        let update = BgpUpdate {
+        // One container each (RFC 7606 §5.1): the MP_UNREACH
+        // withdrawal and the MP_REACH announce ride separate frames.
+        let unreach = BgpUpdate {
             withdrawn: vec![],
-            attrs: vec![
-                PathAttribute::MpUnreach(MpUnreach {
-                    afi: 2,
-                    safi: 1,
-                    withdrawn: vec![Nlri {
-                        prefix: "2001:db8::/32".parse().unwrap(),
-                        path_id: 9,
-                    }],
-                }),
-                PathAttribute::MpReach(MpReach {
-                    afi: 2,
-                    safi: 1,
-                    next_hop: crate::attr::MpNextHop::V6 {
-                        global: "2001:db8::1".parse().unwrap(),
-                        link_local: None,
-                    },
-                    nlri: vec![
-                        Nlri {
-                            prefix: "2001:db8:aa::/48".parse().unwrap(),
-                            path_id: 1,
-                        },
-                        Nlri {
-                            prefix: "2001:db8:aa::/48".parse().unwrap(),
-                            path_id: 0xdead_beef,
-                        },
-                    ],
-                }),
-            ],
+            attrs: vec![PathAttribute::MpUnreach(MpUnreach {
+                afi: 2,
+                safi: 1,
+                withdrawn: vec![Nlri {
+                    prefix: "2001:db8::/32".parse().unwrap(),
+                    path_id: 9,
+                }],
+            })],
             nlri: vec![],
         };
-        let frame = BgpMessage::Update(update.clone())
+        let frame = BgpMessage::Update(unreach.clone())
             .encode_with(true, ctx)
             .unwrap();
         let (back, _) =
             BgpMessage::decode_with_handling(&frame, true, UpdateHandling::StrictRfc4271, ctx)
                 .unwrap();
-        assert_eq!(back, BgpMessage::Update(update.clone()));
+        assert_eq!(back, BgpMessage::Update(unreach));
+
+        let reach = BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![PathAttribute::MpReach(MpReach {
+                afi: 2,
+                safi: 1,
+                next_hop: crate::attr::MpNextHop::V6 {
+                    global: "2001:db8::1".parse().unwrap(),
+                    link_local: None,
+                },
+                nlri: vec![
+                    Nlri {
+                        prefix: "2001:db8:aa::/48".parse().unwrap(),
+                        path_id: 1,
+                    },
+                    Nlri {
+                        prefix: "2001:db8:aa::/48".parse().unwrap(),
+                        path_id: 0xdead_beef,
+                    },
+                ],
+            })],
+            nlri: vec![],
+        };
+        let frame = BgpMessage::Update(reach.clone())
+            .encode_with(true, ctx)
+            .unwrap();
+        let (back, _) =
+            BgpMessage::decode_with_handling(&frame, true, UpdateHandling::StrictRfc4271, ctx)
+                .unwrap();
+        assert_eq!(back, BgpMessage::Update(reach.clone()));
+
         // The v4 top-level fields stay classic under a v6-only
         // negotiation: family-scoped, not session-global.
         assert!(!ctx.for_family(1, 1));
-        // And a v4 classic NLRI in the same message decodes with
-        // path_id 0 (classic key) even under this ctx.
-        let mut mixed = BgpUpdate {
-            withdrawn: vec![],
-            attrs: update.attrs.clone(),
-            nlri: vec![Nlri::from(
-                "203.0.113.0/24".parse::<common::IpPrefix>().unwrap(),
-            )],
-        };
+        // And a v4 classic NLRI in the SAME message decodes with
+        // path_id 0 (classic key) even under this ctx — a receive-side
+        // frame built by hand (§5.1 forbids SENDING the mix; receivers
+        // "MUST still be prepared to receive these fields in any
+        // position or combination").
+        let mut attrs = reach.attrs.clone();
         // The v4 NLRI's mandatory triple (§6.3): the MP-only attrs of
         // the v6 update above do not cover it.
-        mixed.attrs.extend([
+        attrs.extend([
             PathAttribute::Origin(Origin::Igp),
             PathAttribute::AsPath(AsPath::default()),
             PathAttribute::NextHop(id(3)),
         ]);
-        let frame = BgpMessage::Update(mixed.clone())
-            .encode_with(true, ctx)
-            .unwrap();
-        let (back, _) =
-            BgpMessage::decode_with_handling(&frame, true, UpdateHandling::StrictRfc4271, ctx)
+        let mut attr_bytes = Vec::new();
+        crate::attr::encode_attributes(&attrs, &mut attr_bytes, true, ctx).unwrap();
+        let mut body = vec![0x00, 0x00];
+        body.extend_from_slice(&(attr_bytes.len() as u16).to_be_bytes());
+        body.extend_from_slice(&attr_bytes);
+        body.extend_from_slice(&[24, 203, 0, 113]);
+        let (decoded, _) =
+            BgpUpdate::decode_with_handling(&body, true, UpdateHandling::StrictRfc4271, ctx)
                 .unwrap();
-        assert_eq!(back, BgpMessage::Update(mixed));
+        assert_eq!(decoded.nlri.len(), 1);
+        assert_eq!(decoded.nlri[0].path_id, 0, "classic key");
+        assert_eq!(decoded.announced().len(), 3, "2 v6 + 1 v4");
     }
 
     /// The /0 hazard, pinned (RFC 7911's only defense is the
@@ -1555,6 +1651,87 @@ mod tests {
                     "round {round}"
                 );
             }
+        }
+    }
+
+    /// B-4's table: every pair of route containers is a hard encode
+    /// reject (RFC 7606 §5.1's MUST NOT), while each legitimate
+    /// single-container shape — announce, withdrawal, both EOR
+    /// markers — still encodes.
+    #[test]
+    fn encode_rejects_mixed_route_containers() {
+        fn attrs(extra: Vec<PathAttribute>) -> Vec<PathAttribute> {
+            [
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::default()),
+                PathAttribute::NextHop(id(2)),
+            ]
+            .into_iter()
+            .chain(extra)
+            .collect()
+        }
+        let p4 = "203.0.113.0/24".parse().unwrap();
+        let mp_reach = PathAttribute::MpReach(MpReach {
+            afi: 2,
+            safi: 1,
+            next_hop: crate::attr::MpNextHop::V6 {
+                global: "2001:db8::1".parse().unwrap(),
+                link_local: None,
+            },
+            nlri: vec!["2001:db8:aa::/48".parse().unwrap()],
+        });
+        let mp_unreach = PathAttribute::MpUnreach(MpUnreach {
+            afi: 2,
+            safi: 1,
+            withdrawn: vec!["2001:db8::/32".parse().unwrap()],
+        });
+        // Each row names two of the four containers.
+        let mixed = [
+            // withdrawn + NLRI
+            BgpUpdate {
+                withdrawn: vec![p4],
+                attrs: attrs(vec![]),
+                nlri: vec![p4],
+            },
+            // NLRI + MP_REACH
+            BgpUpdate {
+                withdrawn: vec![],
+                attrs: attrs(vec![mp_reach.clone()]),
+                nlri: vec![p4],
+            },
+            // withdrawn + MP_UNREACH
+            BgpUpdate {
+                withdrawn: vec![p4],
+                attrs: attrs(vec![mp_unreach.clone()]),
+                nlri: vec![],
+            },
+            // MP_REACH + MP_UNREACH
+            BgpUpdate {
+                withdrawn: vec![],
+                attrs: attrs(vec![mp_reach.clone(), mp_unreach.clone()]),
+                nlri: vec![],
+            },
+        ];
+        for (i, update) in mixed.iter().enumerate() {
+            let err = update.encode_frame(true).unwrap_err();
+            assert!(err.message.contains("§5.1"), "row {i}: {}", err.message);
+        }
+        // The legitimate shapes pass.
+        for ok in [
+            BgpUpdate::default(),               // v4 EOR
+            BgpUpdate::end_of_rib_marker(2, 1), // v6 EOR
+            BgpUpdate {
+                attrs: attrs(vec![]),
+                nlri: vec![p4],
+                ..Default::default()
+            },
+            BgpUpdate {
+                withdrawn: vec![p4],
+                attrs: attrs(vec![]),
+                ..Default::default()
+            },
+        ] {
+            assert!(ok.encode_frame(true).is_ok());
         }
     }
 

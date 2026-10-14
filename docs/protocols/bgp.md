@@ -133,6 +133,18 @@ containing the entire malformed UPDATE message" (the raw frame, hex,
 rides `DecodedFrame` to the log line). The strict mode carries the
 §6.3-prescribed subcode on its NOTIFICATION.
 
+**The send side of §5.1 (B-4)**: "An UPDATE message MUST NOT contain
+more than one of the following: non-empty Withdrawn Routes field,
+non-empty NLRI field, MP_REACH_NLRI attribute, and MP_UNREACH_NLRI
+attribute" — `BgpUpdate::validate_single_route_container` is the
+encode hard-reject (we must not send what §5.1 forbids), checked at
+the top of `encode`; the End-of-RIB shapes pass (the v4 marker carries
+none of the four, a family's MP marker exactly one). The receive side
+stays tolerant per the same section ("an implementation MUST still be
+prepared to receive these fields in any position or combination"),
+pinned by the merge-decode test, which builds the mixed frame by hand
+since the codec now refuses to produce it.
+
 ### Route-server mode v1 (N5 M2)
 
 `neighbor X route-server` marks an RS client (FRR
