@@ -252,6 +252,10 @@ echo "==> RFC7606: malformed optional attribute from a crafted peer —"
 echo "    route discarded, session survives (treat-as-withdraw)"
 CRAFT_NET_A=198.18.7.0/24   # announced good, then re-announced malformed
 CRAFT_NET_B=198.18.8.0/24   # announced after the malformed UPDATE
+# The fixture lands in quarantine BEFORE the run's own mkdir (line
+# ~326) — on a fresh checkout the dir does not exist yet and the
+# heredoc dies with "No such file or directory" (CI run 38647649951).
+mkdir -p "$QUARANTINE"
 cat > "$QUARANTINE/crafted-peer.pl" <<'PERL'
 #!/usr/bin/perl
 # A crafted BGP peer (N5 M4): establishes with rouster bgpd, announces

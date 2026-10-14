@@ -47,7 +47,9 @@ MGMTD_LOG=/tmp/mgmtd.log
 S2_BFDD_LOG=/tmp/frr-bfdd.log
 S2_ZEBRA_LOG=/tmp/zebra.log
 S2_MGMTD_LOG=/tmp/mgmtd.log
-QUARANTINE="${ROUSTER_W1B_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/../away" && pwd)/2026-10-11/weekend/quarantine/bfd-zapi/smoke}"
+# Repo-root cd + /away suffix: cd-ing into away/ races its own mkdir
+# and fails on a fresh checkout (CI run 38647649951 lesson).
+QUARANTINE="${ROUSTER_W1B_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/away/2026-10-11/weekend/quarantine/bfd-zapi/smoke}"
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;

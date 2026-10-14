@@ -39,7 +39,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 SA=m1-sh-a
 SB=m1-sh-b
 IMAGE=frr-testbed:10.2.2
-QUARANTINE="${ROUSTER_M1_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/../away" && pwd)/2026-10-11/night/quarantine/bfd-singlehop}"
+# Repo-root cd + /away suffix: cd-ing into away/ races its own mkdir
+# and fails on a fresh checkout (CI run 38647649951 lesson).
+QUARANTINE="${ROUSTER_M1_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/away/2026-10-11/night/quarantine/bfd-singlehop}"
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;

@@ -44,8 +44,11 @@ FRR_BFDD_LOG=/tmp/frr-bfdd.log
 ZEBRA_LOG=/tmp/zebra.log
 MGMTD_LOG=/tmp/mgmtd.log
 # Absolute quarantine path (S5): the away program's evidence dir
-# (overridable for debug runs that must inspect the captures).
-QUARANTINE="${ROUSTER_BFD_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/../away" && pwd)/2026-10-11/quarantine/bfd}"
+# (overridable for debug runs that must inspect the captures). The cd
+# anchors on the repo root (always present on a fresh checkout) and
+# appends away/ — cd-ing into away/ itself runs before the mkdir below
+# and dies on a fresh tree (the CI run 38647649951 lesson).
+QUARANTINE="${ROUSTER_BFD_QUARANTINE:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/away/2026-10-11/quarantine/bfd}"
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;
