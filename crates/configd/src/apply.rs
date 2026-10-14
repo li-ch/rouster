@@ -26,15 +26,17 @@
 //! **What is and is not transactional, honestly**: each file
 //! replacement is atomic (a daemon never re-parses a half-written
 //! file); the generation record is written only after every render
-//! succeeded, so a failed apply never advances `current`; and
-//! rollback is explicit (`configd rollback` re-applies the previous
-//! generation through this same pipeline). What v1 does NOT have is
-//! cross-file atomicity or automatic rollback on a daemon's rejected
-//! reload — a daemon that dislikes its new file keeps its running
-//! config (every landed SIGHUP arm behaves this way: parse failure →
-//! warning, running config retained) until the operator rolls back.
-//! Automatic rollback needs daemon status-file semantics beyond
-//! v1's scope (§Deferred, docs/protocols/config.md).
+//! succeeded AND every signaled daemon confirmed its reload (S8-c
+//! M3, step 4.5 below), so a failed or refused apply never advances
+//! `current`; and a refused reload is AUTO-reverted — the current
+//! (last confirmed) generation is re-applied as a new generation
+//! and the apply fails with the honest story ([`ApplyError::
+//! AutoRolledBack`]). What is still NOT covered: cross-file
+//! atomicity on mid-apply write failures (earlier files stay
+//! replaced; §Deferred), daemons that publish no ack surface
+//! (rousterd today — a refused reload there is `unverifiable`, not
+//! rolled back), and `unverified`/`no-status` verdicts, which never
+//! trigger a rollback (absence of evidence is not evidence).
 //!
 //! Failure handling: a write error stops the pipeline at that daemon
 //! (earlier files are already replaced — disclosed above), no
@@ -61,7 +63,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::atomic::write_atomic;
 use crate::render::render_daemon;
@@ -122,6 +124,9 @@ pub enum RollbackSource {
     File(PathBuf),
     /// A rollback re-applying generation `<seq>`.
     Rollback { from: u64 },
+    /// The M3 auto-rollback re-applying generation `<seq>` after a
+    /// daemon's refused reload.
+    AutoRevert { from: u64 },
 }
 
 impl RollbackSource {
@@ -131,6 +136,9 @@ impl RollbackSource {
         match self {
             RollbackSource::File(path) => path.display().to_string(),
             RollbackSource::Rollback { from } => format!("rollback of generation {from}"),
+            RollbackSource::AutoRevert { from } => {
+                format!("auto-rollback to generation {from} (post-signal load refusal)")
+            }
         }
     }
 }
@@ -201,6 +209,13 @@ pub struct ApplyReport {
     /// Per-daemon outcomes, in apply order, only for daemons with a
     /// section in the applied file.
     pub outcomes: Vec<(Daemon, DaemonOutcome)>,
+    /// Post-signal acknowledgment verdicts (S8-c M3) for every
+    /// SIGNALED daemon, in signal order: `confirmed` / `failed` /
+    /// `unverified` / `no-status` for savd/bfdd (status-file ack
+    /// surfaces), `no-ack-surface` for signaled daemons that publish
+    /// nothing config-shaped today (rousterd). Absent when nothing
+    /// was signaled.
+    pub acks: Vec<(Daemon, crate::verify::Ack)>,
     /// The pre-apply gate's verdicts (S8-c): what each section's deep
     /// validation did — `validated`, or the disclosed skip (an absent
     /// or flagless binary). A refusal never reaches a report (it
@@ -229,6 +244,64 @@ pub enum ApplyError {
     Store { path: PathBuf, err: std::io::Error },
     #[error("no previous generation to roll back to ({path} missing or empty)")]
     NoPrevious { path: PathBuf },
+    /// A signaled daemon's rewritten status disagreed with the
+    /// rendered config — a refused reload (S8-c M3's post-signal
+    /// verification). This variant is the inner refusal: it is what
+    /// the auto-rollback pass itself returns to the outer apply when
+    /// the REVERT is what got refused (the outer error names both).
+    #[error("daemon {daemon} refused the reload: expected {expected}, saw {seen}")]
+    LoadRefused {
+        daemon: Daemon,
+        expected: String,
+        seen: String,
+    },
+    /// A refused reload with no confirmed generation to revert to
+    /// (the first-ever apply): the daemon kept its running config,
+    /// but the on-disk file now holds the refused bytes (the next
+    /// start of that daemon would load them — operator action
+    /// required; disclosed).
+    #[error(
+        "daemon {daemon} refused the reload: expected {expected}, saw {seen} \
+         — no confirmed generation to auto-roll back to; the daemon kept its \
+         running config, but the on-disk file holds the refused bytes"
+    )]
+    LoadRefusedNoPrevious {
+        daemon: Daemon,
+        expected: String,
+        seen: String,
+    },
+    /// A refused reload and the auto-rollback to the previous
+    /// generation SUCCEEDED: the system is back on the last
+    /// confirmed config as a new generation; the apply still fails
+    /// (the operator must know what was refused).
+    #[error(
+        "daemon {daemon} refused the reload: expected {expected}, saw {seen} \
+         — auto-rolled back to generation {to} (now generation {now})"
+    )]
+    AutoRolledBack {
+        daemon: Daemon,
+        expected: String,
+        seen: String,
+        to: u64,
+        now: u64,
+        /// The revert pass's full report (the CLI prints it).
+        revert: Box<ApplyReport>,
+    },
+    /// A refused reload whose auto-rollback ALSO failed: the system
+    /// may be running the refused config's predecessor's FILES with
+    /// a daemon that kept something else — worst case, operator
+    /// attention required; every fact is in the message.
+    #[error(
+        "daemon {daemon} refused the reload: expected {expected}, saw {seen} \
+         — auto-rollback to generation {to} also failed: {cause}"
+    )]
+    AutoRollbackFailed {
+        daemon: Daemon,
+        expected: String,
+        seen: String,
+        to: u64,
+        cause: Box<ApplyError>,
+    },
 }
 
 /// FNV-1a 64 over the canonical bytes — the config hash. A change
@@ -245,10 +318,25 @@ pub fn config_hash(bytes: &[u8]) -> String {
 
 /// Applies a canonical file (already read to bytes) through the full
 /// pipeline. `source` records provenance for the status file.
+/// Post-signal verification (S8-c M3) runs for every signaled daemon
+/// with an ack surface; a refused reload auto-reverts to the previous
+/// generation (when one exists) and the apply fails honestly.
 pub fn apply(
     bytes: &[u8],
     source: RollbackSource,
     opts: &ApplyOptions,
+) -> Result<ApplyReport, ApplyError> {
+    apply_inner(bytes, source, opts, true)
+}
+
+/// The pipeline body. `auto_revert` gates the M3 rollback-on-failure
+/// pass (the revert itself runs with it off — one bounce, never a
+/// loop).
+fn apply_inner(
+    bytes: &[u8],
+    source: RollbackSource,
+    opts: &ApplyOptions,
+    auto_revert: bool,
 ) -> Result<ApplyReport, ApplyError> {
     // 1. Parse (structural validation refuses a bad file outright).
     let text = std::str::from_utf8(bytes).map_err(|_| tree::ParseError::Line {
@@ -290,9 +378,16 @@ pub fn apply(
         info!(daemon = daemon.name(), path = %path.display(), bytes = out.len(), "rendered");
     }
 
-    // 4. Signal every ARMED daemon with a section, in order.
+    // 4. Signal every ARMED daemon with a section, in order. For
+    // each signaled daemon with an ack surface, the status file's
+    // mtime is captured BEFORE the signal — the "has the daemon
+    // spoken since" comparison point for step 4.5.
     let registry = registry(&opts.run_dir);
     let mut outcomes = Vec::new();
+    // The pre-signal status mtime per ack-able signaled daemon
+    // (`None` = the file did not exist yet — a later appearance is
+    // a rewrite for verification purposes).
+    let mut pre_signal: Vec<(Daemon, Option<std::time::SystemTime>)> = Vec::new();
     for spec in &registry {
         if !rendered.iter().any(|(d, _, _)| *d == spec.daemon) {
             continue;
@@ -303,13 +398,63 @@ pub fn apply(
         }
         match signal::resolve_pid(&spec.pid_source) {
             Some(pid) if signal::liveness(pid) == signal::Liveness::Alive => {
+                let pre = crate::verify::pre_signal_mtime(spec.daemon, &opts.run_dir);
                 match signal::send_sighup(pid) {
-                    Ok(()) => outcomes.push((spec.daemon, DaemonOutcome::Signaled { pid })),
+                    Ok(()) => {
+                        if crate::verify::ack_file(spec.daemon, &opts.run_dir).is_some() {
+                            pre_signal.push((spec.daemon, pre));
+                        }
+                        outcomes.push((spec.daemon, DaemonOutcome::Signaled { pid }))
+                    }
                     Err(note) => outcomes.push((spec.daemon, DaemonOutcome::SignalFailed { note })),
                 }
             }
             _ => outcomes.push((spec.daemon, DaemonOutcome::NotRunning)),
         }
+    }
+
+    // 4.5 (S8-c M3) Post-signal verification: poll each signaled
+    // daemon's status file for the rendered config's projection.
+    // `failed` (a post-signal rewrite that disagrees) triggers the
+    // auto-rollback below; `unverified`/`no-status` never do (absence
+    // of evidence is not evidence). This runs BEFORE the generation
+    // is recorded, so a refused apply never advances `current` and
+    // the `previous` pointer still names the last confirmed config —
+    // exactly what the revert needs.
+    let mut acks = Vec::new();
+    for daemon in Daemon::all() {
+        let Some((_, _, out)) = rendered.iter().find(|(d, _, _)| *d == daemon) else {
+            continue;
+        };
+        if !outcomes
+            .iter()
+            .any(|(d, o)| *d == daemon && matches!(o, DaemonOutcome::Signaled { .. }))
+        {
+            continue;
+        }
+        let ack = match (
+            crate::verify::ack_file(daemon, &opts.run_dir),
+            crate::verify::projection(daemon, out),
+            pre_signal.iter().find(|(d, _)| *d == daemon),
+        ) {
+            (Some(path), Some(expected), Some((_, pre))) => crate::verify::verify(
+                daemon,
+                &path,
+                *pre,
+                &expected,
+                std::time::Instant::now() + crate::verify::VERIFY_TIMEOUT,
+            ),
+            _ => crate::verify::Ack::NoSurface,
+        };
+        info!(
+            daemon = daemon.name(),
+            ack = ack.word(),
+            "post-signal verification"
+        );
+        acks.push((daemon, ack));
+    }
+    if let Some((daemon, expected, seen)) = first_refusal(&acks) {
+        return run_auto_revert(daemon, expected, seen, opts, auto_revert);
     }
 
     // 5. Record the generation (current + previous), prune history.
@@ -327,6 +472,7 @@ pub fn apply(
         source,
         router_id: parsed.router_id.map(|(_, addr)| addr),
         outcomes,
+        acks,
         validations: validation,
         rendered: rendered
             .into_iter()
@@ -343,6 +489,107 @@ pub fn apply(
     Ok(report)
 }
 
+/// The first `failed` verdict in an ack set, as the (daemon,
+/// expected, seen) triple the rollback errors carry.
+fn first_refusal(acks: &[(Daemon, crate::verify::Ack)]) -> Option<(Daemon, String, String)> {
+    acks.iter().find_map(|(daemon, ack)| match ack {
+        crate::verify::Ack::Failed { expected, seen } => {
+            Some((*daemon, expected.clone(), seen.clone()))
+        }
+        _ => None,
+    })
+}
+
+/// The auto-rollback pass (S8-c M3): re-apply the **current**
+/// generation's bytes — the last CONFIRMED config; the refused apply
+/// never recorded, so `current` still names what the daemons were
+/// running before it — through the full pipeline with auto-revert
+/// OFF (one bounce, never a loop), then fail the apply with the
+/// honest story.
+fn run_auto_revert(
+    daemon: Daemon,
+    expected: String,
+    seen: String,
+    opts: &ApplyOptions,
+    allowed: bool,
+) -> Result<ApplyReport, ApplyError> {
+    if !allowed {
+        // The revert pass itself got refused — the outer apply wraps
+        // this into AutoRollbackFailed; this bare form never escapes
+        // to a caller.
+        return Err(ApplyError::LoadRefused {
+            daemon,
+            expected,
+            seen,
+        });
+    }
+    match generation_at(opts, "current")? {
+        None => Err(ApplyError::LoadRefusedNoPrevious {
+            daemon,
+            expected,
+            seen,
+        }),
+        Some((to, bytes)) => {
+            warn!(
+                daemon = daemon.name(),
+                to = to,
+                "load refused; auto-rolling back"
+            );
+            match apply_inner(&bytes, RollbackSource::AutoRevert { from: to }, opts, false) {
+                Ok(revert) => Err(ApplyError::AutoRolledBack {
+                    daemon,
+                    expected,
+                    seen,
+                    to,
+                    now: revert.generation,
+                    revert: Box::new(revert),
+                }),
+                Err(cause) => Err(ApplyError::AutoRollbackFailed {
+                    daemon,
+                    expected,
+                    seen,
+                    to,
+                    cause: Box::new(cause),
+                }),
+            }
+        }
+    }
+}
+
+/// Reads one generation pointer (`current` or `previous`) and the
+/// canonical bytes it names: `Ok(None)` when the pointer does not
+/// exist or is empty (nothing recorded there yet), `Err` on a store
+/// that cannot be read (permissions) or a pointer naming a missing
+/// generation dir.
+fn generation_at(opts: &ApplyOptions, pointer: &str) -> Result<Option<(u64, Vec<u8>)>, ApplyError> {
+    let store = opts.run_dir.join("configd");
+    let pointer_path = store.join(pointer);
+    let name = match fs::read_to_string(&pointer_path) {
+        Ok(text) => text.trim().to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ApplyError::Store {
+                path: pointer_path,
+                err,
+            })
+        }
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let gen_path = store.join("generations").join(&name).join("rouster.conf");
+    let bytes = fs::read(&gen_path).map_err(|err| ApplyError::Store {
+        path: gen_path,
+        err,
+    })?;
+    let seq = name
+        .split('-')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok(Some((seq, bytes)))
+}
+
 /// Applies an operator file from disk.
 pub fn apply_file(path: &Path, opts: &ApplyOptions) -> Result<ApplyReport, ApplyError> {
     let bytes = fs::read(path).map_err(|err| ApplyError::Read {
@@ -355,38 +602,12 @@ pub fn apply_file(path: &Path, opts: &ApplyOptions) -> Result<ApplyReport, Apply
 /// Rolls back: re-applies the previous generation's canonical bytes
 /// as a new generation.
 pub fn rollback(opts: &ApplyOptions) -> Result<ApplyReport, ApplyError> {
-    let store = opts.run_dir.join("configd");
-    let previous_pointer = store.join("previous");
-    let name = match fs::read_to_string(&previous_pointer) {
-        Ok(text) => text.trim().to_string(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApplyError::NoPrevious {
-                path: previous_pointer,
-            });
-        }
-        Err(err) => {
-            return Err(ApplyError::Store {
-                path: previous_pointer,
-                err,
-            });
-        }
-    };
-    if name.is_empty() {
-        return Err(ApplyError::NoPrevious {
-            path: previous_pointer,
-        });
+    match generation_at(opts, "previous")? {
+        Some((from, bytes)) => apply(&bytes, RollbackSource::Rollback { from }, opts),
+        None => Err(ApplyError::NoPrevious {
+            path: opts.run_dir.join("configd").join("previous"),
+        }),
     }
-    let gen_path = store.join("generations").join(&name).join("rouster.conf");
-    let bytes = fs::read(&gen_path).map_err(|err| ApplyError::Store {
-        path: gen_path,
-        err,
-    })?;
-    let from = name
-        .split('-')
-        .next()
-        .and_then(|seq| seq.parse().ok())
-        .unwrap_or(0);
-    apply(&bytes, RollbackSource::Rollback { from }, opts)
 }
 
 /// Writes the new generation dir, swaps the pointers, prunes history.

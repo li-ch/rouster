@@ -31,6 +31,7 @@ pub mod signal;
 pub mod status;
 pub mod tree;
 pub mod validate;
+pub mod verify;
 
 pub use apply::{
     apply, apply_file, rollback, ApplyError, ApplyOptions, ApplyReport, DaemonOutcome,
@@ -42,3 +43,4 @@ pub use tree::{parse, BodyLine, Canonical, Daemon, ParseError, Section};
 pub use validate::{
     refusal_summary, validate_canonical, validate_rendered, SkipReason, Validation,
 };
+pub use verify::{Ack, Projection, VERIFY_TIMEOUT};

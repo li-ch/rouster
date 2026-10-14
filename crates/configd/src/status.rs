@@ -10,17 +10,21 @@
 //! source /root/rouster.conf
 //! router-id 198.51.100.1          (or: router-id none)
 //! daemons 3
-//! daemon rousterd file /etc/rouster.conf bytes 38 pid 4242 result signaled
-//! daemon savd file /etc/savd.conf bytes 18 pid 4243 result signaled
+//! daemon rousterd file /etc/rouster.conf bytes 38 pid 4242 result signaled ack no-ack-surface
+//! daemon savd file /etc/savd.conf bytes 18 pid 4243 result signaled ack confirmed
 //! daemon bfdd file /etc/bfdd.conf bytes 15 result not-running
 //! ```
 //!
 //! `applied` is Unix seconds (no date math without a dependency; the
 //! fence holds). The hash is the FNV-1a change fingerprint of the
-//! canonical bytes. `result` is the actuation record — what configd
-//! did — NOT a daemon's acceptance: verifying a reload took would
-//! mean re-reading each daemon's status file, which is exactly the
-//! §Deferred auto-rollback machinery (docs/protocols/config.md).
+//! canonical bytes. `result` is the **actuation record** — what
+//! configd did — NOT the daemon's acceptance; `ack` (S8-c M3) is the
+//! acceptance half: the post-signal verification verdict for each
+//! SIGNALED daemon (`confirmed` / `failed` / `unverified` /
+//! `no-status`, or `no-ack-surface` for a signaled daemon that
+//! publishes nothing config-shaped today — rousterd). A `failed` ack
+//! never appears in a published status file: it triggers the
+//! auto-rollback, and the published file describes the revert.
 //!
 //! `configd status` prints this file verbatim (the `savd --show`
 //! shape); [`parse_status`] is the tolerant reader for tooling and
@@ -74,6 +78,12 @@ pub fn render_status(report: &ApplyReport, opts: &ApplyOptions) -> String {
         if let Some(outcome) = outcome {
             line.push_str(&format!(" result {}", outcome.word()));
         }
+        // S8-c M3: the post-signal verification verdict, when the
+        // daemon was signaled and this reader's writer recorded one
+        // (older status files simply lack the word).
+        if let Some((_, ack)) = report.acks.iter().find(|(d, _)| d == daemon) {
+            line.push_str(&format!(" ack {}", ack.word()));
+        }
         out.push_str(line.trim_end());
         out.push('\n');
     }
@@ -91,6 +101,9 @@ pub struct ConfigdStatus {
     pub router_id: Option<String>,
     /// One entry per `daemon` line: (name, result word).
     pub daemons: Vec<(String, String)>,
+    /// Post-signal verification verdicts (S8-c M3), when present:
+    /// (name, ack word). Older status files have none.
+    pub acks: Vec<(String, String)>,
     /// How many lines matched nothing this reader knows.
     pub unknown_lines: usize,
 }
@@ -120,12 +133,20 @@ pub fn parse_status(text: &str) -> ConfigdStatus {
             }
             ["daemons", _count] => {}
             ["daemon", name, rest @ ..] => {
-                // The result word sits at the line end (`result <word>`).
+                // The result word sits at the line end (`result <word>`);
+                // the S8-c ack word may follow it (`ack <word>`).
                 if let Some(pos) = rest.iter().position(|t| *t == "result") {
                     if let Some(word) = rest.get(pos + 1) {
                         status
                             .daemons
                             .push(((*name).to_string(), (*word).to_string()));
+                        if let Some(ack) = rest
+                            .iter()
+                            .position(|t| *t == "ack")
+                            .and_then(|p| rest.get(p + 1))
+                        {
+                            status.acks.push(((*name).to_string(), (*ack).to_string()));
+                        }
                         continue;
                     }
                 }
@@ -166,6 +187,10 @@ mod tests {
                 (Daemon::Savd, DaemonOutcome::Signaled { pid: 4243 }),
                 (Daemon::Bfdd, DaemonOutcome::NotRunning),
             ],
+            acks: vec![
+                (Daemon::Rousterd, crate::verify::Ack::NoSurface),
+                (Daemon::Savd, crate::verify::Ack::Confirmed),
+            ],
             validations: vec![
                 (Daemon::Rousterd, crate::validate::Validation::Validated),
                 (Daemon::Savd, crate::validate::Validation::Validated),
@@ -201,8 +226,8 @@ mod tests {
              run-dir /run/rouster\n\
              etc-dir /etc\n\
              daemons 3\n\
-             daemon rousterd file /etc/rouster.conf bytes 38 pid 4242 result signaled\n\
-             daemon savd file /etc/savd.conf bytes 18 pid 4243 result signaled\n\
+             daemon rousterd file /etc/rouster.conf bytes 38 pid 4242 result signaled ack no-ack-surface\n\
+             daemon savd file /etc/savd.conf bytes 18 pid 4243 result signaled ack confirmed\n\
              daemon bfdd file /etc/bfdd.conf bytes 15 result not-running\n"
         );
     }
@@ -229,6 +254,13 @@ mod tests {
                 ("rousterd".to_string(), "signaled".to_string()),
                 ("savd".to_string(), "signaled".to_string()),
                 ("bfdd".to_string(), "not-running".to_string()),
+            ]
+        );
+        assert_eq!(
+            parsed.acks,
+            vec![
+                ("rousterd".to_string(), "no-ack-surface".to_string()),
+                ("savd".to_string(), "confirmed".to_string()),
             ]
         );
         assert_eq!(parsed.unknown_lines, 0);

@@ -118,6 +118,12 @@ impl Daemon {
     }
 }
 
+impl std::fmt::Display for Daemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// One pass-through body line, with its line number in the canonical
 /// file.
 #[derive(Debug, Clone, PartialEq, Eq)]

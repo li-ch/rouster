@@ -27,7 +27,16 @@ use configd::tree::Daemon;
 
 /// A stand-in daemon: writes its pid like savd (`pidfile`), or
 /// publishes a status header like rousterd (`status`), then traps
-/// SIGHUP to touch a marker — the observable reload.
+/// SIGHUP — the observable reload.
+///
+/// The savd-shaped stand-in is a small honest daemon (S8-c M3): on
+/// SIGHUP it re-reads its rendered config file and REPUBLISHES a
+/// `savd.status` whose `config` line carries the projection the
+/// post-signal verification checks (`poll <N>s interfaces <n>
+/// bindings <n>`), exactly like the real savd does. A config
+/// containing the marker word `refused-load` is REFUSED: the daemon
+/// keeps its running config and republishes THAT (mtime advances,
+/// content stays old) — the observable refused reload.
 ///
 /// Process hygiene, deliberately boring: stdio goes to null (a
 /// stand-in must never hold the test harness's output pipe open
@@ -46,9 +55,30 @@ impl Standin {
         let script = match mode {
             StandinMode::Pidfile => format!(
                 "echo $$ > '{pidfile}'\n\
-                 trap \"touch '{marker}'\" HUP\n\
+                 CONF='{conf}'\n\
+                 STATUS='{status_file}'\n\
+                 publish() {{\n\
+                 poll=$(grep -E '^poll ' \"$CONF\" 2>/dev/null | head -1 | awk '{{print $2}}')\n\
+                 poll=${{poll:-5}}\n\
+                 ifc=$(grep -cE '^interface ' \"$CONF\" 2>/dev/null); ifc=${{ifc:-0}}\n\
+                 bind=$(grep -cE '^binding ' \"$CONF\" 2>/dev/null); bind=${{bind:-0}}\n\
+                 printf 'savd 0.0.0 pid %s\\nconfig mode strict-uRPF action monitor poll %ss interfaces %s bindings %s collision ignore hysteresis 3s backend rp_filter\\n' $$ \"$poll\" \"$ifc\" \"$bind\" > \"$STATUS\"\n\
+                 }}\n\
+                 onhup() {{\n\
+                 if grep -q refused-load \"$CONF\" 2>/dev/null; then\n\
+                 sleep 0.3\n\
+                 touch \"$STATUS\"\n\
+                 else\n\
+                 publish\n\
+                 fi\n\
+                 touch '{marker}'\n\
+                 }}\n\
+                 trap onhup HUP\n\
+                 publish\n\
                  while :; do sleep 0.2; done\n",
                 pidfile = root.join("run/savd.pid").display(),
+                conf = root.join("etc/savd.conf").display(),
+                status_file = root.join("run/savd.status").display(),
                 marker = marker.display(),
             ),
             StandinMode::StatusHeader => format!(
@@ -74,6 +104,21 @@ impl Standin {
         for _ in 0..50 {
             if self.marker.exists() {
                 return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Waits for the savd-shaped stand-in's status to carry the
+    /// given poll cadence (the post-reload word).
+    fn wait_status(&self, run_dir: &Path, poll_secs: &str) -> bool {
+        let wanted = format!("poll {poll_secs}s ");
+        for _ in 0..50 {
+            if let Ok(text) = fs::read_to_string(run_dir.join("savd.status")) {
+                if text.contains(&wanted) {
+                    return true;
+                }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -279,4 +324,123 @@ fn rejected_canonical_leaves_running_files_untouched() {
         fs::read_to_string(temp.root.join("etc/savd.conf")).unwrap(),
         good
     );
+}
+
+/// The canonical with a poison body line: parses structurally, no
+/// daemon binary on this host validates it (skip), but the LIVE
+/// daemon refuses the reload — the S8-c M3 machinery must catch it
+/// via the status-file disagreement and auto-rollback.
+fn canonical_with_poison(poll: u32) -> String {
+    format!(
+        "daemon savd {{\n\
+         mode strict\n\
+         poll {poll}\n\
+         ! refused-load\n\
+         }}\n"
+    )
+}
+
+#[test]
+fn a_refused_reload_auto_rolls_back_to_the_last_confirmed_generation() {
+    let temp = Temp::new("autorollback");
+    let opts = temp.opts();
+    let savd = Standin::spawn("savd", &temp.root, StandinMode::Pidfile);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Generation 1: a clean load the daemon confirms.
+    let file = temp.root.join("rouster.conf");
+    write(&file, &canonical(2));
+    let first = apply_file(&file, &opts).expect("clean first apply");
+    assert_eq!(first.generation, 1);
+    assert!(savd.wait_status(&opts.run_dir, "2"));
+
+    // Generation 2 attempt: the daemon refuses the reload (keeps
+    // poll 2, republishes it) — the apply must fail AND the system
+    // must be back on generation 1's content, as a NEW generation.
+    write(&file, &canonical_with_poison(3));
+    let err = apply_file(&file, &opts).unwrap_err();
+    match &err {
+        configd::ApplyError::AutoRolledBack {
+            daemon,
+            to,
+            now,
+            revert,
+            ..
+        } => {
+            assert_eq!(*daemon, Daemon::Savd);
+            assert_eq!(*to, 1, "reverted to the last confirmed generation");
+            assert_eq!(*now, 2, "the revert is itself a new generation");
+            assert_eq!(revert.generation, 2);
+            assert_eq!(
+                revert.source,
+                configd::RollbackSource::AutoRevert { from: 1 }
+            );
+        }
+        other => panic!("expected AutoRolledBack, got {other:?}"),
+    }
+    assert!(err.to_string().contains("refused the reload"));
+
+    // The rendered file is back to the confirmed content, and the
+    // daemon's own word matches it (the revert was confirmed too).
+    assert_eq!(
+        fs::read_to_string(temp.root.join("etc/savd.conf")).unwrap(),
+        "mode strict\npoll 2\n"
+    );
+    assert!(savd.wait_status(&opts.run_dir, "2"));
+
+    // The published status describes the revert, and the pointers
+    // advanced honestly (current = generation 2, the revert).
+    let published = status::read(&opts.run_dir).expect("status published by the revert");
+    assert_eq!(published.generation, Some(2));
+    assert!(published
+        .source
+        .as_deref()
+        .unwrap_or_default()
+        .contains("auto-rollback to generation 1"));
+    assert!(published
+        .acks
+        .contains(&("savd".to_string(), "confirmed".to_string())));
+    let store = opts.run_dir.join("configd");
+    assert!(fs::read_to_string(store.join("current"))
+        .unwrap()
+        .starts_with("000002-"));
+
+    // And the operator can still roll back explicitly from here
+    // (previous names generation 1) — the store is consistent.
+    assert!(rollback(&opts).is_ok());
+
+    drop(savd);
+}
+
+#[test]
+fn a_first_apply_refusal_without_a_confirmed_generation_is_an_honest_error() {
+    let temp = Temp::new("firstrefusal");
+    let opts = temp.opts();
+    let savd = Standin::spawn("savd", &temp.root, StandinMode::Pidfile);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The FIRST apply is refused: nothing confirmed exists to revert
+    // to. The daemon keeps its running config; the on-disk file
+    // holds the refused bytes; no status is published.
+    let file = temp.root.join("rouster.conf");
+    write(&file, &canonical_with_poison(9));
+    let err = apply_file(&file, &opts).unwrap_err();
+    match &err {
+        configd::ApplyError::LoadRefusedNoPrevious { daemon, .. } => {
+            assert_eq!(*daemon, Daemon::Savd);
+        }
+        other => panic!("expected LoadRefusedNoPrevious, got {other:?}"),
+    }
+    assert!(err.to_string().contains("no confirmed generation"));
+    assert!(err.to_string().contains("refused bytes"));
+    // The refused bytes are on disk (disclosed), the daemon kept its
+    // running word, and no generation/store/status exists at all.
+    assert!(fs::read_to_string(temp.root.join("etc/savd.conf"))
+        .unwrap()
+        .contains("refused-load"));
+    assert!(savd.wait_status(&opts.run_dir, "5")); // its startup word (default poll)
+    assert!(!opts.run_dir.join("configd").exists());
+    assert!(!opts.run_dir.join("configd.status").exists());
+
+    drop(savd);
 }

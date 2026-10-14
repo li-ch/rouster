@@ -182,6 +182,13 @@ fn main() -> ExitCode {
             }
             Err(err) => {
                 eprintln!("configd: {err}");
+                if let configd::ApplyError::AutoRolledBack { revert, .. } = &err {
+                    eprintln!(
+                        "configd: the previous generation was re-applied automatically; \
+                         the system now runs:"
+                    );
+                    print_report(revert);
+                }
                 ExitCode::from(EXIT_EXEC)
             }
         },
@@ -192,6 +199,13 @@ fn main() -> ExitCode {
             }
             Err(err) => {
                 eprintln!("configd: {err}");
+                if let configd::ApplyError::AutoRolledBack { revert, .. } = &err {
+                    eprintln!(
+                        "configd: the rollback was itself refused; the last confirmed \
+                         config was re-applied automatically; the system now runs:"
+                    );
+                    print_report(revert);
+                }
                 match err {
                     configd::ApplyError::NoPrevious { .. } => ExitCode::from(EXIT_NOTHING),
                     _ => ExitCode::from(EXIT_EXEC),
@@ -267,6 +281,23 @@ fn print_report(report: &configd::ApplyReport) {
                 line.push_str(&format!(", SIGHUP FAILED: {note}"));
             }
             None => {}
+        }
+        // The post-signal verification verdict (S8-c M3): what the
+        // daemon itself says it now runs, when it says anything.
+        if let Some((_, ack)) = report.acks.iter().find(|(d, _)| d == daemon) {
+            match ack {
+                configd::verify::Ack::Confirmed => line.push_str(", load confirmed"),
+                configd::verify::Ack::NoSurface => {
+                    line.push_str(", load unverifiable (no ack surface)")
+                }
+                configd::verify::Ack::Unverified => {
+                    line.push_str(", load unverified (deadline, no evidence)")
+                }
+                configd::verify::Ack::NoStatus => line.push_str(", load unverified (no status)"),
+                configd::verify::Ack::Failed { expected, seen } => {
+                    line.push_str(&format!(", LOAD FAILED (expected {expected}, saw {seen})"))
+                }
+            }
         }
         println!("{line}");
     }
