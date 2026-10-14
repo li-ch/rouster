@@ -18,9 +18,18 @@
 #       * its AS path is exactly 65001 — the RS's 65000 never appears,
 #       * the next hop is c1's address (not the RS's),
 #       * MED 77 preserved.
+#   - NO-CLIENT-TO-CLIENT-SESSION (S7-b): each client peers with the
+#     RS ONLY — no direct session between the clients; the exchange
+#     goes THROUGH the route server.
+#   - EXCHANGE-BIDIRECTIONAL (S7-b): c2 announces 198.51.100.0/24 too;
+#     c1 pulls it with `clear bgp ... soft in` (RFC 2918 — our RS
+#     answers the refresh by re-advertising its Adj-RIB-Out) and the
+#     reflection is transparent in THAT direction as well: c1's path
+#     is exactly 65002, next hop c2's address, 65000 never appears,
+#     and c1's own route never reflects back to it.
 #   - RS-KERNEL-CLEAN: the RS itself installed nothing (route-server
 #     RIB stays out of the kernel — no proto bgp route, no zapi route
-#     add in rousterd's log).
+#     add in rousterd's log) — for BOTH exchanged prefixes.
 #
 # FRR clients run `no bgp enforce-first-as` (the FRR docs' own note:
 # "If you have a peering to RS (Route-Server), most likely you MUST
@@ -48,6 +57,7 @@ ROUSTERD_LOG=/var/log/rousterd.log
 BGPD_LOG=/tmp/bgpd.log
 OUR_BGPD_LOG=/var/log/rouster-bgpd.log
 REFLECTED=203.0.113.0/24
+EXCHANGED=198.51.100.0/24
 QUARANTINE="${ROUSTER_BGP_RS_QUARANTINE:-$(cd "$(dirname "$0")/../.." && pwd)/away/2026-10-11/night/quarantine/bgp-rs}"
 
 case "$(uname -m)" in
@@ -210,9 +220,11 @@ docker exec "$C2" sh -c "printf '%s\n' \
   'router bgp 65002' \
   ' no bgp enforce-first-as' \
   ' no bgp ebgp-requires-policy' \
+  ' no bgp network import-check' \
   ' neighbor $RS_IP remote-as 65000' \
   ' neighbor $RS_IP timers 10 30' \
   ' address-family ipv4 unicast' \
+  '  network $EXCHANGED' \
   ' exit-address-family' \
   ' exit' \
   'line vty' \
@@ -233,6 +245,14 @@ wait_in "$C2" "c2 Established" 60 \
     "vtysh -c 'show bgp neighbor $RS_IP' | grep -q 'BGP state = Established'"
 wait_in "$RS" "our bgpd logged c2 Established" 60 \
     "grep 'session Established' $OUR_BGPD_LOG | grep -q '$C2_IP'"
+
+echo "==> NO-CLIENT-TO-CLIENT-SESSION: each client peers with the RS only"
+for side in "$C1" "$C2"; do
+    N=$(docker exec "$side" sh -c "vtysh -c 'show bgp ipv4 unicast summary json'" \
+        | grep -o '"peerState"' | wc -l | tr -d ' ')
+    [ "$N" = 1 ] \
+        || fail "$side has $N peers (expected exactly the RS — no client-to-client session)"
+done
 
 echo "==> REFLECTED-TRANSPARENT: $REFLECTED on c2, path exactly 65001, NH $C1_IP, MED 77"
 wait_in "$C2" "c2 holds the reflected route" 30 \
@@ -259,15 +279,43 @@ echo "$ROUTE_JSON" | grep -q "\"ip\":\"$C1_IP\"" \
 echo "$ROUTE_JSON" | grep -q '"metric":77' \
     || fail "table json MED is not 77: $(echo "$ROUTE_JSON" | grep -o '"metric":[0-9]*')"
 
+echo "==> EXCHANGE-BIDIRECTIONAL: c2's $EXCHANGED back to c1 (RFC 2918 soft-in pull)"
+# c1 established before c2 existed, so its initial dump predates c2's
+# route — c1 requests a re-advertisement (ROUTE-REFRESH, RFC 2918 §4)
+# and our RS answers from its Adj-RIB-Out.
+docker exec "$C1" vtysh -c "clear bgp ipv4 unicast $RS_IP soft in"
+wait_in "$C1" "c1 holds the reverse-reflected route" 30 \
+    "vtysh -c 'show bgp ipv4 unicast $EXCHANGED' | grep -q 'BGP routing table entry for $EXCHANGED'"
+DETAIL_C1=$(docker exec "$C1" sh -c "vtysh -c 'show bgp ipv4 unicast $EXCHANGED'")
+echo "$DETAIL_C1" | grep -qE '^  65002$' \
+    || fail "reverse path is not exactly 65002: $(echo "$DETAIL_C1" | sed -n '/^Paths:/,/^$/p' | head -8)"
+echo "$DETAIL_C1" | grep -qw 65000 \
+    && fail "the route server's AS 65000 appears in the reverse-reflected route"
+echo "$DETAIL_C1" | grep -q "$C2_IP" \
+    || fail "the reverse reflection's next hop is not c2's $C2_IP: $(echo "$DETAIL_C1" | grep -A3 '65002')"
+echo "$DETAIL_C1" | grep -q 'best (' \
+    || fail "the reverse-reflected route is not the best path"
+# And the refresh answer did not leak c1's own route back to it:
+# c1 holds exactly one path for $REFLECTED — its own, "(unspec)"
+# peer (origin-peer floor; a leak would surface as a second path
+# carrying the RS's peer id).
+LEAK=$(docker exec "$C1" sh -c "vtysh -c 'show bgp ipv4 unicast $REFLECTED json'" \
+    | grep -o '"peerId"' | wc -l | tr -d ' ')
+[ "$LEAK" = 1 ] \
+    || fail "c1 holds $LEAK paths for its own $REFLECTED (origin-peer floor violated)"
+
 echo "==> RS-KERNEL-CLEAN: the route server installed nothing"
 sleep 3
 docker exec "$RS" sh -c "ip route show proto bgp" | grep -q . \
     && fail "proto bgp route appeared in the RS kernel (RS RIB must stay separate)"
 docker exec "$RS" sh -c "grep 'zapi: route add' $ROUSTERD_LOG" | grep -q "$REFLECTED" \
     && fail "rousterd programmed the reflected route into the kernel"
+docker exec "$RS" sh -c "grep 'zapi: route add' $ROUSTERD_LOG" | grep -q "$EXCHANGED" \
+    && fail "rousterd programmed the reverse-reflected route into the kernel"
 
 echo "==> final state"
 docker exec "$C2" sh -c "vtysh -c 'show bgp ipv4 unicast'"
+docker exec "$C1" sh -c "vtysh -c 'show bgp ipv4 unicast'"
 docker exec "$RS" sh -c "ip route show proto bgp; echo '(RS kernel, must be empty)'"
 
 echo "bgp-rs interop: PASS"
