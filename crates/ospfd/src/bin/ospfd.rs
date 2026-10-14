@@ -5,7 +5,9 @@
 //! names a socket, then the daemon run loop with SIGTERM/SIGINT
 //! shutdown.
 //!
-//! Usage: `ospfd --config <PATH>`.
+//! Usage: `ospfd --config <PATH>`, or `ospfd --validate-config
+//! <PATH>` to parse a candidate config and exit 0/1 (the configd
+//! pre-apply gate's daemon half, S8-b — no sockets, no runtime).
 
 use std::sync::Arc;
 
@@ -16,8 +18,38 @@ use ospfd::transport::{OspfRawSocket, OspfV6RawSocket};
 use ospfd::zedge;
 use tracing::{error, info};
 
+/// `--validate-config` (S8-b): parse the candidate file with the
+/// daemon's own parser and report. Exit 0 with a one-line OK on
+/// stderr, or exit 1 with the parser's line-numbered error verbatim
+/// (configd surfaces it as the apply's refusal reason). Config-only:
+/// exits before any socket/runtime setup, so it runs on any host.
+fn validate_config(path: &std::path::Path) -> i32 {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match parse_config(&text) {
+            Ok(config) => {
+                eprintln!(
+                    "ospfd: {}: OK ({} areas, {} key chains)",
+                    path.display(),
+                    config.areas.len(),
+                    config.key_chains.len()
+                );
+                0
+            }
+            Err(err) => {
+                eprintln!("ospfd: {}: {err}", path.display());
+                1
+            }
+        },
+        Err(err) => {
+            eprintln!("ospfd: cannot read {}: {err}", path.display());
+            1
+        }
+    }
+}
+
 fn main() {
     let mut config_path = None;
+    let mut validate = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -28,8 +60,19 @@ fn main() {
                         .expect("--config requires a path"),
                 );
             }
+            "--validate-config" => {
+                if validate.is_some() {
+                    eprintln!("ospfd: duplicate --validate-config");
+                    std::process::exit(1);
+                }
+                validate = Some(it.next().map(std::path::PathBuf::from).unwrap_or_else(|| {
+                    eprintln!("ospfd: --validate-config requires a path");
+                    std::process::exit(1);
+                }));
+            }
             "--help" | "-h" => {
                 println!("usage: ospfd --config <PATH>");
+                println!("       ospfd --validate-config <PATH>");
                 std::process::exit(0);
             }
             other => {
@@ -37,6 +80,11 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    // The validate arm is config-only: it exits before the runtime
+    // (so no tracing setup — the OK/error lines are the contract).
+    if let Some(path) = validate {
+        std::process::exit(validate_config(&path));
     }
     let config_path = config_path.expect("missing --config <PATH>");
     let _ = tracing_subscriber::fmt().try_init();
