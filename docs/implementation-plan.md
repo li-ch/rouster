@@ -409,3 +409,16 @@ The phase text above is unchanged; this block is status only.
   one-shot client timeout → transport-only retry), 8× workspace
   stability green, gate 1468/0, smokes 34/34, CI pending push.
   Reports: away/2026-10-14/reports/S8-{a,b,c}.md.
+
+- 2026-10-14 (night, round close) — S9 round GREEN + **v0.1.0
+  RELEASED**: BAR-SAV landed (the sidrops -10 algorithm, pinned and
+  step-cited: cone walk + provider subtraction, RuleOrigin::BarSav
+  provenance through both backends, monitor-default, the bgpd
+  read-only feed, and a live spoof-differential against real FRR
+  peers — the SAVNET complement the plan pre-registered as "a small
+  incremental module"); docker smokes in CI (the frr-testbed recipe
+  reversed in-repo — alpine APK frr=10.2.2-r0, provenance anchored,
+  34/34 equivalence, nightly smokes.yml); CHANGELOG + workspace
+  0.1.0 + README status + the v0.1.0 tag (verified in an isolated
+  worktree after a version-pinning test was made bump-proof).
+  Gate 1498/0 ×3, smokes 35/35, CI green.
