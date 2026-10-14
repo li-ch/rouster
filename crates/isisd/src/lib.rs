@@ -31,13 +31,17 @@
 
 pub mod adjacency;
 pub mod checksum;
+pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod lspdb;
 pub mod pdu;
 pub mod spf;
 pub mod system;
 pub mod tlv;
+pub mod transport;
 pub mod wire;
+pub mod zedge;
 
 /// Architectural constants (ISO 10589's protocol constants; the
 /// values as deployed and cross-checked against FRR 10.2.2).

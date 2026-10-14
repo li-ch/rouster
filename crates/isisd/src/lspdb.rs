@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::error::IsisError;
 use crate::pdu::{Lsp, Pdu};
 use crate::system::LspId;
 use crate::tlv::{LspEntry, Tlv};
@@ -338,6 +339,18 @@ impl Lspdb {
     /// Build a PSNP body (TLV 9 entries) for the LSPs we want.
     pub fn psnp_for(&self, requests: &[LspEntry]) -> Vec<Tlv> {
         vec![Tlv::LspEntries(requests.to_vec())]
+    }
+
+    /// Install one of OUR OWN LSPs (the origination path): unlike a
+    /// received install, anything but Installed is an internal error
+    /// (our sequence counter only moves forward).
+    pub fn install_self(&mut self, lsp: Lsp, now: u64) -> Result<(), IsisError> {
+        match self.install(lsp, now) {
+            InstallOutcome::Installed => Ok(()),
+            other => Err(IsisError::Adjacency(format!(
+                "own LSP install outcome: {other:?}"
+            ))),
+        }
     }
 
     /// Remove an LSP (the daemon's own reorigination path replaces it

@@ -8,8 +8,15 @@ license.workspace = true
 [dependencies]
 common = { workspace = true }
 zapi = { workspace = true }
+# The AF_PACKET seam (M5): socket2 0.6.5 supplies Domain::PACKET +
+# Type::RAW + the protocol-at-creation form; the sockaddr_in6 overlay
+# for sockaddr_ll is documented in transport.rs. A pre-existing
+# workspace member dep (ospfd, bfdd) — no new crate enters the
+# lockfile.
+socket2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
