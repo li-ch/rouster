@@ -54,6 +54,17 @@ Key facts from that inspection:
   public repo).
 - `docker inspect` config: no env beyond the default `PATH`, user
   root, no volumes, `CMD` unset.
+- **CI parity re-verified 2026-10-14/15** (S10-d, run 38647649951):
+  the image is NOT the cause of the "Error: Unknown device type."
+  failures the fresh runner showed on the vrf/dummy legs. A fresh
+  build of this recipe was diffed against the local image
+  (`/etc/apk/world` identical, `/sbin/ip` = iproute2 6.15.0 in both)
+  and creates vrf/dummy/veth devices fine. The message is iproute2
+  relaying the kernel's netlink extack: the runner's azure kernel
+  ships `vrf`/`dummy` as modules and does not have them loaded, and a
+  container without CAP_SYS_MODULE + /lib/modules cannot trigger
+  `request_module`. The fix lives in the workflow (a
+  `modprobe vrf/dummy` pre-step), not in this recipe.
 
 What the smokes actually *require* of the image: the frr 10.2.2
 daemon set under `/usr/lib/frr` (staticd, mgmtd, zebra-shaped daemons
