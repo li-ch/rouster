@@ -15,6 +15,7 @@ members = [
     "crates/vty",
     "crates/ospfd",
     "crates/configd",
+    "crates/isisd",
 ]
 
 [workspace.package]

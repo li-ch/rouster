@@ -226,6 +226,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "isisd"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "zapi",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
