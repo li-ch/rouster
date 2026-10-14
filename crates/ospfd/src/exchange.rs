@@ -923,7 +923,7 @@ mod tests {
             Default::default(),
         );
         c.fsm.state = NeighborState::Full;
-        c.fsm.neighbor_options = Some(Options::E);
+        c.fsm.neighbor_options = Some(u32::from(Options::E));
         let lsr = LsRequest {
             requests: vec![LsRequestId {
                 ls_type: 1,

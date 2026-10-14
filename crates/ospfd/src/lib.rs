@@ -39,6 +39,7 @@ pub mod auth;
 pub mod checksum;
 pub mod config;
 pub mod daemon;
+pub mod daemon_v3;
 pub mod error;
 pub mod exchange;
 pub mod iface;

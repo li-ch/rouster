@@ -9,9 +9,10 @@
 
 use std::sync::Arc;
 
-use ospfd::config::parse as parse_config;
+use ospfd::config::{parse as parse_config, AddressFamily};
 use ospfd::daemon::{self, Ospfd};
-use ospfd::transport::OspfRawSocket;
+use ospfd::daemon_v3::{self, OspfdV3};
+use ospfd::transport::{OspfRawSocket, OspfV6RawSocket};
 use ospfd::zedge;
 use tracing::{error, info};
 
@@ -74,21 +75,98 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let dump = match ospfd::ifdump::sync(&mut client).await {
-                Ok(dump) => dump,
+            // The v4 interface dump (ADD-C2); the v6 runtime's
+            // link-local source is the static `link-local` line (the
+            // dump's v6 merge is §Deferred, see ospf.md).
+            if config.family == AddressFamily::Ipv4 {
+                let dump = match ospfd::ifdump::sync(&mut client).await {
+                    Ok(dump) => dump,
+                    Err(e) => {
+                        error!(error = %e, "ospfd: zapi interface dump failed");
+                        std::process::exit(1);
+                    }
+                };
+                let report = dump.merge_into(&mut config);
+                info!(
+                    dynamic = report.dynamic_address,
+                    fallback = report.static_fallback,
+                    down = report.down,
+                    "ospfd: interface config merged with the zapi dump"
+                );
+            }
+            zapi_client = Some(client);
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+            let _ = shutdown_tx.send(true);
+        });
+
+        // The family fork (S7-a): `address-family ipv6-unicast` runs
+        // the OSPFv3 core over the v6 transport; the default is the
+        // v2 daemon unchanged.
+        if config.family == AddressFamily::Ipv6 {
+            let mut core = match OspfdV3::new(&config) {
+                Ok(core) => core,
                 Err(e) => {
-                    error!(error = %e, "ospfd: zapi interface dump failed");
+                    error!("ospfd(v3): {e}");
                     std::process::exit(1);
                 }
             };
-            let report = dump.merge_into(&mut config);
-            info!(
-                dynamic = report.dynamic_address,
-                fallback = report.static_fallback,
-                down = report.down,
-                "ospfd: interface config merged with the zapi dump"
-            );
-            zapi_client = Some(client);
+            let mut sockets = Vec::new();
+            for iface in &core.interfaces {
+                match OspfV6RawSocket::open(iface.link_local, iface.ifindex) {
+                    Ok(sock) => {
+                        info!(
+                            iface = %iface.name,
+                            link_local = %iface.link_local,
+                            ifindex = iface.ifindex,
+                            instance_id = iface.instance_id,
+                            "ospfd(v3): raw v6 socket open"
+                        );
+                        sockets.push(Arc::new(sock));
+                    }
+                    Err(e) => {
+                        error!(iface = %iface.name, error = %e, "ospfd(v3): cannot open raw v6 socket");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if let Some(client) = zapi_client {
+                match zedge::spawn_with_client(
+                    client,
+                    config.redistribute_static,
+                    AddressFamily::Ipv6,
+                    pushed_tx.clone(),
+                    withdrawn_tx.clone(),
+                )
+                .await
+                {
+                    Ok(tx) => core.attach_zapi(tx),
+                    Err(e) => {
+                        error!(error = %e, "ospfd(v3): zapi edge failed");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            drop(pushed_tx);
+            drop(withdrawn_tx);
+            if let Err(e) =
+                daemon_v3::run(core, sockets, pushed_rx, withdrawn_rx, shutdown_rx).await
+            {
+                error!(error = %e, "ospfd(v3): run loop exited");
+                std::process::exit(1);
+            }
+            info!("ospfd(v3): stopped");
+            return;
         }
 
         let mut core = match Ospfd::new(&config) {
@@ -121,6 +199,7 @@ fn main() {
             match zedge::spawn_with_client(
                 client,
                 config.redistribute_static,
+                AddressFamily::Ipv4,
                 pushed_tx.clone(),
                 withdrawn_tx.clone(),
             )
@@ -135,19 +214,6 @@ fn main() {
         }
         drop(pushed_tx);
         drop(withdrawn_tx);
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        let mut sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = sigint.recv() => {}
-            }
-            let _ = shutdown_tx.send(true);
-        });
 
         if let Err(e) = daemon::run(core, sockets, pushed_rx, withdrawn_rx, shutdown_rx).await {
             error!(error = %e, "ospfd: run loop exited");

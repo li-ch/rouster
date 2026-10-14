@@ -1044,6 +1044,68 @@ impl LsaV3 {
     }
 }
 
+// The AF-generic LSDB seam (S7-a): the v3 family implements the same
+// [`LsaInstance`] surface as v2, so `Lsdb<LsaV3>` runs the ONE §12.2/
+// §13.1/§13.2/§14 implementation unchanged (architecture invariant 3).
+impl crate::lsdb::LsaHeaderInfo for LsaHeaderV3 {
+    fn ls_age(&self) -> u16 {
+        self.ls_age
+    }
+    fn set_ls_age(&mut self, age: u16) {
+        self.ls_age = age;
+    }
+    fn seq(&self) -> u32 {
+        self.seq
+    }
+    fn set_seq(&mut self, seq: u32) {
+        self.seq = seq;
+    }
+    fn checksum(&self) -> u16 {
+        self.checksum
+    }
+    fn length(&self) -> u16 {
+        self.length
+    }
+    fn seq_signed(&self) -> i32 {
+        LsaHeaderV3::seq_signed(self)
+    }
+    fn effective_age(&self) -> u16 {
+        LsaHeaderV3::effective_age(self)
+    }
+    fn is_max_age(&self) -> bool {
+        LsaHeaderV3::is_max_age(self)
+    }
+    fn force_max_age(&mut self) {
+        self.ls_age = (self.ls_age & crate::lsa::DO_NOT_AGE) | crate::MAX_AGE;
+    }
+}
+
+impl crate::lsdb::LsaInstance for LsaV3 {
+    type Header = LsaHeaderV3;
+
+    fn key(&self) -> crate::lsa::LsaKey {
+        LsaV3::key(self)
+    }
+    fn header(&self) -> &LsaHeaderV3 {
+        &self.header
+    }
+    fn header_mut(&mut self) -> &mut LsaHeaderV3 {
+        &mut self.header
+    }
+    fn body_differs(&self, other: &Self) -> bool {
+        // v3 moved the Options into the bodies (A.4.3-A.4.10), so the
+        // body comparison IS the §13.2 contents list's family half.
+        self.body != other.body
+    }
+    fn normalized(&self) -> Self {
+        if self.header.checksum == 0 || self.header.length == 0 {
+            LsaV3::decode(&self.encode()).unwrap_or_else(|_| self.clone())
+        } else {
+            self.clone()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

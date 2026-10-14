@@ -125,10 +125,12 @@ pub struct NeighborFsm {
     /// The DD sequence number in the neighbor data structure.
     pub dd_sequence: u32,
     /// The last received DD packet's summary (duplicate detection,
-    /// §10.6) — I/M/MS, options, DD sequence.
-    pub last_dd: Option<(bool, bool, bool, u8, u32)>,
-    /// Neighbor Options recorded at NegotiationDone (§10.6).
-    pub neighbor_options: Option<u8>,
+    /// §10.6) — I/M/MS, options (u32: v2's octet zero-extended, v3's
+    /// Options24), DD sequence.
+    pub last_dd: Option<(bool, bool, bool, u32, u32)>,
+    /// Neighbor Options recorded at NegotiationDone (§10.6) — u32 to
+    /// carry both families (v2 octet zero-extended, v3 Options24).
+    pub neighbor_options: Option<u32>,
     /// The peer's Router ID is larger than ours (the §10.6 ExStart
     /// comparison input — the daemon layer sets it from the packet
     /// header; tests set it directly).
@@ -288,10 +290,25 @@ impl NeighborFsm {
         (next, actions)
     }
 
-    /// §10.6: process one received Database Description packet.
-    /// Returns the internal events to feed back through `fire` and
-    /// whether a reply DD should be sent (the §10.8 obligations).
+    /// §10.6: process one received Database Description packet
+    /// (v2 flavor) — the family-neutral core does the work.
     pub fn process_dbd(&mut self, pkt: &DbDescription) -> DdResult {
+        self.process_dbd_view(&DdView {
+            init: pkt.init,
+            more: pkt.more,
+            master: pkt.master,
+            options: u32::from(pkt.options.0),
+            dd_sequence: pkt.dd_sequence,
+            has_headers: !pkt.lsa_headers.is_empty(),
+        })
+    }
+
+    /// §10.6 over the family-neutral [`DdView`] — the S7-a seam fix:
+    /// v2 and v3 DBDs share ONE master/slave negotiation, duplicate
+    /// detection and sequence-mismatch core (RFC 5340 §4.2.3: the
+    /// DD receive processing is "almost identical to the IPv4
+    /// procedures documented in Section 10.6 of [OSPFV2]").
+    pub fn process_dbd_view(&mut self, pkt: &DdView) -> DdResult {
         use NeighborEvent as E;
         let mut events = Vec::new();
         let mut send_reply = false;
@@ -299,7 +316,7 @@ impl NeighborFsm {
             i == pkt.init
                 && m == pkt.more
                 && ms == pkt.master
-                && opt == pkt.options.0
+                && opt == pkt.options
                 && seq == pkt.dd_sequence
         });
 
@@ -323,14 +340,13 @@ impl NeighborFsm {
                 return DdResult::rejected();
             }
             NeighborState::ExStart => {
-                let neighbor_id_larger =
-                    pkt.lsa_headers.is_empty() && pkt.init && pkt.more && pkt.master;
+                let neighbor_id_larger = !pkt.has_headers && pkt.init && pkt.more && pkt.master;
                 // Case 1: I/M/MS set, empty, neighbor's Router ID
                 // larger -> we are slave, adopt its DD sequence.
                 if neighbor_id_larger && self.peer_id_larger(pkt) {
                     self.master = false;
                     self.dd_sequence = pkt.dd_sequence;
-                    self.neighbor_options = Some(pkt.options.0);
+                    self.neighbor_options = Some(pkt.options);
                     events.push(E::NegotiationDone);
                     // Slave must reply.
                     send_reply = true;
@@ -342,7 +358,7 @@ impl NeighborFsm {
                     // increments; Figure 14's x+1 first full DD).
                     self.master = true;
                     self.dd_sequence = self.dd_sequence.wrapping_add(1);
-                    self.neighbor_options = Some(pkt.options.0);
+                    self.neighbor_options = Some(pkt.options);
                     events.push(E::NegotiationDone);
                     send_reply = true;
                 } else if pkt.init && pkt.more && pkt.master && !self.peer_id_larger(pkt) {
@@ -387,7 +403,7 @@ impl NeighborFsm {
                         accepted: false,
                     };
                 }
-                if Some(pkt.options.0) != self.neighbor_options {
+                if Some(pkt.options) != self.neighbor_options {
                     events.push(E::SeqNumberMismatch);
                     return DdResult {
                         events,
@@ -425,7 +441,7 @@ impl NeighborFsm {
             }
             NeighborState::Loading | NeighborState::Full => {
                 // Only duplicates are legal (§10.6).
-                if pkt.options.0 != self.neighbor_options.unwrap_or(pkt.options.0) || pkt.init {
+                if pkt.options != self.neighbor_options.unwrap_or(pkt.options) || pkt.init {
                     events.push(E::SeqNumberMismatch);
                     return DdResult {
                         events,
@@ -447,13 +463,7 @@ impl NeighborFsm {
                 };
             }
         }
-        self.last_dd = Some((
-            pkt.init,
-            pkt.more,
-            pkt.master,
-            pkt.options.0,
-            pkt.dd_sequence,
-        ));
+        self.last_dd = Some((pkt.init, pkt.more, pkt.master, pkt.options, pkt.dd_sequence));
         DdResult {
             events,
             send_reply,
@@ -470,12 +480,29 @@ impl NeighborFsm {
         !self.summary_pending
     }
 
-    fn peer_id_larger(&self, _pkt: &DbDescription) -> bool {
+    fn peer_id_larger(&self, _pkt: &DdView) -> bool {
         // The peer's Router ID comes from the packet header at the
         // daemon layer; threaded here as the comparison closure by
         // process_dbd_with_peer below.
         self.peer_id_larger_value.unwrap_or(false)
     }
+}
+
+/// The family-neutral Database Description view (§10.6's inputs):
+/// both wire families' DBDs map onto it — v2's `DbDescription` and
+/// v3's `DbDescriptionV3` (whose Options24 zero-extends into
+/// `options`). The S7-a seam: ONE master/slave core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DdView {
+    pub init: bool,
+    pub more: bool,
+    pub master: bool,
+    /// v2: the Options octet zero-extended; v3: Options24.
+    pub options: u32,
+    pub dd_sequence: u32,
+    /// Whether the packet carries any LSA headers (the ExStart
+    /// negotiation's "empty" test).
+    pub has_headers: bool,
 }
 
 /// Result of DD processing: internal neighbor events to fire, whether
@@ -574,6 +601,56 @@ pub struct HelloParams {
     pub n_capable: bool,
     /// Point-to-point / virtual link: mask ignored on receive.
     pub p2p: bool,
+}
+
+/// §10.5 for OSPFv3 (RFC 5340 §4.2.2.1: "The receive processing of
+/// Hello packets differs from Section 10.5 of [OSPFV2] in the
+/// following ways"): no Network Mask field, neighbors identified
+/// solely by Router ID, DR/BDR claims as Router IDs — so the v3
+/// checks are HelloInterval, RouterDeadInterval and the E-bit
+/// agreement; the event ladder is §10.5's unchanged.
+pub fn process_hello_v3(
+    hello: &crate::packet_v3::HelloV3,
+    own: &HelloParamsV3,
+    own_router_id: crate::lsa::RouterId,
+) -> Result<Vec<NeighborEvent>, crate::error::OspfError> {
+    use crate::error::OspfError;
+    if hello.hello_interval != own.hello_interval {
+        return Err(OspfError::Neighbor(format!(
+            "HelloInterval mismatch: got {} want {}",
+            hello.hello_interval, own.hello_interval
+        )));
+    }
+    if u32::from(hello.router_dead_interval) != own.router_dead_interval {
+        return Err(OspfError::Neighbor(format!(
+            "RouterDeadInterval mismatch: got {} want {}",
+            hello.router_dead_interval, own.router_dead_interval
+        )));
+    }
+    // The E-bit agreement (§10.5 lineage — ExternalRoutingCapability
+    // must match across the area).
+    if hello.options.e_bit() != own.e_capable {
+        return Err(OspfError::Neighbor(
+            "E-bit mismatch with area external routing capability".into(),
+        ));
+    }
+    let mut events = vec![NeighborEvent::HelloReceived];
+    if hello.neighbors.contains(&own_router_id) {
+        events.push(NeighborEvent::TwoWayReceived);
+    } else {
+        events.push(NeighborEvent::OneWayReceived);
+    }
+    Ok(events)
+}
+
+/// The v3 receiving interface's Hello parameters (§4.2.2.1's checks:
+/// intervals + E-bit; v3's dead interval is 16-bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloParamsV3 {
+    pub hello_interval: u16,
+    pub router_dead_interval: u32,
+    /// Area ExternalRoutingCapability (the Options24 E-bit).
+    pub e_capable: bool,
 }
 
 /// §13 steps 1-3 receive-side admission, derived from the area type:

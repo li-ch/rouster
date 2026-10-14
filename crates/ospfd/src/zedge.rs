@@ -50,6 +50,10 @@ pub type ZapiRoute = zapi::message::ZapiRoute;
 pub struct Zedge<IO> {
     client: ZapiClient<IO>,
     redistribute_static: bool,
+    /// The family this daemon consumes/exports (S7-a): v2 registers
+    /// afi 1 pushes and filters v4; the v3 runtime registers afi 2
+    /// and filters v6.
+    family: crate::config::AddressFamily,
     /// Daemon-bound redistribute pushes.
     pushed: mpsc::UnboundedSender<RedistributedRoute>,
     /// Daemon-bound withdraw pushes.
@@ -63,22 +67,28 @@ where
     pub fn new(
         client: ZapiClient<IO>,
         redistribute_static: bool,
+        family: crate::config::AddressFamily,
         pushed: mpsc::UnboundedSender<RedistributedRoute>,
         withdrawn: mpsc::UnboundedSender<RedistributedRoute>,
     ) -> Self {
         Self {
             client,
             redistribute_static,
+            family,
             pushed,
             withdrawn,
         }
     }
 
-    /// HELLO as OSPF (§ the z5c attach) + the redistribute
-    /// registration when configured.
+    /// HELLO as the family's route type (§ the z5c attach) + the
+    /// redistribute registration when configured.
     pub async fn start(&mut self) -> io::Result<()> {
-        self.client.handshake(route_type::OSPF).await?;
-        info!("ospfd: zapi session established (protocol=7)");
+        let route_type = match self.family {
+            crate::config::AddressFamily::Ipv4 => route_type::OSPF,
+            crate::config::AddressFamily::Ipv6 => route_type::OSPF6,
+        };
+        self.client.handshake(route_type).await?;
+        info!("ospfd: zapi session established (protocol={route_type})");
         self.register().await
     }
 
@@ -87,11 +97,16 @@ where
     /// calls this directly; `start` is handshake + this).
     pub async fn register(&mut self) -> io::Result<()> {
         if self.redistribute_static {
-            // afi 1 (v4), STATIC, instance 0 — the z5d byte shape.
+            // The family's afi (1 = v4, 2 = v6), STATIC, instance 0
+            // — the z5d byte shape.
+            let afi = match self.family {
+                crate::config::AddressFamily::Ipv4 => 1,
+                crate::config::AddressFamily::Ipv6 => 2,
+            };
             self.client
-                .send_redistribute_add(1, route_type::STATIC, 0)
+                .send_redistribute_add(afi, route_type::STATIC, 0)
                 .await?;
-            info!("ospfd: redistribute static registered");
+            info!("ospfd: redistribute static registered (afi {afi})");
         }
         Ok(())
     }
@@ -107,7 +122,7 @@ where
                 return;
             }
         };
-        let Ok(entry) = RedistributedRoute::try_from(route) else {
+        let Ok(entry) = self.redistribute_route(route) else {
             return;
         };
         if add {
@@ -115,6 +130,23 @@ where
         } else {
             let _ = self.withdrawn.send(entry);
         }
+    }
+
+    /// The family gate on redistribute pushes (v1: one family per
+    /// daemon — the other family's pushes are not ours).
+    fn redistribute_route(&self, route: &ZapiRoute) -> Result<RedistributedRoute, ()> {
+        let want_v6 = matches!(self.family, crate::config::AddressFamily::Ipv6);
+        let matches_family = match &route.prefix {
+            IpPrefix::V4(_) => !want_v6,
+            IpPrefix::V6(_) => want_v6,
+        };
+        if !matches_family {
+            return Err(());
+        }
+        Ok(RedistributedRoute {
+            prefix: route.prefix,
+            metric: route.metric.unwrap_or(0),
+        })
     }
 
     /// One command drain → ROUTE_ADD/DELETE.
@@ -167,21 +199,6 @@ where
     }
 }
 
-impl TryFrom<&ZapiRoute> for RedistributedRoute {
-    type Error = ();
-
-    fn try_from(route: &ZapiRoute) -> Result<Self, ()> {
-        // v4-only v1 (the whole daemon is v2).
-        if !matches!(route.prefix, IpPrefix::V4(_)) {
-            return Err(());
-        }
-        Ok(Self {
-            prefix: route.prefix,
-            metric: route.metric.unwrap_or(0),
-        })
-    }
-}
-
 /// Connect to the zebra socket with bounded retry (30 attempts, 1 s
 /// apart — the bgpd/staticd pattern): the session a [`spawn`] or an
 /// [`crate::ifdump::sync`] runs on.
@@ -207,10 +224,11 @@ pub async fn connect(
 pub async fn spawn_with_client(
     client: zapi::ZapiClient<tokio::net::UnixStream>,
     redistribute_static: bool,
+    family: crate::config::AddressFamily,
     pushed: mpsc::UnboundedSender<RedistributedRoute>,
     withdrawn: mpsc::UnboundedSender<RedistributedRoute>,
 ) -> io::Result<mpsc::UnboundedSender<ZedgeCommand>> {
-    let mut zedge = Zedge::new(client, redistribute_static, pushed, withdrawn);
+    let mut zedge = Zedge::new(client, redistribute_static, family, pushed, withdrawn);
     zedge.register().await?;
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -226,11 +244,12 @@ pub async fn spawn_with_client(
 pub async fn spawn(
     socket: std::path::PathBuf,
     redistribute_static: bool,
+    family: crate::config::AddressFamily,
     pushed: mpsc::UnboundedSender<RedistributedRoute>,
     withdrawn: mpsc::UnboundedSender<RedistributedRoute>,
 ) -> io::Result<mpsc::UnboundedSender<ZedgeCommand>> {
     let client = connect(&socket).await?;
-    let mut zedge = Zedge::new(client, redistribute_static, pushed, withdrawn);
+    let mut zedge = Zedge::new(client, redistribute_static, family, pushed, withdrawn);
     zedge.start().await?;
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {

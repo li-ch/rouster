@@ -33,8 +33,109 @@
 
 use std::cmp::Ordering;
 
-use crate::lsa::{Lsa, LsaBody, LsaHeader, LsaKey, INITIAL_SEQUENCE_NUMBER, MAX_SEQUENCE_NUMBER};
+use crate::lsa::{Lsa, LsaHeader, LsaKey, INITIAL_SEQUENCE_NUMBER, MAX_SEQUENCE_NUMBER};
 use crate::{LS_REFRESH_TIME, MAX_AGE, MAX_AGE_DIFF, MIN_LS_ARRIVAL, MIN_LS_INTERVAL};
+
+/// The family-neutral LSA-header surface the LSDB semantics run on
+/// (§13.1/§13.2/§14): the fields both wire families' 20-byte headers
+/// share — v2 (`LsaHeader`) and v3 (`LsaHeaderV3`) implement it, and
+/// one generic [`Lsdb`] serves OSPFv2 and OSPFv3 unchanged. This is
+/// architecture invariant 3's "the LSDB is address-family
+/// independent" cashed as code.
+pub trait LsaHeaderInfo {
+    fn ls_age(&self) -> u16;
+    fn set_ls_age(&mut self, age: u16);
+    fn seq(&self) -> u32;
+    fn set_seq(&mut self, seq: u32);
+    fn checksum(&self) -> u16;
+    /// In bytes, including the 20-byte header.
+    fn length(&self) -> u16;
+    /// §12.1.6: the sequence compares as signed i32.
+    fn seq_signed(&self) -> i32;
+    /// Age with the DoNotAge bit masked off.
+    fn effective_age(&self) -> u16;
+    /// §14: MaxAge instances are not used in the routing calculation.
+    fn is_max_age(&self) -> bool;
+    /// §14.1: force MaxAge, preserving the DoNotAge bit.
+    fn force_max_age(&mut self);
+}
+
+/// One LSA family's codec surface for the LSDB: identity, the header
+/// view, the §13.2 contents-difference body half, and the
+/// locally-built normalization (re-encode to fill checksum/length).
+pub trait LsaInstance: Clone {
+    type Header: LsaHeaderInfo;
+
+    fn key(&self) -> LsaKey;
+    fn header(&self) -> &Self::Header;
+    fn header_mut(&mut self) -> &mut Self::Header;
+    /// §13.2's body-side difference (everything except length and
+    /// MaxAge, which the generic comparison covers): v2's Options
+    /// octet + body; v3's body (Options live in bodies there).
+    fn body_differs(&self, other: &Self) -> bool;
+    /// A locally built instance (zero checksum/length) normalized to
+    /// its encoded form; already-normalized instances pass through.
+    fn normalized(&self) -> Self;
+}
+
+impl LsaHeaderInfo for LsaHeader {
+    fn ls_age(&self) -> u16 {
+        self.ls_age
+    }
+    fn set_ls_age(&mut self, age: u16) {
+        self.ls_age = age;
+    }
+    fn seq(&self) -> u32 {
+        self.seq
+    }
+    fn set_seq(&mut self, seq: u32) {
+        self.seq = seq;
+    }
+    fn checksum(&self) -> u16 {
+        self.checksum
+    }
+    fn length(&self) -> u16 {
+        self.length
+    }
+    fn seq_signed(&self) -> i32 {
+        LsaHeader::seq_signed(self)
+    }
+    fn effective_age(&self) -> u16 {
+        LsaHeader::effective_age(self)
+    }
+    fn is_max_age(&self) -> bool {
+        LsaHeader::is_max_age(self)
+    }
+    fn force_max_age(&mut self) {
+        self.ls_age = (self.ls_age & crate::lsa::DO_NOT_AGE) | MAX_AGE;
+    }
+}
+
+impl LsaInstance for Lsa {
+    type Header = LsaHeader;
+
+    fn key(&self) -> LsaKey {
+        Lsa::key(self)
+    }
+    fn header(&self) -> &LsaHeader {
+        &self.header
+    }
+    fn header_mut(&mut self) -> &mut LsaHeader {
+        &mut self.header
+    }
+    fn body_differs(&self, other: &Self) -> bool {
+        // §13.2's Options + body list (the header Options octet is
+        // the v2 half of the family difference).
+        self.header.options != other.header.options || self.body != other.body
+    }
+    fn normalized(&self) -> Self {
+        if self.header.checksum == 0 || self.header.length == 0 {
+            Lsa::decode(&self.encode()).unwrap_or_else(|_| self.clone())
+        } else {
+            self.clone()
+        }
+    }
+}
 
 /// The §13.1 comparison outcome. `Identical` is distinct from `Equal`
 /// only in naming intent (§13.1's final bullet: "the two instances
@@ -49,7 +150,7 @@ pub enum Which {
 /// §13.1: which of two instances of the same LSA is more recent.
 /// Both headers must be of the same LSA (same type/ID/adv-router);
 /// callers guarantee that (the LSDB only ever compares store hits).
-pub fn newer_than(a: &LsaHeader, b: &LsaHeader) -> Which {
+pub fn newer_than<H: LsaHeaderInfo>(a: &H, b: &H) -> Which {
     // 1. The LSA having the newer LS sequence number is more recent
     //    (§12.1.6: signed 32-bit space).
     match a.seq_signed().cmp(&b.seq_signed()) {
@@ -58,7 +159,7 @@ pub fn newer_than(a: &LsaHeader, b: &LsaHeader) -> Which {
         Ordering::Equal => {}
     }
     // 2. Same sequence: larger LS checksum (16-bit unsigned) wins.
-    match a.checksum.cmp(&b.checksum) {
+    match a.checksum().cmp(&b.checksum()) {
         Ordering::Greater => return Which::FirstNewer,
         Ordering::Less => return Which::SecondNewer,
         Ordering::Equal => {}
@@ -84,8 +185,8 @@ pub fn newer_than(a: &LsaHeader, b: &LsaHeader) -> Which {
 
 /// One stored instance plus its bookkeeping.
 #[derive(Debug, Clone)]
-pub struct LsaEntry {
-    pub lsa: Lsa,
+pub struct LsaEntry<T: LsaInstance = Lsa> {
+    pub lsa: T,
     /// Injection-time seconds when this instance was installed.
     pub installed_at: u64,
     /// True when the instance arrived via flooding (subject to the
@@ -155,15 +256,32 @@ pub enum Readopt {
 
 /// The typed link state database for one area (plus the global
 /// AS-external scope — v1 keeps one store; areas are §Deferred).
-#[derive(Debug, Default)]
-pub struct Lsdb {
-    map: std::collections::HashMap<LsaKey, LsaEntry>,
+///
+/// Generic over the LSA family ([`LsaInstance`]): OSPFv2 (`Lsa`) is
+/// the default — every existing use compiles unchanged — and
+/// OSPFv3 instantiates `Lsdb<LsaV3>` (the S7-a seam fix: ONE
+/// implementation of §12.2/§13.1/§13.2/§14 for both families, per
+/// architecture invariant 3).
+#[derive(Debug)]
+pub struct Lsdb<T: LsaInstance = Lsa> {
+    map: std::collections::HashMap<LsaKey, LsaEntry<T>>,
     self_seq: std::collections::HashMap<LsaKey, SeqState>,
     self_originated_at: std::collections::HashMap<LsaKey, u64>,
     last_tick: Option<u64>,
 }
 
-impl Lsdb {
+impl<T: LsaInstance> Default for Lsdb<T> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            self_seq: Default::default(),
+            self_originated_at: Default::default(),
+            last_tick: None,
+        }
+    }
+}
+
+impl<T: LsaInstance> Lsdb<T> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -176,18 +294,18 @@ impl Lsdb {
         self.map.is_empty()
     }
 
-    pub fn get(&self, key: &LsaKey) -> Option<&LsaEntry> {
+    pub fn get(&self, key: &LsaKey) -> Option<&LsaEntry<T>> {
         self.map.get(key)
     }
 
-    pub fn get_mut(&mut self, key: &LsaKey) -> Option<&mut LsaEntry> {
+    pub fn get_mut(&mut self, key: &LsaKey) -> Option<&mut LsaEntry<T>> {
         self.map.get_mut(key)
     }
 
     /// All stored instances (the database summary list of §10.3
     /// ExStart/Exchange — MaxAge entries included; the DD layer moves
     /// them to the retransmission list per §14).
-    pub fn all(&self) -> impl Iterator<Item = &LsaEntry> {
+    pub fn all(&self) -> impl Iterator<Item = &LsaEntry<T>> {
         self.map.values()
     }
 
@@ -196,12 +314,12 @@ impl Lsdb {
     }
 
     /// §13.2 install path. `now` is the injected clock (seconds).
-    pub fn install(&mut self, lsa: Lsa, via_flooding: bool, now: u64) -> InstallOutcome {
+    pub fn install(&mut self, lsa: T, via_flooding: bool, now: u64) -> InstallOutcome {
         // Locally built LSAs carry a zero header checksum/length (the
         // codec fills them at encode); normalize once so the stored
         // header — what DD summaries and LSAcks describe — is the
         // wire truth (§A.4.1: the checksum "cannot be zero").
-        let lsa = normalize_local(&lsa);
+        let lsa = lsa.normalized();
         let key = lsa.key();
         match self.map.get_mut(&key) {
             None => {
@@ -217,10 +335,10 @@ impl Lsdb {
                 InstallOutcome::Installed { changed: true }
             }
             Some(current) => {
-                match newer_than(&lsa.header, &current.lsa.header) {
+                match newer_than(lsa.header(), current.lsa.header()) {
                     Which::SecondNewer => return InstallOutcome::Stale,
                     Which::Identical => {
-                        if lsa.header.seq == current.lsa.header.seq {
+                        if lsa.header().seq() == current.lsa.header().seq() {
                             // §13 step 7: neither more recent — the
                             // same instance as far as the protocol is
                             // concerned (implied-ack territory).
@@ -256,11 +374,11 @@ impl Lsdb {
     /// §13.2's contents-difference list: Options changed, one instance
     /// MaxAge and the other not, length changed, or the body changed
     /// (seq/checksum excluded).
-    pub fn contents_differ_with(&self, candidate: &Lsa) -> bool {
+    pub fn contents_differ_with(&self, candidate: &T) -> bool {
         // Normalize the candidate the same way install does (a
         // locally built LSA carries a zero length until encoded), so
         // the §13.2 length comparison sees the wire truth.
-        let candidate = normalize_local(candidate);
+        let candidate = candidate.normalized();
         match self.map.get(&candidate.key()) {
             None => true,
             Some(entry) => contents_differ(&candidate, &entry.lsa),
@@ -283,15 +401,15 @@ impl Lsdb {
             return report;
         }
         for (key, entry) in &mut self.map {
-            if entry.lsa.header.is_max_age() {
+            if entry.lsa.header().is_max_age() {
                 // Already MaxAge: awaiting the flush removal condition.
                 continue;
             }
-            let age = entry.lsa.header.ls_age;
+            let age = entry.lsa.header().ls_age();
             let dna = age & crate::lsa::DO_NOT_AGE;
             let eff = (age & !crate::lsa::DO_NOT_AGE).saturating_add(delta as u16);
             let new_eff = eff.min(MAX_AGE);
-            entry.lsa.header.ls_age = dna | new_eff;
+            entry.lsa.header_mut().set_ls_age(dna | new_eff);
             if new_eff >= MAX_AGE {
                 report.max_age.push(*key);
             }
@@ -301,8 +419,8 @@ impl Lsdb {
         // is exactly the keys sequence state is tracked for.
         for key in self.self_seq.keys() {
             if let Some(entry) = self.map.get(key) {
-                let eff = entry.lsa.header.effective_age();
-                if eff >= LS_REFRESH_TIME && !entry.lsa.header.is_max_age() {
+                let eff = entry.lsa.header().effective_age();
+                if eff >= LS_REFRESH_TIME && !entry.lsa.header().is_max_age() {
                     report.refresh_due.push(*key);
                 }
             }
@@ -316,7 +434,7 @@ impl Lsdb {
     pub fn flush_ready(&self, adjacency_syncing: bool) -> Vec<LsaKey> {
         self.map
             .iter()
-            .filter(|(_, e)| e.lsa.header.is_max_age())
+            .filter(|(_, e)| e.lsa.header().is_max_age())
             .filter(|(_, e)| !e.on_retransmission)
             .filter(|_| !adjacency_syncing)
             .map(|(k, _)| *k)
@@ -326,7 +444,7 @@ impl Lsdb {
     /// Remove an LSA (the §14 removal, or §12.2's deletion paths).
     /// Returns the removed instance so callers can cascade it off
     /// neighbor retransmission lists.
-    pub fn remove(&mut self, key: &LsaKey) -> Option<Lsa> {
+    pub fn remove(&mut self, key: &LsaKey) -> Option<T> {
         self.self_seq.remove(key);
         self.self_originated_at.remove(key);
         self.map.remove(key).map(|e| e.lsa)
@@ -338,7 +456,7 @@ impl Lsdb {
     /// the full LSA with any sequence number — it is overwritten.
     pub fn originate(
         &mut self,
-        mut lsa: Lsa,
+        mut lsa: T,
         now: u64,
     ) -> Result<InstallOutcome, crate::error::OspfError> {
         let key = lsa.key();
@@ -378,16 +496,16 @@ impl Lsdb {
                 .insert(key, SeqState::Ready { next: next + 1 });
             next
         };
-        lsa.header.seq = new_seq;
+        lsa.header_mut().set_seq(new_seq);
         self.self_originated_at.insert(key, now);
         Ok(self.install(lsa, false, now))
     }
 
     /// §14.1 premature aging: set MaxAge, keep the sequence number,
     /// and report it for the flush reflood.
-    pub fn premature_age(&mut self, key: &LsaKey) -> Option<Lsa> {
+    pub fn premature_age(&mut self, key: &LsaKey) -> Option<T> {
         let entry = self.map.get_mut(key)?;
-        entry.lsa.header.ls_age = (entry.lsa.header.ls_age & crate::lsa::DO_NOT_AGE) | MAX_AGE;
+        entry.lsa.header_mut().force_max_age();
         Some(entry.lsa.clone())
     }
 
@@ -404,19 +522,19 @@ impl Lsdb {
     /// MaxSequenceNumber cannot be advanced past (§12.1.6): the
     /// tracking moves to the flush-before-restart state instead, and
     /// the caller should prematurely age its stored copy (§14.1).
-    pub fn readopt_self_originated(&mut self, received: &Lsa) -> Readopt {
+    pub fn readopt_self_originated(&mut self, received: &T) -> Readopt {
         let key = received.key();
         let Some(SeqState::Ready { next }) = self.self_seq.get(&key) else {
             // Not ours to originate (anymore): nothing to adopt —
             // the flush decision is the caller's policy.
             return Readopt::NotOurs;
         };
-        let recv = received.header.seq as i32;
+        let recv = received.header().seq() as i32;
         let ours = *next as i32;
         if recv < ours {
             return Readopt::Stale;
         }
-        if received.header.seq == crate::lsa::MAX_SEQUENCE_NUMBER {
+        if received.header().seq() == crate::lsa::MAX_SEQUENCE_NUMBER {
             // §12.1.6: nothing exists past MaxSequenceNumber — the
             // old instance must be flushed before the sequence
             // restarts at InitialSequenceNumber.
@@ -431,7 +549,7 @@ impl Lsdb {
         self.self_seq.insert(
             key,
             SeqState::Ready {
-                next: received.header.seq + 1,
+                next: received.header().seq() + 1,
             },
         );
         Readopt::Advanced
@@ -441,11 +559,11 @@ impl Lsdb {
     /// and track its sequence — the AS-scope mirroring path (§7: the
     /// AS-external list is part of every area's database; one
     /// origination, identical instances everywhere).
-    pub fn mirror_originated(&mut self, lsa: &Lsa, now: u64) {
+    pub fn mirror_originated(&mut self, lsa: &T, now: u64) {
         let key = lsa.key();
         let next = lsa
-            .header
-            .seq
+            .header()
+            .seq()
             .wrapping_add(1)
             .max(crate::lsa::INITIAL_SEQUENCE_NUMBER);
         let _ = self.install(lsa.clone(), false, now);
@@ -471,36 +589,21 @@ impl Lsdb {
     }
 }
 
-/// §13.2's difference list as a predicate.
-/// A locally built LSA (zero checksum/length) normalized to its
-/// encoded form; already-normalized LSAs pass through.
-fn normalize_local(lsa: &Lsa) -> Lsa {
-    if lsa.header.checksum == 0 || lsa.header.length == 0 {
-        Lsa::decode(&lsa.encode()).unwrap_or_else(|_| lsa.clone())
-    } else {
-        lsa.clone()
-    }
-}
-
-fn contents_differ(new: &Lsa, old: &Lsa) -> bool {
-    new.header.options != old.header.options
-        || new.header.is_max_age() != old.header.is_max_age()
-        || new.header.length != old.header.length
-        || body_differs(&new.body, &old.body)
-}
-
-/// The body comparison: decoded-structural for the typed bodies.
-/// (Length differences already short-circuit above; two bodies of
-/// different shapes compare unequal via the enum.)
-fn body_differs(a: &LsaBody, b: &LsaBody) -> bool {
-    a != b
+/// §13.2's difference list as a predicate over the family-neutral
+/// surface: MaxAge and length from the header, the body/options
+/// family half from [`LsaInstance::body_differs`].
+fn contents_differ<T: LsaInstance>(new: &T, old: &T) -> bool {
+    new.header().is_max_age() != old.header().is_max_age()
+        || new.header().length() != old.header().length()
+        || new.body_differs(old)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lsa::{
-        LinkStateId, LinkType, LsaHeader, LsaType, Options, RouterId, RouterLink, RouterLsa,
+        LinkStateId, LinkType, LsaBody, LsaHeader, LsaType, Options, RouterId, RouterLink,
+        RouterLsa,
     };
 
     fn hdr(seq: u32, checksum: u16, age: u16) -> LsaHeader {
@@ -926,7 +1029,7 @@ mod tests {
                 );
                 // Day-2: install normalizes the header (checksum/
                 // length filled) — model the same truth here.
-                let lsa = normalize_local(&lsa);
+                let lsa = lsa.normalized();
                 let hdr = lsa.header;
                 let _ = i;
                 db.install(lsa, true, 1000 + 10 * i); // spacing > MinLSArrival
@@ -950,7 +1053,7 @@ mod tests {
         // One self-originated instance at `seq` (as Lsdb::originate
         // would have stamped it), tracking `seq + 1` next.
         let mut db = Lsdb::new();
-        let mut lsa = normalize_local(&router_lsa(seq, 0, 10));
+        let mut lsa = router_lsa(seq, 0, 10).normalized();
         lsa.header.seq = seq;
         let _ = db.install(lsa, false, 0);
         // The self-seq tracking originate() maintains.
@@ -966,7 +1069,7 @@ mod tests {
         // still holding our pre-restart instance (seq 0x80000005)
         // while we restarted at InitialSequenceNumber.
         let mut db = originated_db(INITIAL_SEQUENCE_NUMBER);
-        let received = normalize_local(&router_lsa(0x8000_0005, 0, 10));
+        let received = router_lsa(0x8000_0005, 0, 10).normalized();
         assert_eq!(db.readopt_self_originated(&received), Readopt::Advanced);
         assert_eq!(
             db.next_seq_for(&received.key()),
@@ -977,7 +1080,7 @@ mod tests {
         // aside — inject time past it).
         let mut fresh = router_lsa(0, 0, 10);
         fresh.header.seq = 0xdead_beef; // overwritten by originate
-        let outcome = db.originate(normalize_local(&fresh), 10).unwrap();
+        let outcome = db.originate(fresh.normalized(), 10).unwrap();
         assert!(matches!(outcome, InstallOutcome::Installed { .. }));
         assert_eq!(
             db.get(&received.key()).unwrap().lsa.header.seq,
@@ -992,7 +1095,7 @@ mod tests {
         // instance (0x80000005) or an older one changes nothing.
         let mut db = originated_db(0x8000_0005);
         for seq in [0x8000_0001, 0x8000_0004, 0x8000_0005] {
-            let received = normalize_local(&router_lsa(seq, 0, 10));
+            let received = router_lsa(seq, 0, 10).normalized();
             assert_eq!(db.readopt_self_originated(&received), Readopt::Stale);
             assert_eq!(
                 db.next_seq_for(&received.key()),
@@ -1006,17 +1109,17 @@ mod tests {
         // §13.4 meets §12.1.6: nothing exists past MaxSequenceNumber,
         // so the tracking moves to flush-before-restart.
         let mut db = originated_db(0x7fff_fffd);
-        let received = normalize_local(&router_lsa(MAX_SEQUENCE_NUMBER, 0, 10));
+        let received = router_lsa(MAX_SEQUENCE_NUMBER, 0, 10).normalized();
         assert_eq!(db.readopt_self_originated(&received), Readopt::NeedsFlush);
         // Originating is refused while the old instance is stored
         // (the rollover guard); premature aging plus the §14 removal
         // (the daemon's flush_ready loop) unlock the restart.
         let mut fresh = router_lsa(0, 0, 10);
         fresh.header.seq = 0;
-        assert!(db.originate(normalize_local(&fresh), 10).is_err());
+        assert!(db.originate(fresh.normalized(), 10).is_err());
         assert!(db.premature_age(&received.key()).is_some());
         db.remove(&received.key());
-        let outcome = db.originate(normalize_local(&fresh), 10).unwrap();
+        let outcome = db.originate(fresh.normalized(), 10).unwrap();
         assert!(matches!(outcome, InstallOutcome::Installed { .. }));
         assert_eq!(
             db.get(&received.key()).unwrap().lsa.header.seq,
@@ -1031,7 +1134,9 @@ mod tests {
         // lands in another area's database with the sequence
         // tracking aligned (one origination, consistent instances).
         let mut db = Lsdb::new();
-        let lsa = normalize_local(&router_lsa(0x8000_0007, 0, 10)).with_computed_header();
+        let lsa = router_lsa(0x8000_0007, 0, 10)
+            .normalized()
+            .with_computed_header();
         db.mirror_originated(&lsa, 42);
         let key = lsa.key();
         assert_eq!(db.get(&key).unwrap().lsa.header.seq, 0x8000_0007);
@@ -1047,7 +1152,82 @@ mod tests {
         // advertise, or a network-LSA after losing DR) — the §13.4
         // flush decision belongs to the caller's policy.
         let mut db = Lsdb::new();
-        let foreign = normalize_local(&router_lsa(0x8000_0009, 0, 10));
+        let foreign = router_lsa(0x8000_0009, 0, 10).normalized();
         assert_eq!(db.readopt_self_originated(&foreign), Readopt::NotOurs);
+    }
+
+    /// The AF-generic seam proof (S7-a): the SAME `Lsdb`
+    /// implementation runs the v3 family — install with the §13.2
+    /// contents-difference gate, newer-instance replacement with the
+    /// MinLSArrival guard, §14 aging/refresh reporting — over
+    /// `LsaV3` untouched.
+    #[test]
+    fn the_generic_lsdb_serves_the_v3_family() {
+        use crate::lsa_v3::{
+            LinkTypeV3, LsaBodyV3, LsaHeaderV3, LsaV3, Options24, RouterLinkV3, RouterLsaV3,
+        };
+        fn v3_router_lsa(seq: u32, metric: u16) -> LsaV3 {
+            LsaV3 {
+                header: LsaHeaderV3 {
+                    ls_age: 0,
+                    ls_type: LsaType::V3_ROUTER,
+                    link_state_id: LinkStateId(0),
+                    adv_router: RouterId(0x0a00_0009),
+                    seq,
+                    checksum: 0,
+                    length: 0,
+                },
+                body: LsaBodyV3::Router(RouterLsaV3 {
+                    nt_bit: false,
+                    v_bit: false,
+                    e_bit: true,
+                    b_bit: false,
+                    options: Options24(Options24::V6 | Options24::E),
+                    links: vec![RouterLinkV3 {
+                        link_type: LinkTypeV3::PointToPoint,
+                        metric,
+                        interface_id: 2,
+                        neighbor_interface_id: 7,
+                        neighbor_router_id: RouterId(0x0a00_0001),
+                    }],
+                }),
+            }
+        }
+        let mut db: Lsdb<LsaV3> = Lsdb::new();
+        // Origination stamps the sequence and normalizes the header.
+        let outcome = db.originate(v3_router_lsa(0, 5), 0).unwrap();
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { changed: true }
+        ));
+        let key = LsaKey {
+            ls_type: LsaType::V3_ROUTER,
+            link_state_id: LinkStateId(0),
+            adv_router: RouterId(0x0a00_0009),
+        };
+        let stored = db.get(&key).unwrap();
+        assert_eq!(stored.lsa.header.seq, INITIAL_SEQUENCE_NUMBER);
+        assert_ne!(stored.lsa.header.checksum, 0, "normalized to wire form");
+        assert_eq!(stored.lsa.header.length as usize, stored.lsa.encode().len());
+        // A flood-installed instance one sequence up with a different
+        // body: replaced, changed=true (§13.2's body difference).
+        let outcome = db.install(v3_router_lsa(INITIAL_SEQUENCE_NUMBER + 1, 6), true, 10);
+        assert!(matches!(
+            outcome,
+            InstallOutcome::Installed { changed: true }
+        ));
+        // The MinLSArrival guard (§13 step 5a): another flood
+        // instance within the window is refused.
+        let outcome = db.install(v3_router_lsa(INITIAL_SEQUENCE_NUMBER + 2, 7), true, 10);
+        assert_eq!(outcome, InstallOutcome::RejectedMinLsArrival);
+        // §12.4 refresh reporting + §14.1's DoNotAge-preserving
+        // premature age. (The first aging tick only anchors the
+        // clock — §14's injected-time convention.)
+        db.tick_aging(10);
+        let report = db.tick_aging(10 + LS_REFRESH_TIME as u64 + 5);
+        assert!(report.refresh_due.contains(&key), "self-originated refresh");
+        let aged = db.premature_age(&key).unwrap();
+        assert!(aged.header.is_max_age());
+        assert_eq!(aged.header.seq, INITIAL_SEQUENCE_NUMBER + 1, "seq kept");
     }
 }

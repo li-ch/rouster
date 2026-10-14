@@ -37,7 +37,19 @@
 //! took that step under W1-b M6).
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// The address family the daemon runs (S7-a). v1: one family per
+/// process, selected under `router ospf` — `address-family
+/// ipv6-unicast` runs the OSPFv3 core (`daemon_v3`); the default
+/// (unset) is the OSPFv2 daemon. RFC 5838's multi-instance future
+/// rides with its own grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressFamily {
+    #[default]
+    Ipv4,
+    Ipv6,
+}
 
 /// The parsed daemon configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +58,8 @@ pub struct OspfdConfig {
     /// edge — absent means run standalone).
     pub zapi_socket: Option<String>,
     pub router_id: Option<Ipv4Addr>,
+    /// `address-family ipv6-unicast`: run the OSPFv3 core.
+    pub family: AddressFamily,
     /// The areas, keyed by area ID (OSPF area IDs are 32-bit dotted
     /// quads but compare as raw u32). Multiple areas make the
     /// router an ABR (§12.4.3's summary duties); area 0.0.0.0 is
@@ -158,6 +172,16 @@ pub struct InterfaceConfig {
     /// Packet authentication (Appendix D): None / simple password /
     /// HMAC-SHA-256 cryptographic.
     pub auth: crate::auth::AuthConfig,
+    /// The OSPFv3 runtime's §2.5 link-local source address
+    /// (`link-local <fe80::...>`; required for the v6 core).
+    pub link_local: Option<Ipv6Addr>,
+    /// The OSPFv3 Instance ID (§A.3.1): received packets whose
+    /// Instance ID differs are discarded. Defaults to 0.
+    pub instance_id: u8,
+    /// An explicit kernel ifindex pin (the Interface ID + multicast
+    /// join argument); `None` resolves from the interface name at
+    /// daemon construction (`/proc/net/if_inet6`).
+    pub ifindex: Option<u32>,
 }
 
 impl InterfaceConfig {
@@ -175,6 +199,9 @@ impl InterfaceConfig {
             network_type: NetworkType::Broadcast,
             mtu: 1500,
             auth: crate::auth::AuthConfig::None,
+            link_local: None,
+            instance_id: 0,
+            ifindex: None,
         }
     }
 }
@@ -216,6 +243,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
     let mut cfg = OspfdConfig {
         zapi_socket: None,
         router_id: None,
+        family: AddressFamily::default(),
         areas: Vec::new(),
         networks: vec![],
         redistribute_static: false,
@@ -277,6 +305,18 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
             (1, true) => {
                 // router-level sub-directives.
                 match first {
+                    "address-family" => {
+                        if words.len() != 2 || words[1] != "ipv6-unicast" {
+                            return Err(parse_error(
+                                line_no,
+                                "expected: address-family ipv6-unicast (v1)",
+                            ));
+                        }
+                        if cfg.family != AddressFamily::default() {
+                            return Err(parse_error(line_no, "duplicate address-family"));
+                        }
+                        cfg.family = AddressFamily::Ipv6;
+                    }
                     "router-id" => {
                         if words.len() != 2 {
                             return Err(parse_error(line_no, "expected: router-id <a.b.c.d>"));
@@ -498,7 +538,7 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                     }
                     "cost" | "hello-interval" | "dead-interval" | "priority" | "address"
                     | "network-type" | "mtu" | "authentication-key" | "authentication"
-                    | "message-digest-key" => {
+                    | "message-digest-key" | "link-local" | "instance-id" | "ifindex" => {
                         // Interface parameter inside the LAST interface
                         // stanza of the LAST area; BTreeMap order cannot
                         // express "last", so we require the parameter to
@@ -623,6 +663,40 @@ pub fn parse(text: &str) -> Result<OspfdConfig, crate::error::OspfError> {
                                     "mtu" => iface.mtu = value as u16,
                                     _ => unreachable!(),
                                 }
+                            }
+                            // The OSPFv3 runtime's interface lines
+                            // (S7-a): the §2.5 link-local source, the
+                            // §A.3.1 Instance ID, and an explicit
+                            // ifindex pin (tests; production resolves
+                            // the kernel index from the name).
+                            "link-local" => {
+                                let Some(addr) = words.get(1).and_then(|v| v.parse().ok()) else {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "expected: link-local <fe80::...>",
+                                    ));
+                                };
+                                iface.link_local = Some(addr);
+                            }
+                            "instance-id" => {
+                                let value: u32 =
+                                    words.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| {
+                                        parse_error(line_no, "expected: instance-id <0-255>")
+                                    })?;
+                                if value > 255 {
+                                    return Err(parse_error(
+                                        line_no,
+                                        "instance-id is an octet (0-255, A.3.1)",
+                                    ));
+                                }
+                                iface.instance_id = value as u8;
+                            }
+                            "ifindex" => {
+                                let value: u32 = words
+                                    .get(1)
+                                    .and_then(|v| v.parse().ok())
+                                    .ok_or_else(|| parse_error(line_no, "expected: ifindex <n>"))?;
+                                iface.ifindex = Some(value);
                             }
                             _ => unreachable!(),
                         }
@@ -963,5 +1037,34 @@ router ospf
         // A bare duplicate area line is still a duplicate.
         let err = parse("router ospf\n area 0.0.0.1\n area 0.0.0.1\n").unwrap_err();
         assert!(err.to_string().contains("duplicate area"), "{err}");
+    }
+
+    /// The OSPFv3 runtime's config surface (S7-a): the
+    /// `address-family ipv6-unicast` selector, the interface's
+    /// `link-local` source, `instance-id`, and the `ifindex` pin.
+    #[test]
+    fn ospfv3_address_family_and_interface_lines() {
+        let cfg = parse(
+            "router ospf\n address-family ipv6-unicast\n router-id 10.255.2.1\n area 0.0.0.0\n  interface eth0\n   link-local fe80::a1:1\n   instance-id 7\n   ifindex 3\n   network-type point-to-point\n redistribute static\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.family, AddressFamily::Ipv6);
+        let iface = &cfg.areas[0].interfaces["eth0"];
+        assert_eq!(
+            iface.link_local,
+            Some("fe80::a1:1".parse::<Ipv6Addr>().unwrap())
+        );
+        assert_eq!(iface.instance_id, 7);
+        assert_eq!(iface.ifindex, Some(3));
+        // The default family is v4 (absent selector).
+        let cfg = parse("router ospf\n router-id 10.0.0.1\n area 0.0.0.0\n  interface eth0\n   address 10.0.0.1/30\n").unwrap();
+        assert_eq!(cfg.family, AddressFamily::Ipv4);
+        assert_eq!(cfg.areas[0].interfaces["eth0"].instance_id, 0);
+        // Strictness: unknown family and out-of-range instance IDs.
+        let err = parse("router ospf\n address-family ipv4-unicast\n").unwrap_err();
+        assert!(err.to_string().contains("ipv6-unicast"), "{err}");
+        let err = parse("router ospf\n area 0.0.0.0\n  interface eth0\n   instance-id 256\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("0-255"), "{err}");
     }
 }
