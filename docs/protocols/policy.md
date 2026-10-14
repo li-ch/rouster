@@ -348,7 +348,11 @@ Maps" summary table:
    (exact only with `exact-match`), prefix-list entries match exact
    (subnets only via `le`/`ge`). Pinned by a unit test asserting the
    same `permit 10.0.0.0/8` line accepts `10.1.0.0/16` as an ACL and
-   rejects it as a prefix-list.
+   rejects it as a prefix-list. The representation behind this — the
+   ordered `AccessList` type with its own `Term::AccessList`, never
+   compiled onto `PrefixList` semantics — is the owner-adjudicated
+   answer to POL-4 (2026-10-14 batch adjudication, Group D: "new
+   ordered type — subnet-of default ≠ prefix-list semantics").
 10. **`set comm-list` token order** (M2 fix): the parser originally
    required the inverted `set comm-list delete NAME`; FRR 10.2's CLI
    is `set comm-list NAME delete` (bgpd/bgp_routemap.c

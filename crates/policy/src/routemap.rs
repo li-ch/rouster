@@ -2191,6 +2191,79 @@ access-list A seq 5 deny 10.0.0.0/8
     }
 
     #[test]
+    fn access_list_file_order_does_not_override_seq_order() {
+        // POL-4 (owner-adjudicated 2026-10-14: the ordered type is THE
+        // representation) — order sensitivity is SEQ order, not file
+        // order: entries written in descending seq still evaluate with
+        // seq 5 first.
+        let text = "\
+access-list A seq 10 deny 10.99.0.0/16
+access-list A seq 5 permit 10.0.0.0/8
+route-map r permit 10
+ match ip address A
+";
+        let out = compile_ok(text, "r");
+        let mut route = v4_route("10.99.1.0/24", &[]);
+        assert_eq!(
+            out.filter.apply(&mut route),
+            Verdict::Accept,
+            "seq 5 permit decides first despite being written second"
+        );
+
+        // Same two entries with the seqs swapped: the deny now sorts
+        // first and the same route is rejected.
+        let text2 = "\
+access-list A seq 5 deny 10.99.0.0/16
+access-list A seq 10 permit 10.0.0.0/8
+route-map r permit 10
+ match ip address A
+";
+        let out2 = compile_ok(text2, "r");
+        let mut route2 = v4_route("10.99.1.0/24", &[]);
+        assert_eq!(
+            out2.filter.apply(&mut route2),
+            Verdict::Reject,
+            "seq 5 deny decides first"
+        );
+    }
+
+    #[test]
+    fn access_list_no_entry_covered_falls_through() {
+        // Non-matching fall-through at both levels: no ACL entry covers
+        // the route → the match term is false → the route-map entry
+        // does not match → FRR's implicit deny-all (no `permit any`
+        // tail to catch it).
+        let text = "\
+access-list A permit 10.0.0.0/8
+route-map r permit 10
+ match ip address A
+";
+        let out = compile_ok(text, "r");
+        let mut other = v4_route("198.51.100.0/24", &[]);
+        assert_eq!(
+            out.filter.apply(&mut other),
+            Verdict::Reject,
+            "no entry covers → default deny of the list → implicit route-map deny"
+        );
+
+        // With a permit-all sibling entry the fall-through reaches it:
+        // entry 10 no-matches, entry 20 (empty = always) matches.
+        let text2 = "\
+access-list A permit 10.0.0.0/8
+route-map r permit 10
+ match ip address A
+route-map r permit 20
+";
+        let out2 = compile_ok(text2, "r");
+        let mut other2 = v4_route("198.51.100.0/24", &[]);
+        assert_eq!(
+            out2.filter.apply(&mut other2),
+            Verdict::Accept,
+            "falls through to the next route-map entry"
+        );
+    }
+
+    #[test]
     fn access_list_undefined_reference_is_compile_error() {
         let doc = parse_policy_config("route-map x permit 10\n match ip address NOPE\n").unwrap();
         let e = compile_route_map(&doc, "x").unwrap_err();
