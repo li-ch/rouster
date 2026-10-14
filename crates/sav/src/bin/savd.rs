@@ -15,7 +15,9 @@
 //!
 //! Usage: `savd --config <PATH> --zapi-socket <PATH> [--pidfile <PATH>]
 //! [--status-file <PATH>]`, or `savd --show` to print the daemon's
-//! published status.
+//! published status, or `savd --validate-config <PATH>` to parse a
+//! candidate config and exit 0/1 (the configd pre-apply gate's daemon
+//! half, S8-c; includes the drop-mode friction gate).
 //!
 //! Operator surface (A21), run-dir files only — no IPC, no wire
 //! changes: a pidfile (`/run/rouster/savd.pid` by default) written at
@@ -53,9 +55,11 @@ const DEFAULT_PIDFILE: &str = "/run/rouster/savd.pid";
 /// the daemon after every evaluate.
 const DEFAULT_STATUS_FILE: &str = "/run/rouster/savd.status";
 
-/// What the operator asked savd to do: run the daemon, or print its
+/// What the operator asked savd to do: run the daemon, print its
 /// published status (`--show` needs no config or ZAPI socket — it only
-/// reads the status file).
+/// reads the status file), or validate a candidate config file
+/// (`--validate-config` — the configd pre-apply gate's daemon half,
+/// S8-c; no netlink, no ZAPI, exits before any daemon setup).
 enum Command {
     Run {
         config: PathBuf,
@@ -66,6 +70,9 @@ enum Command {
     Show {
         status_file: PathBuf,
     },
+    Validate {
+        path: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<Command, String> {
@@ -74,6 +81,7 @@ fn parse_args() -> Result<Command, String> {
     let mut pidfile = None;
     let mut status_file = None;
     let mut show = false;
+    let mut validate = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -93,6 +101,11 @@ fn parse_args() -> Result<Command, String> {
                     it.next().ok_or("--status-file requires a path")?,
                 ));
             }
+            "--validate-config" => {
+                validate = Some(PathBuf::from(
+                    it.next().ok_or("--validate-config requires a path")?,
+                ));
+            }
             "--show" => show = true,
             "--help" | "-h" => {
                 println!(
@@ -100,10 +113,14 @@ fn parse_args() -> Result<Command, String> {
                      [--pidfile <PATH>] [--status-file <PATH>]"
                 );
                 println!("       savd --show [--status-file <PATH>]");
+                println!("       savd --validate-config <PATH>");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+    if let Some(path) = validate {
+        return Ok(Command::Validate { path });
     }
     let status_file = status_file.unwrap_or_else(|| PathBuf::from(DEFAULT_STATUS_FILE));
     if show {
@@ -115,6 +132,30 @@ fn parse_args() -> Result<Command, String> {
         pidfile: pidfile.unwrap_or_else(|| PathBuf::from(DEFAULT_PIDFILE)),
         status_file,
     })
+}
+
+/// `--validate-config` (S8-c): parse the candidate file with the
+/// daemon's own parser — which includes the drop-mode friction gate —
+/// and report. Exit 0 with a one-line OK on stderr, or exit 1 with
+/// the parser's line-numbered error verbatim (configd surfaces it as
+/// the apply's refusal reason).
+fn validate_config(path: &Path) -> i32 {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match parse_savd_config(&text) {
+            Ok(config) => {
+                eprintln!("savd: {}: OK ({config})", path.display());
+                0
+            }
+            Err(err) => {
+                eprintln!("savd: {}: {err}", path.display());
+                1
+            }
+        },
+        Err(err) => {
+            eprintln!("savd: cannot read {}: {err}", path.display());
+            1
+        }
+    }
 }
 
 /// The daemon's pidfile (A21): written at start, removed on exit. The
@@ -248,6 +289,9 @@ async fn main() -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, e)
     })?;
     match command {
+        // The validate arm is config-only: it exits before any
+        // netlink/ZAPI setup, so it runs on any host.
+        Command::Validate { path } => std::process::exit(validate_config(&path)),
         Command::Show { status_file } => match show(&status_file) {
             Ok(text) => {
                 print!("{text}");
