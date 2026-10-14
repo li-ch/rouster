@@ -218,17 +218,20 @@ mod tests {
         let text = render_status(&report, &opts);
         assert_eq!(
             text,
-            "configd 0.0.0\n\
-             generation 2 1a2b3c4d5e6f7088\n\
-             applied 1790000123\n\
-             source /root/rouster.conf\n\
-             router-id 198.51.100.1\n\
-             run-dir /run/rouster\n\
-             etc-dir /etc\n\
-             daemons 3\n\
-             daemon rousterd file /etc/rouster.conf bytes 38 pid 4242 result signaled ack no-ack-surface\n\
-             daemon savd file /etc/savd.conf bytes 18 pid 4243 result signaled ack confirmed\n\
-             daemon bfdd file /etc/bfdd.conf bytes 15 result not-running\n"
+            format!(
+                "configd {}\n\
+                 generation 2 1a2b3c4d5e6f7088\n\
+                 applied 1790000123\n\
+                 source /root/rouster.conf\n\
+                 router-id 198.51.100.1\n\
+                 run-dir /run/rouster\n\
+                 etc-dir /etc\n\
+                 daemons 3\n\
+                 daemon rousterd file /etc/rouster.conf bytes 38 pid 4242 result signaled ack no-ack-surface\n\
+                 daemon savd file /etc/savd.conf bytes 18 pid 4243 result signaled ack confirmed\n\
+                 daemon bfdd file /etc/bfdd.conf bytes 15 result not-running\n",
+                env!("CARGO_PKG_VERSION")
+            )
         );
     }
 
