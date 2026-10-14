@@ -225,31 +225,35 @@ pub struct LspEntry {
 pub enum ThreewayState {
     /// "The system has not received any IIH packet containing the
     /// three-way handshake option on this point-to-point circuit."
+    /// Wire value **2**.
     #[default]
     Down,
     /// "...does not know whether the neighbor is receiving its IIH
-    /// packet."
+    /// packet." Wire value **1**.
     Initializing,
     /// "The system knows that the neighbor is receiving its IIH
-    /// packets."
+    /// packets." Wire value **0**.
     Up,
 }
 
 impl ThreewayState {
+    /// RFC 5303 §3.1: "0 - Up, 1 - Initializing, 2 - Down" (note the
+    /// ordering — 0 is Up, not Down; FRR 10.2.2's
+    /// `enum isis_threeway_state` carries the same values).
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::Down),
+            0 => Some(Self::Up),
             1 => Some(Self::Initializing),
-            2 => Some(Self::Up),
+            2 => Some(Self::Down),
             _ => None,
         }
     }
 
     pub fn to_u8(self) -> u8 {
         match self {
-            Self::Down => 0,
+            Self::Up => 0,
             Self::Initializing => 1,
-            Self::Up => 2,
+            Self::Down => 2,
         }
     }
 }

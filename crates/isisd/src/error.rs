@@ -72,7 +72,7 @@ pub enum IsisError {
     BadIsType(u8),
 
     /// RFC 5303 §3: the adjacency three-way state is 0, 1 or 2.
-    #[error("three-way adjacency state {0} is not 0 (Down), 1 (Initializing) or 2 (Up)")]
+    #[error("three-way adjacency state {0} is not 0 (Up), 1 (Initializing) or 2 (Down)")]
     BadThreewayState(u8),
 
     #[error("LSP checksum mismatch: header says {header:#06x}, computed {computed:#06x}")]

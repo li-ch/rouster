@@ -29,6 +29,7 @@
 //!   interface stanzas, the zapi client edge (route type 9 — ISIS),
 //!   the run loop.
 
+pub mod adjacency;
 pub mod checksum;
 pub mod error;
 pub mod lspdb;
