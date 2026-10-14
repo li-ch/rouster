@@ -105,9 +105,28 @@ docker build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 echo "==> starting container $NAME (cap pattern of test-z5b)"
+# apparmor=unconfined: docker's default AppArmor profile carries an
+# unconditional `deny mount` (moby profiles/apparmor/template.go) that
+# overrides CAP_SYS_ADMIN wherever the LSM is active — Ubuntu runners
+# answer the /proc overmount and the `ip netns add` bind-mount with
+# "Permission denied" (CI run 38647649951). Locally (no AppArmor on
+# the docker VM) this changes nothing; seccomp already permits mount
+# for SYS_ADMIN-bounded containers.
 docker run -d --name "$NAME" \
     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined \
     --entrypoint sh "$IMAGE" -c 'while true; do sleep 3600; done' >/dev/null
+
+# Environment parity, not a test leg (the w7 note): hosts that bring
+# container netns up with nonzero rp_filter defaults would fail the
+# baseline below and shadow the differential. The overmount is the w8
+# pattern (the nft backend itself never writes sysctls; the baseline
+# asserts they are untouched — zero them BEFORE asserting).
+docker exec "$NAME" mount -t proc none /proc
+docker exec "$NAME" sysctl -q -w \
+    net.ipv4.conf.all.rp_filter=0 \
+    net.ipv4.conf.default.rp_filter=0 \
+    net.ipv4.conf.lo.rp_filter=0
 
 echo "==> delivering full iproute2 ip (busybox has no netns subcommand)"
 docker rm -f nft-ip-donor >/dev/null 2>&1 || true

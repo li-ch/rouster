@@ -102,12 +102,30 @@ docker build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 echo "==> starting container $NAME (cap pattern of test-z5b)"
+# apparmor=unconfined: docker's default AppArmor profile carries an
+# unconditional `deny mount` (moby profiles/apparmor/template.go) that
+# overrides CAP_SYS_ADMIN wherever the LSM is active — Ubuntu runners
+# answered the overmount and the `ip netns add` bind-mount below with
+# "Permission denied" (CI run 38647649951). Locally (no AppArmor on
+# the docker VM) this changes nothing; seccomp already permits mount
+# for SYS_ADMIN-bounded containers.
 docker run -d --name "$NAME" \
     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined \
     --entrypoint sh "$IMAGE" -c 'while true; do sleep 3600; done' >/dev/null
 
 echo "==> making /proc/sys writable (fresh procfs overmount; rw probe evidence in the W7 report)"
 docker exec "$NAME" mount -t proc none /proc
+
+# Environment parity, not a test leg: some hosts bring container netns
+# up with nonzero rp_filter defaults (run 38647649951's sav family),
+# which would shadow the spoof differential and fail the monitor leg's
+# "sysctl untouched" asserts. Zero the netns templates before any veth
+# exists; every interface this script creates then starts at 0.
+docker exec "$NAME" sysctl -q -w \
+    net.ipv4.conf.all.rp_filter=0 \
+    net.ipv4.conf.default.rp_filter=0 \
+    net.ipv4.conf.lo.rp_filter=0
 
 echo "==> topology: two veth pairs, peer ends in netns ns1"
 docker exec "$NAME" ip link add vethlegit type veth peer name vethlegitp

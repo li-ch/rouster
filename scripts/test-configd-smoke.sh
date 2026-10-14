@@ -207,8 +207,16 @@ docker build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 echo "==> starting container $NAME (w8 cap pattern)"
+# apparmor=unconfined: docker's default AppArmor profile carries an
+# unconditional `deny mount` (moby profiles/apparmor/template.go) that
+# overrides CAP_SYS_ADMIN wherever the LSM is active — Ubuntu runners
+# answered the /proc overmount below with "Permission denied" (CI run
+# 38647649951). Locally (no AppArmor on the docker VM) this changes
+# nothing; seccomp already permits mount for SYS_ADMIN-bounded
+# containers.
 docker run -d --name "$NAME" \
     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined \
     --entrypoint sh "$IMAGE" -c 'while true; do sleep 3600; done' >/dev/null
 
 echo "==> making /proc/sys writable (fresh procfs overmount; the w8 pattern)"

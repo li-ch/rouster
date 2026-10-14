@@ -261,8 +261,16 @@ ROUTER_ID=172.28.0.3 frr_bgp "$PROV" 501 \
     " exit-address-family"
 
 echo "==> rouster container on the three BAR-SAV bridges"
+# apparmor=unconfined: docker's default AppArmor profile carries an
+# unconditional `deny mount` (moby profiles/apparmor/template.go) that
+# overrides CAP_SYS_ADMIN wherever the LSM is active — Ubuntu runners
+# answer the /proc overmount below with "Permission denied" (CI run
+# 38647649951). Locally (no AppArmor on the docker VM) this changes
+# nothing; seccomp already permits mount for SYS_ADMIN-bounded
+# containers.
 docker run -d --name "$ROUSTER" \
     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined \
     --entrypoint sleep "$ROUSTER_IMAGE" infinity >/dev/null
 docker network connect --ip 172.25.0.2 "$NET_CUST" "$ROUSTER"
 docker network connect --ip 172.27.0.2 "$NET_PEER" "$ROUSTER"
@@ -275,9 +283,14 @@ docker exec "$ROUSTER" mkdir -p /etc/rouster /var/log /run/rouster
 # Kernel uRPF must stay OFF the whole run: the nft backend never
 # touches sysctls, and a nonzero rp_filter on eth3 would drop the
 # monitor leg's directionality probe before the SAV table sees it.
-# The mount is read-only in this image class (the test-savd-nft
-# lesson) — zero what is zeroable, then ASSERT the values: a nonzero
-# rp_filter would shadow the whole smoke.
+# Some CI hosts default container netns to loose uRPF (run 38647649951:
+# eth1 read nonzero on the fresh runner) — the read-only /proc/sys is
+# overmounted rw (the w8 pattern, environment prep) and the values
+# zeroed; only then does the ASSERT below mean anything.
+docker exec "$ROUSTER" mount -t proc none /proc
+for i in all default lo eth0 eth1 eth2 eth3; do
+    docker exec "$ROUSTER" sysctl -q -w "net.ipv4.conf.$i.rp_filter=0"
+done
 for i in eth1 eth2 eth3; do
     [ "$(docker exec "$ROUSTER" cat /proc/sys/net/ipv4/conf/$i/rp_filter)" = 0 ] \
         || { echo "FAIL: $i rp_filter is not 0 (kernel uRPF would shadow the test)" >&2; exit 1; }
