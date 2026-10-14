@@ -48,8 +48,9 @@
 //! the BSDs both deliver received raw datagrams with the IP header
 //! in the buffer (raw(7), raw(4)).
 
+use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -57,6 +58,10 @@ use crate::packet::{ALL_D_ROUTERS, ALL_SPF_ROUTERS, IP_PROTO_OSPF};
 
 /// §A.1: all OSPF protocol packets are sent with TTL 1.
 pub const OSPF_TTL: u32 = 1;
+
+/// RFC 5340 §A.1: the multicast Hop Limit value (and our unicast
+/// parity — see the v6 module note).
+pub const OSPF_HOP_LIMIT: u32 = 1;
 
 /// One received datagram after IP-header parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +257,272 @@ impl OspfRawSocket {
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<Option<Received>> {
         let (n, _addr) = self.io.recv_from(buf).await?;
         Ok(extract_ospf(&buf[..n]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The OSPFv3 transport (RFC 5340 §A.1) — raw IPv6 proto 89.
+//
+// What the RFC mandates, pinned exactly (§A.1's encapsulation bullets):
+//
+// - **Multicast hop limit 1** — "packets sent to these addresses
+//   should have their IPv6 Hop Limit set to 1" for AllSPFRouters
+//   (ff02::5) and AllDRouters (ff02::6), both link-local scope. This
+//   is a *multicast-only* mandate: unlike RFC 2328 §A.1's blanket
+//   TTL-1-on-every-packet rule, RFC 5340 places NO hop-limit rule on
+//   the unicast conversation/virtual-link packets. We arm
+//   `IPV6_MULTICAST_HOPS = 1` (the mandated arm) and
+//   `IPV6_UNICAST_HOPS = 1` (the link-local single-hop intent, a
+//   local choice consistent with every real v3 stack's observation;
+//   disclosed as such).
+// - **AllSPFRouters joined always**; **AllDRouters joined only while
+//   the interface is DR or BDR** ("Both the Designated Router and
+//   Backup Designated Router must be prepared to receive packets
+//   destined to this address").
+// - **No receive-side hop-limit enforcement is possible yet**: a raw
+//   IPv6 socket does NOT deliver the IPv6 header in the buffer
+//   (ipv6(7)/RFC 3542 §6 — the v4 raw trick does not port), so the
+//   hop limit is only readable through the `IPV6_RECVHOPLIMIT` cmsg —
+//   and every cmsg reader needs `recvmsg`, which no safe API in our
+//   dependency set wraps. The socketopt IS armed here through
+//   socket2's safe setter (so a future cmsg walker finds it enabled);
+//   the read-back itself is §Deferred with the bfdd audited-block
+//   precedent (arm_v4_recv_ttl / recvmsg_ctl in crates/bfdd — the
+//   owner-exception treatment). No unsafe was added.
+// - **The received IPv6 destination address has the same wall** (it
+//   rides the IPV6_RECVPKTINFO cmsg), but the v3 checksum needs it
+//   (the RFC 8200 §8.1 pseudo-header). Deterministic workaround, same
+//   shape the RFC itself enumerates (§4.2: the destination "MUST be
+//   one of the IPv6 unicast addresses associated with the receiving
+//   interface ..., AllSPFRouters or AllDRouters"): [`decode_v3_dst`]
+//   tries the small candidate set and takes the one whose pseudo-
+//   header verifies. Disclosed: a packet that verifies against NONE
+//   of the candidates is dropped (a checksum collision across
+//   candidates is the only false-accept path).
+//
+// The v6 socket is BOUND to the interface's link-local address (the
+// RFC's source-address rule, §2.5: "OSPF packets are sent using the
+// interface's associated link-local unicast address as the source
+// address") — binding both pins our source and scopes reception to
+// the link (the closest safe substitute for the v2 SO_BINDTODEVICE
+// fence, which stands here too: socket2 0.6.5 has no bind_device).
+
+/// RFC 5340 §A.1: AllSPFRouters — "Hello packets are always sent to
+/// this destination", plus certain flooding packets.
+pub const ALL_SPF_ROUTERS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 5);
+/// RFC 5340 §A.1: AllDRouters — flooding packets the DR/BDR receive.
+pub const ALL_D_ROUTERS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 6);
+
+/// Whether `dst` is one of OSPFv3's two link-local multicast
+/// destinations (the receive-side class distinction: an ff02::5/6
+/// packet is the multicast arm of §A.1, anything else is a unicast
+/// exchange).
+pub fn is_multicast_dst_v6(dst: Ipv6Addr) -> bool {
+    dst == ALL_SPF_ROUTERS_V6 || dst == ALL_D_ROUTERS_V6
+}
+
+/// One received v6 datagram. The IPv6 header is NOT in the buffer
+/// (raw v6 sockets deliver payload only) and the hop limit / true
+/// destination are not readable without the cmsg walk — the two
+/// §Deferred read-backs above. The source comes from recv_from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedV6 {
+    pub src: Ipv6Addr,
+    pub payload: Vec<u8>,
+}
+
+/// Resolve an interface name to its kernel ifindex by parsing
+/// `/proc/net/if_inet6` (Linux — the platform the daemon targets; on
+/// other hosts this returns an error and callers fall back to a
+/// supplied index). Pure std, no libc `if_nametoindex` (that call is
+/// FFI — the unsafe fence).
+pub fn ifindex_of(name: &str) -> io::Result<u32> {
+    let text = std::fs::read_to_string("/proc/net/if_inet6")?;
+    parse_if_inet6(&text)
+        .remove(name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no ifindex for {name}")))
+}
+
+/// Parse `/proc/net/if_inet6` lines
+/// (`<addr> <ifindex-hex> <plen> <scope> <flags> <name>`) into a
+/// name → ifindex map. Malformed lines are skipped (the file's shape
+/// is a kernel ABI, but a defensive parse costs nothing).
+pub fn parse_if_inet6(text: &str) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_addr) = fields.next() else { continue };
+        let Some(index) = fields.next().and_then(|f| u32::from_str_radix(f, 16).ok()) else {
+            continue;
+        };
+        // plen, scope, flags — skipped.
+        let _plen = fields.next();
+        let _scope = fields.next();
+        let _flags = fields.next();
+        if let Some(name) = fields.next() {
+            map.insert(name.to_string(), index);
+        }
+    }
+    map
+}
+
+/// Try decoding an OSPFv3 packet against the interface's candidate
+/// destination set (§4.2's list, the share our socket can know: the
+/// two multicast groups and our own link-local) and return the packet
+/// plus the destination that verified. `None` when no candidate
+/// verifies (wrong interface / corrupted / not for us).
+pub fn decode_v3_dst(
+    buf: &[u8],
+    src: Ipv6Addr,
+    own_link_local: Ipv6Addr,
+) -> Option<(crate::packet_v3::PacketV3, Ipv6Addr)> {
+    for dst in [ALL_SPF_ROUTERS_V6, ALL_D_ROUTERS_V6, own_link_local] {
+        if let Ok(packet) = crate::packet_v3::PacketV3::decode(buf, src, dst) {
+            return Some((packet, dst));
+        }
+    }
+    None
+}
+
+/// One per-interface OSPFv3 raw socket: bound to the interface's
+/// link-local address (the §2.5 source rule), AllSPFRouters joined at
+/// open, multicast hop limit 1 (§A.1), unicast hops 1 (local parity),
+/// hop-limit receive arming on (the cmsg read-back is §Deferred).
+pub struct OspfV6RawSocket {
+    /// The socket2 handle: the sockopt surface (multicast joins,
+    /// hops) shared by both handles (see the v2 struct's note).
+    socket: std::sync::Mutex<Socket>,
+    /// The dup'd-fd tokio handle for the safe async IO path.
+    io: tokio::net::UdpSocket,
+    /// The interface's link-local address — our packet source (§2.5)
+    /// and the unicast candidate in the destination trial.
+    pub link_local: Ipv6Addr,
+    /// The kernel interface index: the multicast join/egress argument
+    /// and (by §A.2/C.1 convention) our OSPFv3 Interface ID.
+    pub ifindex: u32,
+    /// Whether ff02::6 (AllDRouters) is currently joined.
+    joined_dr: std::sync::atomic::AtomicBool,
+}
+
+impl OspfV6RawSocket {
+    /// Open and arm the socket on the interface's link-local address:
+    /// proto 89, bound to `link_local` (scope `ifindex`), AllSPFRouters
+    /// membership, multicast egress `ifindex`, hop limits, receive
+    /// arming, multicast loopback off.
+    pub fn open(link_local: Ipv6Addr, ifindex: u32) -> io::Result<Self> {
+        let socket = Socket::new(
+            Domain::IPV6,
+            Type::RAW,
+            Some(Protocol::from(IP_PROTO_OSPF as std::os::raw::c_int)),
+        )?;
+        // §2.5: the link-local source. The scope id in the sockaddr
+        // selects the interface for the (per-link ambiguous) address.
+        socket.bind(&socket2::SockAddr::from(SocketAddrV6::new(
+            link_local, 0, 0, ifindex,
+        )))?;
+        socket.join_multicast_v6(&ALL_SPF_ROUTERS_V6, ifindex)?;
+        socket.set_multicast_if_v6(ifindex)?;
+        // §A.1's hop-limit mandate is the multicast arm; the unicast
+        // arm is local parity (documented above).
+        socket.set_multicast_hops_v6(OSPF_HOP_LIMIT)?;
+        socket.set_unicast_hops_v6(OSPF_HOP_LIMIT)?;
+        socket.set_multicast_loop_v6(false)?;
+        // The receive-side arming (RFC 3542 §6): on, so the future
+        // cmsg read-back finds it — the wall is the reader, not the
+        // setter (see the module note).
+        socket.set_recv_hoplimit_v6(true)?;
+        socket.set_nonblocking(true)?;
+        // The safe-I/O seam (the v2 module note), v6 flavor.
+        use std::os::fd::AsFd;
+        let dup = socket.as_fd().try_clone_to_owned()?;
+        let std_sock = std::net::UdpSocket::from(dup);
+        let io = tokio::net::UdpSocket::from_std(std_sock)?;
+        Ok(Self {
+            socket: std::sync::Mutex::new(socket),
+            io,
+            link_local,
+            ifindex,
+            joined_dr: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// §A.1: join AllDRouters when this interface elects itself DR or
+    /// BDR.
+    pub fn join_all_drouters(&self) -> io::Result<()> {
+        if !self
+            .joined_dr
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.socket
+                .lock()
+                .expect("ospf v6 socket lock")
+                .join_multicast_v6(&ALL_D_ROUTERS_V6, self.ifindex)?;
+        }
+        Ok(())
+    }
+
+    /// The inverse when the role is lost.
+    pub fn leave_all_drouters(&self) -> io::Result<()> {
+        if self
+            .joined_dr
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.socket
+                .lock()
+                .expect("ospf v6 socket lock")
+                .leave_multicast_v6(&ALL_D_ROUTERS_V6, self.ifindex)?;
+        }
+        Ok(())
+    }
+
+    /// The async IO handle (readiness + safe send/recv).
+    pub fn io(&self) -> &tokio::net::UdpSocket {
+        &self.io
+    }
+
+    /// Send an OSPFv3 packet to AllSPFRouters (ff02::5) — Hellos and
+    /// the p2p/broadcast-DR floods (§A.1).
+    pub async fn send_multicast(&self, packet: &[u8]) -> io::Result<usize> {
+        self.io
+            .send_to(
+                packet,
+                SocketAddr::V6(SocketAddrV6::new(ALL_SPF_ROUTERS_V6, 0, 0, 0)),
+            )
+            .await
+    }
+
+    /// Send an OSPFv3 packet to AllDRouters (ff02::6) — a DR Other's
+    /// broadcast-network flood (§4.5.2/§A.1).
+    pub async fn send_multicast_drouters(&self, packet: &[u8]) -> io::Result<usize> {
+        self.io
+            .send_to(
+                packet,
+                SocketAddr::V6(SocketAddrV6::new(ALL_D_ROUTERS_V6, 0, 0, 0)),
+            )
+            .await
+    }
+
+    /// Send an OSPFv3 packet unicast to `dst` — the conversation
+    /// packets (DD, LSR, LSU, direct LSAck; §A.1).
+    pub async fn send_unicast(&self, packet: &[u8], dst: Ipv6Addr) -> io::Result<usize> {
+        self.io
+            .send_to(packet, SocketAddr::V6(SocketAddrV6::new(dst, 0, 0, 0)))
+            .await
+    }
+
+    /// Receive one raw datagram. The buffer holds ONLY the OSPF
+    /// packet (no IPv6 header — the v6 raw-socket rule); the source
+    /// comes from recv_from.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<Option<ReceivedV6>> {
+        let (n, addr) = self.io.recv_from(buf).await?;
+        let src = match addr.ip() {
+            std::net::IpAddr::V6(v6) => v6,
+            std::net::IpAddr::V4(_) => return Ok(None),
+        };
+        Ok(Some(ReceivedV6 {
+            src,
+            payload: buf[..n].to_vec(),
+        }))
     }
 }
 
@@ -484,5 +755,219 @@ mod tests {
             "the header's TTL octet is the raw-socket readout"
         );
         assert_eq!(received.src, Ipv4Addr::LOCALHOST);
+    }
+
+    // ----- The OSPFv3 transport tests (RFC 5340 §A.1) -----
+
+    /// The two link-local multicast constants and the destination
+    /// class split (§A.1 / §4.2's destination list).
+    #[test]
+    fn v6_multicast_constants_and_dst_class() {
+        assert_eq!(ALL_SPF_ROUTERS_V6.octets()[0..2], [0xff, 0x02]);
+        assert_eq!(ALL_SPF_ROUTERS_V6.octets()[15], 5, "ff02::5");
+        assert_eq!(ALL_D_ROUTERS_V6.octets()[15], 6, "ff02::6");
+        assert!(is_multicast_dst_v6(ALL_SPF_ROUTERS_V6));
+        assert!(is_multicast_dst_v6(ALL_D_ROUTERS_V6));
+        assert!(!is_multicast_dst_v6("fe80::1".parse().unwrap()));
+        assert!(!is_multicast_dst_v6("2001:db8::1".parse().unwrap()));
+    }
+
+    /// `/proc/net/if_inet6` parsing: the name → ifindex map from the
+    /// kernel ABI's line shape (addr, ifindex-hex, plen, scope,
+    /// flags, name). Malformed lines are skipped.
+    #[test]
+    fn parses_proc_net_if_inet6() {
+        let text = "fe800000000000000000000000000001 02 80 10 80 eth0\n\
+                    00000000000000000000000000000000 01 80 10 80 lo\n\
+                    garbage\n\
+                    fe800000000000000000000000000002 ff 80 10 80 eth1\n";
+        let map = parse_if_inet6(text);
+        assert_eq!(map.get("lo"), Some(&1), "hex 01");
+        assert_eq!(map.get("eth0"), Some(&2), "hex 02");
+        assert_eq!(map.get("eth1"), Some(&0xff), "hex ff");
+        assert!(!map.contains_key("garbage"));
+        assert_eq!(parse_if_inet6("").len(), 0);
+        // ifindex_of reads the real file when there is one (Linux);
+        // elsewhere it errors NotFound — both outcomes are fine here,
+        // the parse logic is what this pins.
+        match ifindex_of("lo0").or_else(|_| ifindex_of("lo")) {
+            Ok(idx) => assert!(idx > 0),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+        }
+    }
+
+    /// The destination-trial decode (the §4.2 destination list as the
+    /// pseudo-header candidate set): a packet encoded for ff02::5
+    /// verifies against ff02::5, a unicast one against the peer's
+    /// link-local, and corruption fails every candidate.
+    #[test]
+    fn v3_dst_trial_picks_the_verifying_destination() {
+        use crate::lsa::RouterId;
+        use crate::lsa_v3::Options24;
+        use crate::packet_v3::{HelloV3, PacketBodyV3, PacketHeaderV3, PacketV3};
+        let src: Ipv6Addr = "fe80::a1".parse().unwrap();
+        let own: Ipv6Addr = "fe80::b2".parse().unwrap();
+        let hello = PacketV3 {
+            header: PacketHeaderV3 {
+                version: 3,
+                packet_type: 1,
+                length: 0,
+                router_id: RouterId(1),
+                area_id: 0,
+                checksum: 0,
+                instance_id: 0,
+            },
+            body: PacketBodyV3::Hello(HelloV3 {
+                interface_id: 3,
+                router_priority: 1,
+                options: Options24(Options24::V6 | Options24::E | Options24::R),
+                hello_interval: 10,
+                router_dead_interval: 40,
+                designated_router: RouterId(0),
+                backup_designated_router: RouterId(0),
+                neighbors: vec![],
+            }),
+        };
+        let bytes = hello.encode(src, ALL_SPF_ROUTERS_V6);
+        let (back, dst) = decode_v3_dst(&bytes, src, own).expect("multicast candidate verifies");
+        assert_eq!(dst, ALL_SPF_ROUTERS_V6);
+        assert_eq!(back.header.router_id, RouterId(1));
+
+        let bytes = hello.encode(src, own);
+        let (_, dst) = decode_v3_dst(&bytes, src, own).expect("unicast candidate verifies");
+        assert_eq!(dst, own);
+
+        // Corrupted payload verifies against nothing.
+        let mut bad = hello.encode(src, ALL_SPF_ROUTERS_V6);
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(decode_v3_dst(&bad, src, own).is_none());
+        // The wrong source address fails too (pseudo-header covers it).
+        let bytes = hello.encode(src, ALL_SPF_ROUTERS_V6);
+        let other_src: Ipv6Addr = "fe80::c3".parse().unwrap();
+        assert!(decode_v3_dst(&bytes, other_src, own).is_none());
+    }
+
+    /// The arming read-back (privileged-gated like the v4 test): the
+    /// §A.1 multicast hop limit 1, the unicast hops parity, the
+    /// IPV6_RECVHOPLIMIT arming, and the AllDRouters join/leave
+    /// round-trip.
+    #[tokio::test]
+    async fn raw_v6_socket_opens_and_arms_hop_limits() {
+        // Loopback is index 1 on every supported host.
+        let ifindex = ifindex_of("lo0").or_else(|_| ifindex_of("lo")).unwrap_or(1);
+        let sock = match OspfV6RawSocket::open(Ipv6Addr::LOCALHOST, ifindex) {
+            Ok(sock) => sock,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: raw v6 sockets need root here ({err})");
+                return;
+            }
+            Err(err) => panic!("unexpected v6 open error: {err}"),
+        };
+        let guard = sock.socket.lock().expect("socket lock");
+        // §A.1: the multicast Hop Limit mandate.
+        assert_eq!(guard.multicast_hops_v6().unwrap(), OSPF_HOP_LIMIT);
+        // The unicast hops parity (local choice, documented).
+        assert_eq!(guard.unicast_hops_v6().unwrap(), OSPF_HOP_LIMIT);
+        // RFC 3542 §6: the receive arming is on (the read-back is
+        // the deferred cmsg walk).
+        assert!(guard.recv_hoplimit_v6().unwrap());
+        assert!(!guard.multicast_loop_v6().unwrap());
+        drop(guard);
+        sock.join_all_drouters().unwrap();
+        sock.join_all_drouters().unwrap(); // idempotent
+        sock.leave_all_drouters().unwrap();
+        sock.leave_all_drouters().unwrap(); // idempotent
+    }
+
+    /// The wire proof of the v6 transport and the destination trial:
+    /// two real raw proto-89 v6 sockets on loopback — a multicast
+    /// send to ff02::5 and a unicast send — both received, decoded,
+    /// and attributed to the right destination by the pseudo-header.
+    /// Privileged-gated like the v4 loopback test.
+    #[tokio::test]
+    async fn raw_v6_loopback_roundtrips_and_trials_the_dst() {
+        let ifindex = ifindex_of("lo0").or_else(|_| ifindex_of("lo")).unwrap_or(1);
+        let mk = || match OspfV6RawSocket::open(Ipv6Addr::LOCALHOST, ifindex) {
+            Ok(s) => Ok(s),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: raw v6 sockets need root here ({err})");
+                Err(())
+            }
+            Err(err) => panic!("unexpected v6 open error: {err}"),
+        };
+        let sender = match mk() {
+            Ok(s) => s,
+            Err(()) => return,
+        };
+        let receiver = match mk() {
+            Ok(s) => s,
+            Err(()) => return,
+        };
+        // A minimal but well-formed Hello (checksum valid for the
+        // real addresses — the trial decodes it below).
+        use crate::lsa::RouterId;
+        use crate::lsa_v3::Options24;
+        use crate::packet_v3::{HelloV3, PacketBodyV3, PacketHeaderV3, PacketV3};
+        let hello = PacketV3 {
+            header: PacketHeaderV3 {
+                version: 3,
+                packet_type: 1,
+                length: 0,
+                router_id: RouterId(0x0a00_0001),
+                area_id: 0,
+                checksum: 0,
+                instance_id: 0,
+            },
+            body: PacketBodyV3::Hello(HelloV3 {
+                interface_id: 7,
+                router_priority: 1,
+                options: Options24(Options24::V6 | Options24::E | Options24::R),
+                hello_interval: 10,
+                router_dead_interval: 40,
+                designated_router: RouterId(0),
+                backup_designated_router: RouterId(0),
+                neighbors: vec![],
+            }),
+        };
+        let mut buf = vec![0u8; 65535];
+        async fn try_recv(receiver: &OspfV6RawSocket, buf: &mut [u8]) -> Option<ReceivedV6> {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv(buf)).await
+            {
+                Ok(Ok(Some(received))) => Some(received),
+                _ => None,
+            }
+        }
+
+        // Multicast leg: ff02::5 on the loopback link.
+        sender
+            .send_multicast(&hello.encode(Ipv6Addr::LOCALHOST, ALL_SPF_ROUTERS_V6))
+            .await
+            .unwrap();
+        let Some(received) = try_recv(&receiver, &mut buf).await else {
+            eprintln!("skipping: no loopback v6 multicast delivery here");
+            return;
+        };
+        assert_eq!(received.src, Ipv6Addr::LOCALHOST);
+        let (packet, dst) = decode_v3_dst(&received.payload, received.src, receiver.link_local)
+            .expect("multicast candidate verifies on real wire bytes");
+        assert_eq!(dst, ALL_SPF_ROUTERS_V6);
+        assert_eq!(packet.header.router_id, RouterId(0x0a00_0001));
+
+        // Unicast leg: straight to our own bound address.
+        sender
+            .send_unicast(
+                &hello.encode(Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST),
+                Ipv6Addr::LOCALHOST,
+            )
+            .await
+            .unwrap();
+        let Some(received) = try_recv(&receiver, &mut buf).await else {
+            eprintln!("skipping: no loopback v6 unicast delivery here");
+            return;
+        };
+        let (_, dst) =
+            decode_v3_dst(&received.payload, received.src, receiver.link_local).expect("");
+        assert_eq!(dst, Ipv6Addr::LOCALHOST, "the unicast candidate verified");
     }
 }
