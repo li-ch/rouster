@@ -16,6 +16,8 @@
 //!  neighbor 192.0.2.9 role peer
 //!  neighbor 192.0.2.9 update-error-handling rfc7606
 //!  neighbor 192.0.2.9 route-server
+//!  neighbor 10.0.0.9 route-reflector-client
+//!  graceful-restart deferral 120
 //!  neighbor 192.0.2.9 graceful-restart 120
 //!  neighbor 192.0.2.9 addpath both
 //!  network 203.0.113.0/24
@@ -220,6 +222,13 @@ pub struct NeighborConfig {
     /// prepend, NEXT_HOP/MED preserved (FRR `neighbor PEER
     /// route-server-client`, doc/user/routeserver.rst).
     pub route_server: bool,
+    /// Route-reflector client (RFC 4456, S7-b): routes from this
+    /// iBGP neighbor re-advertise to all iBGP peers, and routes from
+    /// other iBGP peers re-advertise to it — the §9.2 exception.
+    /// Client config only: ORIGINATOR_ID/CLUSTER_LIST loop
+    /// prevention stays §Deferred (v1 relies on the origin-peer
+    /// floor).
+    pub rr_client: bool,
     /// Graceful Restart role (RFC 4724; B-5 helper-first): the
     /// receiving-speaker retention (§4.2) is on for any peer that
     /// advertises the capability, whatever the local role — the knob
@@ -535,6 +544,7 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                             role: None,
                             update_handling: UpdateErrorHandling::default(),
                             route_server: false,
+                            rr_client: false,
                             graceful_restart: None,
                             add_path_rx: false,
                             add_path_tx: false,
@@ -596,6 +606,14 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                     ["route-server"] => {
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
                         neighbor.route_server = true;
+                    }
+                    ["route-reflector-client"] => {
+                        // RFC 4456 (S7-b): mark this iBGP neighbor a
+                        // route-reflector client — §9.2's
+                        // no-iBGP-redistribution rule lifts toward and
+                        // from it.
+                        let neighbor = require_neighbor(&mut config, addr, line_no)?;
+                        neighbor.rr_client = true;
                     }
                     ["graceful-restart", rest @ ..] => {
                         // RFC 4724 role knob (B-5 helper-first):
@@ -1128,6 +1146,27 @@ bgp community-list standard CHOP-COMM permit 65000:1
         )
         .unwrap_err();
         assert!(e.to_string().contains("no remote-as yet"), "{e}");
+    }
+
+    /// RFC 4456 knob (S7-b): `neighbor X route-reflector-client`
+    /// marks the iBGP peer a reflection client; default off.
+    #[test]
+    fn route_reflector_client_knob_parses() {
+        let config = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 10.0.0.9 remote-as 65000\nneighbor 10.0.0.9 route-reflector-client\n",
+        )
+        .unwrap();
+        assert!(config.neighbors[&"10.0.0.9".parse::<IpAddr>().unwrap()].rr_client);
+        let bare = parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 10.0.0.9 remote-as 65000\n",
+        )
+        .unwrap();
+        assert!(!bare.neighbors[&"10.0.0.9".parse::<IpAddr>().unwrap()].rr_client);
+        // An unknown variant must not silently parse.
+        assert!(parse_config(
+            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 10.0.0.9 remote-as 65000\nneighbor 10.0.0.9 route-reflector-server\n"
+        )
+        .is_err());
     }
 
     /// RFC 7911 knobs (B-21, BIRD-shaped default off): `addpath rx`,

@@ -122,6 +122,16 @@ fn main() {
                     .filter(|n| n.route_server)
                     .map(|n| n.address),
             );
+            // RFC 4456 (S7-b): the route-reflector client set —
+            // §9.2's iBGP redistribution prohibition lifts toward and
+            // from these peers.
+            rib.set_route_reflector_clients(
+                config
+                    .neighbors
+                    .values()
+                    .filter(|n| n.rr_client)
+                    .map(|n| n.address),
+            );
         }
         let sink = SharedSink(Arc::new(Mutex::new(RibSink::new(Arc::clone(&loc_rib)))));
         let out_rib = Arc::new(LocRibOut::new(

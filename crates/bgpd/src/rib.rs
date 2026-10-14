@@ -62,6 +62,11 @@ pub struct Route {
     /// NEXT_HOP/MED preserved) and never installs into the kernel —
     /// the RS RIB stays separate from the kernel RIB.
     pub rs_client: bool,
+    /// Learned from a configured route-reflector CLIENT (RFC 4456):
+    /// §9.2's no-iBGP-redistribution prohibition lifts for it — a
+    /// route from a client may be re-advertised to all iBGP peers
+    /// (RFC 4456 §4's reflection table).
+    pub rr_client: bool,
     /// RFC 4724 §4.2: retained across a GR peer's session loss. Stale
     /// routes keep feeding forwarding/best-path until flushed (EOR,
     /// re-establishment without the R bit, or the restart timer); a
@@ -91,6 +96,7 @@ impl Route {
             rov: None,
             aspa: None,
             rs_client: false,
+            rr_client: false,
             stale: false,
             path_id: 0,
         }
@@ -107,6 +113,7 @@ impl PartialEq for Route {
             && self.rov == other.rov
             && self.aspa == other.aspa
             && self.rs_client == other.rs_client
+            && self.rr_client == other.rr_client
             && self.path_id == other.path_id
     }
 }
@@ -339,6 +346,10 @@ pub struct LocRib {
     /// Route-server client addresses (N5): their routes carry the
     /// transparent-reflection and never-install semantics.
     rs_clients: BTreeSet<IpAddr>,
+    /// Route-reflector client addresses (RFC 4456, S7-b): routes from
+    /// these iBGP peers re-advertise to all iBGP peers; routes from
+    /// other iBGP peers re-advertise to clients only.
+    rr_clients: BTreeSet<IpAddr>,
 }
 
 impl LocRib {
@@ -353,6 +364,7 @@ impl LocRib {
             best: BTreeMap::new(),
             import,
             rs_clients: BTreeSet::new(),
+            rr_clients: BTreeSet::new(),
         }
     }
 
@@ -363,6 +375,16 @@ impl LocRib {
 
     pub fn is_route_server_client(&self, addr: &IpAddr) -> bool {
         self.rs_clients.contains(addr)
+    }
+
+    /// Configure the route-reflector client set (RFC 4456; the
+    /// `neighbor X route-reflector-client` knob).
+    pub fn set_route_reflector_clients(&mut self, clients: impl IntoIterator<Item = IpAddr>) {
+        self.rr_clients = clients.into_iter().collect();
+    }
+
+    pub fn is_route_reflector_client(&self, addr: &IpAddr) -> bool {
+        self.rr_clients.contains(addr)
     }
 
     pub fn local_as(&self) -> u32 {
@@ -378,9 +400,11 @@ impl LocRib {
         let rib = self.adj_in.entry(peer.address).or_default();
         let internal = peer.remote_as == self.local_as;
         let rs_client = self.rs_clients.contains(&peer.address);
+        let rr_client = internal && self.rr_clients.contains(&peer.address);
         for nlri in update.announced() {
             let mut route = Route::new(nlri.prefix, update.attrs.clone(), *peer, internal);
             route.rs_client = rs_client;
+            route.rr_client = rr_client;
             route.path_id = nlri.path_id;
             match self.import.import(route) {
                 Some(route) => {
@@ -603,6 +627,67 @@ impl RouteSink for RibSink {
     }
 }
 
+/// RFC 4271 §9.2's iBGP dissemination rule with the RFC 4456 §4
+/// exception — the export gate for learned routes toward one peer:
+///
+/// §9.2: "When a BGP speaker receives an UPDATE message from an
+/// internal peer, the receiving BGP speaker SHALL NOT re-distribute
+/// the routing information contained in that UPDATE message to other
+/// internal peers (unless the speaker acts as a BGP Route
+/// Reflector [RFC2796])."
+///
+/// The reflection table (RFC 4456 §4): a route learned from a
+/// non-client iBGP peer reflects to CLIENTS only; a route learned
+/// from a client reflects to all iBGP peers (clients and
+/// non-clients). Locally-originated and eBGP-learned routes are
+/// untouched by the prohibition.
+pub fn ibgp_readvertisement_allowed(
+    route_internal: bool,
+    from_rr_client: bool,
+    to_internal: bool,
+    to_rr_client: bool,
+) -> bool {
+    if !route_internal || !to_internal {
+        return true; // the prohibition covers internal → internal only
+    }
+    to_rr_client || from_rr_client
+}
+
+/// RFC 4271 §9.1.3's Adj-RIB-Out installation floor: "A route SHALL
+/// NOT be installed in the Adj-Rib-Out unless the destination, and
+/// NEXT_HOP described by this route, may be forwarded appropriately
+/// by the Routing Table." The v1 shape of "forwarded appropriately":
+/// the route must name a next hop its family can carry (v4 NEXT_HOP /
+/// v6 MP_REACH). Full §9.1.2.1 resolvability (resolution through the
+/// kernel Routing Table) is §Deferred with route next-hop resolution
+/// (v1: single-hop peers only).
+pub fn forwardable(route: &Route) -> bool {
+    if route.attr(attr_type::NEXT_HOP).is_some() {
+        return true;
+    }
+    route.attrs.iter().any(|attr| {
+        matches!(attr, PathAttribute::MpReach(mp) if !matches!(mp.next_hop, crate::attr::MpNextHop::Raw(_)))
+    })
+}
+
+/// RFC 4271 §5.1.5's LOCAL_PREF shape for one exported UPDATE:
+/// "SHALL be included in all UPDATE messages that a given BGP speaker
+/// sends to other internal peers" and "MUST NOT include this
+/// attribute in UPDATE messages it sends to external peers" — an
+/// eBGP-learned route synthesizes the local degree of preference
+/// (materialized as LOCAL_PREF) toward internal peers, and an
+/// iBGP-learned route's LOCAL_PREF never leaks externally.
+pub fn shape_local_pref(attrs: &mut Vec<PathAttribute>, internal: bool) {
+    let has = attrs.iter().any(|a| a.attr_type() == attr_type::LOCAL_PREF);
+    if internal && !has {
+        // The §9.1.1 degree of preference this daemon materializes as
+        // LOCAL_PREF (100 = the FRR-parity default).
+        attrs.push(PathAttribute::LocalPref(100));
+    } else if !internal && has {
+        attrs.retain(|a| a.attr_type() != attr_type::LOCAL_PREF);
+    }
+}
+
 /// A withdrawal as a zebra ROUTE_DELETE entry (the fixture shape: no
 /// nexthops in the delete).
 pub fn route_delete_entry(prefix: IpPrefix) -> RouteEntry {
@@ -698,6 +783,9 @@ impl crate::peer::OutRib for LocRibOut {
                             attrs.push(attr.clone());
                         }
                     }
+                    // §5.1.5: locally-originated routes carry
+                    // LOCAL_PREF toward internal peers too.
+                    shape_local_pref(&mut attrs, internal);
                     update.attrs = attrs;
                     updates.push(update);
                 }
@@ -721,19 +809,38 @@ impl crate::peer::OutRib for LocRibOut {
             // that peer are not modified"; bgp_route.c's transparency
             // check requires BOTH ends to be RS clients).
             let to_is_client = rib.is_route_server_client(&to_peer);
+            // RFC 4456: is the target one of OUR route-reflector
+            // clients (§9.2's exception)?
+            let to_is_rr_client = rib.is_route_reflector_client(&to_peer);
             for route in rib.best_routes() {
                 if to_is_client && !route.rs_client {
                     continue; // "RS-clients do not receive any announce from the Main Loc-RIB"
+                }
+                // RFC 4271 §9.2: an iBGP-learned route is not
+                // re-distributed to other internal peers — unless the
+                // RFC 4456 §4 reflection table lifts it (target is a
+                // client, or the route came from one).
+                if !ibgp_readvertisement_allowed(
+                    route.internal,
+                    route.rr_client,
+                    internal,
+                    to_is_rr_client,
+                ) {
+                    continue;
                 }
                 // The export-policy seam (Phase 3); the default blocks
                 // reflection to the origin peer.
                 let Some(exported) = self.policy.export(route, &to_peer_info, internal) else {
                     continue;
                 };
-                let Some(&PathAttribute::NextHop(_)) = exported.attr(attr_type::NEXT_HOP) else {
+                // §9.1.3's floor: no Adj-RIB-Out installation without a
+                // forwardable NEXT_HOP.
+                if !forwardable(&exported) {
                     continue;
-                };
+                }
                 let mut attrs = exported.attrs;
+                // §5.1.5's LOCAL_PREF shape for the session type.
+                shape_local_pref(&mut attrs, internal);
                 // Phase 3 (§5.1.2): prepend the local AS on eBGP
                 // re-advertisement; keep AS_PATH on iBGP. RS-client
                 // targets are the exception: the reflection is
@@ -1542,6 +1649,200 @@ mod tests {
         assert!(
             route_entry(best).is_some(),
             "still exportable — forwarding continues"
+        );
+    }
+
+    // ---- RFC 4271 §9.2 / RFC 4456: iBGP dissemination (S7-b) -----
+
+    /// §9.2's prohibition: "When a BGP speaker receives an UPDATE
+    /// message from an internal peer, the receiving BGP speaker SHALL
+    /// NOT re-distribute the routing information ... to other
+    /// internal peers" — the iBGP-learned best is absent from the
+    /// Adj-RIB-Out toward another internal peer, present toward an
+    /// external one (with §5.1.5's synthesized LOCAL_PREF).
+    #[test]
+    fn ibgp_learned_route_not_readvertised_to_ibgp() {
+        let mut rib = LocRib::new(65000);
+        let internal_peer = peer("10.0.0.9", 65000, 9); // same AS: iBGP
+        rib.announce(
+            &internal_peer,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65042, 65043], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        rib.recompute();
+        let out = LocRibOut::new(
+            Arc::new(Mutex::new(rib)),
+            crate::peer::ConfiguredNetworks::new(65000, vec![]),
+            Arc::new(AcceptAll),
+        );
+        // Toward another INTERNAL peer: nothing (§9.2).
+        let to_internal = crate::peer::OutRib::advertisements(
+            &out,
+            1,
+            1,
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.10".parse().unwrap(),
+            true,
+        );
+        assert!(
+            to_internal.is_empty(),
+            "iBGP-learned route suppressed toward another internal peer (§9.2)"
+        );
+        // Toward an EXTERNAL peer: advertised, AS_PATH prepended, and
+        // without LOCAL_PREF (§5.1.5 MUST NOT externally).
+        let to_external = crate::peer::OutRib::advertisements(
+            &out,
+            1,
+            1,
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
+            false,
+        );
+        assert_eq!(to_external.len(), 1);
+        let update = &to_external[0];
+        assert_eq!(
+            update.as_path().unwrap().path_length(),
+            3,
+            "local AS prepended"
+        );
+        assert!(
+            update.attr(attr_type::LOCAL_PREF).is_none(),
+            "§5.1.5 external"
+        );
+    }
+
+    /// The RFC 4456 §4 reflection table, driven through the export
+    /// path: a route from a CLIENT reflects to every internal peer;
+    /// a route from a NON-client reflects to clients only — never to
+    /// another non-client.
+    #[test]
+    fn rr_client_reflection_table() {
+        let mut rib = LocRib::new(65000);
+        let client_a = peer("10.0.0.21", 65000, 21);
+        let client_b_addr: IpAddr = "10.0.0.22".parse().unwrap();
+        let non_client_c = peer("10.0.0.31", 65000, 31);
+        let non_client_d_addr: IpAddr = "10.0.0.32".parse().unwrap();
+        rib.set_route_reflector_clients(vec![client_a.address, client_b_addr]);
+        // A route from client A ...
+        rib.announce(
+            &client_a,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65042], None),
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        // ... and one from non-client C.
+        rib.announce(
+            &non_client_c,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65043], None),
+                nlri: vec!["198.51.100.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        rib.recompute();
+        let out = LocRibOut::new(
+            Arc::new(Mutex::new(rib)),
+            crate::peer::ConfiguredNetworks::new(65000, vec![]),
+            Arc::new(AcceptAll),
+        );
+        let holds = |to: IpAddr, prefix: &str| {
+            crate::peer::OutRib::advertisements(&out, 1, 1, "10.0.0.1".parse().unwrap(), to, true)
+                .iter()
+                .any(|u| u.nlri.iter().any(|n| n.prefix.to_string() == prefix))
+        };
+        // From a client: to the other client AND to non-clients.
+        assert!(holds(client_b_addr, "203.0.113.0/24"), "client → client");
+        assert!(
+            holds(non_client_d_addr, "203.0.113.0/24"),
+            "client → non-client (RFC 4456 §4)"
+        );
+        // From a non-client: to clients, never to another non-client.
+        assert!(
+            holds(client_b_addr, "198.51.100.0/24"),
+            "non-client → client"
+        );
+        assert!(
+            !holds(non_client_d_addr, "198.51.100.0/24"),
+            "§9.2: non-client → non-client stays suppressed"
+        );
+    }
+
+    /// §9.1.3's floor: "A route SHALL NOT be installed in the
+    /// Adj-Rib-Out unless the destination, and NEXT_HOP described by
+    /// this route, may be forwarded appropriately" — a candidate with
+    /// no next hop its family can carry never reaches the Adj-RIB-Out.
+    #[test]
+    fn export_requires_forwardable_next_hop() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        // ORIGIN + AS_PATH but no NEXT_HOP (and no MP_REACH): not
+        // forwardable in any family.
+        rib.announce(
+            &p,
+            &BgpUpdate {
+                attrs: vec![
+                    PathAttribute::Origin(Origin::Igp),
+                    PathAttribute::AsPath(AsPath::sequence([65001])),
+                ],
+                nlri: vec!["203.0.113.0/24".parse().unwrap()],
+                ..Default::default()
+            },
+        );
+        rib.recompute();
+        let out = LocRibOut::new(
+            Arc::new(Mutex::new(rib)),
+            crate::peer::ConfiguredNetworks::new(65000, vec![]),
+            Arc::new(AcceptAll),
+        );
+        assert!(
+            crate::peer::OutRib::advertisements(
+                &out,
+                1,
+                1,
+                "192.0.2.1".parse().unwrap(),
+                "192.0.2.9".parse().unwrap(),
+                false
+            )
+            .is_empty(),
+            "no forwardable NEXT_HOP, no Adj-RIB-Out entry (§9.1.3)"
+        );
+    }
+
+    /// §5.1.5's LOCAL_PREF shape as the pure table: synthesized toward
+    /// internal peers when missing, kept when present, never sent
+    /// externally.
+    #[test]
+    fn local_pref_shape_table() {
+        let mut attrs = vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::sequence([65001])),
+        ];
+        shape_local_pref(&mut attrs, true);
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a.attr_type() == attr_type::LOCAL_PREF),
+            Some(&PathAttribute::LocalPref(100)),
+            "synthesized toward internal peers"
+        );
+        shape_local_pref(&mut attrs, true);
+        assert_eq!(
+            attrs
+                .iter()
+                .filter(|a| a.attr_type() == attr_type::LOCAL_PREF)
+                .count(),
+            1,
+            "no duplicate when already present"
+        );
+        shape_local_pref(&mut attrs, false);
+        assert!(
+            attrs.iter().all(|a| a.attr_type() != attr_type::LOCAL_PREF),
+            "stripped toward external peers (MUST NOT)"
         );
     }
 

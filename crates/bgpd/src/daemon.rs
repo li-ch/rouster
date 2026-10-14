@@ -816,6 +816,7 @@ mod tests {
             role: None,
             update_handling: Default::default(),
             route_server: false,
+            rr_client: false,
             graceful_restart: None,
             add_path_rx: false,
             add_path_tx: false,
