@@ -277,6 +277,10 @@ pub struct BgpdConfig {
     /// restarting speaker's deferred route selection waits for
     /// End-of-RIB markers before proceeding anyway. Default 120 s.
     pub gr_deferral: u32,
+    /// The `barsav feed <path>` knob: publish the Adj-RIB-In snapshot
+    /// (read-only, S9-a M3) for the SAV side's BAR-SAV derivation.
+    /// `None` = no feed published.
+    pub barsav_feed: Option<PathBuf>,
 }
 
 impl Default for BgpdConfig {
@@ -295,6 +299,7 @@ impl Default for BgpdConfig {
             aspa: AspaMode::default(),
             policy_text: String::new(),
             gr_deferral: GR_DEFERRAL_DEFAULT,
+            barsav_feed: None,
         }
     }
 }
@@ -356,6 +361,7 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
     let mut in_router = false;
     let mut router_seen = false;
     let mut in_rpki = false;
+    let mut in_barsav = false;
     let mut in_route_map = false;
     let mut policy_lines: Vec<String> = Vec::new();
 
@@ -424,11 +430,26 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                 config.local_as = asn;
                 in_router = true;
                 in_rpki = false;
+                in_barsav = false;
                 router_seen = true;
             }
             ["rpki"] => {
                 in_rpki = true;
                 in_router = false;
+            }
+            // The BAR-SAV feed stanza (S9-a M3): `barsav` opens it,
+            // `feed <path>` names the snapshot file the daemon
+            // publishes its read-only Adj-RIB-In view at.
+            ["barsav"] => {
+                in_barsav = true;
+                in_router = false;
+                in_rpki = false;
+            }
+            ["feed", path] if in_barsav => {
+                if config.barsav_feed.is_some() {
+                    return Err(err(line_no, "duplicate `barsav feed` line"));
+                }
+                config.barsav_feed = Some(PathBuf::from(path));
             }
             ["cache", host, port] if in_rpki => {
                 if config.rpki.vrp_file.is_some() {

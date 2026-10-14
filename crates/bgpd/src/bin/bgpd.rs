@@ -151,6 +151,41 @@ fn main() {
             );
         }
         let sink = SharedSink(Arc::new(Mutex::new(RibSink::new(Arc::clone(&loc_rib)))));
+        // The BAR-SAV feed writer (S9-a M3, `barsav feed <path>`): a
+        // read-only Adj-RIB-In snapshot publisher. It never touches
+        // the decision path — it locks the Loc-RIB just long enough
+        // to render `LocRib::barsav_feed_text`, and swaps the file
+        // atomically (tmp + rename) only when the snapshot changed,
+        // so savd's poll never reads a half-written line. Determinism
+        // of the render makes change detection a plain compare.
+        if let Some(feed_path) = config.barsav_feed.clone() {
+            let feed_rib = Arc::clone(&loc_rib);
+            tokio::spawn(async move {
+                let mut last = String::new();
+                loop {
+                    let text = {
+                        let rib = feed_rib.lock().unwrap();
+                        rib.barsav_feed_text()
+                    };
+                    if text != last {
+                        let tmp = feed_path.with_extension("tmp");
+                        if let Err(e) = std::fs::write(&tmp, &text) {
+                            warn!(error = %e, path = %feed_path.display(),
+                                "bgpd: cannot write barsav feed snapshot");
+                        } else if let Err(e) = std::fs::rename(&tmp, &feed_path) {
+                            warn!(error = %e, path = %feed_path.display(),
+                                "bgpd: cannot publish barsav feed snapshot");
+                        } else {
+                            let lines = text.lines().count() - 2; // header
+                            info!(path = %feed_path.display(), paths = lines,
+                                "bgpd: barsav feed snapshot published");
+                            last = text;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+        }
         let out_rib = Arc::new(LocRibOut::new(
             Arc::clone(&loc_rib),
             ConfiguredNetworks::from_config(&config),

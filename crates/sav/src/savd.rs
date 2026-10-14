@@ -143,6 +143,15 @@
 //! i-understand-drop-mode yes        ! required friction to start in drop mode
 //! interface <name>                  ! opens a per-interface stanza
 //!   mode <strict|loose|fp|efp>      ! per-interface mode override
+//!   mode barsav                     ! BAR-SAV derivation gates this iface
+//!   role <customer|peer|provider>   ! required with mode barsav (the
+//!                                   ! neighbor's RFC 9234 role)
+//!   remote-as <asn>                 ! required with mode barsav (AS-k,
+//!                                   ! BAR-SAV -10 §4 Step 1)
+//! barsav feed <path>                ! bgpd's Adj-RIB-In snapshot (M3)
+//! barsav vrp-file <path>            ! RPKI snapshot (bgpd vrp-file format)
+//! barsav local-as <asn>             ! the local AS (cone guard; 0 = unset)
+//! barsav provider-exempt <prefix>   ! BAR-SAV -10 §8 Step 7 exemption
 //! binding <prefix> interface <name>...
 //!                                   ! operator SIB binding (Config origin)
 //! ```
@@ -166,6 +175,7 @@
 //! whole Config origin through [`Sib::replace_origin`].
 
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use common::{
@@ -180,6 +190,10 @@ use zapi::{route_type, ZapiClient, ZapiMessage};
 // The hosted agent's trait methods (experimental-savnet only).
 #[cfg(feature = "experimental-savnet")]
 use crate::agent::SavAgent;
+use crate::barsav::{
+    generate_barsav, parse_barsav_feed, parse_rpki_snapshot, BarNeighbor, BarPath, BarRole,
+    BarsavInput,
+};
 use crate::gen::{generate_urpf, RuleOrigin, UrpfMode};
 use crate::mode::{SavAction, SavConfig, ValidationMode};
 use crate::monitor::SpoofMonitor;
@@ -238,11 +252,21 @@ fn sync_marker() -> IpPrefix {
 }
 
 /// One configured interface stanza: the name (resolved to an ifindex
-/// against the local mirror at evaluation time) and its generator mode.
+/// against the local mirror at evaluation time), its generator mode,
+/// and — when `mode barsav` selected the BAR-SAV derivation — the
+/// neighbor's role and AS-k (draft-ietf-sidrops-bar-sav-10 §2/§4
+/// Step 1: customer and lateral peer run §4, provider runs §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceLine {
     pub name: String,
     pub mode: UrpfMode,
+    /// `mode barsav` was set in this stanza (the uRPF `mode` above is
+    /// then ignored).
+    pub barsav: bool,
+    /// `role <customer|peer|provider>` (required iff barsav).
+    pub role: Option<BarRole>,
+    /// `remote-as <asn>`: AS-k (required iff barsav).
+    pub remote_as: Option<u32>,
 }
 
 /// One configured `binding <prefix> interface <name>...` line: an
@@ -316,6 +340,18 @@ pub struct SavdConfig {
     pub interfaces: Vec<InterfaceLine>,
     /// Configured `binding` lines, in file order (one per prefix).
     pub bindings: Vec<BindingLine>,
+    /// `barsav feed <path>`: bgpd's read-only Adj-RIB-In snapshot
+    /// (the M3 edge) — the BAR-SAV derivation's path source.
+    pub barsav_feed: Option<PathBuf>,
+    /// `barsav vrp-file <path>`: the RPKI snapshot feeding §4 Step 11
+    /// / §8 Step 4 (bgpd's vrp-file format; ROAs and ASPAs both).
+    pub barsav_vrp_file: Option<PathBuf>,
+    /// `barsav local-as <asn>`: the local AS for the cone guard (0 =
+    /// unset; the guard is inert then, disclosed).
+    pub barsav_local_as: u32,
+    /// `barsav provider-exempt <prefix>` lines: BAR-SAV -10 §8
+    /// Step 7's local exemptions, in file order.
+    pub barsav_provider_exempt: Vec<IpPrefix>,
 }
 
 impl Default for SavdConfig {
@@ -330,6 +366,10 @@ impl Default for SavdConfig {
             drop_ack: false,
             interfaces: Vec::new(),
             bindings: Vec::new(),
+            barsav_feed: None,
+            barsav_vrp_file: None,
+            barsav_local_as: 0,
+            barsav_provider_exempt: Vec::new(),
         }
     }
 }
@@ -348,7 +388,18 @@ impl fmt::Display for SavdConfig {
             self.collision_policy,
             self.hysteresis_secs,
             self.backend
-        )
+        )?;
+        if self.barsav_feed.is_some() || self.interfaces.iter().any(|i| i.barsav) {
+            write!(
+                f,
+                " barsav[ifaces {} feed {} vrps {} exempt {}]",
+                self.interfaces.iter().filter(|i| i.barsav).count(),
+                self.barsav_feed.is_some(),
+                self.barsav_vrp_file.is_some(),
+                self.barsav_provider_exempt.len()
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -427,19 +478,33 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
             // default the stanzas inherit.
             ["mode", m] if !config.interfaces.is_empty() => {
                 let iface = config.interfaces.last_mut().expect("stanza open");
-                match parse_mode(m) {
-                    Some(mode) => iface.mode = mode,
-                    None => {
-                        return Err(fail(
-                            line_no,
-                            format!("bad mode `{m}` (strict|loose|fp|efp)"),
-                        ))
+                if *m == "barsav" {
+                    // BAR-SAV (draft-ietf-sidrops-bar-sav-10): the
+                    // derivation replaces the uRPF generator for this
+                    // interface; role/remote-as complete the stanza.
+                    iface.barsav = true;
+                } else {
+                    match parse_mode(m) {
+                        Some(mode) => iface.mode = mode,
+                        None => {
+                            return Err(fail(
+                                line_no,
+                                format!("bad mode `{m}` (strict|loose|fp|efp|barsav)"),
+                            ))
+                        }
                     }
                 }
             }
             ["mode", m] => {
                 if seen_global_mode {
                     return Err(fail(line_no, "duplicate global `mode` line"));
+                }
+                if *m == "barsav" {
+                    return Err(fail(
+                        line_no,
+                        "`mode barsav` selects the per-interface BAR-SAV derivation; \
+                         it cannot be the global default",
+                    ));
                 }
                 match parse_mode(m) {
                     Some(mode) => config.mode = mode,
@@ -451,6 +516,25 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                     }
                 }
                 seen_global_mode = true;
+            }
+            ["role", r] if !config.interfaces.is_empty() => {
+                let iface = config.interfaces.last_mut().expect("stanza open");
+                match BarRole::parse(r) {
+                    Some(role) => iface.role = Some(role),
+                    None => {
+                        return Err(fail(
+                            line_no,
+                            format!("bad role `{r}` (customer|peer|provider)"),
+                        ))
+                    }
+                }
+            }
+            ["remote-as", asn] if !config.interfaces.is_empty() => {
+                let iface = config.interfaces.last_mut().expect("stanza open");
+                let asn: u32 = asn
+                    .parse()
+                    .map_err(|_| fail(line_no, format!("bad remote-as `{asn}`")))?;
+                iface.remote_as = Some(asn);
             }
             ["interface", name] => {
                 if name.len() > 15 {
@@ -467,6 +551,9 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                 config.interfaces.push(InterfaceLine {
                     name: (*name).to_string(),
                     mode: config.mode,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 });
             }
             // Position-independent operator binding (the SIB's Config
@@ -500,6 +587,39 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                     prefix,
                     interfaces: names.iter().map(|name| (*name).to_string()).collect(),
                 });
+            }
+            // The BAR-SAV inputs (draft-ietf-sidrops-bar-sav-10): the
+            // M3 feed, the RPKI snapshot, the local AS, and §8
+            // Step 7's exemptions.
+            ["barsav", "feed", p] => {
+                if config.barsav_feed.is_some() {
+                    return Err(fail(line_no, "duplicate `barsav feed` line"));
+                }
+                config.barsav_feed = Some(PathBuf::from(p));
+            }
+            ["barsav", "vrp-file", p] => {
+                if config.barsav_vrp_file.is_some() {
+                    return Err(fail(line_no, "duplicate `barsav vrp-file` line"));
+                }
+                config.barsav_vrp_file = Some(PathBuf::from(p));
+            }
+            ["barsav", "local-as", asn] => {
+                if config.barsav_local_as != 0 {
+                    return Err(fail(line_no, "duplicate `barsav local-as` line"));
+                }
+                let asn: u32 = asn
+                    .parse()
+                    .map_err(|_| fail(line_no, format!("bad local-as `{asn}`")))?;
+                config.barsav_local_as = asn;
+            }
+            ["barsav", "provider-exempt", prefix] => {
+                let prefix: IpPrefix = prefix
+                    .parse()
+                    .map_err(|_| fail(line_no, format!("bad prefix `{prefix}`")))?;
+                if config.barsav_provider_exempt.contains(&prefix) {
+                    return Err(fail(line_no, format!("duplicate exemption `{prefix}`")));
+                }
+                config.barsav_provider_exempt.push(prefix);
             }
             ["action", a] => {
                 if seen_action {
@@ -593,15 +713,42 @@ pub fn parse_savd_config(input: &str) -> Result<SavdConfig, SavdConfigError> {
                 return Err(fail(
                     line_no,
                     format!(
-                        "expected `mode <strict|loose|fp|efp>`, `action <monitor|drop>`, \
-                         `poll <secs>`, `hysteresis <secs>`, \
+                        "expected `mode <strict|loose|fp|efp|barsav>`, \
+                         `role <customer|peer|provider>`, `remote-as <asn>`, \
+                         `action <monitor|drop>`, `poll <secs>`, `hysteresis <secs>`, \
                          `collision-policy <ignore|subtract>`, \
                          `backend <rp_filter|nft>`, \
-                         `i-understand-drop-mode <yes|no>`, `interface <name>`, or \
+                         `i-understand-drop-mode <yes|no>`, `interface <name>`, \
+                         `barsav feed|vrp-file|local-as|provider-exempt ...`, or \
                          `binding <prefix> interface <name>...`, got `{line}`"
                     ),
                 ))
             }
+        }
+    }
+    // BAR-SAV stanza completeness: `mode barsav` requires the role
+    // and AS-k; the two lines on a non-barsav stanza are config
+    // errors (they would silently do nothing).
+    for iface in &config.interfaces {
+        if iface.barsav {
+            if iface.role.is_none() || iface.remote_as.is_none() {
+                return Err(fail(
+                    0,
+                    format!(
+                        "interface `{}`: mode barsav requires `role <customer|peer|provider>` \
+                         and `remote-as <asn>`",
+                        iface.name
+                    ),
+                ));
+            }
+        } else if iface.role.is_some() || iface.remote_as.is_some() {
+            return Err(fail(
+                0,
+                format!(
+                    "interface `{}`: `role`/`remote-as` without `mode barsav`",
+                    iface.name
+                ),
+            ));
         }
     }
     config.validate().map_err(SavdConfigError::Validation)?;
@@ -1406,6 +1553,9 @@ where
     fn resolved_interfaces(&self) -> Vec<(u32, UrpfMode)> {
         let mut out = Vec::new();
         for line in &self.config.interfaces {
+            if line.barsav {
+                continue; // the BAR-SAV partition builds below
+            }
             match self
                 .rib
                 .interfaces()
@@ -1420,6 +1570,133 @@ where
             }
         }
         out
+    }
+
+    /// The resolved BAR-SAV stanzas: (ifindex, the whole stanza line).
+    /// Same mirror resolution as [`Self::resolved_interfaces`]; a
+    /// `barsav` stanza whose name is not (yet) mirrored warns and is
+    /// skipped (nothing derives for it — unknown ≠ invalid).
+    fn resolved_barsav(&self) -> Vec<(u32, &InterfaceLine)> {
+        let mut out = Vec::new();
+        for line in &self.config.interfaces {
+            if !line.barsav {
+                continue;
+            }
+            match self
+                .rib
+                .interfaces()
+                .iter()
+                .find(|(_, iface)| iface.name == line.name)
+            {
+                Some((&ifindex, _)) => out.push((ifindex, line)),
+                None => warn!(
+                    interface = %line.name,
+                    "savd: barsav interface not in mirror (yet); skipped"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Which interface a peer address is on-link for: the mirror's
+    /// CONNECT table (every address on every UP interface as its
+    /// network prefix) read through the public rib surface — the
+    /// first connected prefix containing the address answers with its
+    /// egress ifindex. Single-hop eBGP's shape; a multi-hop peer
+    /// resolves to nothing and the feed line drops out (disclosed —
+    /// iBGP and multi-hop feeds are §Deferred with the agent wire).
+    fn connected_ifindex_of(&self, peer: std::net::IpAddr) -> Option<u32> {
+        let table = self.rib.connected_table(MAIN_TABLE)?;
+        for (prefix, candidates) in table.iter() {
+            if !crate::prefix_contains(*prefix, peer) {
+                continue;
+            }
+            for entry in candidates {
+                for egress in crate::rib_egress(&self.rib, &entry.nexthops) {
+                    if let Some(ifindex) = egress.ifindex() {
+                        return Some(ifindex);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Run the BAR-SAV derivation over the configured inputs
+    /// (draft-ietf-sidrops-bar-sav-10 §4/§8): bgpd's feed snapshot +
+    /// the RPKI snapshot + the resolved stanzas. `Err(())` = an input
+    /// file is missing or unparseable — the caller leaves every
+    /// BAR-SAV interface UNJUDGED (unknown ≠ invalid: no seeded empty
+    /// allowlist, no spoof counters), the fail-open posture of §7.5.1
+    /// ("fail open" to loose uRPF / no enforcement on RPKI failure).
+    fn barsav_derivation(
+        &self,
+        stanzas: &[(u32, &InterfaceLine)],
+    ) -> Result<crate::barsav::BarsavDerivation, ()> {
+        let Some(feed_path) = self.config.barsav_feed.clone() else {
+            warn!("savd: barsav stanzas configured but no `barsav feed` path; unjudged");
+            return Err(());
+        };
+        let feed_text = std::fs::read_to_string(&feed_path).map_err(|e| {
+            warn!(error = %e, path = %feed_path.display(),
+                "savd: barsav feed unreadable; interfaces unjudged (unknown != invalid)");
+        })?;
+        let feed = parse_barsav_feed(&feed_text).map_err(|e| {
+            warn!(error = %e, path = %feed_path.display(),
+                "savd: barsav feed unparseable; interfaces unjudged");
+        })?;
+        let (vrps, aspas) = match &self.config.barsav_vrp_file {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    warn!(error = %e, path = %path.display(),
+                        "savd: barsav vrp-file unreadable; interfaces unjudged");
+                })?;
+                parse_rpki_snapshot(&text).map_err(|e| {
+                    warn!(error = %e, path = %path.display(),
+                        "savd: barsav vrp-file unparseable; interfaces unjudged");
+                })?
+            }
+            None => (rpki::VrpTable::new(), rpki::AspaTable::new()),
+        };
+        // The stanza side: one BarNeighbor per resolved interface.
+        let neighbors: Vec<BarNeighbor> = stanzas
+            .iter()
+            .map(|&(ifindex, line)| {
+                BarNeighbor::new(
+                    ifindex,
+                    line.remote_as.expect("parser guarantees remote-as"),
+                    line.role.expect("parser guarantees role"),
+                )
+            })
+            .collect();
+        // The feed side: peer address -> ifindex through the mirror's
+        // connected prefixes (single-hop eBGP — the on-link case;
+        // multi-hop peers do not resolve and drop out with a debug
+        // line, disclosed). The stanza join then knows each path's
+        // receiving interface for the §4 preamble's role-selected
+        // verification.
+        let mut paths = Vec::new();
+        for line in &feed {
+            let Some(ifindex) = self.connected_ifindex_of(line.peer) else {
+                debug!(peer = %line.peer, "savd: barsav feed peer not on-link; skipped");
+                continue;
+            };
+            paths.push(BarPath {
+                prefix: line.prefix,
+                as_path: line.as_path.clone(),
+                has_as_set: line.has_as_set,
+                ingress: ifindex,
+            });
+        }
+        let input = BarsavInput {
+            local_as: self.config.barsav_local_as,
+            neighbors: &neighbors,
+            paths: &paths,
+            vrps: &vrps,
+            aspas: &aspas,
+            provider_exempt: &self.config.barsav_provider_exempt,
+        };
+        Ok(generate_barsav(&input))
     }
 
     /// Feed the configured `binding` lines into the SIB's Config origin
@@ -1512,6 +1789,58 @@ where
             let rules = generate_urpf(*mode, &sib, &self.rib, cfg);
             for op in compile_with(&rules, cfg, self.config.collision_policy) {
                 ops.push((*mode, op));
+            }
+        }
+        // The BAR-SAV partition (draft-ietf-sidrops-bar-sav-10 §4/§8,
+        // S9-a M2/M3): the derivation runs over bgpd's read-only feed
+        // + the RPKI snapshot, its typed IBA rules compile through the
+        // SAME table manager (provenance bar-sav riding the ops), the
+        // action is the config's — Monitor unless the operator's
+        // `action drop` + friction line said otherwise (the house
+        // rule). The ops tag Loose: the program hint a content-blind
+        // rp_filter backend approximates with (route-existence —
+        // disclosed; the nft backend enforces the allowlist CONTENT)
+        // and the hysteresis identity (mode, ifindex, action — the
+        // ifindex keeps BAR-SAV and uRPF-loose identities apart).
+        // An input file that is missing or unparseable derives
+        // NOTHING and enables nothing: every BAR-SAV interface stays
+        // unjudged (unknown ≠ invalid — the §7.5.1 fail-open
+        // posture), never a seeded deny-all.
+        let stanzas = self.resolved_barsav();
+        if !stanzas.is_empty() {
+            if let Ok(derivation) = self.barsav_derivation(&stanzas) {
+                for result in &derivation.results {
+                    match result {
+                        crate::barsav::IfaceResult::Customer(c) => info!(
+                            ifindex = c.ifindex,
+                            role = %c.role,
+                            cone = c.cone.len(),
+                            prefixes = c.allowlist.len(),
+                            "savd: barsav allowlist derived (bar-sav -10 §4)"
+                        ),
+                        crate::barsav::IfaceResult::Provider(p) => info!(
+                            ifindex = p.ifindex,
+                            du = p.du.len(),
+                            subtracted = p.s.len(),
+                            prefixes = p.allowlist.len(),
+                            "savd: barsav provider allowlist derived (bar-sav -10 §8)"
+                        ),
+                    }
+                }
+                if derivation.paths_excluded > 0 {
+                    debug!(
+                        excluded = derivation.paths_excluded,
+                        "savd: barsav paths excluded by the §4 preamble (ROV/ASPA/as-set)"
+                    );
+                }
+                let rules = derivation.rules();
+                let mut cfg = SavConfig::new();
+                for (ifindex, _) in &stanzas {
+                    cfg.enable_interface(*ifindex, ValidationMode::Iba, self.config.action);
+                }
+                for op in compile_with(&rules, &cfg, self.config.collision_policy) {
+                    ops.push((UrpfMode::Loose, op));
+                }
             }
         }
         ops
@@ -1925,13 +2254,13 @@ mod tests {
 
     #[test]
     fn parses_the_full_grammar() {
-        let config = cfg("! monitor by default until acknowledged\n\
+        let config = cfg("! monitor by default until acknowledged\n \
              mode strict\n\
              poll 2\n\
              hysteresis 10\n\
-             collision-policy subtract\n\
-             interface vethlegit\n\
-             mode loose\n\
+             collision-policy subtract\n \
+             interface vethlegit\n \
+             mode loose\n \
              interface vethspoof\n\
              binding 203.0.113.0/24 interface vethlegit vethspoof\n\
              binding 2001:db8::/64 interface vethlegit\n\
@@ -1955,11 +2284,17 @@ mod tests {
             vec![
                 InterfaceLine {
                     name: "vethlegit".into(),
-                    mode: UrpfMode::Loose
+                    mode: UrpfMode::Loose,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
                 InterfaceLine {
                     name: "vethspoof".into(),
-                    mode: UrpfMode::Strict
+                    mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
             ]
         );
@@ -2578,10 +2913,16 @@ mod tests {
                 InterfaceLine {
                     name: "eth2".into(),
                     mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
                 InterfaceLine {
                     name: "eth3".into(),
                     mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
             ],
             ..SavdConfig::default()
@@ -2928,7 +3269,7 @@ mod tests {
                 monitor_allow(2, &["192.0.2.0/24", "203.0.113.0/24"]),
                 monitor_allow(3, &["198.51.100.0/24"]),
             ],
-            "config pinned 198.51.100.0/24 to eth3 (rib egress eth2 shadowed); \
+            "config pinned 198.51.100.0/24 to eth3 (rib egress eth2 shadowed);\n\
              203.0.113.0/24 config-only on eth2; 192.0.2.0/24 resolved through \
              eth2 alone (eth9 unmirrored, dropped); 198.18.0.0/15 stored nothing"
         );
@@ -3446,14 +3787,23 @@ mod tests {
                 InterfaceLine {
                     name: "eth2".into(),
                     mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
                 InterfaceLine {
                     name: "eth3".into(),
                     mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
                 InterfaceLine {
                     name: "eth4".into(),
                     mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
             ],
             ..SavdConfig::default()
@@ -3573,6 +3923,9 @@ mod tests {
         config.interfaces.push(InterfaceLine {
             name: "eth9".into(),
             mode: UrpfMode::Strict,
+            barsav: false,
+            role: None,
+            remote_as: None,
         });
         daemon.set_config(config);
         daemon.initial_sync().await.unwrap();
@@ -3601,10 +3954,16 @@ mod tests {
                 InterfaceLine {
                     name: "eth2".into(),
                     mode: UrpfMode::Strict,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
                 InterfaceLine {
                     name: "eth3".into(),
                     mode: UrpfMode::Loose,
+                    barsav: false,
+                    role: None,
+                    remote_as: None,
                 },
             ],
             ..SavdConfig::default()
@@ -3739,6 +4098,299 @@ mod tests {
                 "hosting the monitor agent changes no installed op"
             );
             assert_eq!(bare.ops()[0], monitor_allow(2, &["198.51.100.0/24"]));
+        }
+    }
+
+    // ---- BAR-SAV (S9-a M3 wiring; draft-ietf-sidrops-bar-sav-10) ----
+
+    fn address_up(ifindex: u32, prefix: &str) -> DataplaneEvent {
+        DataplaneEvent::AddressNew {
+            ifindex,
+            prefix: prefix.parse().unwrap(),
+        }
+    }
+
+    fn temp_file(name: &str, content: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("savd-barsav-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn parses_the_barsav_grammar() {
+        let config = cfg("\n\
+             barsav feed /run/rouster/barsav-adj-rib-in.txt\n\
+             barsav vrp-file /etc/rouster/rpki.snapshot\n\
+             barsav local-as 65000\n\
+             barsav provider-exempt 192.0.2.0/24\n\
+             barsav provider-exempt 198.18.0.0/15\n\
+             interface vethcust\n\
+             mode barsav\n\
+             role customer\n\
+             remote-as 64500\n\
+             interface vethpeer\n\
+             mode barsav\n\
+             role peer\n\
+             remote-as 64501\n\
+             interface vethprov\n\
+             mode barsav\n\
+             role provider\n\
+             remote-as 64502\
+             ");
+        assert_eq!(
+            config.barsav_feed,
+            Some("/run/rouster/barsav-adj-rib-in.txt".into())
+        );
+        assert_eq!(
+            config.barsav_vrp_file,
+            Some("/etc/rouster/rpki.snapshot".into())
+        );
+        assert_eq!(config.barsav_local_as, 65000);
+        assert_eq!(config.barsav_provider_exempt.len(), 2);
+        let [cust, peer, prov] = &config.interfaces[..] else {
+            panic!("three stanzas");
+        };
+        assert!(cust.barsav && cust.role == Some(BarRole::Customer));
+        assert_eq!(cust.remote_as, Some(64500));
+        assert!(peer.barsav && peer.role == Some(BarRole::LateralPeer));
+        assert!(prov.barsav && prov.role == Some(BarRole::Provider));
+        // The running-config line names the barsav partition.
+        assert!(config.to_string().contains("barsav[ifaces 3 feed true"));
+    }
+
+    #[test]
+    fn rejects_bad_barsav_config() {
+        let cases = [
+            ("mode barsav", "barsav as the global default"),
+            (
+                "interface a\nmode barsav",
+                "barsav stanza without role/remote-as",
+            ),
+            (
+                "interface a\nmode barsav\nrole customer",
+                "role without remote-as",
+            ),
+            (
+                "interface a\nrole customer\nremote-as 1",
+                "role/remote-as without mode barsav",
+            ),
+            ("interface a\nmode barsav\nrole lateral", "bad role token"),
+            (
+                "interface a\nmode barsav\nrole customer\nremote-as x",
+                "bad remote-as",
+            ),
+            ("barsav feed /a\nbarsav feed /b", "duplicate feed"),
+            (
+                "barsav vrp-file /a\nbarsav vrp-file /b",
+                "duplicate vrp-file",
+            ),
+            ("barsav local-as 1\nbarsav local-as 2", "duplicate local-as"),
+            (
+                "barsav provider-exempt 10.0.0.0/8\nbarsav provider-exempt 10.0.0.0/8",
+                "duplicate exemption",
+            ),
+            ("barsav provider-exempt nope", "bad exemption prefix"),
+            ("barsav bogus x", "unknown barsav directive"),
+        ];
+        for (input, why) in cases {
+            assert!(parse_savd_config(input).is_err(), "{why}: `{input}`");
+        }
+    }
+
+    /// The daemon end of the M3 feed: bgpd's feed, the RPKI snapshot
+    /// and the on-link mirror drive build_ops — the derived IBA ops,
+    /// provenance bar-sav, tagged Loose (the program hint), carrying
+    /// the monitor action by default. Topology (global-range neighbor
+    /// ASNs, staying outside §4 Step 6's special-purpose removal set):
+    /// local AS 64512; customer AS 64600 on eth2 (192.0.2.0/24, peer
+    /// .9) with deep customer AS 64601; lateral peer AS 64700 on eth3
+    /// (198.51.100.0/24, peer .2); provider AS 64800 on eth4.
+    fn barsav_daemon(
+        feed_path: std::path::PathBuf,
+        vrp_path: std::path::PathBuf,
+    ) -> SavDaemon<tokio::io::DuplexStream> {
+        let (client_io, _server) = tokio::io::duplex(64);
+        let mut daemon = SavDaemon::new(ZapiClient::new(client_io));
+        daemon.apply_event(&link_up(2, "eth2"));
+        daemon.apply_event(&link_up(3, "eth3"));
+        daemon.apply_event(&link_up(4, "eth4"));
+        daemon.apply_event(&address_up(2, "192.0.2.1/24"));
+        daemon.apply_event(&address_up(3, "198.51.100.1/24"));
+        daemon.apply_event(&address_up(4, "203.0.113.1/24"));
+        daemon.set_config(SavdConfig {
+            interfaces: vec![
+                {
+                    let mut l = InterfaceLine {
+                        name: "eth2".into(),
+                        mode: UrpfMode::Strict,
+                        barsav: true,
+                        role: Some(BarRole::Customer),
+                        remote_as: Some(64600),
+                    };
+                    l.mode = UrpfMode::Strict;
+                    l
+                },
+                InterfaceLine {
+                    name: "eth3".into(),
+                    mode: UrpfMode::Strict,
+                    barsav: true,
+                    role: Some(BarRole::LateralPeer),
+                    remote_as: Some(64700),
+                },
+                InterfaceLine {
+                    name: "eth4".into(),
+                    mode: UrpfMode::Strict,
+                    barsav: true,
+                    role: Some(BarRole::Provider),
+                    remote_as: Some(64800),
+                },
+            ],
+            barsav_feed: Some(feed_path),
+            barsav_vrp_file: Some(vrp_path),
+            barsav_local_as: 64512,
+            ..SavdConfig::default()
+        });
+        daemon
+    }
+
+    fn barsav_feed_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        let feed = temp_file(
+            "feed.txt",
+            "198.51.100.0/24 peer 192.0.2.9 path 64600\n\
+             203.0.113.0/24 peer 192.0.2.9 path 64600 64601\n\
+             192.0.2.0/24 peer 198.51.100.2 path 64700\n\
+             198.18.0.0/15 peer 203.0.113.9 path 64800\
+             ",
+        );
+        let vrps = temp_file(
+            "rpki.snapshot",
+            "vrp 198.51.100.0/24 max 24 as 64600\n\
+             vrp 203.0.113.0/24 max 24 as 64601\n\
+             aspa 64601 provider 64600\
+             ",
+        );
+        (feed, vrps)
+    }
+
+    #[test]
+    fn barsav_ops_derive_from_the_feed_end_to_end() {
+        let (feed, vrps) = barsav_feed_fixture();
+        let mut daemon = barsav_daemon(feed, vrps);
+        let ops = daemon.build_ops();
+        let permit = |ifindex: u32| {
+            ops.iter()
+                .find(|(mode, op)| {
+                    *mode == UrpfMode::Loose
+                        && matches!(op, SavOp::IbaPermit { ifindex: i, .. } if *i == ifindex)
+                })
+                .map(|(_, op)| op.clone())
+                .unwrap_or_else(|| panic!("barsav op for ifindex {ifindex}"))
+        };
+        // Customer (§4): the cone's two prefixes.
+        match permit(2) {
+            SavOp::IbaPermit {
+                prefixes,
+                action,
+                origin,
+                ..
+            } => {
+                assert_eq!(
+                    prefixes,
+                    vec![
+                        "198.51.100.0/24".parse().unwrap(),
+                        "203.0.113.0/24".parse().unwrap()
+                    ]
+                );
+                assert_eq!(action, SavAction::Monitor, "monitor default");
+                assert_eq!(origin, Some(RuleOrigin::BarSav));
+            }
+            _ => panic!("iba op"),
+        }
+        // Lateral peer (§2): its own prefix.
+        match permit(3) {
+            SavOp::IbaPermit { prefixes, .. } => {
+                assert_eq!(prefixes, vec!["192.0.2.0/24".parse().unwrap()]);
+            }
+            _ => panic!("iba op"),
+        }
+        // Provider (§8): loose − S; both cone prefixes are
+        // cone-exclusive here (ROV-valid, clean attestations), so the
+        // provider allowlist keeps only the peer's and far prefixes.
+        match permit(4) {
+            SavOp::IbaPermit { prefixes, .. } => {
+                assert_eq!(
+                    prefixes,
+                    vec![
+                        "192.0.2.0/24".parse().unwrap(),
+                        "198.18.0.0/15".parse().unwrap()
+                    ]
+                );
+            }
+            _ => panic!("iba op"),
+        }
+        assert_eq!(ops.len(), 3, "exactly the three barsav interfaces");
+    }
+
+    /// The feed-unavailable posture: a missing or unparseable input
+    /// derives NOTHING and enables NOTHING — no seeded empty
+    /// allowlist, no deny-all — every BAR-SAV interface unjudged
+    /// (unknown ≠ invalid; the §7.5.1 fail-open shape).
+    #[test]
+    fn barsav_feed_unavailable_leaves_interfaces_unjudged() {
+        let (feed, vrps) = barsav_feed_fixture();
+        // Missing file.
+        let mut daemon = barsav_daemon(
+            std::path::PathBuf::from("/nonexistent/barsav-feed"),
+            vrps.clone(),
+        );
+        assert!(daemon.build_ops().is_empty());
+        // Unparseable feed.
+        let bad = temp_file("bad-feed.txt", "total junk\n");
+        let mut daemon = barsav_daemon(bad, vrps.clone());
+        assert!(daemon.build_ops().is_empty());
+        // Unreadable vrp-file.
+        let mut daemon = barsav_daemon(
+            feed.clone(),
+            std::path::PathBuf::from("/nonexistent/rpki.snapshot"),
+        );
+        assert!(daemon.build_ops().is_empty());
+        // And the good files still work (the controls above did not
+        // consume the fixtures' validity).
+        let mut daemon = barsav_daemon(feed.clone(), vrps);
+        assert_eq!(daemon.build_ops().len(), 3);
+    }
+
+    /// A feed peer that is not on-link (no connected prefix covers
+    /// it) drops out of the derivation — multi-hop/iBGP feeds are
+    /// §Deferred; the single-hop eBGP case is tonight's scope.
+    #[test]
+    fn barsav_off_link_feed_peers_drop_out() {
+        let (feed, vrps) = barsav_feed_fixture();
+        let mut daemon = barsav_daemon(feed, vrps);
+        // eth3's address leaves: its peer 198.51.100.2 is no longer
+        // on-link, so the peer interface's own prefix no longer
+        // derives (Q2 loses the 64700-originated path).
+        daemon.apply_event(&DataplaneEvent::AddressDel {
+            ifindex: 3,
+            prefix: "198.51.100.1/24".parse().unwrap(),
+        });
+        let ops = daemon.build_ops();
+        let peer_op = ops
+            .iter()
+            .find(|(_, op)| matches!(op, SavOp::IbaPermit { ifindex: 3, .. }))
+            .expect("peer op still seeded");
+        match peer_op.1 {
+            SavOp::IbaPermit { ref prefixes, .. } => {
+                // The peer's stanza exists, so the op seeds; but no
+                // path derives for it anymore (its only feed line
+                // dropped out) — the empty allowlist is the honest
+                // derivation (GSC §2.1 deny-all, monitor action).
+                assert!(prefixes.is_empty());
+            }
+            _ => panic!("iba op"),
         }
     }
 }

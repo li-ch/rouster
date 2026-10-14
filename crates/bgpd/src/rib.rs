@@ -559,6 +559,57 @@ impl LocRib {
     pub fn route_count(&self) -> usize {
         self.adj_in.values().map(|rib| rib.len()).sum()
     }
+
+    /// The BAR-SAV Adj-RIB-In feed snapshot (S9-a M3, the read-only
+    /// edge): every stored per-peer path rendered as one feed line —
+    /// `<prefix> peer <addr> path <asn>... [as-set]` — behind a
+    /// header naming the format. READ-ONLY: takes the RIB lock for
+    /// reading through the caller (`&self`), touches no decision
+    /// state, and changes nothing on the wire; the daemon's feed
+    /// writer task snapshots this on change and swaps the file
+    /// atomically, and savd's `sav::barsav::parse_barsav_feed` is the
+    /// consuming half (draft-ietf-sidrops-bar-sav-10 §4 Step 7/12's
+    /// "unique AS_PATHs in Adj-RIBs-In of all interfaces").
+    ///
+    /// Deterministic by construction (the BTreeMap iteration order),
+    /// so the writer's change detection is a plain string compare.
+    /// AS_SEQUENCE segments flatten in wire order (leftmost = the
+    /// neighbor's AS); a path carrying any AS_SET keeps its flattened
+    /// sequence but gains the `as-set` marker — the consumer excludes
+    /// such paths (aspa-verification §5.5 step 3), and flattening
+    /// only ever happens to a path that will not be used.
+    pub fn barsav_feed_text(&self) -> String {
+        let mut out = String::from(
+            "# bgpd BAR-SAV Adj-RIB-In feed v1\n\
+             # one line per (prefix, path, peer); `as-set` marks an AS_SET path\n",
+        );
+        for (peer, rib) in &self.adj_in {
+            for route in rib.values() {
+                let mut has_set = false;
+                let mut asns: Vec<u32> = Vec::new();
+                if let Some(PathAttribute::AsPath(path)) = route.attr(attr_type::AS_PATH) {
+                    for segment in &path.segments {
+                        match segment {
+                            AsSegment::Sequence(v) => asns.extend(v.iter().copied()),
+                            AsSegment::Set(v) => {
+                                has_set = true;
+                                asns.extend(v.iter().copied());
+                            }
+                        }
+                    }
+                }
+                let rendered: Vec<String> = asns.iter().map(|asn| asn.to_string()).collect();
+                out.push_str(&format!(
+                    "{} peer {} path {}{}\n",
+                    route.prefix,
+                    peer,
+                    rendered.join(" "),
+                    if has_set { " as-set" } else { "" }
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// The [`RouteSink`] that feeds the Loc-RIB: sessions call into this;
@@ -2062,6 +2113,66 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(stored.local_pref(), 200, "internal kept");
+    }
+
+    /// The BAR-SAV feed snapshot (S9-a M3): the Adj-RIB-In rendered
+    /// read-only — wire-order AS_PATHs per (prefix, peer), the
+    /// `as-set` marker for set-carrying paths, deterministic
+    /// (peer-address, prefix) order — and pure (nothing changes in
+    /// the RIB). The sav-side parser (`sav::barsav::parse_barsav_feed`)
+    /// is the consuming half; the format is pinned by both tests.
+    #[test]
+    fn barsav_feed_renders_the_adj_rib_in_read_only() {
+        let update = |path: AsPath, prefix: &str| BgpUpdate {
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(path),
+                PathAttribute::NextHop("192.0.2.1".parse().unwrap()),
+            ],
+            nlri: vec![Nlri::from(prefix.parse::<IpPrefix>().unwrap())],
+            ..Default::default()
+        };
+        let mut rib = LocRib::new(65000);
+        let customer = peer("192.0.2.9", 65001, 1);
+        rib.announce(
+            &customer,
+            &update(AsPath::sequence([65001]), "198.51.100.0/24"),
+        );
+        rib.announce(
+            &customer,
+            &update(AsPath::sequence([65001, 65002]), "203.0.113.0/24"),
+        );
+        // A set-carrying path: flattened sequence + the marker.
+        let mixed = AsPath {
+            segments: vec![
+                AsSegment::Sequence(vec![65001]),
+                AsSegment::Set(vec![65003, 65004]),
+            ],
+        };
+        rib.announce(&customer, &update(mixed, "198.19.0.0/15"));
+        let other = peer("198.51.100.2", 65010, 2);
+        rib.announce(&other, &update(AsPath::sequence([65010]), "192.0.2.0/24"));
+
+        let before = rib.route_count();
+        let text = rib.barsav_feed_text();
+        assert_eq!(
+            before,
+            rib.route_count(),
+            "read-only: nothing stored or dropped"
+        );
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("# bgpd BAR-SAV Adj-RIB-In feed v1"));
+        assert_eq!(
+            lines[2..],
+            [
+                "198.19.0.0/15 peer 192.0.2.9 path 65001 65003 65004 as-set",
+                "198.51.100.0/24 peer 192.0.2.9 path 65001",
+                "203.0.113.0/24 peer 192.0.2.9 path 65001 65002",
+                "192.0.2.0/24 peer 198.51.100.2 path 65010",
+            ],
+            "deterministic (peer, prefix) order; wire-order paths; as-set marked"
+        );
     }
 
     /// The ladder consequence: two eBGP peers fighting with inflated
