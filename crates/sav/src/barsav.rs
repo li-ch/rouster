@@ -1379,4 +1379,402 @@ mod tests {
         );
         assert_eq!(allowlist_of(&derivation.results, 3), &[p("192.0.2.0/24")]);
     }
+
+    // ---- The S10-c ASPA-provider-set edges -----------------------------
+    //
+    // The draft's two load-bearing wordings, quoted once here because
+    // every test below cites one or both:
+    //
+    //   §4 Step 5 (PERMISSIVE): "Create AS-set A(i) of all ASNs whose
+    //   ASPA data declares at least one ASN in AS-set Z(i-1) as a
+    //   Provider."
+    //
+    //   §8 Step 5 (STRICT): "keep only the prefixes with all feasible
+    //   routes from their respective origin ASes to the local AS
+    //   (i.e., AS doing SAV) such that each AS in the AS path of each
+    //   route has all its Provider ASes (per ASPAs) contained within
+    //   AS-set Du."
+    //
+    // Where the draft is genuinely silent (AS 0 and special-purpose
+    // ASNs in provider SETS, the local AS's own Du membership, the
+    // route source for "feasible routes"), these tests pin the
+    // literal reading and DISCLOSE the gap — no policy is invented.
+
+    /// §4 Step 5, permissive: a multi-homed ASPA customer joins the
+    /// cone when ANY of its providers is in the frontier — "at least
+    /// one ASN in AS-set Z(i-1) as a Provider" — even though its other
+    /// provider (701) is nowhere near the cone. Here 202 is reachable
+    /// ONLY through ASPA (the deep AS_PATH is absent), so the cone
+    /// discovery is purely the "at least one" wording.
+    #[test]
+    fn step5_at_least_one_admits_multihomed_aspa_customers() {
+        let aspas = aspa_table(&[(202, &[201, 701])]);
+        let (vrps, aspas) = (vrp_table(&[]), aspas);
+        // Doc topology WITHOUT the [201, 202] path: B(i) cannot find
+        // 202; only A(i) can.
+        let paths = vec![
+            BarPath::sequence("198.51.100.0/24", 2, &[201]),
+            BarPath::sequence("192.0.2.0/24", 3, &[401]),
+            BarPath::sequence("198.18.0.0/15", 4, &[501, 502]),
+        ];
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        let cone = &customer_of(&derivation).cone;
+        assert!(cone.contains(&202), "via the 'at least one' provider 201");
+        assert!(!cone.contains(&701), "the other provider never joins");
+    }
+
+    /// §8 Step 5, strict, against §4 Step 5, permissive — the deliberate
+    /// asymmetry: the SAME dual-homed ASPA (202 → providers 201 AND
+    /// 701) that §4 Step 5 admits to D ("at least one") is barred from
+    /// S by §8 Step 5 ("all its Provider ASes ... contained within
+    /// AS-set Du") — 701 ∉ Du — so its prefix stays PERMITTED on the
+    /// provider interface (traffic may legitimately arrive via 701).
+    #[test]
+    fn step8_all_providers_contained_drops_dual_homed_cone_as_from_s() {
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        let aspas = aspa_table(&[(202, &[201, 701])]);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        let provider = provider_of(&derivation);
+        assert!(provider.du.contains(&202), "permissive side: in D");
+        assert!(
+            !provider.s.contains(&p("203.0.113.0/24")),
+            "strict side: 701 ∉ Du bars it from S"
+        );
+        assert!(
+            provider.allowlist.contains(&p("203.0.113.0/24")),
+            "Step 6: stays permitted on the provider interface"
+        );
+        assert!(
+            provider.s.contains(&p("198.51.100.0/24")),
+            "the unattested origin's prefix is unaffected"
+        );
+    }
+
+    /// §8 Step 5 at the TOP of the cone: whether the SAV-performing
+    /// local AS belongs in Du is the draft's own open edge — nothing in
+    /// §8 computes it in (Step 1 unions the §4 cones, which start at
+    /// AS-k), and the safety addendum keeps the local AS out. Literal
+    /// reading: when the direct customer attests us as a provider
+    /// (ASPA 201 → 100), "all its Provider ASes ... contained within
+    /// AS-set Du" FAILS (100 ∉ Du) and every prefix whose path crosses
+    /// 201 leaves S; unattested (the S9-a smoke's shape), containment
+    /// holds vacuously and they stay. One attestation flips it —
+    /// pinned, with the gap disclosed (savnet.md).
+    #[test]
+    fn top_of_cone_attestation_flips_s_membership() {
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        // Unattested 201: both cone prefixes reach S (vacuous
+        // containment — the smoke's snapshot shape).
+        let unattested = aspa_table(&[(202, &[201])]);
+        let input = doc_input(&neighbors, &paths, &vrps, &unattested);
+        let derivation = generate_barsav(&input);
+        let provider = provider_of(&derivation);
+        assert_eq!(
+            provider.s,
+            vec![p("198.51.100.0/24"), p("203.0.113.0/24")],
+            "no attestation of 201: containment holds vacuously"
+        );
+        // The SAME topology plus ASPA 201 → {100}: both leave S.
+        let attested = aspa_table(&[(202, &[201]), (201, &[100])]);
+        let input = doc_input(&neighbors, &paths, &vrps, &attested);
+        let derivation = generate_barsav(&input);
+        let provider = provider_of(&derivation);
+        assert!(
+            provider.s.is_empty(),
+            "attested to the local AS (100 ∉ Du): the letter drops both"
+        );
+        assert!(provider.allowlist.contains(&p("198.51.100.0/24")));
+    }
+
+    /// AS 0 inside a provider SET at §8 Step 5: §4 Step 6 removes AS 0
+    /// from the CUSTOMER side ("If AS-set A(i) contains AS 0 ... remove
+    /// such ASes"), but nothing scrubs provider sets, and the literal
+    /// "all its Provider ASes ... contained within AS-set Du" counts
+    /// AS 0 (never in Du) against containment — even though an AS 0
+    /// listing asserts "no other providers" (aspa-verification §5.1),
+    /// which would argue the opposite. GAP DISCLOSED: we follow the
+    /// letter; recorded in savnet.md, not re-decided here.
+    #[test]
+    fn as0_in_provider_set_counts_against_step5_containment() {
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        // 201 stays a Provider+ of 202, so the deep path is NOT
+        // preamble-Invalid — only Step 5 sees the AS 0.
+        let aspas = aspa_table(&[(202, &[0, 201])]);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        let provider = provider_of(&derivation);
+        assert!(
+            !provider.s.contains(&p("203.0.113.0/24")),
+            "literal: 0 ∉ Du counts against containment"
+        );
+        assert!(
+            provider.s.contains(&p("198.51.100.0/24")),
+            "the unattested origin is the vacuous contrast"
+        );
+    }
+
+    /// Same class, non-zero special-purpose ASN: §4 Step 6's IANA
+    /// scrub applies to A(i) MEMBERSHIP only; a private ASN (64512)
+    /// inside a provider set still fails §8 Step 5's "contained within
+    /// AS-set Du" (64512 ∉ Du). GAP DISCLOSED as above.
+    #[test]
+    fn special_purpose_provider_counts_against_containment() {
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        let aspas = aspa_table(&[(202, &[201, 64512])]);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        let provider = provider_of(&derivation);
+        assert!(!provider.s.contains(&p("203.0.113.0/24")));
+        assert!(provider.allowlist.contains(&p("203.0.113.0/24")));
+    }
+
+    /// §8 Step 5's route scope: "each AS in the AS path of EACH route"
+    /// — with the after-Step-8 note ("the feasible paths are computed
+    /// by utilizing the customer-to-provider AS relationships that are
+    /// discovered at Steps 5 and 7 in the algorithm in Section 4").
+    /// Reading (disclosed): the feasible routes are the preamble-clean
+    /// Adj-RIBs-In routes over ALL interfaces — the same source §4
+    /// Step 7 uses. So a cone prefix ALSO learned via the provider
+    /// interface, on a path carrying an AS whose providers leave Du,
+    /// loses S membership even though its customer-interface route is
+    /// clean.
+    #[test]
+    fn provider_side_feasible_route_joins_the_step5_walk() {
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        // The provider-side alternative route [501, 601, 202] verifies
+        // clean downstream (601 → 501 Provider+, 202 → 601 Provider+),
+        // but 601's provider set {501, 701} leaves Du.
+        let aspas = aspa_table(&[(202, &[201, 601]), (601, &[501, 701])]);
+        let mut paths = doc_topology_paths();
+        paths.push(BarPath::sequence("203.0.113.0/24", 4, &[501, 601, 202]));
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        assert_eq!(derivation.paths_excluded, 0, "the extra route is clean");
+        let provider = provider_of(&derivation);
+        assert!(
+            !provider.s.contains(&p("203.0.113.0/24")),
+            "601's providers {{501, 701}} not within Du on the provider-side route"
+        );
+        assert!(
+            provider.s.contains(&p("198.51.100.0/24")),
+            "the customer-only-route prefix is the contrast"
+        );
+    }
+
+    /// §8 Step 3's "all RPKI-ROV Valid and have Valid AS path per ASPA
+    /// verification" over ZERO customer routes: an ASPA-Invalid path
+    /// (the preamble's exclusion) leaves the prefix in Qu via its ROA
+    /// (Step 11) but with no usable customer-interface route at all.
+    /// Vacuous "all Valid" would keep it; we require ≥1 attesting
+    /// route (nothing else attests cone exclusivity) — the disclosed
+    /// S9-a reading, pinned here. The prefix also misses the loose
+    /// set (no usable route anywhere): unjudged at the provider
+    /// interface, never spoof-flagged.
+    #[test]
+    fn aspa_invalid_customer_route_starves_step3() {
+        let vrps = vrp_table(&[("203.0.113.0/24", 24, 202)]);
+        // AS 0 as 202's only provider: the [201, 202] path is
+        // AS_PATH-verification Invalid, so the preamble drops it.
+        let aspas = aspa_table(&[(202, &[0])]);
+        let paths = doc_topology_paths();
+        // The ASN ACL keeps 202 in the cone despite the dead path
+        // (§4 Step 3: "Extend AS-set Z(1) to include ASNs from any ASN
+        // ACL configured for the interface").
+        let mut customer = BarNeighbor::new(2, 201, BarRole::Customer);
+        customer.asn_acl = vec![202];
+        let neighbors = vec![
+            customer,
+            BarNeighbor::new(3, 401, BarRole::LateralPeer),
+            BarNeighbor::new(4, 501, BarRole::Provider),
+        ];
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        assert_eq!(derivation.paths_excluded, 1);
+        assert!(customer_of(&derivation).cone.contains(&202), "ACL-seeded");
+        assert!(
+            allowlist_of(&derivation.results, 2).contains(&p("203.0.113.0/24")),
+            "Q1 still carries it on the customer interface (Step 11)"
+        );
+        let provider = provider_of(&derivation);
+        assert!(
+            !provider.s.contains(&p("203.0.113.0/24")),
+            "zero usable customer routes: our ≥1 reading drops it from S"
+        );
+        assert!(
+            !provider.allowlist.contains(&p("203.0.113.0/24")),
+            "no usable route at all: not in the loose set either"
+        );
+    }
+
+    /// §8 Step 1's "for each CUSTOMER interface": an AS attesting the
+    /// LATERAL PEER as provider (451 → 401) joins the peer's own §4
+    /// cone (§2: "the CC includes the AS belonging to the customer or
+    /// lateral peer") but never Du — the provider subtraction is
+    /// customer-only, so peer-cone prefixes stay permitted on provider
+    /// interfaces. We follow the letter; whether lateral peers should
+    /// join the subtraction is unaddressed by the draft (§Deferred).
+    #[test]
+    fn peer_cone_aspas_never_join_du() {
+        let aspas = aspa_table(&[(451, &[401])]);
+        let (vrps, aspas) = (vrp_table(&[]), aspas);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        let peer = match &derivation.results[1] {
+            IfaceResult::Customer(c) => c,
+            _ => panic!("second result is the peer interface"),
+        };
+        assert!(peer.cone.contains(&451), "the peer's own cone grows");
+        let provider = provider_of(&derivation);
+        assert_eq!(provider.du, vec![201, 202], "customer-only union");
+        assert!(
+            provider.allowlist.contains(&p("192.0.2.0/24")),
+            "peer-cone prefixes stay permitted at providers"
+        );
+    }
+
+    /// §4 Step 5, permissive, with the local AS inside the provider
+    /// set: an ASPA naming BOTH a frontier member (201) and the local
+    /// AS (100) as providers still admits its customer to the cone —
+    /// "at least one ASN in AS-set Z(i-1)" is satisfied by 201; the
+    /// local-AS entry blocks discovery not at all (the guard only
+    /// stops the local AS entering as a CUSTOMER).
+    #[test]
+    fn local_as_among_providers_still_admits_cone_discovery() {
+        let aspas = aspa_table(&[(310, &[201, 100])]);
+        let (vrps, aspas) = (vrp_table(&[]), aspas);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        let cone = &customer_of(&derivation).cone;
+        assert!(cone.contains(&310), "discovered via the 201 entry");
+        assert!(!cone.contains(&100), "the local AS never enters");
+    }
+
+    /// The capstone table: one prefix (203.0.113.0/24, origin 202 in
+    /// the cone), the smoke's shape (201 unattested), and 202's
+    /// provider set varied row by row — every row cites the wording
+    /// that decides it.
+    #[test]
+    fn aspa_provider_set_edge_table() {
+        struct Row {
+            name: &'static str,
+            citation: &'static str,
+            providers: Option<&'static [u32]>,
+            in_s: bool,
+        }
+        let rows = [
+            Row {
+                name: "unattested origin (Unknown)",
+                // §4 preamble: "any Invalid AS_PATHs must be excluded"
+                // — Unknown survives the preamble, but §8 Step 3 wants
+                // "Valid AS path per ASPA verification", and Unknown is
+                // not Valid.
+                citation:
+                    "§8 Step 3 'Valid AS path' (strict) vs §4 preamble 'Invalid' (permissive)",
+                providers: None,
+                in_s: false,
+            },
+            Row {
+                name: "attested wholly inside Du",
+                citation: "§8 Step 5 'all ... contained within AS-set Du' holds",
+                providers: Some(&[201]),
+                in_s: true,
+            },
+            Row {
+                name: "dual-homed outside the cone",
+                citation: "§8 Step 5 'all ... contained' fails (701 ∉ Du)",
+                providers: Some(&[201, 701]),
+                in_s: false,
+            },
+            Row {
+                name: "AS 0 among the providers",
+                citation: "§8 Step 5 literal: AS 0 ∉ Du (draft gap: §4 Step 6 scrubs only A(i))",
+                providers: Some(&[0, 201]),
+                in_s: false,
+            },
+            Row {
+                name: "private ASN among the providers",
+                citation: "§8 Step 5 literal: 64512 ∉ Du (same gap class)",
+                providers: Some(&[201, 64512]),
+                in_s: false,
+            },
+        ];
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        for row in rows {
+            let aspas = match row.providers {
+                Some(providers) => aspa_table(&[(202, providers)]),
+                None => aspa_table(&[]),
+            };
+            let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+            let derivation = generate_barsav(&input);
+            let provider = provider_of(&derivation);
+            assert_eq!(
+                provider.s.contains(&p("203.0.113.0/24")),
+                row.in_s,
+                "row `{}` ({}) — S = {:?}",
+                row.name,
+                row.citation,
+                provider.s
+            );
+            // Every row has a usable customer-interface route, so G is
+            // exactly the S complement for this prefix.
+            assert_eq!(
+                provider.allowlist.contains(&p("203.0.113.0/24")),
+                !row.in_s,
+                "row `{}`: G must mirror S (Step 6)",
+                row.name
+            );
+        }
+    }
+
+    /// The two ASPA bars in one draft, sharpest contrast: the §4
+    /// preamble excludes ONLY Invalid ("any Invalid AS_PATHs must be
+    /// excluded from inputs to the BAR-SAV procedure") — an Unknown
+    /// path still feeds the cone walk (Step 7's B(i)) and Q2 — while
+    /// §8 Step 3 demands "Valid AS path per ASPA verification", and
+    /// Unknown is not Valid. With no ASPAs at all, the deep prefix
+    /// (path [201, 202], hop 202 → 201 unattested ⇒ Unknown) reaches
+    /// neither S nor exclusion, and the single-AS path [201] (no hops
+    /// ⇒ trivially Valid) rides vacuous Step-5 containment into S.
+    #[test]
+    fn step3_requires_valid_while_the_preamble_admits_unknown() {
+        let vrps = vrp_table(&[("198.51.100.0/24", 24, 201), ("203.0.113.0/24", 24, 202)]);
+        let (vrps, aspas) = (vrps, aspa_table(&[]));
+        let paths = doc_topology_paths();
+        let neighbors = doc_neighbors();
+        let input = doc_input(&neighbors, &paths, &vrps, &aspas);
+        let derivation = generate_barsav(&input);
+        assert_eq!(derivation.paths_excluded, 0, "Unknown is not Invalid");
+        assert!(
+            customer_of(&derivation).cone.contains(&202),
+            "the Unknown path still feeds B(i) (§4 Step 7)"
+        );
+        let provider = provider_of(&derivation);
+        assert_eq!(
+            provider.s,
+            vec![p("198.51.100.0/24")],
+            "only the trivially-Valid single-AS path survives Step 3"
+        );
+        assert!(
+            provider.allowlist.contains(&p("203.0.113.0/24")),
+            "the Unknown prefix stays permitted (loose set, Step 6)"
+        );
+    }
 }
