@@ -698,24 +698,81 @@ pub fn rfc7606_disposition(attr_type: u8, subcode: u8, internal: bool) -> Dispos
     }
 }
 
-/// The RFC 7606 report attached to one decoded UPDATE: which
-/// attributes were discarded, and whether the routes it carried must
-/// be treated as withdrawn.
+/// The RFC 7606 handling ledger collected while one attribute list
+/// decodes (the intermediate form — `BgpUpdate::decode_with_handling`
+/// finalizes it against the UPDATE's NLRI into the structured
+/// [`UpdateOutcome`], applying §3(j)/§5.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UpdateReport {
-    /// (attribute type, reason) for every attribute-discard.
-    pub discarded: Vec<(u8, String)>,
-    /// RFC 7606 §2: "treat as though all contained routes had been
-    /// withdrawn".
-    pub treat_as_withdraw: bool,
+pub struct AttrHandling {
+    /// (attribute type, reason) for every discard-class attribute and
+    /// every treat-as-withdraw trigger (the §6 diagnostics).
+    pub causes: Vec<(u8, String)>,
+    /// §2 treat-as-withdraw was triggered by some malformed attribute.
+    pub withdraw: bool,
+    /// The first triggering error's prescribed NOTIFICATION pair —
+    /// §5.2's escalation needs it back when the no-reachable-NLRI
+    /// shape voids treat-as-withdraw in favor of the session reset.
+    pub notify: Option<(u8, u8)>,
+}
+
+impl AttrHandling {
+    /// Record one discard-class attribute (§2 "attribute discard": the
+    /// UPDATE continues to process without it).
+    pub fn discard(&mut self, attr_type: u8, reason: String) {
+        self.causes.push((attr_type, reason));
+    }
+
+    /// Record one treat-as-withdraw trigger (§2), remembering the
+    /// first error's NOTIFICATION pair for §5.2's escalation.
+    pub fn treat_as_withdraw(&mut self, attr_type: u8, reason: String, notify: Option<(u8, u8)>) {
+        self.withdraw = true;
+        if self.notify.is_none() {
+            self.notify = notify.or(Some((
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::MALFORMED_ATTRIBUTE_LIST,
+            )));
+        }
+        self.causes.push((attr_type, reason));
+    }
+}
+
+/// The structured RFC 7606 outcome for one decoded UPDATE (B-1): the
+/// explicit third disposition — attribute discard — beside §2's
+/// treat-as-withdraw, with the session reset staying the `Err` side
+/// of the decode result. §3(j) is handled structurally: the
+/// [`Self::Withdrawn`] routes are exactly the successfully parsed
+/// NLRI/MP sets, and an UPDATE whose NLRI cannot be parsed never
+/// produces this type — it is the session reset (`Err`) per §3(j)'s
+/// "the 'session reset' approach (or the 'AFI/SAFI disable' approach)
+/// MUST be followed".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// No malformed attribute — the UPDATE processes normally.
+    #[default]
+    Clean,
+    /// §2 "attribute discard": the named attributes are dropped and
+    /// "the UPDATE message continues to be processed" (only for
+    /// attributes with no effect on route selection).
+    Discarded(Vec<(u8, String)>),
+    /// §2 "treat-as-withdraw": "treat the UPDATE message ... as though
+    /// all contained routes had been withdrawn" — both directions of
+    /// "contained": the announced NLRI/MP_REACH routes leave the
+    /// Adj-RIB-In and the explicit withdrawals still apply.
+    Withdrawn {
+        /// Every route the UPDATE named (announced + withdrawn), built
+        /// only from what actually parsed (§3(j)).
+        routes: Vec<Nlri>,
+        /// The malformed attributes that triggered it (§6 diagnostics).
+        causes: Vec<(u8, String)>,
+    },
 }
 
 /// The decode outcome carrying the strict attribute list plus the
-/// RFC 7606 handling report.
+/// RFC 7606 handling ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttrDecode {
     pub attrs: Vec<PathAttribute>,
-    pub report: UpdateReport,
+    pub handling: AttrHandling,
 }
 
 /// Decodes a whole attribute list (the `Path Attributes` field of an
@@ -752,15 +809,16 @@ pub fn decode_attributes_with(
         let attr_type = r.u8();
         let (flags, attr_type) = match (flags, attr_type) {
             (Some(f), Some(t)) => (f, t),
-            // Truncated header: RFC 7606 §5 — fewer than 3 octets
+            // Truncated header: RFC 7606 §4 — fewer than three octets
             // remaining for one attribute header+length is a
             // treat-as-withdraw level error (the NLRI is still
-            // parseable).
+            // parseable; §5.2 may yet escalate).
             _ if lenient => {
-                out.report.treat_as_withdraw = true;
-                out.report
-                    .discarded
-                    .push((0, "truncated attribute header (RFC 7606 §5)".into()));
+                out.handling.treat_as_withdraw(
+                    attr_type.unwrap_or(0),
+                    "truncated attribute header (RFC 7606 §4)".into(),
+                    None,
+                );
                 break;
             }
             _ => return Err(attr_truncated("attribute header")),
@@ -773,10 +831,11 @@ pub fn decode_attributes_with(
         let length = match length {
             Some(l) => l,
             _ if lenient => {
-                out.report.treat_as_withdraw = true;
-                out.report
-                    .discarded
-                    .push((attr_type, "truncated attribute length (RFC 7606 §5)".into()));
+                out.handling.treat_as_withdraw(
+                    attr_type,
+                    "truncated attribute length (RFC 7606 §4)".into(),
+                    None,
+                );
                 break;
             }
             _ => return Err(attr_truncated("attribute length")),
@@ -785,14 +844,14 @@ pub fn decode_attributes_with(
             Some(v) => v,
             None => {
                 // The declared length overruns the attribute field:
-                // §5 keeps this treat-as-withdraw unless a more
+                // §4 keeps this treat-as-withdraw unless a more
                 // severe error was signaled (none is, here).
                 if lenient {
-                    out.report.treat_as_withdraw = true;
-                    out.report.discarded.push((
+                    out.handling.treat_as_withdraw(
                         attr_type,
-                        format!("length {length} overruns attribute field (RFC 7606 §5)"),
-                    ));
+                        format!("length {length} overruns attribute field (RFC 7606 §4)"),
+                        None,
+                    );
                     break;
                 }
                 return Err(BgpError::notify(
@@ -816,7 +875,7 @@ pub fn decode_attributes_with(
             ));
         }
         if seen.contains(&attr_type) && (well_known || lenient) {
-            // RFC 7606 §7: a second MP_REACH/MP_UNREACH is a
+            // RFC 7606 §3(g): a second MP_REACH/MP_UNREACH is a
             // Malformed Attribute List (session reset); any other
             // duplicate — "all occurrences other than the first one
             // SHALL be discarded and the UPDATE message will continue
@@ -829,14 +888,14 @@ pub fn decode_attributes_with(
                 return Err(BgpError::notify(
                     error::error_code::UPDATE_MESSAGE,
                     error::update_subcode::MALFORMED_ATTRIBUTE_LIST,
-                    format!("duplicate attribute {attr_type} (RFC 7606 §7)"),
+                    format!("duplicate attribute {attr_type} (RFC 7606 §3(g))"),
                 ));
             }
             if lenient {
-                out.report.discarded.push((
+                out.handling.discard(
                     attr_type,
-                    "duplicate occurrence discarded (RFC 7606 §7)".into(),
-                ));
+                    "duplicate occurrence discarded (RFC 7606 §3(g))".into(),
+                );
                 continue;
             }
             return Err(BgpError::notify(
@@ -852,16 +911,16 @@ pub fn decode_attributes_with(
         match decode_one(attr_type, flags, value, asn4, addpath) {
             Ok(attr) => out.attrs.push(attr),
             Err(err) => {
-                let (_, subcode) = err
-                    .notification
-                    .unwrap_or((3, error::update_subcode::OPTIONAL_ATTRIBUTE_ERROR));
+                let notify = err.notification;
+                let (_, subcode) =
+                    notify.unwrap_or((3, error::update_subcode::OPTIONAL_ATTRIBUTE_ERROR));
                 match (rfc7606_disposition(attr_type, subcode, internal), handling) {
                     (Disposition::DiscardAttribute, UpdateHandling::Rfc7606 { .. }) => {
-                        out.report.discarded.push((attr_type, err.message));
+                        out.handling.discard(attr_type, err.message);
                     }
                     (Disposition::TreatAsWithdraw, UpdateHandling::Rfc7606 { .. }) => {
-                        out.report.treat_as_withdraw = true;
-                        out.report.discarded.push((attr_type, err.message));
+                        out.handling
+                            .treat_as_withdraw(attr_type, err.message, notify);
                     }
                     _ => return Err(err),
                 }
@@ -1627,23 +1686,23 @@ mod tests {
     fn lenient_malformed_route_attributes_treat_as_withdraw() {
         // ORIGIN with length 2 (flags 0x40, type 1, len 2).
         let out = lenient(&[0x40, 1, 2, 0, 0], false);
-        assert!(out.report.treat_as_withdraw);
-        assert_eq!(out.report.discarded[0].0, attr_type::ORIGIN);
+        assert!(out.handling.withdraw);
+        assert_eq!(out.handling.causes[0].0, attr_type::ORIGIN);
         // COMMUNITIES with length 3 (not a multiple of 4).
         let out = lenient(&[0xC0, 8, 3, 1, 2, 3], false);
-        assert!(out.report.treat_as_withdraw);
-        assert_eq!(out.report.discarded[0].0, attr_type::COMMUNITIES);
+        assert!(out.handling.withdraw);
+        assert_eq!(out.handling.causes[0].0, attr_type::COMMUNITIES);
         // Zero-length COMMUNITIES is not a non-zero multiple of 4
         // either (§4: only AS_PATH/ATOMIC_AGGREGATE may be empty).
         let out = lenient(&[0xC0, 8, 0], false);
-        assert!(out.report.treat_as_withdraw);
+        assert!(out.handling.withdraw);
         // MED with length 3.
         let out = lenient(&[0x80, 4, 3, 1, 2, 3], false);
-        assert!(out.report.treat_as_withdraw);
-        assert_eq!(out.report.discarded[0].0, attr_type::MULTI_EXIT_DISC);
+        assert!(out.handling.withdraw);
+        assert_eq!(out.handling.causes[0].0, attr_type::MULTI_EXIT_DISC);
         // OTC with length 3 (RFC 9234; disclosed judgment).
         let out = lenient(&[0xC0, 35, 3, 1, 2, 3], false);
-        assert!(out.report.treat_as_withdraw);
+        assert!(out.handling.withdraw);
     }
 
     /// §7: LOCAL_PREF length error — eBGP discards the attribute and
@@ -1652,10 +1711,10 @@ mod tests {
     fn lenient_local_pref_depends_on_session_type() {
         let bad = [0x40, 5, 3, 0, 0, 1]; // well-known, length 3
         let ebgp = lenient(&bad, false);
-        assert!(!ebgp.report.treat_as_withdraw, "eBGP: route kept");
-        assert_eq!(ebgp.report.discarded.len(), 1);
+        assert!(!ebgp.handling.withdraw, "eBGP: route kept");
+        assert_eq!(ebgp.handling.causes.len(), 1);
         let ibgp = lenient(&bad, true);
-        assert!(ibgp.report.treat_as_withdraw, "iBGP: routes withdrawn");
+        assert!(ibgp.handling.withdraw, "iBGP: routes withdrawn");
     }
 
     /// §7: AGGREGATOR / ATOMIC_AGGREGATE length errors discard the
@@ -1666,16 +1725,16 @@ mod tests {
         let mut bytes = attrs_bytes(&[PathAttribute::Origin(Origin::Igp)], false);
         bytes.extend_from_slice(&[0xC0, 7, 3, 1, 2, 3]);
         let out = lenient(&bytes, false);
-        assert!(!out.report.treat_as_withdraw);
-        assert_eq!(out.report.discarded.len(), 1);
-        assert_eq!(out.report.discarded[0].0, attr_type::AGGREGATOR);
+        assert!(!out.handling.withdraw);
+        assert_eq!(out.handling.causes.len(), 1);
+        assert_eq!(out.handling.causes[0].0, attr_type::AGGREGATOR);
         assert_eq!(out.attrs, vec![PathAttribute::Origin(Origin::Igp)]);
 
         // ATOMIC_AGGREGATE with length 1.
         let out = lenient(&[0x40, 6, 1, 0], false);
-        assert!(!out.report.treat_as_withdraw);
+        assert!(!out.handling.withdraw);
         assert!(out.attrs.is_empty());
-        assert_eq!(out.report.discarded[0].0, attr_type::ATOMIC_AGGREGATE);
+        assert_eq!(out.handling.causes[0].0, attr_type::ATOMIC_AGGREGATE);
     }
 
     /// §7's general flags rule: an Optional/Transitive conflict (MED
@@ -1685,7 +1744,7 @@ mod tests {
     fn flags_conflict_withdraws_in_7606_and_resets_in_strict() {
         let bytes = vec![0xC0, 4, 4, 0, 0, 0, 100];
         let out = lenient(&bytes, false);
-        assert!(out.report.treat_as_withdraw);
+        assert!(out.handling.withdraw);
         let err = decode_attributes(&bytes, false).unwrap_err();
         assert_eq!(
             err.notification,
@@ -1701,11 +1760,11 @@ mod tests {
         let mut bytes = attrs_bytes(&[PathAttribute::Origin(Origin::Egp)], false);
         bytes.extend_from_slice(&attrs_bytes(&[PathAttribute::Origin(Origin::Igp)], false));
         let out = lenient(&bytes, false);
-        assert!(!out.report.treat_as_withdraw);
+        assert!(!out.handling.withdraw);
         assert_eq!(out.attrs.len(), 1, "the first occurrence stands");
         assert!(out
-            .report
-            .discarded
+            .handling
+            .causes
             .iter()
             .any(|(t, _)| *t == attr_type::ORIGIN));
 
@@ -1741,10 +1800,10 @@ mod tests {
     fn lenient_framing_edges() {
         // Declares 8 bytes of AS_PATH, provides none.
         let out = lenient(&[0x40, 2, 8], false);
-        assert!(out.report.treat_as_withdraw);
+        assert!(out.handling.withdraw);
         // Truncated header: a lone flags octet.
         let out = lenient(&[0x40], false);
-        assert!(out.report.treat_as_withdraw);
+        assert!(out.handling.withdraw);
 
         // Unknown well-known attribute: reset in both modes.
         let err = decode_attributes_with(

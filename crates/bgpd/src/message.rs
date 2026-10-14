@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 
 use crate::attr::{
     decode_attributes_with, decode_nlri, encode_attributes, encode_nlri, AddPathCtx, AsPath, Nlri,
-    Origin, PathAttribute, UpdateHandling, UpdateReport,
+    Origin, PathAttribute, UpdateHandling, UpdateOutcome,
 };
 use crate::capability::{decode_capabilities, encode_capabilities, Capability};
 use crate::error::{self, BgpError, BgpResult};
@@ -109,16 +109,16 @@ impl BgpMessage {
     /// [`Self::decode`] with RFC 7606 UPDATE error handling and the
     /// negotiated ADD-PATH direction: extended NLRI (the 4-octet Path
     /// Identifier per prefix, RFC 7911 §3) decodes only for the
-    /// families that negotiated it. A malformed-but-salvageable
-    /// UPDATE decodes to itself plus the handling report (discarded
-    /// attributes, treat-as-withdraw); errors that keep the session
-    /// reset still return `Err`.
+    /// families that negotiated it. A malformed-but-salvageable UPDATE
+    /// decodes to itself plus the structured handling outcome
+    /// (attribute discard / treat-as-withdraw carrying the routes);
+    /// errors that keep the session reset still return `Err`.
     pub fn decode_with_handling(
         buf: &[u8],
         asn4: bool,
         handling: UpdateHandling,
         addpath: AddPathCtx,
-    ) -> BgpResult<(Self, UpdateReport)> {
+    ) -> BgpResult<(Self, UpdateOutcome)> {
         let mut r = Reader::new(buf);
         let marker = r.take(16).ok_or_else(|| BgpError::local("short header"))?;
         if marker != BGP_MARKER {
@@ -167,7 +167,7 @@ impl BgpMessage {
             ));
         }
         Ok(match msg_type {
-            message_type::OPEN => (Self::Open(BgpOpen::decode(body)?), UpdateReport::default()),
+            message_type::OPEN => (Self::Open(BgpOpen::decode(body)?), UpdateOutcome::Clean),
             message_type::UPDATE => {
                 let (update, report) =
                     BgpUpdate::decode_with_handling(body, asn4, handling, addpath)?;
@@ -175,14 +175,14 @@ impl BgpMessage {
             }
             message_type::NOTIFICATION => (
                 Self::Notification(BgpNotification::decode(body)?),
-                UpdateReport::default(),
+                UpdateOutcome::Clean,
             ),
             // §4.4: a KEEPALIVE is exactly the 19-octet header (the
             // type-minimum check above rejected any data octets).
-            message_type::KEEPALIVE => (Self::Keepalive, UpdateReport::default()),
+            message_type::KEEPALIVE => (Self::Keepalive, UpdateOutcome::Clean),
             _ => (
                 Self::RouteRefresh(BgpRouteRefresh::decode(body)?),
-                UpdateReport::default(),
+                UpdateOutcome::Clean,
             ),
         })
     }
@@ -605,13 +605,17 @@ impl BgpUpdate {
     /// top-level fields (the withdrawn/NLRI framing rules are
     /// un-revised: a message-level overrun stays Malformed Attribute
     /// List and NLRI errors stay Invalid Network Field, both session
-    /// resets).
+    /// resets). The structured [`UpdateOutcome`] (B-1) is finalized
+    /// here: §3(j) routes only what parsed, §3(d)'s missing
+    /// well-known mandatory attributes fold into treat-as-withdraw,
+    /// and §5.2's no-reachable-NLRI shape escalates to the session
+    /// reset.
     pub(crate) fn decode_with_handling(
         buf: &[u8],
         asn4: bool,
         handling: UpdateHandling,
         addpath: AddPathCtx,
-    ) -> BgpResult<(Self, UpdateReport)> {
+    ) -> BgpResult<(Self, UpdateOutcome)> {
         let mut r = Reader::new(buf);
         let withdrawn_len = r
             .u16()
@@ -650,14 +654,85 @@ impl BgpUpdate {
             nlri.push(decode_nlri(&mut r, false, addpath.v4)?);
         }
 
-        Ok((
-            Self {
-                withdrawn,
-                attrs: decoded.attrs,
-                nlri,
-            },
-            decoded.report,
-        ))
+        let update = Self {
+            withdrawn,
+            attrs: decoded.attrs,
+            nlri,
+        };
+        let mut ledger = decoded.handling;
+
+        // §3(d): "If any of the well-known mandatory attributes are
+        // not present in an UPDATE message, then 'treat-as-withdraw'
+        // MUST be used" — folded into the outcome for v4-NLRI
+        // announcements (validate_well_known's scope; RFC 4760 §3.2
+        // governs MP routes), the strict mode keeping the RFC 4271
+        // session reset via `validate_well_known` below. A mandatory
+        // attribute that was malformed names itself already; its
+        // post-discard absence is not double-reported.
+        if handling.is_rfc7606() && !update.nlri.is_empty() {
+            for want in [
+                crate::attr::attr_type::ORIGIN,
+                crate::attr::attr_type::AS_PATH,
+                crate::attr::attr_type::NEXT_HOP,
+            ] {
+                if update.attr(want).is_none() && !ledger.causes.iter().any(|(t, _)| *t == want) {
+                    ledger.treat_as_withdraw(
+                        want,
+                        format!("UPDATE with NLRI missing well-known attribute {want} (§6.3)"),
+                        Some((
+                            error::error_code::UPDATE_MESSAGE,
+                            error::update_subcode::MISSING_WELL_KNOWN_ATTRIBUTE,
+                        )),
+                    );
+                }
+            }
+        } else {
+            update.validate_well_known()?;
+        }
+
+        let outcome = if !ledger.withdraw {
+            if ledger.causes.is_empty() {
+                UpdateOutcome::Clean
+            } else {
+                UpdateOutcome::Discarded(ledger.causes)
+            }
+        } else {
+            // §5.2: an UPDATE "that does contain path attributes other
+            // than MP_UNREACH_NLRI and doesn't encode any reachable
+            // NLRI" leaves us unable "to be confident that the NLRI
+            // have been successfully parsed as Section 3 (j) requires"
+            // — any non-discard error there escalates to the session
+            // reset. (A well-formed lone MP_UNREACH — the EOR shape —
+            // never carries a trigger; a malformed attribute is
+            // itself a "path attribute other than MP_UNREACH_NLRI".)
+            let has_reachable = !update.nlri.is_empty()
+                || update
+                    .attrs
+                    .iter()
+                    .any(|a| matches!(a, PathAttribute::MpReach(mp) if !mp.nlri.is_empty()));
+            if !has_reachable {
+                let (code, sub) = ledger.notify.unwrap_or((
+                    error::error_code::UPDATE_MESSAGE,
+                    error::update_subcode::MALFORMED_ATTRIBUTE_LIST,
+                ));
+                return Err(BgpError::notify(
+                    code,
+                    sub,
+                    "no reachable NLRI with a treat-as-withdraw-class error: \
+                     session reset (RFC 7606 §5.2)",
+                ));
+            }
+            // §2: "as though all contained routes had been withdrawn" —
+            // the announced set leaves and the explicit withdrawals
+            // still apply; every route named only as parsed (§3(j)).
+            let mut routes = update.announced();
+            routes.extend(update.withdrawn_all());
+            UpdateOutcome::Withdrawn {
+                routes,
+                causes: ledger.causes,
+            }
+        };
+        Ok((update, outcome))
     }
 
     /// True when this UPDATE is an End-of-RIB marker (RFC 4724 §3): no
@@ -770,6 +845,19 @@ impl BgpRouteRefresh {
 /// Reusable builders for the messages the session layer sends.
 pub fn keepalive() -> BgpMessage {
     BgpMessage::Keepalive
+}
+
+/// One frame the session read: the decoded message, its RFC 7606
+/// outcome (UPDATEs; [`UpdateOutcome::Clean`] otherwise), and the raw
+/// frame bytes — RFC 7606 §6's debugging facility "must include
+/// logging an error listing the NLRI involved and containing the
+/// entire malformed UPDATE message", so the bytes ride along for
+/// exactly that log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrame {
+    pub message: BgpMessage,
+    pub outcome: UpdateOutcome,
+    pub frame: Vec<u8>,
 }
 
 pub fn route_refresh(afi: u16, safi: u8) -> BgpMessage {
@@ -1099,6 +1187,9 @@ mod tests {
             attrs: vec![
                 PathAttribute::Origin(Origin::Igp),
                 PathAttribute::AsPath(AsPath::default()),
+                // The v4 NLRI needs the mandatory triple (§6.3; the
+                // §3(d) fold makes strict decode check it here).
+                PathAttribute::NextHop(id(2)),
                 PathAttribute::MpUnreach(MpUnreach {
                     afi: 2,
                     safi: 1,
@@ -1252,13 +1343,20 @@ mod tests {
         assert!(!ctx.for_family(1, 1));
         // And a v4 classic NLRI in the same message decodes with
         // path_id 0 (classic key) even under this ctx.
-        let mixed = BgpUpdate {
+        let mut mixed = BgpUpdate {
             withdrawn: vec![],
             attrs: update.attrs.clone(),
             nlri: vec![Nlri::from(
                 "203.0.113.0/24".parse::<common::IpPrefix>().unwrap(),
             )],
         };
+        // The v4 NLRI's mandatory triple (§6.3): the MP-only attrs of
+        // the v6 update above do not cover it.
+        mixed.attrs.extend([
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(AsPath::default()),
+            PathAttribute::NextHop(id(3)),
+        ]);
         let frame = BgpMessage::Update(mixed.clone())
             .encode_with(true, ctx)
             .unwrap();
@@ -1457,6 +1555,176 @@ mod tests {
                     "round {round}"
                 );
             }
+        }
+    }
+
+    // ---- RFC 7606 structured outcome (B-1/B-2, S8-a) ----------------
+
+    use crate::attr::UpdateOutcome;
+
+    fn decode_7606(body: &[u8]) -> BgpResult<(BgpUpdate, UpdateOutcome)> {
+        BgpUpdate::decode_with_handling(
+            body,
+            false,
+            UpdateHandling::Rfc7606 { internal: false },
+            AddPathCtx::default(),
+        )
+    }
+
+    /// B-1's enum end to end (UPDATE level): Clean / Discarded /
+    /// Withdrawn, the withdrawal set built from the parseable NLRI
+    /// (§3(j)) and naming both directions of "contained" (§2).
+    #[test]
+    fn update_outcome_enum_three_dispositions() {
+        // Clean: the golden announce shape.
+        let clean = unhex("0000 0012 40010100 400204 0201fdea 400304 0a000002 18cb0071");
+        let (_, outcome) = decode_7606(&clean).unwrap();
+        assert_eq!(outcome, UpdateOutcome::Clean);
+
+        // Withdrawn (§2): malformed ORIGIN (length 2) with NLRI — the
+        // routes are exactly what parsed (AS_PATH + NEXT_HOP are good,
+        // so ORIGIN is the sole cause).
+        let taw = unhex("0000 0013 400102 0000 400204 0201fdea 400304 0a000002 18cb0071");
+        let (update, outcome) = decode_7606(&taw).unwrap();
+        assert_eq!(
+            outcome,
+            UpdateOutcome::Withdrawn {
+                routes: vec!["203.0.113.0/24".parse().unwrap()],
+                causes: vec![(1, "attribute 1 length 2, expected 1 (§4.3)".into())],
+            },
+            "the announced prefix is the withdrawal set"
+        );
+        assert!(
+            !update.nlri.is_empty(),
+            "the NLRI parsed — §3(j)'s prerequisite for treat-as-withdraw"
+        );
+
+        // Withdrawn names the explicit withdrawals too (§2 "all
+        // contained routes") — a mixed frame (receiver tolerance,
+        // §5.1's "MUST still be prepared to receive ... any ...
+        // combination") carries both directions.
+        let taw = unhex("0004 18c63364 0013 400102 0000 400204 0201fdea 400304 0a000002 18cb0071");
+        let (_, outcome) = decode_7606(&taw).unwrap();
+        match outcome {
+            UpdateOutcome::Withdrawn { routes, .. } => assert_eq!(
+                routes,
+                vec![
+                    "203.0.113.0/24".parse().unwrap(),
+                    "198.51.100.0/24".parse().unwrap(),
+                ]
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        // Discarded (§2's third disposition): a wrong-length
+        // AGGREGATOR rides with a processable route.
+        let disc =
+            unhex("0000 0018 40010100 400204 0201fdea 400304 0a000002 c00703 010203 18cb0071");
+        let (update, outcome) = decode_7606(&disc).unwrap();
+        assert_eq!(update.nlri.len(), 1, "the route processes");
+        match outcome {
+            UpdateOutcome::Discarded(causes) => assert_eq!(causes[0].0, 7),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// §3(d): "If any of the well-known mandatory attributes are not
+    /// present in an UPDATE message, then 'treat-as-withdraw' MUST be
+    /// used" — folded into the outcome (the strict mode keeps the
+    /// §6.3 session reset with subcode 3 and the absent type in the
+    /// data field shape).
+    #[test]
+    fn missing_well_known_folds_into_the_outcome() {
+        // ORIGIN + AS_PATH but no NEXT_HOP, with NLRI.
+        let body = unhex("0000 0007 40010100 400200 18cb0071");
+        let (update, outcome) = decode_7606(&body).unwrap();
+        assert!(!update.nlri.is_empty());
+        match outcome {
+            UpdateOutcome::Withdrawn { routes, causes } => {
+                assert_eq!(routes, vec!["203.0.113.0/24".parse().unwrap()]);
+                assert!(causes[0].1.contains("missing well-known"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let err = BgpUpdate::decode(&body, false).unwrap_err();
+        assert_eq!(
+            err.notification,
+            Some((3, error::update_subcode::MISSING_WELL_KNOWN_ATTRIBUTE)),
+            "strict mode: the RFC 4271 session reset"
+        );
+    }
+
+    /// §5.2, verbatim shape: "if an UPDATE message ... does contain
+    /// path attributes other than MP_UNREACH_NLRI and doesn't encode
+    /// any reachable NLRI ... if any ... error specifies an approach
+    /// other than 'attribute discard', then the 'session reset'
+    /// approach MUST be used" — treat-as-withdraw is voided for the
+    /// no-NLRI shapes, kept when NLRI parsed, and attribute discard
+    /// never escalates.
+    #[test]
+    fn rfc7606_5_2_no_reachable_nlri_escalates_to_reset() {
+        // Bad ORIGIN, no NLRI at all: cannot be confident the NLRI
+        // parsed (§3(j)) → session reset with the triggering subcode.
+        let body = unhex("0000 0005 400102 0000");
+        let err = decode_7606(&body).unwrap_err();
+        assert_eq!(
+            err.notification,
+            Some((3, error::update_subcode::ATTRIBUTE_LENGTH_ERROR))
+        );
+        assert!(err.message.contains("§5.2"));
+
+        // Withdrawal-only UPDATE with a bad MED: same escalation.
+        let body = unhex("0004 18c63364 000a 40010100 800403 000001");
+        let err = decode_7606(&body).unwrap_err();
+        assert_eq!(
+            err.notification,
+            Some((3, error::update_subcode::ATTRIBUTE_LENGTH_ERROR)),
+            "no reachable NLRI: treat-as-withdraw voided (§5.2)"
+        );
+
+        // The contrast: the same bad ORIGIN WITH NLRI stays
+        // treat-as-withdraw (§2/§3(j) satisfied).
+        let body = unhex("0000 0005 400102 0000 18cb0071");
+        assert!(matches!(
+            decode_7606(&body).unwrap().1,
+            UpdateOutcome::Withdrawn { .. }
+        ));
+
+        // Attribute-discard errors never escalate (§5.2's "other than
+        // 'attribute discard'"): bad AGGREGATOR, no NLRI → Discarded.
+        let body = unhex("0000 000a 40010100 c00703 010203");
+        assert!(matches!(
+            decode_7606(&body).unwrap().1,
+            UpdateOutcome::Discarded(_)
+        ));
+    }
+
+    /// The strict escape hatch (B-2's knob,
+    /// `neighbor X update-error-handling strict-rfc4271`): the same
+    /// frames under RFC 4271 handling are session resets, never
+    /// salvageable outcomes.
+    #[test]
+    fn strict_rfc4271_keeps_the_session_resets() {
+        let strict = |body: &[u8]| {
+            BgpUpdate::decode_with_handling(
+                body,
+                false,
+                UpdateHandling::StrictRfc4271,
+                AddPathCtx::default(),
+            )
+        };
+        for body in [
+            // treat-as-withdraw class: malformed ORIGIN with NLRI.
+            unhex("0000 0005 400102 0000 18cb0071"),
+            // attribute-discard class: bad AGGREGATOR.
+            unhex("0000 0007 40010100 c00703 010203"),
+        ] {
+            let err = strict(&body).unwrap_err();
+            assert_eq!(
+                err.notification.map(|(c, _)| c),
+                Some(3),
+                "UPDATE Message Error, the §6.3 reset"
+            );
         }
     }
 }

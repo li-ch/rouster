@@ -25,15 +25,16 @@ use tracing::{info, warn};
 
 use crate::attr::{
     AddPathCtx, AsPath, MpNextHop, MpReach, Nlri, Origin, PathAttribute, UpdateHandling,
-    UpdateReport,
+    UpdateOutcome,
 };
 use crate::capability::{AddPathFamily, Capability};
 use crate::error::{self, BgpError, BgpResult};
 use crate::fsm::{Action, Event, Fsm, SessionConfig, State};
 use crate::message::{
-    BgpMessage, BgpNotification, BgpOpen, BgpRouteRefresh, BgpUpdate, BGP_HEADER_LEN, BGP_MARKER,
-    BGP_MAX_MESSAGE_LEN,
+    BgpMessage, BgpNotification, BgpOpen, BgpRouteRefresh, BgpUpdate, DecodedFrame, BGP_HEADER_LEN,
+    BGP_MARKER, BGP_MAX_MESSAGE_LEN,
 };
+use crate::wire::hex;
 
 /// What the session learned, for RIB bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,8 +643,8 @@ where
             tokio::select! {
                 read = read_frame_with(&mut self.io, asn4, handling, add_path) => {
                     match read {
-                        Ok(Ok((message, report))) => {
-                            if let Some(end) = self.on_message(message, report, sink).await {
+                        Ok(Ok(decoded)) => {
+                            if let Some(end) = self.on_message(decoded, sink).await {
                                 return end;
                             }
                         }
@@ -825,10 +826,10 @@ where
 
     async fn on_message<S: RouteSink>(
         &mut self,
-        message: BgpMessage,
-        report: UpdateReport,
+        decoded: DecodedFrame,
         sink: &mut S,
     ) -> Option<SessionEnd> {
+        let message = decoded.message;
         match message {
             BgpMessage::Open(open) => {
                 // §6.2: the peer's AS must match the configured one.
@@ -881,51 +882,46 @@ where
                     }
                     return self.step(Event::UpdateMsg, sink).await;
                 }
-                if let Err(err) = update.validate_well_known() {
-                    let (code, sub) = err.notification.unwrap_or((3, 1));
-                    // RFC 7606 §7: a missing well-known mandatory
-                    // attribute is treat-as-withdraw, not a session
-                    // reset ("missing well-known mandatory attributes
-                    // require treat-as-withdraw").
-                    if self.update_handling.is_rfc7606() {
-                        let gone = update.announced();
-                        if !gone.is_empty() {
-                            warn!(peer = %self.peer.address, detail = %err,
-                                "bgpd: UPDATE missing well-known attribute, routes withdrawn (RFC 7606 §7)");
-                            sink.withdraw(&self.peer, &gone);
+                // RFC 7606's structured outcome (B-1): the explicit
+                // third disposition. §3(d)'s missing well-known
+                // mandatory attributes and §5.2's escalation fold in
+                // at the decode; §6's full-UPDATE log line rides here.
+                match decoded.outcome {
+                    UpdateOutcome::Withdrawn { routes, causes } => {
+                        // §2: "treat the UPDATE ... as though all
+                        // contained routes had been withdrawn" — the
+                        // announced prefixes leave the Adj-RIB-In, the
+                        // explicit withdrawals still apply, and the
+                        // session itself is unaffected. §6: "logging
+                        // an error listing the NLRI involved and
+                        // containing the entire malformed UPDATE
+                        // message".
+                        warn!(peer = %self.peer.address,
+                            nlri = ?routes.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                            attrs = ?causes.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+                            update = %hex(&decoded.frame),
+                            "bgpd: malformed UPDATE treated as withdrawal (RFC 7606 §2, §6)");
+                        #[cfg(feature = "experimental-savnet")]
+                        if let Some(agent) = &self.agent {
+                            let source = sav::agent::SavEventSource::Bgp(self.sav_peer());
+                            for nlri in &routes {
+                                agent.on_event(sav::agent::SavAgentEvent::RouteWithdrawn {
+                                    source: source.clone(),
+                                    prefix: nlri.prefix,
+                                });
+                            }
                         }
+                        sink.withdraw(&self.peer, &routes);
                         return self.step(Event::UpdateMsg, sink).await;
                     }
-                    return self.step(Event::UpdateMsgErr(code, sub), sink).await;
-                }
-                if report.treat_as_withdraw {
-                    // RFC 7606 §2: "treat the UPDATE ... as though all
-                    // contained routes had been withdrawn" — the
-                    // announced prefixes leave the Adj-RIB-In, the
-                    // explicit withdrawals still apply, and the
-                    // session itself is unaffected.
-                    let mut gone = update.announced();
-                    gone.extend(update.withdrawn_all());
-                    warn!(peer = %self.peer.address,
-                        attrs = ?report.discarded.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-                        "bgpd: malformed UPDATE treated as withdrawal (RFC 7606)");
-                    #[cfg(feature = "experimental-savnet")]
-                    if let Some(agent) = &self.agent {
-                        let source = sav::agent::SavEventSource::Bgp(self.sav_peer());
-                        for nlri in &gone {
-                            agent.on_event(sav::agent::SavAgentEvent::RouteWithdrawn {
-                                source: source.clone(),
-                                prefix: nlri.prefix,
-                            });
-                        }
+                    UpdateOutcome::Discarded(causes) => {
+                        warn!(peer = %self.peer.address,
+                            nlri = ?update.announced().iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                            attrs = ?causes,
+                            update = %hex(&decoded.frame),
+                            "bgpd: malformed attributes discarded, UPDATE processed (RFC 7606 §2, §6)");
                     }
-                    sink.withdraw(&self.peer, &gone);
-                    return self.step(Event::UpdateMsg, sink).await;
-                }
-                if !report.discarded.is_empty() {
-                    warn!(peer = %self.peer.address,
-                        attrs = ?report.discarded,
-                        "bgpd: malformed attributes discarded, UPDATE processed (RFC 7606 §2)");
+                    UpdateOutcome::Clean => {}
                 }
                 // §9.5: discard UPDATEs whose AS_PATH carries our own
                 // AS (loop); the connection itself is unaffected.
@@ -1250,12 +1246,13 @@ pub async fn read_frame<IO: AsyncRead + Unpin>(
         AddPathCtx::default(),
     )
     .await
-    .map(|r| r.map(|(m, _)| m))
+    .map(|r| r.map(|decoded| decoded.message))
 }
 
 /// [`read_frame`] with selectable UPDATE error handling: an RFC 7606
-/// mode returns salvageable UPDATEs together with their handling
-/// report instead of an error. `add_path` carries the negotiated
+/// mode returns salvageable UPDATEs together with the structured
+/// handling outcome (and the raw frame, for §6's full-UPDATE debug
+/// log) instead of an error. `add_path` carries the negotiated
 /// ADD-PATH direction (RFC 7911 §3): extended NLRI decodes only where
 /// both sides negotiated it.
 pub async fn read_frame_with<IO: AsyncRead + Unpin>(
@@ -1263,7 +1260,7 @@ pub async fn read_frame_with<IO: AsyncRead + Unpin>(
     asn4: bool,
     handling: UpdateHandling,
     add_path: AddPathCtx,
-) -> io::Result<BgpResult<(BgpMessage, UpdateReport)>> {
+) -> io::Result<BgpResult<DecodedFrame>> {
     let mut header = [0u8; BGP_HEADER_LEN as usize];
     io.read_exact(&mut header).await?;
     if header[..16] != BGP_MARKER {
@@ -1285,9 +1282,15 @@ pub async fn read_frame_with<IO: AsyncRead + Unpin>(
     io.read_exact(&mut body).await?;
     let mut frame = header.to_vec();
     frame.extend_from_slice(&body);
-    Ok(BgpMessage::decode_with_handling(
-        &frame, asn4, handling, add_path,
-    ))
+    Ok(
+        BgpMessage::decode_with_handling(&frame, asn4, handling, add_path).map(
+            |(message, outcome)| DecodedFrame {
+                message,
+                outcome,
+                frame,
+            },
+        ),
+    )
 }
 
 /// The v1 Adj-RIB-Out source: the `network` lines from the config,

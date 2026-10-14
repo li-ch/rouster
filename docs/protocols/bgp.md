@@ -85,37 +85,53 @@ rules.
 - **Unconfigured = accept-all = v1 behavior** — both interop smokes
   (the unmodified P2-b one and the policy one) run the same daemon.
 
-### RFC 7606 revised error handling (N5 M1)
+### RFC 7606 revised error handling (N5 M1, restaged S8-a)
 
-The UPDATE decoder applies the §7 per-attribute disposition table
-(`attr::rfc7606_disposition`, table-driven and cited row by row) by
-default; the RFC 4271 §6.3 session-reset behavior remains available
-per neighbor as `neighbor X update-error-handling strict-rfc4271`
-(default `rfc7606`). The implemented rows (subcodes as the strict
-decoder produces them):
+The UPDATE decode path is structured around `attr::UpdateOutcome`
+(B-1): **Clean / Discarded(causes) / Withdrawn { routes, causes }**,
+with the session reset remaining the `Err` side — the explicit third
+disposition §2 names, and §3(j) handled structurally: `Withdrawn`
+carries exactly the successfully parsed NLRI/MP sets, and an UPDATE
+whose NLRI cannot be parsed is the `Err` reset ("the 'session reset'
+approach ... MUST be followed"). The per-attribute dispositions come
+from the §7 table (`attr::rfc7606_disposition`, table-driven and
+cited row by row); the RFC 4271 §6.3 session-reset behavior remains
+available per neighbor as `neighbor X update-error-handling
+strict-rfc4271` (default `rfc7606`). The implemented rows (subcodes
+as the strict decoder produces them):
 
-- **Treat-as-withdraw**: ORIGIN (any malformation), AS_PATH, NEXT_HOP,
-  MULTI_EXIT_DISC, COMMUNITIES ("not a non-zero multiple of 4"), AS4_PATH,
-  OTC (disclosed judgment — §7 does not list type 35; discarding a
-  malformed OTC would silently change leak eligibility), LOCAL_PREF
-  from iBGP, missing well-known mandatory attributes, and
-  Optional/Transitive flag conflicts for every attribute (§7's general
-  flags rule).
-- **Attribute discard**: LOCAL_PREF from eBGP, ATOMIC_AGGREGATE (len ≠ 0),
-  AGGREGATOR/AS4_AGGREGATOR (wrong length) — the route processes
-  normally without the attribute; later occurrences of a duplicate
-  attribute (§7) are discarded too.
+- **Treat-as-withdraw** (§3(e), §7): ORIGIN (any malformation),
+  AS_PATH, NEXT_HOP, MULTI_EXIT_DISC, COMMUNITIES ("not a non-zero
+  multiple of 4"), AS4_PATH (§8 mirrors AS_PATH), OTC (disclosed
+  judgment — §7 does not list type 35; discarding a malformed OTC
+  would silently change leak eligibility), LOCAL_PREF from iBGP,
+  missing well-known mandatory attributes (§3(d), folded into the
+  outcome at the UPDATE level), and Optional/Transitive flag
+  conflicts for every attribute (§3(c)).
+- **Attribute discard** (§3(f), §7): LOCAL_PREF from eBGP,
+  ATOMIC_AGGREGATE (len ≠ 0), AGGREGATOR/AS4_AGGREGATOR (wrong
+  length) — the route processes normally without the attribute;
+  later occurrences of a duplicate attribute (§3(g)) are discarded
+  too.
 - **Session reset** (unchanged by RFC 7606): message-level framing
-  overruns (Malformed Attribute List), unrecognized well-known
-  attributes (§6.3), unparseable MP_REACH/MP_UNREACH content
-  (§5: next-hop length inconsistencies and bad NLRI keep the reset),
-  and duplicate MP_REACH/MP_UNREACH.
+  overruns (Malformed Attribute List, §3(b)), unrecognized well-known
+  attributes (§6.3), unparseable MP_REACH/MP_UNREACH content (§5.3:
+  next-hop length inconsistencies and bad NLRI keep the reset),
+  duplicate MP_REACH/MP_UNREACH (§3(g)), and **§5.2's escalation**: a
+  treat-as-withdraw-class error in an UPDATE that carries path
+  attributes other than a lone MP_UNREACH but "doesn't encode any
+  reachable NLRI" voids treat-as-withdraw — "we cannot be confident
+  that the NLRI have been successfully parsed as Section 3 (j)
+  requires" — and the session reset runs with the triggering error's
+  subcode. Attribute-discard errors never escalate (§5.2's "other
+  than 'attribute discard'").
 
 Treat-as-withdraw withdraws the UPDATE's own NLRI from the
-Adj-RIB-In (`peer.rs` logs "treated as withdrawal"); attribute
-discards log and process. The strict mode also now carries the
-§6.3-prescribed subcode on its NOTIFICATION (previously flattened
-to 1).
+Adj-RIB-In; attribute discards log and process. Both arms carry §6's
+debugging facility — "logging an error listing the NLRI involved and
+containing the entire malformed UPDATE message" (the raw frame, hex,
+rides `DecodedFrame` to the log line). The strict mode carries the
+§6.3-prescribed subcode on its NOTIFICATION.
 
 ### Route-server mode v1 (N5 M2)
 
