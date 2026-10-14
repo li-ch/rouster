@@ -233,11 +233,30 @@ exemptions leave (Step 7), and G applies at every provider interface
 selected by the receiving role), or AS_SET-carrying never feed the
 derivation.
 
+**The ASPA-provider-set edges (S10-c)** — the draft's two load-bearing
+wordings against each other, every case test-pinned in `barsav.rs`
+(30 unit tests total):
+
+- §4 Step 5, permissive: *"AS-set A(i) of all ASNs whose ASPA data
+  declares **at least one** ASN in AS-set Z(i-1) as a Provider."*
+- §8 Step 5, strict: *"each AS in the AS path of each route has **all**
+  its Provider ASes (per ASPAs) **contained within AS-set Du**."*
+
+| Edge (test) | Wording that decides | Disclosed gaps |
+|---|---|---|
+| Dual-homed cone AS joins D but is barred from S | "at least one" (§4) vs "all contained" (§8) — the asymmetry is the draft's own | none — both wordings explicit |
+| Top-of-cone customer attested to the local AS: prefixes leave S; unattested, they stay (one attestation flips it) | "all ... contained within AS-set Du", literally (the local AS ∉ Du) | whether the SAV-performing AS belongs in Du is unspecified — this is why the S9-a smoke leaves the top AS unattested; we follow the letter |
+| AS 0 inside a provider set counts against containment | "all its Provider ASes ... contained", literally (0 ∉ Du) | §4 Step 6 scrubs AS 0 from A(i) membership only; nothing scrubs provider sets. An AS 0 listing asserts "no other providers" (aspa-verification §5.1), which would argue the opposite — recorded, not re-decided |
+| A private/IANA special-purpose ASN inside a provider set ditto | same literal | same gap class |
+| Provider-interface feasible routes join the §8 Step-5 walk ("each route") | the after-Step-8 note: feasible paths come from §4's discovered relations | "feasible routes" has no enumerated source; we read it as the preamble-clean Adj-RIBs-In over all interfaces (§4 Step 7's source) |
+| §8 Step 3 wants "Valid AS path" while the §4 preamble excludes only Invalid | Step 3's "Valid" (strict) vs preamble's "Invalid" (permissive) | an Unknown path feeds the cone walk and Q2 but not S; a prefix with zero usable customer routes starves Step 3 (≥1 required — nothing else attests exclusivity) |
+| Peer-cone ASPAs never join Du | §8 Step 1: "for each customer interface" | whether lateral peers should join the subtraction is unaddressed; we follow the letter |
+
 The derivation's output is typed IBA rules (GSC -03 §2.1 — BAR-SAV is
-one of the mechanisms GSC names as needing exactly that shape) with
+one of the mechanisms GSC names as needing exactly this shape) with
 provenance `RuleOrigin::BarSav` (a NEW origin, deliberately not
 `SavnetAgent`), compiled through the SAME SAV table manager as every
-other rule source. 19 unit tests + 5 table tests
+other rule source. 30 unit tests + 5 table tests
 (`crates/sav/tests/barsav_table.rs`).
 
 ### The feed (M3) and the knobs (M2)
@@ -289,18 +308,15 @@ stay green untouched.
 
 ### §Deferred (BAR-SAV)
 
-- **The draft's open ASPA edges** (named by -10 itself): §8 Step 5's
-  "all its Provider ASes (per ASPAs) contained within AS-set Du" is
-  implemented as the literal vacuous truth for an unattested AS —
-  which makes the top-of-cone customer (whose provider is the local
-  AS, never in Du) pass on no-attestation but fail when attested to
-  us. Whether the local AS belongs in Du for Step 5 is the draft's
-  open edge; the smoke's snapshot simply leaves the top AS
-  unattested. Same class: §8 Step 3's "all RPKI-ROV Valid" over
-  zero customer routes (we require ≥1).
-- **§8 Step 1's wording** computes Du over CUSTOMER interfaces only —
-  whether lateral peers join the provider subtraction is unaddressed
-  by the draft; we follow the letter.
+- **The draft's ASPA-provider-set edges are LANDED and pinned** (the
+  table above): the permissive/strict asymmetry, the top-of-cone
+  local-AS attestation flip, AS 0 and special-purpose ASNs in provider
+  sets, the "each route" scope, Step 3's Valid-vs-the-preamble's-
+  Invalid bar, customer-only Du. What stays open is the DRAFT's
+  silence itself: the literal readings above (local AS ∉ Du at
+  Step 5; AS 0 / special-purpose ASNs counting against provider-set
+  containment; the feasible-route source) hold until a -11 (or
+  successor) says otherwise — tracked, not re-decided locally.
 - §4 Step 3/13's per-interface ASN/Prefix ACLs exist in the pure
   model (`BarNeighbor`) but have no savd.conf lines yet.
 - The §8 Step 8 per-provider-interface extension of G, iBGP and
