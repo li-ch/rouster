@@ -83,6 +83,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "configd"
+version = "0.0.0"
+dependencies = [
+ "common",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

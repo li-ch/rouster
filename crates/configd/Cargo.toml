@@ -1,0 +1,12 @@
+[package]
+name = "configd"
+description = "Rouster config manager - transactional compose/validate/apply across daemons (Phase 4 opener)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { workspace = true }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
