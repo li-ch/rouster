@@ -218,7 +218,7 @@ runtime-error-to-reject path; totality is what makes evaluation pure
 and safely concurrent. Hot path: `Filter::apply` walks `&Term`/`&Action`
 and mutates the caller's `RouteData` — no allocation except
 community-list rewrites and path prepends (attribute edits by nature).
-Not benchmarked; disclosed.
+Measured: §8.
 
 ## 5. The route-map compatibility grammar (M4)
 
@@ -434,6 +434,56 @@ Maps" summary table:
   communities.
 - A BIRD-syntax parser over the same `Term`/`Action` data (the
   language is Rust-API first by design; the parser is additive later).
-- Prefix-set trie if sets grow beyond configuration scale.
-- Benchmarks for the hot path (allocation-free claim is by
-  construction, not measurement).
+
+## 8. Benchmarks (S10-c)
+
+Harness: `crates/policy/tests/bench.rs` — `std::time::Instant` timing
+over fixed-seed generated programs/routes (splitmix64; no bench
+dependency — criterion & co. are out of scope by fence). Two tiers:
+sub-second smoke cases run in the normal gate; the full matrix is
+`#[ignore]`d and run explicitly:
+
+```text
+cargo test -p policy --release --test bench -- --ignored --nocapture
+```
+
+Determinism: every case carries a checksum (hit counts, tag sums)
+asserted identical across reps and stable across code changes — the
+recorded numbers are comparable row-to-row.
+
+**Machine**: Apple M5 Max, 128 GB, macOS 27.0.1, rustc 1.99.0
+(b940084d7 2026-09-28), release profile, best of 3 reps,
+2026-10-15. Baseline (the linear `PrefixSet::matches` scan as landed
+in W1-a):
+
+| Case | entries | evals | best | ns/eval |
+|---|---|---|---|---|
+| `PrefixSet::matches` | 100 | 1k | 0.19 ms | 191 |
+| `PrefixSet::matches` | 100 | 100k | 10.6 ms | 106 |
+| `PrefixSet::matches` | 10k | 1k | 17.2 ms | 17 210 |
+| `PrefixSet::matches` | 10k | 100k | 1 729 ms | 17 294 |
+| `PrefixSet::matches` | 100k | 1k | 201 ms | 200 901 |
+| `PrefixSet::matches` | 100k | 100k | 20 849 ms | 208 488 |
+| `AsSet::contains` (binary search) | 10k ranges | 100k | 1.9 ms | 19.4 |
+| `PrefixList::first_match` | 1k | 100k | 47 ms | 469 |
+| `PrefixList::first_match` | 10k | 100k | 605 ms | 6 049 |
+| `AccessList::first_match` | 10k | 100k | 758 ms | 7 579 |
+| `Filter::apply` (8 rules, 1k set, incl. route clone) | 8 | 100k | 275 ms | 2 748 |
+| route-map parse (one-shot) | 100k lines | — | 20.0 ms | — |
+| route-map compile (one-shot) | 100k lines | — | 0.26 ms | — |
+
+Reading: at configuration scale (100 entries) the linear prefix-set
+scan is ~0.1-0.2 µs per lookup — fine. It grows linearly with set
+size and crosses from "configuration-sized" into a real hotspot at
+10k+ entries (17 µs per lookup, 201 µs at 100k — a full-table
+re-filter of 100k routes against a 100k-entry set would cost ~21 s).
+That is the §3.1-disclosed linear longest-match scan, now measured;
+the response is the §3.1 per-network bucket index (below). The FRR
+ordered first-match scans (`PrefixList`, `AccessList`) are also
+linear and stay so deliberately: their semantics is "first covering
+entry in sequence order", which the longest-match index cannot
+answer — sequence order and cover order are independent. Disclosed;
+config-scale only. `AsSet::contains` is the contrast column: the
+§3.2 interval representation ships O(log n) already.
+- Prefix-set trie if sets grow beyond configuration scale (the §8
+  measurement now says when that happens).
