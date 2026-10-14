@@ -17,7 +17,7 @@
 //!  neighbor 192.0.2.9 update-error-handling rfc7606
 //!  neighbor 192.0.2.9 route-server
 //!  neighbor 192.0.2.9 graceful-restart 120
-//!  neighbor 192.0.2.9 addpath rx
+//!  neighbor 192.0.2.9 addpath both
 //!  network 203.0.113.0/24
 //!  network 2001:db8:1::/48
 //!  import IN
@@ -186,13 +186,18 @@ pub struct NeighborConfig {
     /// — the 12-bit wire field). The receiving side is always on for
     /// peers that advertise the capability.
     pub graceful_restart: Option<u16>,
-    /// ADD-PATH receive (RFC 7911, `neighbor X addpath rx`, N5B):
+    /// ADD-PATH receive (RFC 7911, `neighbor X addpath rx|both`):
     /// advertise Send/Receive 1 for v4+v6 unicast; when the peer
-    /// offers to send (S/R 2/3), inbound NLRI for those families
-    /// uses the extended per-path encoding. Off by default. The send
-    /// side (S/R 2/3, per-path advertisement) is §Deferred — the
-    /// knob deliberately parses nothing else.
+    /// offers to send (S/R 2/3), inbound NLRI for those families uses
+    /// the extended per-path encoding. Off by default (BIRD-shaped
+    /// opt-in; FRR's receive side is default-on).
     pub add_path_rx: bool,
+    /// ADD-PATH transmit (RFC 7911, `neighbor X addpath tx|both`):
+    /// advertise Send/Receive 2 (3 together with rx) for v4+v6
+    /// unicast; when the peer offers to receive (S/R 1/3), outbound
+    /// NLRI uses the extended encoding under per-peer monotonic path
+    /// ids (the B-19 convention). Off by default.
+    pub add_path_tx: bool,
 }
 
 /// The whole daemon config.
@@ -464,6 +469,7 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                             route_server: false,
                             graceful_restart: None,
                             add_path_rx: false,
+                            add_path_tx: false,
                         });
                         if neighbor.remote_as != asn {
                             return Err(err(
@@ -539,23 +545,30 @@ pub fn parse_config(input: &str) -> Result<BgpdConfig, ConfigError> {
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
                         neighbor.graceful_restart = Some(secs);
                     }
-                    ["addpath", "rx"] => {
-                        // RFC 7911 receive side (N5B): S/R 1 toward the
-                        // peer for v4+v6 unicast. `tx`/`both` parse-error
-                        // until the send side lands (§Deferred) — a knob
-                        // that silently does nothing would be a lie.
+                    ["addpath", dir @ ..] => {
+                        // RFC 7911 knob (BIRD-shaped, default off):
+                        // `rx` = Send/Receive 1, `tx` = 2, `both` = 3
+                        // for both unicast families. Anything else is
+                        // an error naming the grammar — a knob that
+                        // silently does nothing would be a lie.
                         let neighbor = require_neighbor(&mut config, addr, line_no)?;
-                        neighbor.add_path_rx = true;
-                    }
-                    ["addpath", other @ ..] => {
-                        return Err(err(
-                            line_no,
-                            format!(
-                                "addpath expects rx (receive side, RFC 7911); the send side \
-                                 (`addpath {}`) is not implemented yet",
-                                other.join(" ")
-                            ),
-                        ))
+                        match dir {
+                            ["rx"] => neighbor.add_path_rx = true,
+                            ["tx"] => neighbor.add_path_tx = true,
+                            ["both"] => {
+                                neighbor.add_path_rx = true;
+                                neighbor.add_path_tx = true;
+                            }
+                            other => {
+                                return Err(err(
+                                    line_no,
+                                    format!(
+                                        "addpath expects rx|tx|both (RFC 7911), got `{}`",
+                                        other.join(" ")
+                                    ),
+                                ))
+                            }
+                        }
                     }
                     ["update-error-handling", mode] => {
                         let handling = UpdateErrorHandling::parse(mode).ok_or_else(|| {
@@ -986,27 +999,34 @@ bgp community-list standard CHOP-COMM permit 65000:1
         assert!(e.to_string().contains("no remote-as yet"), "{e}");
     }
 
-    /// RFC 7911 receive knob (N5B): `neighbor X addpath rx` on, off by
-    /// default, and nothing else parses — the send side is §Deferred
-    /// and a silently-dead knob would be worse than an error.
+    /// RFC 7911 knobs (B-21, BIRD-shaped default off): `addpath rx`,
+    /// `addpath tx`, and `addpath both` map to the Send/Receive
+    /// directions; anything else is an error naming the grammar.
     #[test]
-    fn addpath_rx_knob_parses() {
-        let config = parse_config(
-            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 addpath rx\n",
-        )
-        .unwrap();
-        assert!(config.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].add_path_rx);
-        let config = parse_config(
-            "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\n",
-        )
-        .unwrap();
-        assert!(!config.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()].add_path_rx);
-        for bad in ["addpath tx", "addpath both", "addpath"] {
-            let e = parse_config(&format!(
-                "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 {bad}\n"
+    fn addpath_knobs_parse() {
+        let parse = |knob: &str| {
+            parse_config(&format!(
+                "router bgp 65000\nbgp router-id 10.0.0.1\nneighbor 192.0.2.9 remote-as 65001\nneighbor 192.0.2.9 {knob}\n"
             ))
-            .unwrap_err();
-            assert!(e.to_string().contains("addpath"), "{bad}: {e}");
+        };
+        let rx = parse("addpath rx").unwrap();
+        let neighbor = &rx.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()];
+        assert!(neighbor.add_path_rx && !neighbor.add_path_tx);
+        let tx = parse("addpath tx").unwrap();
+        let neighbor = &tx.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()];
+        assert!(!neighbor.add_path_rx && neighbor.add_path_tx);
+        let both = parse("addpath both").unwrap();
+        let neighbor = &both.neighbors[&"192.0.2.9".parse::<IpAddr>().unwrap()];
+        assert!(neighbor.add_path_rx && neighbor.add_path_tx);
+        // Default off, and nothing else parses.
+        let bare = parse("addpath-nothing").unwrap_err();
+        assert!(bare.to_string().contains("unknown neighbor directive"));
+        for bad in ["addpath", "addpath rx tx"] {
+            let e = parse(bad).unwrap_err();
+            assert!(
+                e.to_string().contains("addpath expects rx|tx|both"),
+                "{bad}: {e}"
+            );
         }
     }
 }

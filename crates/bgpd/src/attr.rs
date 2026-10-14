@@ -521,8 +521,10 @@ impl std::str::FromStr for Nlri {
 /// Which families this session decodes/encodes with the ADD-PATH
 /// extended NLRI (RFC 7911 §3): the negotiated per-`<AFI, SAFI>`
 /// direction, a session fact like `asn4` — never a wire fact. Off by
-/// default (the RFC 4271 classic encoding); v1 fills it only from the
-/// *receive* negotiation (send side §Deferred).
+/// default (the RFC 4271 classic encoding); filled from the §5
+/// negotiation in BOTH directions — receive (locally configured rx AND
+/// the peer offered S/R 2/3) for inbound decode, transmit (locally
+/// configured tx AND the peer offered S/R 1/3) for outbound encode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AddPathCtx {
     /// Extended encoding active for (AFI 1, SAFI 1) — the top-level

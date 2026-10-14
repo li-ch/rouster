@@ -759,11 +759,13 @@ impl crate::peer::OutRib for LocRibOut {
                 updates.push(BgpUpdate {
                     withdrawn: vec![],
                     attrs,
-                    // Classic path id 0: re-advertised routes get OUR
-                    // encoding (RFC 7911 §2 — a re-advertiser "MUST
-                    // generate its own Path Identifier" — that send
-                    // side, with its per-peer allocator, is §Deferred;
-                    // v1 advertises the single best path per prefix).
+                    // Classic path id 0 at this seam: re-advertised
+                    // routes get OUR encoding (RFC 7911 §2 — a
+                    // re-advertiser "MUST generate its own Path
+                    // Identifier"), so the per-peer allocation happens
+                    // at the session send path (`PeerSession::
+                    // assign_tx_path_ids`), never by leaking the id
+                    // the route arrived under.
                     nlri: vec![Nlri::from(exported.prefix)],
                 });
             }

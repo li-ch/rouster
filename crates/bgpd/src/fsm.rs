@@ -136,10 +136,16 @@ pub struct SessionConfig {
     /// Locally configured ADD-PATH receive per unicast family
     /// (RFC 7911, `neighbor X addpath rx`): we then advertise
     /// Send/Receive 1 for that family. Off by default — the classic
-    /// NLRI encoding. (Send side §Deferred: no S/R 2/3 is ever
-    /// advertised in v1.)
+    /// NLRI encoding.
     pub add_path_rx_v4: bool,
     pub add_path_rx_v6: bool,
+    /// Locally configured ADD-PATH transmit per unicast family
+    /// (RFC 7911, `neighbor X addpath tx` — or `both`): we then
+    /// advertise Send/Receive 2 (3 together with rx) for that family,
+    /// and outbound NLRI toward a receiving peer uses the extended
+    /// encoding under our own per-peer path ids. Off by default.
+    pub add_path_tx_v4: bool,
+    pub add_path_tx_v6: bool,
 }
 
 impl SessionConfig {
@@ -151,6 +157,8 @@ impl SessionConfig {
             local_four_octet: true,
             add_path_rx_v4: false,
             add_path_rx_v6: false,
+            add_path_tx_v4: false,
+            add_path_tx_v6: false,
         }
     }
 }
@@ -184,6 +192,13 @@ pub struct Negotiated {
     /// extended encoding (the 4-octet Path Identifier, §3).
     pub add_path_rx_v4: bool,
     pub add_path_rx_v6: bool,
+    /// Effective ADD-PATH *transmit* direction per family — the §5
+    /// MUST mirrored: true only when we advertised Send/Receive 2 or 3
+    /// (locally configured tx) AND the peer advertised 1 or 3 (willing
+    /// to receive). Only then may outbound NLRI for the family use the
+    /// extended encoding, under our own path ids (§2).
+    pub add_path_tx_v4: bool,
+    pub add_path_tx_v6: bool,
 }
 
 /// The RFC 4724 §3 facts a receiving speaker needs from the peer's
@@ -420,6 +435,13 @@ impl Fsm {
                         && matches!(open.add_path(1, 1), 2 | 3),
                     add_path_rx_v6: self.config.add_path_rx_v6
                         && matches!(open.add_path(2, 1), 2 | 3),
+                    // The mirrored transmit MUST: we send multiple
+                    // paths only when we offered S/R 2/3 and the peer
+                    // offered S/R 1/3 (willing to receive).
+                    add_path_tx_v4: self.config.add_path_tx_v4
+                        && matches!(open.add_path(1, 1), 1 | 3),
+                    add_path_tx_v6: self.config.add_path_tx_v6
+                        && matches!(open.add_path(2, 1), 1 | 3),
                 };
                 let zero_hold = negotiated.hold_time == 0;
                 self.negotiated = Some(negotiated);
@@ -999,6 +1021,73 @@ mod tests {
         f.fire(Event::TcpConnectionConfirmed);
         f.fire(Event::BgpOpen(open_with(2, 0)));
         assert!(!f.negotiated().unwrap().add_path_rx_v6);
+    }
+
+    /// RFC 7911 §5's transmit MUST as the mirrored matrix: we send
+    /// extended NLRI only when locally configured tx AND the peer
+    /// offered Send/Receive 1 or 3 (willing to receive) for the family.
+    /// `both` against a `both` peer turns every direction on.
+    #[test]
+    fn add_path_effective_tx_matrix() {
+        let open_with = |v4: u8| {
+            let caps = if v4 == 0 {
+                vec![]
+            } else {
+                vec![Capability::AddPath(vec![
+                    crate::capability::AddPathFamily {
+                        afi: 1,
+                        safi: 1,
+                        send_receive: v4,
+                    },
+                ])]
+            };
+            BgpOpen::new(65001, 90, "10.9.9.9".parse().unwrap(), caps)
+        };
+        let negotiate = |local_tx: bool, peer_v4: u8| {
+            let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+            config.add_path_tx_v4 = local_tx;
+            let mut f = Fsm::new(config);
+            f.fire(Event::Start { passive: false });
+            f.fire(Event::TcpConnectionConfirmed);
+            f.fire(Event::BgpOpen(open_with(peer_v4)));
+            f.negotiated().unwrap().add_path_tx_v4
+        };
+        // local off: nothing the peer says turns extended tx on.
+        for peer in [0u8, 1, 2, 3] {
+            assert!(!negotiate(false, peer), "local-tx off, peer {peer}");
+        }
+        // local on: only a peer willing to receive (1 or 3) does.
+        assert!(!negotiate(true, 0), "peer silent");
+        assert!(negotiate(true, 1), "peer receive-only");
+        assert!(!negotiate(true, 2), "peer send-only");
+        assert!(negotiate(true, 3), "peer both");
+    }
+
+    /// `addpath both` against a both-capable peer: rx and tx both
+    /// negotiate for the family (S/R 3 on each side).
+    #[test]
+    fn add_path_both_config_negotiates_both_directions() {
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_rx_v4 = true;
+        config.add_path_tx_v4 = true;
+        let mut f = Fsm::new(config);
+        f.fire(Event::Start { passive: false });
+        f.fire(Event::TcpConnectionConfirmed);
+        f.fire(Event::BgpOpen(BgpOpen::new(
+            65001,
+            90,
+            "10.9.9.9".parse().unwrap(),
+            vec![Capability::AddPath(vec![
+                crate::capability::AddPathFamily {
+                    afi: 1,
+                    safi: 1,
+                    send_receive: 3,
+                },
+            ])],
+        )));
+        let n = f.negotiated().unwrap();
+        assert!(n.add_path_rx_v4 && n.add_path_tx_v4);
+        assert!(!n.add_path_rx_v6 && !n.add_path_tx_v6, "v6 untouched");
     }
 
     /// Session-identity facts: iBGP detection and AS_TRANS peers.

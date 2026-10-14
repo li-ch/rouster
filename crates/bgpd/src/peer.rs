@@ -279,6 +279,18 @@ pub struct PeerSession<IO> {
     /// lands — the FSM clears `negotiated` during teardown rows,
     /// before the actions perform).
     gr_negotiated: Option<crate::fsm::GracefulRestartInfo>,
+    /// ADD-PATH transmit (RFC 7911): our own Path Identifiers for this
+    /// peer, keyed by prefix — the B-19 per-peer monotonic-counter
+    /// convention. The map IS the stability guarantee: a prefix keeps
+    /// the id it was first assigned across re-advertisements (refresh
+    /// re-dumps, attribute churn); a fresh prefix takes the next
+    /// counter value; ids are never reused after withdrawal (§2 keys
+    /// the pair per neighbor; monotonicity is the convention, not an
+    /// RFC MUST).
+    tx_path_ids: BTreeMap<IpPrefix, u32>,
+    /// The monotonic counter backing [`Self::tx_path_ids`] (starts at
+    /// 1; 0 is the classic no-ADD-PATH key and is never allocated).
+    tx_next_path_id: u32,
     end: Option<SessionEnd>,
     /// Daemon-side observability (None in tests).
     shared: Option<Arc<SessionShared>>,
@@ -317,20 +329,21 @@ where
                 asn: local.local_as,
             },
         ];
-        // RFC 7911 §4 (receive side): one capability instance, one
-        // Send/Receive-1 tuple per locally rx-enabled family. Never
-        // advertised by default (classic encoding); S/R 2/3 is the
-        // §Deferred send side.
+        // RFC 7911 §4 (both directions): one capability instance, one
+        // tuple per locally-enabled family — Send/Receive 1 for rx, 2
+        // for tx, 3 for both. Never advertised by default (classic
+        // encoding); the single-instance MUST rules the shape.
+        let sr = |rx: bool, tx: bool| (rx as u8) | ((tx as u8) << 1);
         let add_path_tuples = [
-            (local.add_path_rx_v4).then_some(AddPathFamily {
+            (local.add_path_rx_v4 || local.add_path_tx_v4).then_some(AddPathFamily {
                 afi: 1,
                 safi: 1,
-                send_receive: 1,
+                send_receive: sr(local.add_path_rx_v4, local.add_path_tx_v4),
             }),
-            (local.add_path_rx_v6).then_some(AddPathFamily {
+            (local.add_path_rx_v6 || local.add_path_tx_v6).then_some(AddPathFamily {
                 afi: 2,
                 safi: 1,
-                send_receive: 1,
+                send_receive: sr(local.add_path_rx_v6, local.add_path_tx_v6),
             }),
         ]
         .into_iter()
@@ -360,6 +373,8 @@ where
             gr_retained: false,
             gr_hard_clear: false,
             gr_negotiated: None,
+            tx_path_ids: BTreeMap::new(),
+            tx_next_path_id: 1,
             end: None,
             shared: None,
             #[cfg(feature = "experimental-savnet")]
@@ -462,6 +477,67 @@ where
                 v6: n.add_path_rx_v6,
             },
             None => AddPathCtx::default(),
+        }
+    }
+
+    /// The ADD-PATH direction outbound UPDATEs encode under (RFC 7911
+    /// §5, the transmit MUST): extended NLRI only toward a peer that
+    /// negotiated it — locally configured tx AND the peer offered
+    /// S/R 1/3 (willing to receive) for the family.
+    fn current_add_path_tx_ctx(&self) -> AddPathCtx {
+        match self.fsm.negotiated() {
+            Some(n) => AddPathCtx {
+                v4: n.add_path_tx_v4,
+                v6: n.add_path_tx_v6,
+            },
+            None => AddPathCtx::default(),
+        }
+    }
+
+    /// Our Path Identifier for `prefix` toward this peer (RFC 7911
+    /// §2): stable once assigned (the re-advertisement keeps its id),
+    /// fresh prefixes take the next monotonic value, 0 is never
+    /// returned (the classic key).
+    fn tx_id_for(&mut self, prefix: IpPrefix) -> u32 {
+        if let Some(id) = self.tx_path_ids.get(&prefix) {
+            return *id;
+        }
+        let id = self.tx_next_path_id;
+        self.tx_next_path_id = self.tx_next_path_id.saturating_add(1);
+        self.tx_path_ids.insert(prefix, id);
+        id
+    }
+
+    /// Stamps our path ids onto every NLRI field of an outbound UPDATE
+    /// whose family negotiated ADD-PATH transmit (RFC 7911 §3): v4
+    /// top-level NLRI and withdrawn, v6 MP_REACH/MP_UNREACH lists.
+    /// Withdrawals look up the same map, so they carry exactly the id
+    /// the announcement used — the receiver's replacement key (§5).
+    /// Fields of a classic (non-negotiated) family are left untouched
+    /// (id 0; the codec would refuse otherwise).
+    fn assign_tx_path_ids(&mut self, update: &mut BgpUpdate) {
+        let ctx = self.current_add_path_tx_ctx();
+        if ctx.v4 {
+            for nlri in update.nlri.iter_mut().chain(update.withdrawn.iter_mut()) {
+                nlri.path_id = self.tx_id_for(nlri.prefix);
+            }
+        }
+        if ctx.v6 {
+            for attr in update.attrs.iter_mut() {
+                match attr {
+                    PathAttribute::MpReach(mp) => {
+                        for nlri in mp.nlri.iter_mut() {
+                            nlri.path_id = self.tx_id_for(nlri.prefix);
+                        }
+                    }
+                    PathAttribute::MpUnreach(mp) => {
+                        for nlri in mp.withdrawn.iter_mut() {
+                            nlri.path_id = self.tx_id_for(nlri.prefix);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -869,8 +945,8 @@ where
         let to_peer = self.peer.address;
         let internal = self.fsm.negotiated().is_some_and(|n| n.internal);
         if let Some(rib) = self.out_rib.clone() {
-            for update in rib.advertisements(rr.afi, rr.safi, next_hop, to_peer, internal) {
-                if let Err(e) = self.send_update(&update).await {
+            for mut update in rib.advertisements(rr.afi, rr.safi, next_hop, to_peer, internal) {
+                if let Err(e) = self.send_update(&mut update).await {
                     self.end = Some(SessionEnd::Transport(e.to_string()));
                     return self.end.clone();
                 }
@@ -895,12 +971,12 @@ where
         let internal = self.fsm.negotiated().is_some_and(|n| n.internal);
         for (afi, safi) in families {
             if let Some(rib) = self.out_rib.clone() {
-                for update in rib.advertisements(afi, safi, next_hop, to_peer, internal) {
-                    self.send_update(&update).await?;
+                for mut update in rib.advertisements(afi, safi, next_hop, to_peer, internal) {
+                    self.send_update(&mut update).await?;
                 }
             }
-            self.send_update(&BgpUpdate::end_of_rib_marker(afi, safi))
-                .await?;
+            let mut marker = BgpUpdate::end_of_rib_marker(afi, safi);
+            self.send_update(&mut marker).await?;
         }
         Ok(())
     }
@@ -1015,7 +1091,7 @@ where
         self.keepalive_sleep.as_mut().reset(far);
     }
 
-    async fn send_update(&mut self, update: &BgpUpdate) -> io::Result<()> {
+    async fn send_update(&mut self, update: &mut BgpUpdate) -> io::Result<()> {
         // Coarse MRAI gate: hold the whole message until the window
         // opens (§9.2.1.1; default 0 = off — FRR parity, disclosed).
         if self.mrai > Duration::ZERO {
@@ -1027,9 +1103,15 @@ where
             }
             self.next_advertisement = Some((self.now)() + self.mrai);
         }
+        // RFC 7911 §3/§5 (transmit): stamp our per-peer path ids and
+        // encode the negotiated families in the extended form — only
+        // toward a peer that agreed to receive it (the codec's classic
+        // gate stays the backstop against mis-gating).
+        self.assign_tx_path_ids(update);
         let asn4 = self.fsm.negotiated().is_none_or(|n| n.asn4);
+        let add_path = self.current_add_path_tx_ctx();
         let frame = update
-            .encode_frame(asn4)
+            .encode_frame_with(asn4, add_path)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.io.write_all(&frame).await?;
         self.io.flush().await
@@ -1858,6 +1940,289 @@ mod tests {
         }
         assert!(!driver.is_finished());
         driver.abort();
+    }
+
+    /// RFC 7911 §5 (transmit) + §2: with `addpath tx` configured our
+    /// OPEN advertises S/R 2; the peer's S/R 1 turns the effective
+    /// direction on (§5's MUST); the initial UPDATEs leave with the
+    /// extended NLRI under our own per-peer ids — distinct per prefix,
+    /// monotonic (B-19) — and a ROUTE-REFRESH re-advertisement keeps
+    /// exactly the same ids (the stability the re-advertisement rule
+    /// wants).
+    #[tokio::test]
+    async fn add_path_tx_session_sends_extended_updates() {
+        let (ours, theirs) = duplex(8192);
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_tx_v4 = true;
+        let mut sess = PeerSession::new(
+            ours,
+            config,
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            Some(Arc::new(Networks(vec![
+                "203.0.113.0/24".parse().unwrap(),
+                "198.51.100.0/24".parse().unwrap(),
+            ]))),
+            Duration::ZERO,
+        );
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+        let mut peer = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+
+        // Our OPEN must carry ONE AddPath capability, S/R 2 for v4
+        // (§4: tx willing-to-send).
+        let frame = read_bytes(&mut peer.io).await;
+        let our_open = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Open(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            our_open.capabilities.iter().any(|c| matches!(c,
+                Capability::AddPath(tuples)
+                    if tuples == &vec![AddPathFamily { afi: 1, safi: 1, send_receive: 2 }])),
+            "S/R 2 advertised once tx is configured: {:?}",
+            our_open.capabilities
+        );
+
+        // The peer offers to RECEIVE (S/R 1) — and route refresh, for
+        // the re-advertisement leg below.
+        let mine = BgpOpen::new(
+            65001,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![
+                Capability::RouteRefresh,
+                Capability::AddPath(vec![AddPathFamily {
+                    afi: 1,
+                    safi: 1,
+                    send_receive: 1,
+                }]),
+            ],
+        );
+        write_bytes(&mut peer.io, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let frame = read_bytes(&mut peer.io).await;
+        assert_eq!(frame[18], message_type::KEEPALIVE);
+        write_bytes(&mut peer.io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        // The initial dump: two UPDATEs (in the Networks order), each
+        // decodable ONLY under the extended gate, with ids 1 and 2.
+        let ctx = crate::attr::AddPathCtx {
+            v4: true,
+            v6: false,
+        };
+        async fn read_update(
+            io: &mut tokio::io::DuplexStream,
+            ctx: crate::attr::AddPathCtx,
+        ) -> BgpUpdate {
+            let frame = read_bytes(io).await;
+            match BgpMessage::decode_with_handling(
+                &frame,
+                true,
+                crate::attr::UpdateHandling::StrictRfc4271,
+                ctx,
+            )
+            .unwrap()
+            .0
+            {
+                BgpMessage::Update(u) => u,
+                other => panic!("expected UPDATE, got {other:?}"),
+            }
+        }
+        let first = read_update(&mut peer.io, ctx).await;
+        assert_eq!(
+            first.nlri[0].prefix,
+            "203.0.113.0/24".parse::<IpPrefix>().unwrap()
+        );
+        assert_eq!(first.nlri[0].path_id, 1, "the first prefix takes id 1");
+        let second = read_update(&mut peer.io, ctx).await;
+        assert_eq!(
+            second.nlri[0].prefix,
+            "198.51.100.0/24".parse::<IpPrefix>().unwrap()
+        );
+        assert_eq!(
+            second.nlri[0].path_id, 2,
+            "the second prefix takes the next id"
+        );
+        // Classic decode of the same frame fails loudly (the id's top
+        // octet is not a prefix length) — the /0 hazard's mirror.
+        let raw = BgpMessage::Update(first.clone())
+            .encode_with(true, ctx)
+            .unwrap();
+        assert!(
+            BgpMessage::decode(&raw, true).is_err()
+                || !matches!(&BgpMessage::decode(&raw, true).unwrap(),
+                    BgpMessage::Update(u) if u.nlri[0].prefix == first.nlri[0].prefix),
+            "classic decode must not read the extended NLRI as the same prefix"
+        );
+
+        // Re-advertisement (RFC 2918 §4): the same prefixes keep their
+        // ids — §2's own-identifier regeneration is per path, and the
+        // B-19 convention keeps a path's id stable across re-sends.
+        // (Read past the initial dump's End-of-RIB marker first.)
+        let eor = read_update(&mut peer.io, ctx).await;
+        assert!(
+            eor.nlri.is_empty() && eor.withdrawn.is_empty(),
+            "the v4 EOR marker closes the initial dump"
+        );
+        write_bytes(
+            &mut peer.io,
+            &BgpMessage::RouteRefresh(BgpRouteRefresh { afi: 1, safi: 1 })
+                .encode(true)
+                .unwrap(),
+        )
+        .await;
+        let again_first = read_update(&mut peer.io, ctx).await;
+        assert_eq!(
+            again_first.nlri[0].path_id, 1,
+            "id 1 survives the re-advertisement"
+        );
+        let again_second = read_update(&mut peer.io, ctx).await;
+        assert_eq!(again_second.nlri[0].path_id, 2);
+        assert!(!driver.is_finished());
+        driver.abort();
+    }
+
+    /// The v6 transmit arm: MP_REACH NLRI carries the id when the v6
+    /// direction negotiated (RFC 7911 §3 — every NLRI field of the
+    /// family).
+    #[tokio::test]
+    async fn add_path_tx_assigns_v6_mp_reach_ids() {
+        struct V6Networks(IpPrefix);
+        impl OutRib for V6Networks {
+            fn advertisements(
+                &self,
+                _afi: u16,
+                _safi: u8,
+                nh: IpAddr,
+                _to_peer: IpAddr,
+                internal: bool,
+            ) -> Vec<BgpUpdate> {
+                vec![originated_update(self.0, 65000, nh, internal)]
+            }
+            fn families(&self) -> Vec<(u16, u8)> {
+                vec![(2, 1)]
+            }
+        }
+
+        let (ours, theirs) = duplex(8192);
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_tx_v6 = true;
+        let mut sess = PeerSession::new(
+            ours,
+            config,
+            PeerInfo {
+                address: "2001:db8::9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "2001:db8::1".parse().unwrap(),
+            Some(Arc::new(V6Networks("2001:db8:aa::/48".parse().unwrap()))),
+            Duration::ZERO,
+        );
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+        let mut peer = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+
+        let frame = read_bytes(&mut peer.io).await;
+        let our_open = match BgpMessage::decode(&frame, true).unwrap() {
+            BgpMessage::Open(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert!(our_open.capabilities.iter().any(|c| matches!(c,
+            Capability::AddPath(tuples)
+                if tuples == &vec![AddPathFamily { afi: 2, safi: 1, send_receive: 2 }])));
+
+        let mine = BgpOpen::new(
+            65001,
+            30,
+            "10.9.9.9".parse().unwrap(),
+            vec![Capability::AddPath(vec![AddPathFamily {
+                afi: 2,
+                safi: 1,
+                send_receive: 1,
+            }])],
+        );
+        write_bytes(&mut peer.io, &BgpMessage::Open(mine).encode(true).unwrap()).await;
+        let frame = read_bytes(&mut peer.io).await;
+        assert_eq!(frame[18], message_type::KEEPALIVE);
+        write_bytes(&mut peer.io, &BgpMessage::Keepalive.encode(true).unwrap()).await;
+
+        let ctx = crate::attr::AddPathCtx {
+            v4: false,
+            v6: true,
+        };
+        let frame = read_bytes(&mut peer.io).await;
+        let update = match BgpMessage::decode_with_handling(
+            &frame,
+            true,
+            crate::attr::UpdateHandling::StrictRfc4271,
+            ctx,
+        )
+        .unwrap()
+        .0
+        {
+            BgpMessage::Update(u) => u,
+            other => panic!("expected UPDATE, got {other:?}"),
+        };
+        let mp = update
+            .attrs
+            .iter()
+            .find_map(|a| match a {
+                PathAttribute::MpReach(mp) => Some(mp),
+                _ => None,
+            })
+            .expect("v6 rides MP_REACH");
+        assert_eq!(mp.nlri.len(), 1);
+        assert_eq!(mp.nlri[0].path_id, 1, "the MP_REACH NLRI carries our id");
+        driver.abort();
+    }
+
+    /// The B-19 allocator as a unit: ids start at 1 (0 is the classic
+    /// key), grow monotonically with fresh prefixes, never move once
+    /// assigned, and withdrawals consult the same mapping.
+    #[tokio::test]
+    async fn add_path_tx_allocator_monotonic_and_stable() {
+        let (ours, _theirs) = duplex(64);
+        let mut config = SessionConfig::new(65000, "10.0.0.1".parse().unwrap(), 90);
+        config.add_path_tx_v4 = true;
+        let mut sess = PeerSession::new(
+            ours,
+            config,
+            PeerInfo {
+                address: "192.0.2.9".parse().unwrap(),
+                remote_as: 65001,
+                bgp_id: None,
+            },
+            "192.0.2.1".parse().unwrap(),
+            None,
+            Duration::ZERO,
+        );
+        let a: IpPrefix = "203.0.113.0/24".parse().unwrap();
+        let b: IpPrefix = "198.51.100.0/24".parse().unwrap();
+        assert_eq!(sess.tx_id_for(a), 1, "first allocation is 1, never 0");
+        assert_eq!(sess.tx_id_for(b), 2, "second prefix takes the next value");
+        assert_eq!(
+            sess.tx_id_for(a),
+            1,
+            "stability: the same prefix keeps its id"
+        );
+        assert_eq!(sess.tx_id_for(b), 2);
+        // The send path is negotiation-gated (§5): without a
+        // negotiated tx direction nothing is stamped — id 0, classic
+        // encoding (the wire legs live in the session tests above).
+        let mut update = originated_update(a, 65000, "192.0.2.1".parse().unwrap(), false);
+        sess.assign_tx_path_ids(&mut update);
+        assert_eq!(update.nlri[0].path_id, 0, "unnegotiated: no ids assigned");
     }
 
     /// A malformed AGGREGATOR (length 3) is attribute-discard only:

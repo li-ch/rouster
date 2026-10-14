@@ -469,9 +469,21 @@ pub struct BgpUpdate {
 }
 
 impl BgpUpdate {
-    /// Full encoded frame for this UPDATE alone (header + body).
+    /// Full encoded frame for this UPDATE alone (header + body),
+    /// classic NLRI encoding.
     pub fn encode_frame(&self, asn4: bool) -> BgpResult<Vec<u8>> {
         BgpMessage::Update(self.clone()).encode(asn4)
+    }
+
+    /// [`Self::encode_frame`] with the ADD-PATH direction negotiated
+    /// for the send (RFC 7911 §3/§5): toward a peer that agreed to
+    /// receive extended NLRI for a family, that family's fields encode
+    /// `Path Identifier (4) | Length (1) | Prefix`. The ids themselves
+    /// are the caller's per-neighbor allocation (§2 — "MUST generate
+    /// its own Path Identifier"); the codec only refuses a nonzero id
+    /// under the classic gate.
+    pub fn encode_frame_with(&self, asn4: bool, addpath: AddPathCtx) -> BgpResult<Vec<u8>> {
+        BgpMessage::Update(self.clone()).encode_with(asn4, addpath)
     }
 
     /// Convenience accessors over the attribute list.

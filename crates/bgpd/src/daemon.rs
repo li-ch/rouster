@@ -651,8 +651,8 @@ async fn connector_loop<S: RouteSink + 'static>(
 }
 
 /// Builds the FSM session config for a neighbor (per-neighbor timer
-/// overrides beat the global hold; `addpath rx` maps to both unicast
-/// families' receive direction, RFC 7911).
+/// overrides beat the global hold; `addpath rx|tx|both` maps to both
+/// unicast families' receive/transmit directions, RFC 7911).
 fn session_config_for(config: &BgpdConfig, neighbor: &NeighborConfig) -> SessionConfig {
     let hold = neighbor.timers.map(|(_, h)| h).unwrap_or(config.hold_time);
     let mut session = SessionConfig::new(
@@ -662,6 +662,8 @@ fn session_config_for(config: &BgpdConfig, neighbor: &NeighborConfig) -> Session
     );
     session.add_path_rx_v4 = neighbor.add_path_rx;
     session.add_path_rx_v6 = neighbor.add_path_rx;
+    session.add_path_tx_v4 = neighbor.add_path_tx;
+    session.add_path_tx_v6 = neighbor.add_path_tx;
     session
 }
 
@@ -720,6 +722,7 @@ mod tests {
             route_server: false,
             graceful_restart: None,
             add_path_rx: false,
+            add_path_tx: false,
         };
         assert_eq!(session_config_for(&config, &neighbor).hold_time, 30);
         neighbor.timers = None;
