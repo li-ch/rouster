@@ -198,7 +198,7 @@ docker exec "$R2" sh -c "printf '%s\n' \
   ' redistribute static' \
   > /etc/rouster-ospfd.conf"
 docker exec "$R2" sh -c "cat /etc/rouster-ospfd.conf"
-docker exec -d "$R2" sh -c "NO_COLOR=1 rouster-ospfd --config /etc/rouster-ospfd.conf > $OUR_OSPFD_LOG 2>&1"
+docker exec -d "$R2" sh -c "NO_COLOR=1 ROUSTER_OSPFV3_TRACE=1 rouster-ospfd --config /etc/rouster-ospfd.conf > $OUR_OSPFD_LOG 2>&1"
 wait_in "$R2" "our ospfd(v3) is up" 10 "pidof rouster-ospfd"
 wait_in "$R2" "our v3 core constructed" 10 "grep -q 'ospfv3: running' $OUR_OSPFD_LOG"
 

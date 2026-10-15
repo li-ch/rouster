@@ -16,7 +16,11 @@ AF-generic seams cashed as code, and the live FRR ospf6d interop
 evening) closed the security lane: the v6 cmsg receive read-back
 (the audited recvmsg, AGENTS.md's named exception), the RFC 8177
 key chains feeding BOTH crypto engines, and the RFC1583Compatibility
-knob (O-2, default enabled per §C.1).
+knob (O-2, default enabled per §C.1). The S10-b round
+(2026-10-15) closed the v3 runtime remainder (the full §4.8 SPF, the
+broadcast arm, the IAPRs), the NSSA translator election (RFC 3101
+§3.1), `area range`, and the virtual-link tails (§16.1 step 4, the
+live vlink interop).
 
 ## Layout
 
@@ -27,7 +31,8 @@ knob (O-2, default enabled per §C.1).
 | `lsa_v3` | The OSPFv3 LSA codecs (RFC 5340 §A.4): the 16-bit LS type, the A.4.1 prefix triple, the seven v3 bodies + the U-bit `Unknown`, 24-bit Options |
 | `packet_v3` | The OSPFv3 packet codecs (RFC 5340 §A.3): the 16-byte header with Instance ID, Hello/DBD/LSR/LSU/LSAck, the IPv6 pseudo-header checksum |
 | `lsdb` | The typed store keyed (LS type, LS ID, adv router) (§12.2); the §13.1 "which instance is newer" ordering; §13.2 install with contents-difference SPF gating and the MinLSArrival guard; §14 aging/MaxAge/refresh bookkeeping; §12.1.6 rollover guard |
-| `spf` | The §16.1 two-stage Dijkstra (stub networks in stage two), §16.1.1 per-path next hops, §16.1 step-3 network-before-router tiebreak, equal-cost accumulation, TransitCapability; the pure throttle scheduler |
+| `spf` | The §16.1 two-stage Dijkstra (stub networks in stage two), §16.1.1 per-path next hops, §16.1 step-3 network-before-router tiebreak, equal-cost accumulation, TransitCapability; the §16.1-step-4 tree parents + vlink endpoint addresses; the pure throttle scheduler |
+| `spf_v3` | The OSPFv3 intra-area SPF (RFC 5340 §4.8.1/§4.8.2): transit vertices keyed (DR Interface ID, DR Router ID), the A.4.3 fragment concatenation with lowest-LS-ID flags, the V6/R gate, link-LSA next hops, the IAPR stage-two walk |
 | `packet` | §A.3 codecs: header, Hello, DBD, LSR, LSU, LSAck with packet checksum verification |
 | `neighbor` | The §10.3 neighbor state table, §10.5 Hello processing, §10.6-§10.8 DBD master/slave exchange, §13 flooding steps 1-8 as `flood_step` |
 | `iface` | The §9 interface state machine and the §9.4 DR election (broadcast networks), pure and AF-generic |
@@ -40,7 +45,7 @@ knob (O-2, default enabled per §C.1).
 | `daemon_v3` | The OSPFv3 runtime (RFC 5340): the same run-loop shape over the v6 transport, Router-ID neighbors, Instance-ID dispatch, scope-aware flooding (link-LSAs in per-interface stores), v3 origination, §16.4-lite exports |
 | `zedge` | ospfd as a zebra client: HELLO attach, `redistribute static` → §12.4.4 origination/withdrawal, route export |
 | `wire` | Checked little helpers over byte slices — the house codec convention (A19: never trust counts) |
-| `config` | `ospfd.conf` grammar (A11/B7 conventions): router-id, area, interface stanzas, network bindings, redistribute static, the RFC 8177 `key chain` stanza + interface references, `rfc1583-compatibility` |
+| `config` | `ospfd.conf` grammar (A11/B7 conventions): router-id, area, interface stanzas, network bindings, redistribute static, the RFC 8177 `key chain` stanza + interface references, `rfc1583-compatibility`, `area <id> range` (advertise status + cost), the NSSA translator role/stability, the v3 interface `prefix` lines |
 | `bin/ospfd` | Thin shell (bgpd/savd shape): config → sockets → zedge → the daemon run loop |
 
 ## Pinned design decisions
@@ -764,51 +769,180 @@ fresh netns interfaces with `disable_ipv6=1` and the sysctl write
 needs `/proc/sys` writable; the caps-only v2 rig shape cannot bring
 v6 up. Disclosed in the script header.
 
-## §Deferred (updated S8-b, 2026-10-14)
+## The S10-b round (2026-10-15): the v3 runtime remainder, the NSSA translator, ranges, vlink tails
 
-- §16.3 (transit areas' summary-LSAs — the V-bit now lands with the
+### The full v3 SPF (RFC 5340 §4.8.1/§4.8.2)
+
+`spf_v3` replaces the S7-a §16.4-lite direct-ASBR interim in the v3
+daemon's walk. The three §Deferred-named specifics, each pinned by a
+dedicated test and the property batteries (a Bellman-Ford oracle over
+random fragmented topologies, a fragment-split equivalence property,
+the first-edge next-hop oracle in the v3 hop shape):
+
+- **Transit vertices key on (DR Interface ID, DR Router ID)** — the
+  network-LSA's (LS ID, Advertising Router) pair (§4.8.1's vertex ID);
+  two networks sharing a DR Interface ID stay distinct (tested).
+- **The A.4.3 multiple-router-LSA concatenation**: all fragments of
+  one router process as an aggregate (links concatenated), with the
+  Options and Nt/V/E/B bits taken from the fragment with the
+  SMALLEST Link State ID — the V-bit on a higher fragment is ignored
+  for TransitCapability (tested both ways). Origination stays
+  single-fragment while links fit (disclosed).
+- **§4.8.2 next hops**: the adjacent router's link-local comes from
+  its link-LSA in the outgoing link's link-local-scope store (the
+  RFC's primary path); the hop also carries the adjacent Router ID
+  (`via`) for the RFC's Hello-source fallback (the daemon substitutes
+  the adjacency's Hello source when the link-LSA is not there yet);
+  an IAPR referencing a directly-connected network-LSA takes the
+  no-address form ("the next hop is solely the outgoing link").
+- Stage two walks the intra-area-prefix-LSAs (referenced router OR
+  network vertex, NU-bit prefixes excluded); §4.8.1 step 2b's V6/R
+  gate excludes non-transit routers.
+- The daemon: the SPT runs on the v2 engine's FRR-parity throttle
+  with §16.5's class split (router/network LSAs recompute the SPT;
+  IAPR/external installs rerun the table walk on the cached result);
+  the external calculation resolves ASBRs THROUGH the tree (multi-hop
+  ASBRs route — tested over a three-core chain), with §4.8.5's F-bit
+  forwarding-address longest-prefix resolution.
+
+### The v3 broadcast arm + the IAPRs
+
+- **The §9.4 election over v3 Router-ID claims**: the shared
+  `hello_interface_events`/`elect_dr` machinery wired over v3
+  identities — DR/BDR claims are Router IDs (§A.3.2) riding the
+  shared election's identity slot (`rid_identity` — compared, never
+  interpreted as an address); BackupSeen/NeighborChange/WaitTimer
+  fire; §10.4's broadcast AdjOK answer applies (adjacent with/toward
+  the DR/BDR only).
+- **The ff02::6 receive gate** (§4.2/§A.1): AllDRouters packets
+  process on the DR/BDR only; the run loop reconciles the socket's
+  ff02::6 membership to the elected role (S7-a's armed join arm,
+  now driven). Floods on broadcast links go multicast per §13.3 —
+  ff02::5 from the DR/BDR, ff02::6 from DR Others (retransmissions
+  unicast).
+- **The DR duties**: the network-LSA (§4.4.3.3 — LS ID = the DR's
+  Interface ID, attached = the Full set + self, Options = the OR of
+  the attached routers' link-LSAs) and the network-referenced IAPR
+  (§4.4.3.9 part 1 — every fully-adjacent router's link-LSA prefixes
+  at metric 0, NU/LA skipped, duplicates OR-combined), flushed on
+  losing DR; the router-referenced IAPR (§4.4.3.9 part 2 — the p2p
+  interfaces' configured prefixes at the interface output cost).
+  Interface prefixes are configured per interface (`prefix <v6/len>`)
+  and ride the link-LSA (§4.4.3.8).
+- Riding fix: origination dirty flags survive MinLSInterval
+  rejections (a cleared-on-reject flag stranded the updated LSA
+  content — found by the broadcast mesh test).
+- Live state: the pure three-core broadcast mesh test covers the
+  election agreement, the §10.4 matrix, the network-LSA + IAPR
+  contents, and the DROther's SPF installing peers' prefixes as
+  directly connected; a broadcast leg against FRR ospf6d is §Deferred
+  (the p2p FRR leg stays the v3 interop).
+
+### The NSSA translator remainder (RFC 3101 §3.1/§3.2/E)
+
+- **The election**: `area <id> nssa translate-candidate|translate-always`
+  (FRR's spellings; default Candidate per Appendix D.1) +
+  `translate-stability-interval <1-3600>` (default 40 s). The
+  Candidate election runs in the §16 walk over the §3.1 list (border
+  routers reachable over the NSSA AND the transit topology); an
+  Nt-set or higher-ID member outranks us; a deposed translator keeps
+  translating through the stability interval (the tick forces a walk
+  at the deadline; the retirement flush runs there).
+- **The Nt bit** (Appendix B, router-LSA flag 0x10 — the W bit 0x08
+  and the top reserved bits stay rejected): set in the router-LSA
+  originated INTO the NSSA while the translator state is
+  enabled/elected; SPF's router flags carry (B, E, Nt) per area.
+- **Type-7 address ranges** = the configured `area <id> range` list
+  on the NSSA: §3.2 step (1)'s most-specific DoNotAdvertise
+  suppression; step (3)'s aggregation (path type 2 when any member is
+  type 2, metric = highest type-1 cost / highest type-2 cost + 1, FA
+  0.0.0.0, one type-5 per range, members suppressed, our own
+  same-[addr,mask] type-5s joining the metric computation); step
+  (2)'s plain translation with the highest-Router-ID equivalence
+  rule; and the LS-ID host-bit remapping when the natural ID is
+  taken by one of our own type-5s describing a different network.
+- **Appendix E**: a border router now INSTALLS the foreign P-clear
+  type-7 default locally (never propagating — §3.2 never translates
+  a P-clear default). Divergence from FRR 10.2.2 (which stores the
+  LSA but installs no route — probed live in the N3 interop): the
+  RFC appendix's technique wins here.
+
+### Area ranges (§12.4.3 + §16.2(3))
+
+`area <id> range <a.b.c.d/m> [advertise|not-advertise] [cost <n>]`.
+Each ACTIVE range of the range-owning area (at least one
+contributing intra-area route) coalesces its members into ONE
+summary advertised into every other admitting area — metric = the
+members' minimum cost or the configured `cost` override, mask = the
+RANGE's — with the members' own summaries suppressed;
+DoNotAdvertise suppresses them outright; the split-horizon gate
+applies to the contributing set. §16.2 step (3): a foreign summary
+describing a network inside one of OUR actively-advertised ranges is
+not installed (differential-tested — a foreign summary outside the
+ranges still installs).
+
+### The virtual-link tails (§15/§16.1 step 4/§12.4.1)
+
+- **§16.1 step 4's endpoint resolution**: the SPF tree tracks each
+  router vertex's parent and reports X's interface address pointing
+  back at X's parent; the §15 resolution uses it — the MULTI-HOP
+  transit shape resolves the peer's OWN transit-facing address, not
+  the first-hop gateway (v1's interim, kept as the fallback). The
+  type-4 Link Data keeps §16.1 step 4's address form, with a
+  synthetic MIB-II ifIndex fallback for the unnumbered form.
+- **§15's routed packets**: the vlink socket carries TTL 64 (§A.1
+  scopes TTL-1 to multicast; the packets are IP-forwarded through
+  the transit area), the receive-side N1 TTL check exempts vlink
+  endpoints, and the run loop's on-link demux accepts the RESOLVED
+  vlink peer addresses.
+- **§13.5's sequence-aware retransmission clearing** (direct and
+  implied acks): an ack for an OLDER instance does not retire a
+  newer queued retransmission — the MinLSArrival same-instance race
+  stranded re-originated LSAs forever; found live against FRR.
+- **The live interop leg** (`scripts/test-ospf-vlink-interop.sh`,
+  exit 0 twice back-to-back): the partitioned backbone joined by a
+  virtual link between two rouster endpoints over a REAL FRR 10.2.2
+  transit — transit Full both sides, both §16.1-step-4 resolutions
+  on the wire, the vlink adjacencies Full, the backbone databases
+  joined, r1's area-0 stub routed into r2's kernel through the vlink
+  and r2's redistributed static into r1's, 20 s soak. Rig truths:
+  the transit box must ip_forward (FRR zebra enables it; rousterd
+  does not yet), and FRR-side vlink ENDPOINTS do not come up against
+  our zebra (FRR's vlink socket wants a kernel "VLINK0" interface
+  and its up-state rides zebra NHT our zapi server does not feed) —
+  both endpoints run ours; the FRR-endpoint form stays §Deferred.
+
+## §Deferred (updated S10-b, 2026-10-15)
+
+- §16.3 (transit areas' summary-LSAs — the V-bit lands with the
   virtual links, the summary rules themselves remain); graceful
   restart (RFC 3623); DNA honoring.
-- **OSPFv3 runtime remainder** (S7-a landed the transport, the
-  daemon core and the live interop; S8-b closed the cmsg read-back —
-  see the sections above; what remains): full v3 SPF (link-LSA next hops, IAPR
-  prefix attachment, transit networks keyed by (DR Interface ID,
-  DR Router ID) — the §16.4-lite direct-ASBR form serves v1);
-  multiple-router-LSA concatenation with lowest-LS-ID precedence
-  (A.4.3 — any LSDB helper assuming one router-LSA per (router,
-  area) must not survive into that slice); the broadcast-network
-  arm (§9.4 election over v3 Router-ID claims + the ff02::6 receive
-  gate — the join/leave socket arm is implemented and armed);
-  multi-area v3; intra-area-prefix-LSA origination (nothing
-  advertises intra prefixes v1 — the externals carry the interop);
-  RFC 8362 E-LSAs (O-12: 5340 fixed layouts first — the live oracle
-  speaks legacy); RFC 5838 address-family instances; v3 auth
-  (IPsec/RFC 4552, trailer/RFC 7166 — the auth.rs MAC skeleton is
-  v3-ready); virtual links with v3 semantics (global-scope
-  sources); the ifdump v6 link-local merge (the static
-  `link-local` line is v1's source); NSSA-in-v3 (type-7 0x2007
-  rides the shared external codec; the §2.x v3 semantics do not).
-- Virtual-link remainder: multi-hop transit endpoint refinement,
-  ifIndex Link Data, vlink auth (v1 rides the transit interface's
-  auth), and the live FRR virtual-link interop leg.
-- NSSA remainder: translator election (Nt bit, Candidate role,
-  TranslatorStabilityInterval — RFC 3101 §3.1), Type-7 address
-  ranges, §3.2 LS-ID remapping, the Appendix E P-bit-default
-  install technique.
-- `area range` configuration — §12.4.3's address-range
-  coalescing/DoNotAdvertise (the per-network default is implemented);
-  §16.2 step (3)'s own-active-range check rides with it.
-- NBMA and Point-to-MultiPoint networks (§C.3) — the unicast-hello
-  and per-neighbor-poll machinery; the §9.4 election's NBMA step
-  (6) rides with it.
-- Receive-side TTL verification: **CLOSED on BOTH arms** — v4
-  unicast (night N1, the raw-socket header read, no cmsg) and v6
-  (S8-b: the audited recvmsg read-back named in AGENTS.md's
-  2026-10-14 exception — hop limit AND true destination off the
-  RFC 3542 cmsgs, the destination-trial decode demoted to the
-  fallback). Placement note (N1, still open): hoisting the walker
-  into `common` and dropping bfdd's copy is an owner decision away.
-  SO_BINDTODEVICE-style interface scoping rides with it.
+- **OSPFv3 runtime remainder** (S10-b closed the SPF, the broadcast
+  arm, and the IAPRs; what remains): multi-area v3; RFC 8362 E-LSAs
+  (O-12: 5340 fixed layouts first — the live oracle speaks legacy);
+  RFC 5838 address-family instances; v3 auth (IPsec/RFC 4552,
+  trailer/RFC 7166 — the auth.rs MAC skeleton is v3-ready); virtual
+  links with v3 semantics (global-scope sources; the §4.8.1 step-4
+  LA-bit neighbor-address rule); the ifdump v6 link-local merge (the
+  static `link-local` line is the source); NSSA-in-v3 (type-7 0x2007
+  rides the shared external codec; the §2.x v3 semantics — including
+  the v3 form of the S10-b translator election — do not); the
+  multiple-fragment v3 router-LSA ORIGINATION (the SPF consumer
+  concatenates; origination stays single-fragment while links fit);
+  the FRR broadcast leg for v3 (the p2p leg stays the interop).
+- **The FRR-side vlink endpoint**: FRR 10.2.2's vlink endpoint
+  against our zebra does not come up (its vlink socket binds to a
+  kernel "VLINK0" interface — ENODEV without one — and even with a
+  dummy VLINK0 its receive path discards our backbone-area packets
+  on the transit interface with "ospf_read invalid Area ID"; its
+  up-state rides zebra NHT our zapi server does not feed). The live
+  vlink leg runs both endpoints as rouster over an FRR transit; the
+  FRR-endpoint form wants zapi-server NHT first (an owner decision
+  on rousterd's zapi surface).
+- vlink auth (v1 rides the transit interface's auth); §16.3.
+- NBMA and Point-to-MultiPoint networks (§C.3).
+- The walker-hoist-into-common owner decision (bfdd's copy now has a
+  sibling); SO_BINDTODEVICE-style interface scoping rides with it.
 - Auth remainder: the live FRR key-chain interop leg (FRR 10.2.2's
   `key chain` with hmac-sha-256/md5), wall-clock/NTP-anchored
   lifetimes (v1 rides the injected clock — the `now` seam is the
@@ -816,15 +950,10 @@ v6 up. Disclosed in the script header.
   duration-based lifetimes, per-area auth surfaces, and the
   `sha2`/`hmac` crate swap (owner decision; one-file change).
 - Interface link-state tracking ONGOING (the dump's startup snapshot
-  landed with ADD-C2 above: a down/loopback interface stays Down at
-  construction and sends no Hellos; what remains is reacting to
-  INTERFACE_UP/DOWN/ADDRESS changes on a RUNNING daemon); the MTU
-  overlay once the interface mirror carries the kernel's MTU;
-  `passive-interface` (loopbacks as stub-only members).
+  landed with ADD-C2); the MTU overlay once the interface mirror
+  carries the kernel's MTU; `passive-interface` (loopbacks as
+  stub-only members).
 - The SAVNET intra-domain IGP signaling wire protocol
   (`experimental-savnet`) once the draft's format is pinned. The
-  in-process half LANDED (2026-10-11) behind the flag: the
-  `InstallAndFlood { changed: true }` products and the adjacency
-  transitions report to a hosted `sav::agent::SavAgent` through the
-  conversation reports (`after_report` / `reevaluate_adjacency`) —
-  see [savnet.md](savnet.md).
+  in-process half LANDED (2026-10-11) behind the flag: see
+  [savnet.md](savnet.md).

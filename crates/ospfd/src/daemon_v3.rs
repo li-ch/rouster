@@ -1418,10 +1418,12 @@ impl OspfdV3 {
             self.mark_spf_dirty(now);
         }
         // The interop machine-check surface: a FOREIGN router- or
-        // link-LSA landed (the LSDB-convergence proof).
+        // link-LSA landed (the LSDB-convergence proof). The trace
+        // widens to every foreign LSA.
         for lsa in &report.changed_lsas {
             if lsa.header.adv_router != self.router_id
-                && matches!(lsa.header.ls_type, V3_ROUTER | V3_LINK)
+                && (matches!(lsa.header.ls_type, V3_ROUTER | V3_LINK)
+                    || std::env::var_os("ROUSTER_OSPFV3_TRACE").is_some())
             {
                 info!(
                     lsa = lsa.header.ls_type.name(),
