@@ -27,6 +27,7 @@
 pub mod apply;
 pub mod atomic;
 pub mod render;
+pub mod restconf;
 pub mod signal;
 pub mod status;
 pub mod tree;

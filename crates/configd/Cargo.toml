@@ -8,7 +8,10 @@ license.workspace = true
 [dependencies]
 common = { workspace = true }
 yang = { path = "../yang" }
-tokio.workspace = true
+# io-util: the AsyncRead/WriteExt extension traits the restconf
+# HTTP/1.1 core needs (the vty crate's exact precedent — a feature
+# of the workspace tokio, not a new dependency).
+tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 thiserror.workspace = true
 
