@@ -471,6 +471,49 @@ grammar: `vrp <prefix> max <len> as <asn>` and
 - FRR records received Cease in `show bgp neighbor`'s Last reset line,
   not in bgpd.log at default log config.
 
+## Bench round 2026-10-15: F1/F5/F7 fixed, F8 open
+
+The pre-registered bench round (docs/benchmarks.md §R) measured
+full-table ingestion and found three bgpd-side defects, fixed in
+commit `47ef0ee`:
+
+- **F1 — O(n²) ingestion.** `RibSink::announce`/`withdraw` ran the
+  full-table `recompute()` per UPDATE (union + sort + per-prefix
+  flatten of every peer's Adj-RIB-In). The hot path now calls
+  `LocRib::recompute_prefix` — the §9.1 decision process is
+  per-prefix, and the `Nlri` key orders by prefix first, so each
+  peer's Adj-RIB-In range-scans in O(log n). Bulk `recompute()`
+  stays for session-level events (peer clear, stale flush, soft
+  reset) and delegates per prefix; an equivalence test pins
+  incremental == bulk (same best table, same change stream).
+- **F7 — session-loop read drop.** The select! reader
+  (`read_frame_with`) is a multi-`read_exact` future: once the
+  19-byte header (or part of the body) was consumed, a timer branch
+  winning the select dropped the future and its buffered bytes —
+  wire-proven by the bench tee-proxy (a clean 7,966-frame stream
+  desynced bgpd where FRR consumed it). Reads now append into a
+  persistent session buffer via one bounded `read` (cancel-safe:
+  Ready implies the branch runs) and frames drain synchronously
+  after every select cycle.
+- **F5 — hot-path logging.** The per-UPDATE info line builds counts,
+  no longer the full announced-prefix string list.
+
+Receipts (§R, post-fix entry): full 1,126,490-prefix table at EOR in
+4.73 s median (≈238k routes/s), zero malformed, zero rejected,
+unpaced at hold 90 — where the pre-fix reader desynced at 120 msg/s
+paced.
+
+- **F8 — OPEN (rousterd, not bgpd): the FIB programming path.**
+  Post-fix, the end-to-end wall (main-table complete, median
+  247.8 s) is dominated by rousterd programming ~1.12M routes at
+  ≈4.8k routes/s (235 CPU-s; FRR zebra's ledgered cost: 9.67 CPU-s).
+  Owner decision pending: batched/netlink-merge work on the
+  rousterd side is the next performance unlock.
+- Also recorded by the round (not fixed): first-AS enforcement is
+  absent (FRR rejects AS_PATHs that do not open with the peer AS,
+  RFC 4271 §6.3; the bench feed prepends symmetrically to stay
+  well-formed for both).
+
 ## §Deferred anchors
 
 Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime

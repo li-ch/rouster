@@ -258,6 +258,41 @@ in the chat record. The "Your decision" column stays the owner's.
   sub-2× deltas stay unresolved — none here are. No verdicts; the
   numbers and conditions are the deliverable.
 
+- 2026-10-15 · E1+E5 Rouster full-table, POST-FIX (F1+F7+F5, commit
+  `47ef0ee`) · host=darwin-vm (OrbStack, same rig: SUT pinned 4-11,
+  injector 0-3) · versions: rouster repo @47ef0ee · feed: identical
+  dump/pick/surgery (sha256 above), full 1,126,490 prefixes ·
+  runs: 6 (1 warmup + 5 measured), UNPACED, hold-time 90 (the F7
+  mitigation — pacing 120 msg/s + hold 900 — is retired with the
+  fix; this is the FRR-shaped protocol) · **BGP-level wall
+  first-UPDATE→EOR: median 4.73 s, p95 4.87 s (556,132 UPDATEs ≈
+  118k msg/s; ≈238k routes/s) — malformed 0, rejected 0 on every
+  run** (the F7 receipt: the pre-fix reader desynced at 120 msg/s
+  paced) · CPU s: bgpd median 9.14 (p95 9.28), rousterd median
+  235.08, injector 1.11 · **wall first-UPDATE→main-table-complete:
+  median 247.8 s, p95 284.1 s — dominated by the FIB programming
+  path (new finding F8: rousterd programs ~1.12M routes at ≈4.8k
+  routes/s where FRR zebra's ledgered cost is 9.67 CPU-s; 235 s of
+  the 248 s wall is rousterd CPU)** · RSS: bgpd 1,972 → final
+  1,851,468 KiB, HWM 2,120,784 (median) · **E5: bgpd ≈1,681 B/prefix
+  final (≈1,926 peak), rousterd ≈922 B/prefix final** (stage-wise
+  speaker marks are unusable this run: bgpd finishes the full table
+  in 4.7 s while the main-table poll marks run for minutes — the
+  E5 deltas above use empty→final/HWM) · main-table peaks
+  1,120,924–1,126,481 across runs (3/5 measured runs reach feed−9 =
+  1,126,481; two plateau 0.1–0.5 % short with rousterd CPU still
+  pegged at poll end — disclosed, unattributed; candidate: poll
+  window vs programming tail) · raw:
+  `target/bench-logs/rouster-20261015T094736Z/` (summary mirrored
+  at away/2026-10-15/bench/e1-rerun-summary.json) · notes: the
+  FRR-side comparison numbers are the earlier entries (same feed,
+  same rig): end-to-end wall 30.36 s (FRR) vs 247.8 s (Rouster) —
+  the >2× delta is resolved and attributed to F8, the kernel-
+  programming path, while the speaker-level CPU comparison
+  (bgpd 9.14 vs 11.03 CPU-s) is sub-2× and stays unresolved under
+  §F's darwin-vm rule. No verdict prose; F8 goes to the owner
+  decision list.
+
 ## Where things live (conventions)
 
 - Scripts: `scripts/bench-<E#>-<name>.sh` (the smoke-suite shape;

@@ -469,3 +469,22 @@ The phase text above is unchanged; this block is status only.
   preserved). One real bug fixed en route (linebind stale-origin
   preference after tree mutation). Gate 1769/0 (+54), both new +
   existing smokes green (38 scripts).
+
+- 2026-10-15 (night, bench round + fix round) — the pre-registered
+  benchmark program (docs/benchmarks.md, decisions D1–D6
+  owner-ratified) ran E1/E5/E7 against FRR 10.2.2 and found two
+  real bgpd defects plus one rousterd bottleneck: **F1** (O(n²)
+  LocRib::recompute per UPDATE — full-table ingestion projected to
+  weeks), **F7** (the session select! dropped framed bytes under a
+  timer race; tee-proxy wire-proven), **F8** (rousterd FIB
+  programming ≈4.8k routes/s vs FRR zebra's 9.67 CPU-s — OPEN,
+  owner decision). Fix round `47ef0ee`: recompute_prefix (per-prefix
+  §9.1 election, O(log n) Nlri range-scan, incremental==bulk
+  equivalence test), the cancel-safe persistent-read session loop,
+  counts-only UPDATE logging (F5). Gate 1770/0, clippy clean. §R
+  post-fix entry: full 1,126,490-prefix table at EOR **4.73 s
+  median (≈238k routes/s), zero malformed, zero rejected, unpaced
+  at hold 90**; end-to-end 247.8 s dominated by F8. D3's nightly
+  bench job landed (`bench.yml`). The in-repo mrt-replay injector
+  (225k routes/s, zero new deps) is a keeper dev tool. Evidence:
+  away/2026-10-15/bench/ (REPORT.md + state + captures).

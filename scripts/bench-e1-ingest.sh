@@ -47,12 +47,11 @@ IMAGE=frr-testbed:10.2.2
 SUT_CPUS=${BENCH_SUT_CPUS:-4-11}
 INJ_CPUS=${BENCH_INJ_CPUS:-0-3}
 REPLAY_RATE=${BENCH_REPLAY_RATE:-0}
-# Hold-time both session ends propose (negotiated = min). The Rouster
-# runs use 900: bgpd's session loop can drop a completed read_frame
-# when the keepalive timer wins a select! race (finding F7 — clean
-# wire capture, tee-proxy evidence); a longer hold widens the KA
-# interval and pacing (REPLAY_RATE) empties the race window. FRR runs
-# keep 90 (unaffected).
+# Hold-time both session ends propose (negotiated = min). 90 for
+# everyone: F7 (the select! read-drop) is FIXED as of 47ef0ee — the
+# post-fix full-table re-run went unpaced at hold 90 with zero
+# malformed. The pre-fix mitigation was BENCH_HOLD=900 + pacing
+# 120 msg/s (kept here as history; do not re-enable without cause).
 HOLD=${BENCH_HOLD:-90}
 TIMEOUT=${BENCH_TIMEOUT:-3600}
 
