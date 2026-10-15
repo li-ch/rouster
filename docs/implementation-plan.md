@@ -422,3 +422,19 @@ The phase text above is unchanged; this block is status only.
   0.1.0 + README status + the v0.1.0 tag (verified in an isolated
   worktree after a version-pinning test was made bump-proof).
   Gate 1498/0 ×3, smokes 35/35, CI green.
+
+- 2026-10-15 — S10 round GREEN, Phase 5 opened: **IS-IS live** (the
+  full TLV stack — codec/LSPDB/SPF/adjacency/AF_PACKET transport
+  with the 802.3+LLC trap solved — at Up three-way adjacency with
+  real FRR isisd and redistributed routes in both kernels);
+  ospfd's depth queue cleared (full v3 SPF with A.4.3 fragments,
+  broadcast arm + IAPRs, NSSA translator, area ranges, the
+  virtual-link interop leg ×2); the polish lane (31× PrefixSet
+  index with bench-proven equivalence, BAR-SAV's ASPA edges);
+  CI smoke parity (all 16 nightly failures root-caused — runner
+  kernel modules, AppArmor, uid/gortr, rp_filter defaults — and
+  passing). The escalated v3 REDIST-IN flake was OURS: the
+  deferred own router-LSA landing never re-dirtied the v3 SPF
+  (green runs raced FRR's 5s refresh); fixed with the v2-parity
+  mark-dirty + regression test (4e0910a). Gate 1623/0, smokes
+  37/37 in 1392 s.
