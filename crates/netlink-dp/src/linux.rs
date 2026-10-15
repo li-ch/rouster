@@ -477,9 +477,11 @@ fn nl_protocol(entry: &RouteEntry) -> NlRouteProtocol {
         P::Connected => NlRouteProtocol::Kernel, // connected routes are kernel-owned
         P::Static => NlRouteProtocol::Static,
         P::Bgp => NlRouteProtocol::Bgp,
-        // The kernel has no RTPROT_ISIS; fall back to Static.
         P::Ospf => NlRouteProtocol::Ospf,
-        P::IsIs => NlRouteProtocol::Static,
+        // RTPROT_ISIS (187) — netlink-packet-route has the variant and
+        // common's NeighbourProtocol::ISIS pinned the value long ago;
+        // the old Static fallback predates both (S10-a M6).
+        P::IsIs => NlRouteProtocol::Isis,
         P::Rip => NlRouteProtocol::Rip,
         P::Local => NlRouteProtocol::Static,
     }
