@@ -47,6 +47,13 @@ IMAGE=frr-testbed:10.2.2
 SUT_CPUS=${BENCH_SUT_CPUS:-4-11}
 INJ_CPUS=${BENCH_INJ_CPUS:-0-3}
 REPLAY_RATE=${BENCH_REPLAY_RATE:-0}
+# Hold-time both session ends propose (negotiated = min). The Rouster
+# runs use 900: bgpd's session loop can drop a completed read_frame
+# when the keepalive timer wins a select! race (finding F7 — clean
+# wire capture, tee-proxy evidence); a longer hold widens the KA
+# interval and pacing (REPLAY_RATE) empties the race window. FRR runs
+# keep 90 (unaffected).
+HOLD=${BENCH_HOLD:-90}
 TIMEOUT=${BENCH_TIMEOUT:-3600}
 
 case "$(uname -m)" in
@@ -109,7 +116,7 @@ start_sut_rouster() { # name
         ' bgp router-id $SUT_IP' \
         ' neighbor $INJ_IP remote-as $INJ_AS' \
         ' neighbor $INJ_IP passive' \
-        ' hold-time 90' \
+        ' hold-time $HOLD' \
         > /etc/rouster-bgp.conf"
     docker exec "$1" sh -c "rouster-bgpd --validate-config /etc/rouster-bgp.conf"
     docker exec -d "$1" sh -c "rouster-bgpd --config /etc/rouster-bgp.conf > /var/log/rouster-bgpd.log 2>&1"
@@ -136,7 +143,7 @@ start_sut_frr() { # name — zebra + mgmtd + real bgpd, vtysh -b push
         ' no bgp network import-check' \
         ' no bgp ebgp-requires-policy' \
         ' neighbor $INJ_IP remote-as $INJ_AS' \
-        ' neighbor $INJ_IP timers 30 90' \
+        ' neighbor $INJ_IP timers 30 $HOLD' \
         ' address-family ipv4 unicast' \
         '  exit-address-family' \
         'line vty' \
@@ -164,7 +171,7 @@ start_injector() { # name - mrt-replay on the other pinned cpuset
     INJ_ARGS="--peer $SUT_IP:179 --local-addr $INJ_IP --local-as $INJ_AS \
         --peer-as $SUT_AS --router-id $INJ_IP --mrt /feed.mrt \
         --prepend-as $INJ_AS --next-hop $INJ_IP $LIMIT_ARG \
-        --rate $REPLAY_RATE"
+        --rate $REPLAY_RATE --hold $HOLD"
 }
 
 for run in $(seq 1 "$RUNS"); do

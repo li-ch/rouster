@@ -66,7 +66,13 @@ def parse_bgpd_log(path):
 def parse_injector_log(path):
     out = {}
     if not path.exists():
-        return out
+        # the harness renamed the capture (exabgp injector.log ->
+        # mrt-replay injector.txt); accept either
+        alt = path.parent / "injector.txt"
+        if alt.exists():
+            path = alt
+        else:
+            return out
     for line in path.read_text(errors="replace").splitlines():
         m = re.search(r"REPLAY-(FIRST|LAST)-UPDATE .*wall=([\d.]+)", line)
         if m:
@@ -107,12 +113,20 @@ def parse_poll(path):
         if v:
             peak_main = max(peak_main, v)
     out["main_prefixes_peak"] = peak_main
-    out["main_prefixes_at_100k_s"] = None
-    for r in rows:
-        v = to_int(r.get("sut_prefixes_main"))
-        if v is not None and v >= 100_000:
-            out["main_prefixes_at_100k_s"] = float(r["t_host"])
-            break
+    # E5: the SUT daemons' RSS at first-seen table-size marks
+    for mark in (5_000, 10_000, 100_000):
+        out[f"t_at_{mark}_s"] = None
+        out[f"sut_bgpd_rss_at_{mark}_kb"] = None
+        out[f"sut_zebra_rss_at_{mark}_kb"] = None
+        for r in rows:
+            v = to_int(r.get("sut_prefixes_main"))
+            if v is not None and v >= mark:
+                out[f"t_at_{mark}_s"] = float(r["t_host"])
+                out[f"sut_bgpd_rss_at_{mark}_kb"] = to_int(
+                    r.get("sut_bgpd_rss_kb"))
+                out[f"sut_zebra_rss_at_{mark}_kb"] = to_int(
+                    r.get("sut_zebra_rss_kb"))
+                break
     # CPU seconds + RSS from the LAST poll row (cumulative jiffies).
     for tag in ("sut_bgpd", "sut_zebra", "inj"):
         u = fnum(rows[-1], f"{tag}_utime")

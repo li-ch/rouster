@@ -170,6 +170,47 @@ in the chat record. The "Your decision" column stays the owner's.
   {rouster, frr, bird, kernel}, feed checksum, runs, median, p95,
   raw-log path, notes}`)
 
+- 2026-10-15 · E1+FRR-full · host=darwin-vm (OrbStack 7.2.9-orbstack,
+  macOS 27.0.1 host, linux/aarch64 VM, 18 CPUs, SUT pinned 4-11,
+  injector 0-3) · versions: FRR 10.2.2 (`frr-testbed:10.2.2`), harness
+  rouster repo @1aa88be · feed: route-views2 rib.20261015.0400.bz2
+  (sha256 930bcfce34b31ca48c52d7c9d8f8081db1ff8b9ee8ec7d8db7e4ddd023153d5b),
+  1,126,490 IPv4-unicast prefixes, lowest-peer-index path per prefix,
+  NEXT_HOP rewritten + injector AS 65412 prepended (mrt-replay) ·
+  runs: 6 (1 warmup + 5 measured) · injector: in-repo `mrt-replay`
+  (D1(c) switch; exabgp disqualified — ~36 msg/s sustained,
+  deterministic hold-time session death in bulk API mode) ·
+  **wall first-UPDATE→main-table-complete: median 30.36 s,
+  p95 30.42 s (≈37.1k routes/s; ~33.4k UPDATE msg/s)** · CPU s:
+  bgpd median 11.03 (p95 11.07), zebra 9.67 (9.85), injector 1.28 ·
+  RSS peak: bgpd 1,022,508 KiB (median), zebra 606,272 KiB; final:
+  bgpd 1,022,440, zebra 593,908 · E5 (this run): bgpd RSS
+  11,408→1,022,508 KiB ≈ **897 B/prefix**; zebra 7,976→593,908 ≈
+  **519 B/prefix** · raw: `target/bench-logs/frr-20261015T062832Z/`
+  · notes: wall anchored at the injector's first UPDATE send and
+  main-table = zebra `show ip route summary` Totals (includes kernel
+  FIB install completion); FRR json pfxRcd settles at feed−9
+  (0.0008 %, bgpd log clean at info level, cause unattributed);
+  556,132 UPDATE messages delivered in 5.01 s (injector sustained
+  ≈225k routes/s, CPU 1.28 s — the D1 gate: injector headroom
+  ≈3,500× FRR's own consumption); EOR-then-linger keeps the session
+  up so the table survives measurement.
+
+- 2026-10-15 · E7+zapi-codec · host=macbook-native (macOS 27.0.1,
+  aarch64, quiet-machine criterion run; NOT darwin-vm — no containers)
+  · versions: rouster repo @<this commit>, criterion 0.5.1 (crates/zapi
+  dev-dependency, D2's one-crate-first pattern) · corpus: the Z1
+  pinned wire fixtures (`crates/zapi/tests/fixtures/{staticd,bgpd,
+  ospfd}-10.2.2.log`, 15/23/5 captured messages; non-empty bodies) ·
+  runs: criterion defaults (100 samples, 3 s warmup) ·
+  **decode (full-corpus pass): staticd median 147.4 ns, bgpd 33.5 ns,
+  ospfd 6.0 ns** · **encode_body (full-corpus pass): staticd 324 ns,
+  bgpd 357 ns, ospfd 57 ns** · raw: `target/criterion/` +
+  `cargo bench -p zapi` rerunnable · notes: `benches/zapi_codec.rs`
+  asserts nothing — descriptive micro numbers only; the byte-exact
+  ground truth stays in `tests/golden.rs`. The D3 nightly CI dispatch
+  job is deliberately NOT wired (owner requests it separately).
+
 ## Where things live (conventions)
 
 - Scripts: `scripts/bench-<E#>-<name>.sh` (the smoke-suite shape;

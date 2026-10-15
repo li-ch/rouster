@@ -13,3 +13,12 @@ thiserror.workspace = true
 # feature set; needed by the zapi-sniff debug binary's socket loop.
 tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
+
+# E7 codec micro-benchmarks (docs/benchmarks.md D2: criterion on zapi
+# first — the tokio-test-util precedent: dev-dep, reviewable).
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "zapi_codec"
+harness = false
