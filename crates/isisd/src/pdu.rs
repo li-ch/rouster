@@ -739,8 +739,7 @@ mod tests {
                 Tlv::ThreewayAdjacency(ThreewayAdjacency {
                     state: ThreewayState::Initializing,
                     extended_local_circuit_id: 1,
-                    neighbor_system_id: PEER,
-                    neighbor_extended_circuit_id: None,
+                    neighbor: Some((PEER, 0)),
                 }),
             ],
         );
@@ -758,7 +757,11 @@ mod tests {
         assert_eq!(bytes[19], 1);
         // TLV 1: [code 1][len 4][alen 3][49 00 01]
         assert_eq!(&bytes[20..26], &[1, 4, 3, 0x49, 0x00, 0x01]);
-        assert_eq!(bytes.len(), 20 + 6 + 3 + 6 + 13);
+        assert_eq!(
+            bytes.len(),
+            20 + 6 + 3 + 6 + 17,
+            "TLV 240 is now the 15-octet form"
+        );
         // Level from the type byte: P2P IIH (17) belongs to the
         // L2 family block in `level()`; the levels themselves ride
         // the circuit-type byte.

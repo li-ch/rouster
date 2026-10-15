@@ -131,18 +131,24 @@ impl Adjacency {
     }
 
     /// The TLV 240 option our next IIH carries (RFC 5303 §3.2's
-    /// clause e: the current state; the neighbour fields when known —
-    /// Initializing or Up).
+    /// clause e, in FRR's deployed shape): the current state always;
+    /// the neighbour pair once the adjacency record exists (the
+    /// 15-octet form), the bare 5-octet form before that.
     pub fn threeway_option(&self, ctx: &CircuitContext) -> ThreewayAdjacency {
+        let neighbor = if self.state == crate::adjacency::AdjacencyState::Down
+            && self.threeway == ThreewayState::Down
+        {
+            None
+        } else {
+            Some((
+                self.neighbor,
+                self.neighbor_extended_circuit_id.unwrap_or(0),
+            ))
+        };
         ThreewayAdjacency {
             state: self.threeway,
             extended_local_circuit_id: ctx.extended_circuit_id,
-            neighbor_system_id: self.neighbor,
-            neighbor_extended_circuit_id: if self.threeway == ThreewayState::Down {
-                None
-            } else {
-                self.neighbor_extended_circuit_id
-            },
+            neighbor,
         }
     }
 
@@ -227,14 +233,12 @@ pub fn accept_hello(
     // Neighbor Extended Local Circuit ID does not match the local
     // system's extended circuit ID, the PDU SHALL be discarded".
     if let Some(tw) = &hello.threeway {
-        if tw.state != ThreewayState::Down {
-            if tw.neighbor_system_id != ctx.our_system_id {
+        if let Some((nsys, ncid)) = tw.neighbor {
+            if nsys != ctx.our_system_id {
                 return Err("three-way neighbor system id is not us");
             }
-            if let Some(ncid) = tw.neighbor_extended_circuit_id {
-                if ncid != ctx.extended_circuit_id {
-                    return Err("three-way neighbor circuit id is not ours");
-                }
+            if ncid != ctx.extended_circuit_id {
+                return Err("three-way neighbor circuit id is not ours");
             }
         }
     }
@@ -364,10 +368,11 @@ mod tests {
         circuit_type: Level,
         holding: u16,
     ) -> HelloInfo {
-        let neighbor_extended_circuit_id = if threeway == Some(ThreewayState::Up) {
-            Some(7)
-        } else {
-            None
+        // The deployed 15-octet form whenever the neighbour pair is
+        // known (states Initializing/Up); Down without fields.
+        let neighbor = match threeway {
+            Some(ThreewayState::Initializing) | Some(ThreewayState::Up) => Some((US, 7)),
+            _ => None,
         };
         HelloInfo {
             source: THEM,
@@ -378,8 +383,7 @@ mod tests {
             threeway: threeway.map(|state| ThreewayAdjacency {
                 state,
                 extended_local_circuit_id: 9,
-                neighbor_system_id: US,
-                neighbor_extended_circuit_id,
+                neighbor,
             }),
             pdu_length: 50,
         }
@@ -436,8 +440,7 @@ mod tests {
         // their circuit id.
         let opt = adj.threeway_option(&ctx);
         assert_eq!(opt.state, ThreewayState::Initializing);
-        assert_eq!(opt.neighbor_system_id, THEM);
-        assert_eq!(opt.neighbor_extended_circuit_id, Some(9));
+        assert_eq!(opt.neighbor, Some((THEM, 9)));
 
         // Their second IIH: Initializing, listing US — we go Up.
         let action = process_hello(
@@ -646,7 +649,7 @@ mod tests {
             30,
         );
         wrong.threeway = wrong.threeway.map(|mut tw| {
-            tw.neighbor_system_id = SystemId::from_bytes([9, 9, 9, 9, 9, 9]);
+            tw.neighbor = Some((SystemId::from_bytes([9, 9, 9, 9, 9, 9]), 7));
             tw
         });
         assert_eq!(
@@ -654,7 +657,7 @@ mod tests {
             Err("three-way neighbor system id is not us")
         );
 
-        // Three-way neighbor circuit id not ours (present only in Up).
+        // Three-way neighbor circuit id not ours (the 15-octet form).
         let mut wrong_cid = hello(
             Some(ThreewayState::Up),
             vec![ctx.our_areas[0].clone()],
@@ -662,7 +665,7 @@ mod tests {
             30,
         );
         wrong_cid.threeway = wrong_cid.threeway.map(|mut tw| {
-            tw.neighbor_extended_circuit_id = Some(999);
+            tw.neighbor = Some((US, 999));
             tw
         });
         assert_eq!(

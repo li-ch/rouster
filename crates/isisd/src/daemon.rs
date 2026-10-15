@@ -496,8 +496,15 @@ impl Daemon {
             1, // local circuit id (one circuit)
             tlvs,
         );
+        // ISO 8.2.3's maxsize-1 rule with the LLC accounted: FRR pads
+        // its PDU to MTU-3 (1497 on a 1500 circuit) so the LLC+PDU
+        // payload fits the Ethernet MTU; we match (the wire dump
+        // pinned it).
         let mut bytes = pdu.encode();
-        crate::transport::pad_pdu(&mut bytes, self.config.interface.mtu as usize - 1);
+        crate::transport::pad_pdu(
+            &mut bytes,
+            self.config.interface.mtu as usize - crate::transport::LLC_ISIS.len(),
+        );
         // The padding changed the total: re-patch the PDU length (the
         // fixed part's field) so the strict decoder accepts it.
         let total = bytes.len() as u16;

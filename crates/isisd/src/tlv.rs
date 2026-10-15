@@ -259,18 +259,25 @@ impl ThreewayState {
 }
 
 /// The P2P three-way adjacency TLV 240 (RFC 5303 §3): adjacency
-/// state, extended local circuit ID, neighbor system ID, and — only
-/// in the Up state — the neighbor's extended circuit ID (11 or 15
-/// octets).
+/// state, extended local circuit ID, and — when the neighbor is
+/// known — its system ID and extended circuit ID.
+///
+/// The deployed length forms are exactly two (pinned to FRR 10.2.2's
+/// `unpack_tlv_threeway_adj`, which rejects every other size):
+/// **5 octets** (state + local circuit ID — "If no adjacency exists,
+/// the state SHALL be reported as Down" with no neighbor fields) and
+/// **15 octets** (the neighbor pair added once known — RFC 5303 §3.2
+/// clause e: "If the system ID and Extended Local Circuit ID of the
+/// neighboring system are known … SHALL be reported", both or
+/// neither). FRR sends the 15-octet form in Initializing and Down
+/// states alike once an adjacency record exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreewayAdjacency {
     pub state: ThreewayState,
     pub extended_local_circuit_id: u32,
-    pub neighbor_system_id: SystemId,
-    /// Present (and on the wire) only when `state == Up` (RFC 5303
-    /// §3: "the Neighbor Extended Local Circuit ID is not included"
-    /// otherwise).
-    pub neighbor_extended_circuit_id: Option<u32>,
+    /// The 15-octet form's neighbor pair (`None` in the 5-octet
+    /// form).
+    pub neighbor: Option<(SystemId, u32)>,
 }
 
 /// The typed TLV model. One PDU carries a `Vec<Tlv>` in wire order.
@@ -587,30 +594,24 @@ fn decode_one(kind: u8, value: &[u8]) -> Result<Tlv, IsisError> {
         }
         TLV_THREEWAY_ADJACENCY => {
             // RFC 5303 §3: state (1), extended local circuit ID (4),
-            // neighbor system ID (6), neighbor extended circuit ID (4,
-            // only in Up) — lengths 11 or 15.
-            if value.len() != 11 && value.len() != 15 {
+            // then the neighbor pair (system ID 6 + circuit ID 4) in
+            // the 15-octet form — the two deployed lengths.
+            if value.len() != 5 && value.len() != 15 {
                 return Err(IsisError::BadLength {
-                    field: "TLV 240",
+                    field: "TLV 240 (5 or 15 octets)",
                     declared: value.len(),
-                    actual: 11,
+                    actual: 5,
                 });
             }
             let state =
                 ThreewayState::from_u8(value[0]).ok_or(IsisError::BadThreewayState(value[0]))?;
-            let neighbor_extended_circuit_id = if value.len() == 15 {
-                if state != ThreewayState::Up {
-                    // The 15-octet form is only meaningful Up; a
-                    // non-Up state carrying it is malformed.
-                    return Err(IsisError::BadLength {
-                        field: "TLV 240 (neighbor circuit id present but state is not Up)",
-                        declared: 15,
-                        actual: 11,
-                    });
-                }
-                Some(u32::from_be_bytes([
-                    value[11], value[12], value[13], value[14],
-                ]))
+            let neighbor = if value.len() == 15 {
+                Some((
+                    SystemId::from_bytes([
+                        value[5], value[6], value[7], value[8], value[9], value[10],
+                    ]),
+                    u32::from_be_bytes([value[11], value[12], value[13], value[14]]),
+                ))
             } else {
                 None
             };
@@ -619,10 +620,7 @@ fn decode_one(kind: u8, value: &[u8]) -> Result<Tlv, IsisError> {
                 extended_local_circuit_id: u32::from_be_bytes([
                     value[1], value[2], value[3], value[4],
                 ]),
-                neighbor_system_id: SystemId::from_bytes([
-                    value[5], value[6], value[7], value[8], value[9], value[10],
-                ]),
-                neighbor_extended_circuit_id,
+                neighbor,
             })
         }
         other => Tlv::Unknown {
@@ -768,8 +766,8 @@ pub fn encode_tlv(buf: &mut Vec<u8>, tlv: &Tlv) {
         Tlv::ThreewayAdjacency(tw) => {
             put_u8(&mut value, tw.state.to_u8());
             put_u32(&mut value, tw.extended_local_circuit_id);
-            value.extend_from_slice(&tw.neighbor_system_id.0);
-            if let Some(ncid) = tw.neighbor_extended_circuit_id {
+            if let Some((nsys, ncid)) = tw.neighbor {
+                value.extend_from_slice(&nsys.0);
                 put_u32(&mut value, ncid);
             }
         }
@@ -1140,41 +1138,46 @@ mod tests {
         ));
     }
 
-    /// RFC 5303 §3: 11 octets Down/Initializing, 15 Up; states 0-2
-    /// only; the neighbor circuit id exists only Up.
+    /// RFC 5303 §3 + FRR 10.2.2 parity: the two deployed lengths —
+    /// 5 octets (Down, no neighbor fields) and 15 (the neighbor
+    /// pair); states 0-2 only; anything else rejected.
     #[test]
     fn threeway_adjacency_lengths_and_states() {
         let down = Tlv::ThreewayAdjacency(ThreewayAdjacency {
             state: ThreewayState::Down,
             extended_local_circuit_id: 7,
-            neighbor_system_id: SYS,
-            neighbor_extended_circuit_id: None,
+            neighbor: None,
+        });
+        let initializing = Tlv::ThreewayAdjacency(ThreewayAdjacency {
+            state: ThreewayState::Initializing,
+            extended_local_circuit_id: 7,
+            neighbor: Some((SYS, 9)),
         });
         let up = Tlv::ThreewayAdjacency(ThreewayAdjacency {
             state: ThreewayState::Up,
             extended_local_circuit_id: 7,
-            neighbor_system_id: SYS,
-            neighbor_extended_circuit_id: Some(9),
+            neighbor: Some((SYS, 9)),
         });
         let mut buf = Vec::new();
         encode_tlv(&mut buf, &down);
-        assert_eq!(buf.len(), 2 + 11);
+        assert_eq!(buf.len(), 2 + 5);
+        let mut buf = Vec::new();
+        encode_tlv(&mut buf, &initializing);
+        assert_eq!(buf.len(), 2 + 15);
         let mut buf = Vec::new();
         encode_tlv(&mut buf, &up);
         assert_eq!(buf.len(), 2 + 15);
-        assert_eq!(roundtrip(&[down.clone(), up.clone()]), vec![down, up]);
-        // Bad state value.
+        assert_eq!(roundtrip(std::slice::from_ref(&down)), vec![down]);
+        assert_eq!(roundtrip(std::slice::from_ref(&up)), vec![up]);
+        // Bad state value (the 5-octet form).
         assert!(matches!(
-            decode_tlvs(&{
-                let mut v = vec![TLV_THREEWAY_ADJACENCY, 11, 3];
-                v.extend_from_slice(&[0; 10]);
-                v
-            }),
+            decode_tlvs(&[TLV_THREEWAY_ADJACENCY, 5, 3, 0, 0, 0, 0]),
             Err(IsisError::BadThreewayState(3))
         ));
-        // Neighbor circuit id present while not Up.
-        let mut v = vec![TLV_THREEWAY_ADJACENCY, 15, 1];
-        v.extend_from_slice(&[0; 14]);
+        // The 11-octet intermediate form is NOT deployed: FRR rejects
+        // it, so do we.
+        let mut v = vec![TLV_THREEWAY_ADJACENCY, 11, 1];
+        v.extend_from_slice(&[0; 10]);
         assert!(matches!(decode_tlvs(&v), Err(IsisError::BadLength { .. })));
     }
 

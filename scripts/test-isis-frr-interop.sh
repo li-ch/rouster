@@ -22,7 +22,7 @@
 #   - REDIST-OUT: staticd on r2 injects 198.51.100.0/24 -> rousterd
 #     pushes the STATIC redistribute to our isisd -> we originate the
 #     TLV 135 entry -> FRR installs it (r1 kernel `proto isis`).
-#   - REDIST-IN: staticd on r1 + FRR `redistribute static` -> FRR's
+#   - REDIST-IN: staticd on r1 + FRR `redistribute ipv4 static level-2` -> FRR's
 #     TLV 135 (203.0.113.0/24) -> our SPF -> ROUTE_ADD through
 #     rousterd -> r2 kernel `proto isis` via FRR.
 #   - SOAK: 30 s — adjacency still Up, routes still present, no zapi
@@ -156,17 +156,22 @@ wait_in "$R1" "r1 FRR daemons up" 30 "pidof mgmtd staticd isisd"
 wait_in "$R1" "r1 isisd vty socket" 30 "test -S /var/run/frr/isisd.vty"
 
 echo "==> FRR side config (vtysh -b, retried past the zebra-view race)"
+# NOTE: the `router isis` stanza must precede `ip router isis` on the
+# interface — FRR's northbound validation rejects the interface
+# reference otherwise ("Mandatory node 'area-tag' instance does not
+# exist").
 docker exec "$R1" sh -c "printf '%s\n' \
   'frr version 10.2' \
   'frr defaults traditional' \
   'hostname isis-frr-r1' \
-  'interface eth0' \
-  ' ip router isis' \
-  ' isis network point-to-point' \
-  'router isis' \
+  'router isis CORE' \
   ' net $FRR_NET' \
   ' is-type level-2-only' \
-  ' redistribute static' \
+  ' redistribute ipv4 static level-2' \
+  'interface eth0' \
+  ' ip router isis CORE' \
+  ' isis network point-to-point' \
+  ' isis circuit-type level-2' \
   'line vty' \
   > $FRR_CONF"
 APPLIED=0
@@ -214,8 +219,10 @@ wait_in "$R1" "FRR neighbor Up" 90 "vtysh -c 'show isis neighbor' | grep -q ' Up
 wait_in "$R2" "our isisd logged adjacency UP" 90 "grep -q 'adjacency UP' $OUR_ISISD_LOG"
 
 echo "==> LSDB-BOTH: each database holds the other's LSP"
+# NB: FRR prints LSP IDs with the DYNAMIC hostname once known
+# (RFC 5301) — our LSP shows as "rouster-r2.00-00".
 wait_in "$R1" "FRR's database holds our LSP" 30 \
-    "vtysh -c 'show isis database' | grep -q '1921.6800.1002'"
+    "vtysh -c 'show isis database' | grep -q 'rouster-r2'"
 wait_in "$R2" "our isisd installed FRR-derived routes" 30 \
     "grep -q 'IS-IS route installed' $OUR_ISISD_LOG"
 

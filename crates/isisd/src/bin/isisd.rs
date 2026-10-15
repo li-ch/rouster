@@ -132,10 +132,13 @@ mod linux_main {
                 match socket.recv(&mut buf).await {
                     Ok(n) => {
                         if let Some(frame) = isisd::transport::parse_frame(&buf[..n]) {
-                            if let Ok(pdu) = Pdu::decode(frame.payload) {
-                                let _ = rx_tx.send(Event::Pdu(pdu));
-                            } else {
-                                tracing::debug!("isisd: undecodable PDU on the wire (dropped)");
+                            match Pdu::decode(frame.payload) {
+                                Ok(pdu) => {
+                                    let _ = rx_tx.send(Event::Pdu(pdu));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("isisd: undecodable PDU on the wire (dropped): {e}");
+                                }
                             }
                         }
                     }

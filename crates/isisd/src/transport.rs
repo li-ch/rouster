@@ -1,16 +1,19 @@
 //! The IS-IS link transport: Ethernet framing (pure, every platform)
 //! and the Linux AF_PACKET ethertype-0x00FE socket (cfg-gated).
 //!
-//! **Framing** (pure): IS-IS rides Ethernet directly — ethertype
-//! 0x00FE, destination 01:80:c2:00:00:14 (AllL1ISs) / 01:80:c2:00:
-//! 00:15 (AllL2ISs) / 09:00:2b:00:00:05 (All ISs, RFC 5309's p2p-
-//! over-LAN) per ISO 10589 §8.4.8's Table 9 constants (verified in
-//! FRR 10.2.2 `isisd/isis_pfpacket.c`). The p2p wire form carries the
-//! PDU straight after the ethertype (no LLC); LAN frames from FRR
-//! carry the LLC header (FE FE 03) after it — [`parse_frame`] accepts
-//! both, [`frame`] emits the p2p form (what FRR's p2p TX path emits:
-//! `isis_send_pdu_p2p` sends the bare PDU with `sll_protocol =
-//! htons(0x00FE)`).
+//! **Framing** (pure): IS-IS rides Ethernet directly — destination
+//! 01:80:c2:00:00:14 (AllL1ISs) / 01:80:c2:00:00:15 (AllL2ISs) /
+//! 09:00:2b:00:00:05 (All ISs, RFC 5309's p2p-over-LAN) per ISO
+//! 10589 §8.4.8's Table 9 constants (verified in FRR 10.2.2
+//! `isisd/isis_pfpacket.c`). The ETHERNET wire form is **802.3 +
+//! LLC** (`length | FE FE 03 | PDU`) — the 0x00FE "ethertype" form
+//! is a trap: 0x00FE < 1536, so receiving stacks classify it as an
+//! 802.3 length (254!) and ethertype-matched filters (FRR's BPF,
+//! AF_PACKET protocol filters) never match it. [`frame`] emits the
+//! LLC form; [`parse_frame`] accepts the LLC form (both the length
+//! field and FRR's 0x8870 extended-LLC variant) AND the bare
+//! 0x00FE form (FRR's `isis_send_pdu_p2p` emits it on pure-p2p
+//! interfaces, where the far end's stack apparently copes).
 //!
 //! **The socket** (Linux only): a `SOCK_RAW` `AF_PACKET` socket with
 //! the protocol bound at creation — `socket(AF_PACKET, SOCK_RAW,
@@ -115,16 +118,42 @@ impl std::fmt::Display for Mac {
     }
 }
 
-/// Build one Ethernet frame: `dst | src | 0x00FE | PDU` (the p2p wire
-/// form — FRR's `isis_send_pdu_p2p`).
+/// Build one Ethernet frame — the **802.3 + LLC form**:
+/// `dst | src | length | FE FE 03 | PDU`.
+///
+/// Why not the 0x00FE ethertype form (FRR's `isis_send_pdu_p2p`
+/// writes it): **0x00FE = 254 sits below the 802.3/DIX threshold of
+/// 1536**, so the receiver's `eth_type_trans` classifies the frame
+/// as 802.3 and hands the stack `ETH_P_802_2` — an ethertype-matched
+/// socket or BPF (FRR's) never sees it (found live in the S10-a
+/// smoke bring-up; the wire dump showed our ethertype frames
+/// arriving at FRR and dying in its BPF). Every Ethernet IS-IS
+/// deployment uses the LLC form — FRR's LAN TX path
+/// (`isis_send_pdu_bcast` + `isis_ethertype()`: the length field for
+/// frames ≤ 1535, the 0x8870 extended-LLC ethertype above) — and so
+/// do we, with the length field set to the LLC+PDU length as FRR
+/// does.
 pub fn frame(dst: Mac, src: Mac, pdu: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(14 + pdu.len());
+    let llc_len = LLC_ISIS.len() + pdu.len();
+    let mut out = Vec::with_capacity(14 + llc_len);
     out.extend_from_slice(&dst.0);
     out.extend_from_slice(&src.0);
-    out.extend_from_slice(&ETHERTYPE_ISIS.to_be_bytes());
+    let type_field = if llc_len > MAX_LLC_LEN {
+        ETHERTYPE_EXT_LLC
+    } else {
+        llc_len as u16
+    };
+    out.extend_from_slice(&type_field.to_be_bytes());
+    out.extend_from_slice(&LLC_ISIS);
     out.extend_from_slice(pdu);
     out
 }
+
+/// FRR's `MAX_LLC_LEN` (0x5ff): above it the type field becomes the
+/// extended-LLC ethertype 0x8870 (FRR's own constant pair).
+pub const MAX_LLC_LEN: usize = 0x5ff;
+/// FRR's `ETHERTYPE_EXT_LLC`.
+pub const ETHERTYPE_EXT_LLC: u16 = 0x8870;
 
 /// A parsed frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,26 +165,44 @@ pub struct ParsedFrame<'a> {
     pub payload: &'a [u8],
 }
 
-/// Parse one received frame. Accepts the LLC-bearing LAN form
-/// (ethertype followed by FE FE 03) and the bare p2p form; rejects
-/// other ethertypes and runt frames. Ethernet minimum sizes are not
-/// enforced — padding after the PDU is the receiver's non-problem
-/// (the PDU's own length field frames it).
+/// Parse one received frame. Two IS-IS encapsulations exist on
+/// Ethernet (both accepted, FRR 10.2.2 emits both depending on the
+/// circuit):
+///
+/// - **Ethertype form**: `dst | src | 0x00FE | PDU` — the p2p wire
+///   form (FRR's `isis_send_pdu_p2p`; also our TX form).
+/// - **802.3 form**: `dst | src | length ≤ 1500 | FE FE 03 | PDU` —
+///   the LAN/broadcast form (FRR's `isis_send_pdu_bcast`, including
+///   its p2p-over-broadcast-interface hellos, which go to All-ISs
+///   09:00:2b:00:00:05 WITH the LLC header — verified on the wire in
+///   the S10-a smoke bring-up).
+///
+/// Other ethertypes and runts are rejected; trailing padding is the
+/// PDU length field's business.
 pub fn parse_frame(bytes: &[u8]) -> Option<ParsedFrame<'_>> {
     if bytes.len() < 14 {
         return None;
     }
     let dst = Mac([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]]);
     let src = Mac([bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11]]);
-    let ethertype = u16::from_be_bytes([bytes[12], bytes[13]]);
-    if ethertype != ETHERTYPE_ISIS {
-        return None;
-    }
+    let type_or_len = u16::from_be_bytes([bytes[12], bytes[13]]);
     let rest = &bytes[14..];
-    let payload = if rest.len() >= 3 && rest[..3] == LLC_ISIS {
+    let payload = if type_or_len == ETHERTYPE_ISIS {
+        // Ethertype form: an LLC header MAY follow (the LAN shape).
+        if rest.len() >= 3 && rest[..3] == LLC_ISIS {
+            &rest[3..]
+        } else {
+            rest
+        }
+    } else if (type_or_len <= 1500 || type_or_len == ETHERTYPE_EXT_LLC)
+        && rest.len() >= 3
+        && rest[..3] == LLC_ISIS
+    {
+        // 802.3 length form (or FRR's extended-LLC ethertype) with
+        // the IS-IS LLC.
         &rest[3..]
     } else {
-        rest
+        return None;
     };
     Some(ParsedFrame {
         dst,
@@ -248,13 +295,16 @@ mod packet {
             let mac_text = read_sysctl(&format!("/sys/class/net/{ifname}/address"))?;
             let our_mac = Mac::parse(mac_text.trim())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no MAC"))?;
-            // AF_PACKET SOCK_RAW with the protocol in network byte
-            // order (packet(7)); socket2 0.6.5's Protocol takes the
-            // raw c_int.
+            // AF_PACKET SOCK_RAW over ETH_P_ALL in network byte order
+            // (packet(7)) — NOT a 0x00FE filter: peers encapsulate
+            // IS-IS as 802.3+LLC (length field, no ethertype), which
+            // an ethertype filter never sees (FRR opens ETH_P_ALL +
+            // a BPF program for the same reason; we filter purely in
+            // `parse_frame` — no BPF, no unsafe).
             let socket = Socket::new(
                 Domain::PACKET,
                 Type::RAW,
-                Some(Protocol::from(super::ETHERTYPE_ISIS.to_be() as i32)),
+                Some(Protocol::from(0x0003u16.to_be() as i32)),
             )?;
             socket.set_nonblocking(true)?;
             let dup = socket.as_fd().try_clone_to_owned()?;
@@ -272,25 +322,24 @@ mod packet {
             self.our_mac
         }
 
-        /// Receive one frame into `buf` (the whole Ethernet frame —
-        /// SOCK_RAW delivers it in the buffer); returns the length.
-        /// Our own looped-back transmissions (source MAC == ours) and
-        /// non-IS-IS frames are consumed silently — the next call
-        /// reads again. The caller parses with [`super::parse_frame`].
+        /// Receive one IS-IS frame into `buf` (the whole Ethernet
+        /// frame — SOCK_RAW delivers it); returns the length. Frames
+        /// that are not IS-IS (the ETH_P_ALL socket sees all bridge
+        /// traffic), our own looped-back transmissions (source MAC ==
+        /// ours — both the PACKET_OUTGOING kernel copy and the
+        /// bridge-reflected multicast copy) and runts are consumed
+        /// silently; the next call reads again. The caller parses
+        /// with [`super::parse_frame`].
         pub async fn recv(&self, buf: &mut [u8; 9000]) -> io::Result<usize> {
             loop {
                 let n = self.io.recv(buf).await?;
-                if let Some(parsed) = super::parse_frame(&buf[..n]) {
-                    if parsed.src == self.our_mac {
-                        continue; // PACKET_OUTGOING loopback of our own send
-                    }
+                let Some(parsed) = super::parse_frame(&buf[..n]) else {
+                    continue; // not IS-IS (ARP/IP/... on the shared socket)
+                };
+                if parsed.src == self.our_mac {
+                    continue;
                 }
-                if super::parse_frame(&buf[..n]).is_some() {
-                    return Ok(n);
-                }
-                // Not an IS-IS frame (another ethertype sharing the
-                // socket cannot happen — the protocol filters at the
-                // kernel — but runts can).
+                return Ok(n);
             }
         }
 
@@ -364,21 +413,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_roundtrip_p2p_and_llc_forms() {
+    fn frame_is_the_8023_llc_form() {
         let pdu = [0x83u8, 0x14, 0x01, 0x00, 0x11, 0x01, 0x00, 0x00, 0x03];
         let bytes = frame(Mac::ALL_L1_ISS, Mac([2, 3, 4, 5, 6, 7]), &pdu);
-        assert_eq!(&bytes[12..14], &[0x00, 0xFE]);
+        // Type field = LLC+PDU length (FRR's isis_ethertype), then
+        // the LLC, then the PDU.
+        assert_eq!(&bytes[12..14], &((pdu.len() + 3) as u16).to_be_bytes());
+        assert_eq!(&bytes[14..17], &LLC_ISIS);
         let parsed = parse_frame(&bytes).unwrap();
         assert_eq!(parsed.dst, Mac::ALL_L1_ISS);
         assert_eq!(parsed.src, Mac([2, 3, 4, 5, 6, 7]));
         assert!(parsed.multicast);
         assert_eq!(parsed.payload, &pdu);
 
-        // The LLC-bearing LAN form (FRR's LAN TX): payload skips it.
-        let mut lan = bytes.clone();
-        lan.splice(14..14, LLC_ISIS);
-        let parsed = parse_frame(&lan).unwrap();
+        // The 0x00FE ethertype form (FRR's pure-p2p TX): accepted on
+        // RX, never emitted.
+        let mut ethertype_form = vec![0x01, 0x80, 0xc2, 0x00, 0x00, 0x15];
+        ethertype_form.extend_from_slice(&[2, 3, 4, 5, 6, 7]);
+        ethertype_form.extend_from_slice(&[0x00, 0xFE]);
+        ethertype_form.extend_from_slice(&pdu);
+        let parsed = parse_frame(&ethertype_form).unwrap();
         assert_eq!(parsed.payload, &pdu);
+
+        // FRR's extended-LLC variant (type field 0x8870): accepted.
+        let mut ext = frame(Mac::ALL_ISS, Mac([2, 3, 4, 5, 6, 7]), &pdu);
+        ext[12..14].copy_from_slice(&ETHERTYPE_EXT_LLC.to_be_bytes());
+        let parsed = parse_frame(&ext).unwrap();
+        assert_eq!(parsed.payload, &pdu);
+
+        // A length field without the IS-IS LLC is not IS-IS.
+        let mut not_isis = bytes.clone();
+        not_isis[14] = 0xAA; // SNAP instead of FE FE 03
+        not_isis[15] = 0xAA;
+        not_isis[16] = 0x03;
+        assert!(parse_frame(&not_isis).is_none());
 
         // Other ethertypes rejected; runts rejected.
         let mut other = bytes.clone();
