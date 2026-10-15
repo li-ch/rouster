@@ -608,6 +608,17 @@ fn generation_at(opts: &ApplyOptions, pointer: &str) -> Result<Option<(u64, Vec<
     Ok(Some((seq, bytes)))
 }
 
+/// The current (last CONFIRMED) generation's canonical bytes — the
+/// RESTCONF running view (S12-a): `Ok(None)` until the first
+/// confirmed apply.
+pub fn current_generation(run_dir: &Path) -> Result<Option<Vec<u8>>, ApplyError> {
+    let opts = ApplyOptions {
+        run_dir: run_dir.to_path_buf(),
+        etc_dir: PathBuf::from("/etc"),
+    };
+    Ok(generation_at(&opts, "current")?.map(|(_, bytes)| bytes))
+}
+
 /// Applies an operator file from disk.
 pub fn apply_file(path: &Path, opts: &ApplyOptions) -> Result<ApplyReport, ApplyError> {
     let bytes = fs::read(path).map_err(|err| ApplyError::Read {

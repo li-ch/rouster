@@ -42,3 +42,4 @@
 //! so nothing is lost when option A is wanted.
 
 pub mod http;
+pub mod resources;
