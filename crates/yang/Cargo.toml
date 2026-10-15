@@ -1,0 +1,10 @@
+[package]
+name = "yang"
+description = "Rouster YANG core - the subset parser, data tree, and validator (RFC 7950 constructs we use, no deps)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
