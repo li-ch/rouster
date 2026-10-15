@@ -84,6 +84,25 @@ per-daemon asks are §Deferred).
 Section order in the file does not matter; apply order is
 configd's registry (§2), not file order.
 
+## 1.5 The YANG layer (S11-a M4 — invariant 5's flip)
+
+Since S11-a the canonical file's section bodies BIND to YANG models
+(`yang/*.yang`, parsed by `crates/yang` — the RFC 7950-subset core):
+each section body → a data tree against its daemon's module. The
+tree is the **internal source of truth**: validation runs on it
+(§8.1: types at bind time, mandatory/leaf-list/`must` after), and
+the per-daemon files RENDER FROM THE TREES — byte-identical to the
+section-split render (pinned by `crates/configd/tests/yang_flip.rs`
+against the legacy renderer, which stays as the oracle and the
+`--no-yang` escape's fallback). The text grammar remains the edge
+input; the daemon `--validate-config` gates stay (§2 step 1.5) — a
+line the model does not cover is pass-through, disclosed, and the
+daemon remains its semantic gate. `configd dump --json <FILE>`
+emits the bound trees in the RFC 7951 JSON encoding (defaults
+filled; a non-standard `#unmodeled-<daemon>` member carries the
+pass-through disclosure) — the form is documented in
+[../yang.md](../yang.md).
+
 ## 2. The apply pipeline
 
 ```text
@@ -91,6 +110,12 @@ configd's registry (§2), not file order.
                             │ read
                             v
                  parse → section tree (structural validate)
+                            │
+                            v
+        1.4 YANG bind+validate (S11-a M4): each section body binds
+            to its model; tree violations refuse the apply with
+            data-path + line errors; unmodeled lines are disclosed
+            pass-through (crates/yang, docs/yang.md)
                             │
                             v
         1.5 deep validation: each section's rendered bytes through
@@ -247,6 +272,7 @@ binary discovery, default: configd's own dir then `PATH`):
 | `status` | prints `<run-dir>/configd.status` verbatim (the `savd --show` shape) | 0 · 2 · 3 no status published |
 | `render <FILE>` | parse + render + **write** the daemon files, no signals, no generation (staging) | 0 · 1 · 2 |
 | `render <FILE> --dry-run` | prints each daemon's output with its destination, touches nothing | 0 · 1 · 2 |
+| `dump --json <FILE>` | the bound trees in the RFC 7951 JSON encoding (needs the YANG mode) | 0 · 1 · 2 |
 
 Dead-pid daemons never fail an apply (exit 0, `not-running`
 recorded); a structurally- or semantically-rejected canonical file
@@ -369,14 +395,16 @@ at a time (no lockfile; disclosed).
    recorded; the first taker is rousterd's grammar (a `router-id`
    line in `rouster.conf`), then configd renders it into that
    section's output.
-6. **The YANG mapping** — the architecture invariant-5 target: the
-   canonical tree maps onto a YANG datastore; the section grammar
-   and the renderer survive as the northbound parse layer and the
-   southbound appliers respectively (vty.md's K3 criterion:
-   nothing in this interim survives as a second source of truth).
-   The vtyd write path (landed S8-c, vty.md) is the interim's
-   second half: the session tree merges into the canonical file
-   and writes THROUGH configd — never around it.
+6. **DONE (S11-a M4)** ~~The YANG mapping~~ — the bodies bind to
+   `yang/*.yang` models, validate as trees, and the daemon files
+   render FROM the trees (§1.5; `crates/yang` is the RFC 7950-subset
+   core, `docs/yang.md` the model reference). The section grammar
+   and the legacy renderer survive as the northbound parse layer
+   and the byte-identity oracle (vty.md's K3 criterion holds:
+   nothing is a second source of truth). The residuals live in
+   `docs/yang.md` §Deferred (the full RFC 7950 surface — grouping/
+   uses/augment, when, choice, anydata, deviations — and the
+   cross-module data composition they enable).
 7. **DONE (S8-c)** ~~The vtyd write path~~ — landed: `write file`/
    `write memory` stage the merged canonical and spawn
    `configd apply` (vty.md's "Config apply" section, rewritten as

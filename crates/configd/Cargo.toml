@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 common = { workspace = true }
+yang = { path = "../yang" }
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+yang = { path = "../yang" }

@@ -32,15 +32,22 @@ pub mod status;
 pub mod tree;
 pub mod validate;
 pub mod verify;
+pub mod yangmode;
 
 pub use apply::{
     apply, apply_file, rollback, ApplyError, ApplyOptions, ApplyReport, DaemonOutcome,
     RollbackSource, KEEP_GENERATIONS,
 };
-pub use render::{render_all, render_daemon};
+pub use render::{render_all as render_all_sections, render_daemon as render_section_text};
 pub use status::{parse_status, read as read_status, ConfigdStatus};
 pub use tree::{parse, BodyLine, Canonical, Daemon, ParseError, Section};
 pub use validate::{
     refusal_summary, validate_canonical, validate_rendered, SkipReason, Validation,
 };
 pub use verify::{Ack, Projection, VERIFY_TIMEOUT};
+// The YANG render is THE render (invariant 5); the legacy
+// section-split renderer stays exported as the byte-identity
+// oracle for tests and the `--no-yang` escape.
+pub use yangmode::{
+    bind, dialect_for, dump_json, render_all, render_daemon, Bound, SectionBind, YangError,
+};

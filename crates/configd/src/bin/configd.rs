@@ -35,7 +35,7 @@ use std::process::ExitCode;
 use configd::apply::{apply_file, rollback, ApplyOptions};
 use configd::tree::{self, Daemon};
 use configd::validate::{self, SkipReason, Validation};
-use configd::{render_daemon, ParseError};
+use configd::ParseError;
 
 const EXIT_OK: u8 = 0;
 const EXIT_EXEC: u8 = 1;
@@ -48,6 +48,7 @@ enum Command {
     Rollback,
     Status,
     Render { file: PathBuf, dry_run: bool },
+    Dump { file: PathBuf },
 }
 
 struct Cli {
@@ -55,6 +56,9 @@ struct Cli {
     run_dir: PathBuf,
     etc_dir: PathBuf,
     daemon_bin_dir: Option<PathBuf>,
+    /// `--no-yang`: skip the YANG bind/validate/render flip (the
+    /// escape hatch; the YANG mode is the default — invariant 5).
+    no_yang: bool,
 }
 
 fn usage() -> String {
@@ -63,6 +67,9 @@ fn usage() -> String {
      \x20      configd rollback [--run-dir <PATH>] [--etc-dir <PATH>]\n\
      \x20      configd status [--run-dir <PATH>]\n\
      \x20      configd render <FILE> [--dry-run] [--etc-dir <PATH>]\n\
+     \x20      configd dump --json <FILE>\n\
+     \n\
+     \x20      --no-yang disables the YANG validate/render mode (default on)\n\
      \n\
      defaults: --run-dir /run/rouster, --etc-dir /etc\n\
      daemon binary search: --daemon-bin-dir, $ROUSTER_DAEMON_BIN_DIR,\n\
@@ -78,6 +85,7 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut verb = None;
     let mut positional: Vec<String> = Vec::new();
     let mut dry_run = false;
+    let mut no_yang = false;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -96,6 +104,9 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
             "-h" | "--help" => {
                 print!("{}", usage());
                 std::process::exit(i32::from(EXIT_OK));
+            }
+            "--no-yang" => {
+                no_yang = true;
             }
             "-V" | "--version" => {
                 println!("configd {}", env!("CARGO_PKG_VERSION"));
@@ -127,6 +138,9 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
             file: PathBuf::from(&positional.first().ok_or("render requires <FILE>")?),
             dry_run,
         },
+        Some("dump") => Command::Dump {
+            file: PathBuf::from(&positional.first().ok_or("dump requires <FILE>")?),
+        },
         Some(other) => return Err(format!("unknown command `{other}`")),
         None => return Err("missing command".to_string()),
     };
@@ -140,6 +154,7 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
         run_dir: run_dir.unwrap_or_else(|| PathBuf::from("/run/rouster")),
         etc_dir: etc_dir.unwrap_or_else(|| PathBuf::from("/etc")),
         daemon_bin_dir,
+        no_yang,
     })
 }
 
@@ -160,9 +175,13 @@ fn main() -> ExitCode {
     };
     // The explicit bin-dir rides the env var the library's search
     // reads (apply_file's signature is the e2e-pinned surface; the
-    // CLI is single-threaded here, before any library call).
+    // CLI is single-threaded here, before any library call). The
+    // --no-yang escape rides the same pattern.
     if let Some(dir) = &cli.daemon_bin_dir {
         std::env::set_var(validate::BIN_DIR_ENV, dir);
+    }
+    if cli.no_yang {
+        std::env::set_var(configd::yangmode::NO_YANG_ENV, "1");
     }
 
     match cli.command {
@@ -229,6 +248,13 @@ fn main() -> ExitCode {
             }
         }
         Command::Render { file, dry_run } => match render_command(&file, &opts, dry_run) {
+            Ok(()) => ExitCode::from(EXIT_OK),
+            Err(err) => {
+                eprintln!("configd: {err}");
+                ExitCode::from(EXIT_EXEC)
+            }
+        },
+        Command::Dump { file } => match dump_command(&file) {
             Ok(()) => ExitCode::from(EXIT_OK),
             Err(err) => {
                 eprintln!("configd: {err}");
@@ -327,6 +353,20 @@ fn validate_command(
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| format!("{} is not valid UTF-8", file.display()))?;
     let parsed = tree::parse(text).map_err(|err| format!("canonical file rejected: {err}"))?;
+    // Step 1.4 (S11-a M4): bind to the YANG models and validate the
+    // trees — the internal source of truth, before anything else.
+    if configd::yangmode::yang_enabled() {
+        let bound = configd::yangmode::bind(&parsed)
+            .map_err(|e| format!("YANG validation refused: {e}"))?;
+        for section in &bound.sections {
+            println!(
+                "configd: {}: YANG OK ({} modeled, {} unmodeled pass-through)",
+                section.daemon.name(),
+                section.report.modeled,
+                section.report.unmodeled.len()
+            );
+        }
+    }
     let dirs = validate::search_dirs(bin_dir);
     let results = validate::validate_canonical(&parsed, &dirs);
     for (daemon, verdict) in &results {
@@ -372,9 +412,25 @@ fn render_command(
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| format!("{} is not valid UTF-8", file.display()))?;
     let parsed = tree::parse(text).map_err(|err| render_parse_error(&err))?;
+    // The render reads the TREES (invariant 5); --no-yang falls
+    // back to the legacy section-split renderer.
+    let bound = if configd::yangmode::yang_enabled() {
+        Some(
+            configd::yangmode::bind(&parsed)
+                .map_err(|e| format!("YANG validation refused: {e}"))?,
+        )
+    } else {
+        None
+    };
     for daemon in Daemon::all() {
         if let Some(section) = parsed.section(daemon) {
-            let out = render_daemon(section);
+            let out = match &bound {
+                Some(bound) => bound
+                    .section(daemon)
+                    .map(configd::yangmode::render_daemon)
+                    .unwrap_or_default(),
+                None => configd::render_section_text(section),
+            };
             let dest = opts.etc_dir.join(daemon.file_name());
             if dry_run {
                 println!(
@@ -399,6 +455,23 @@ fn render_command(
             }
         }
     }
+    Ok(())
+}
+
+/// `configd dump --json <FILE>`: the bound trees in the RFC 7951
+/// JSON encoding (defaults filled; `#unmodeled` the pass-through
+/// disclosure) — docs/yang.md documents the form.
+fn dump_command(file: &std::path::Path) -> Result<(), String> {
+    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("{} is not valid UTF-8", file.display()))?;
+    let parsed = tree::parse(text).map_err(|err| render_parse_error(&err))?;
+    if !configd::yangmode::yang_enabled() {
+        return Err("dump requires the YANG mode (drop --no-yang)".to_string());
+    }
+    let bound =
+        configd::yangmode::bind(&parsed).map_err(|e| format!("YANG validation refused: {e}"))?;
+    println!("{}", configd::yangmode::dump_json(&bound));
     Ok(())
 }
 

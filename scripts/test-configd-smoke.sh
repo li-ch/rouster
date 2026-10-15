@@ -68,6 +68,7 @@ STATUS_FILE=/run/rouster/savd.status
 BFDD_STATUS=/run/rouster/bfdd.status
 CONFIGD_STATUS=/run/rouster/configd.status
 CANONICAL_BAD=/root/rouster-bad.conf
+CANONICAL_UNMODELED=/root/rouster-unmodeled.conf
 CANONICAL_POISON=/root/rouster-poison.conf
 # away/<program>/quarantine sits next to the rouster repo's parent.
 QUARANTINE="${ROUSTER_CONFIGD_QUARANTINE:-$SCRIPT_DIR/../../away/2026-10-14/quarantine/configd}"
@@ -149,6 +150,20 @@ write_canonical_bad() {
       '      mode nosuch' \
       '}' \
       > $CANONICAL_BAD"
+}
+
+# The canonical UNMODELED-BAD: a directive no model covers rides
+# pass-through (disclosed), and the REAL savd refuses it — the
+# daemon-verbatim half of the validate gate (S8-c contract, kept).
+write_canonical_unmodeled() {
+    docker exec "$NAME" sh -c "printf '%s\n' \
+      'daemon savd {' \
+      '    interface veths1' \
+      '      mode strict' \
+      '    poll 2' \
+      '    frobnicate 7' \
+      '}' \
+      > $CANONICAL_UNMODELED"
 }
 
 # The canonical POISON: parses + validates fine (poll 9 is legal) but
@@ -299,16 +314,33 @@ VALIDATE_OUT="$(docker exec "$NAME" configd validate "$CANONICAL_BAD" 2>&1)"
 VALIDATE_RC=$?
 set -e
 [ "$VALIDATE_RC" -ne 0 ] || { echo "FAIL: validate accepted the bad canonical"; exit 1; }
-echo "$VALIDATE_OUT" | grep -q 'line 2: bad mode `nosuch`' || {
-    echo "FAIL: refusal missing savd's line-numbered word: $VALIDATE_OUT"; exit 1; }
-# The apply runs the same gate first and refuses: nothing changes.
+# S11-a M4: the YANG gate catches this one layer earlier than the
+# daemon (the CANONICAL file's line 3 — the model numbers the
+# operator's file, not the rendered fragment). Both refused pre-apply.
+echo "$VALIDATE_OUT" | grep -q 'line 3:' || {
+    echo "FAIL: refusal is not line-numbered: $VALIDATE_OUT"; exit 1; }
+echo "$VALIDATE_OUT" | grep -q 'nosuch' || {
+    echo "FAIL: refusal does not name the bad token: $VALIDATE_OUT"; exit 1; }
+# The apply runs the same gates first and refuses: nothing changes.
 set +e
 APPLY_OUT="$(docker exec "$NAME" configd apply "$CANONICAL_BAD" 2>&1)"
 APPLY_RC=$?
 set -e
 [ "$APPLY_RC" -ne 0 ] || { echo "FAIL: apply accepted the bad canonical"; exit 1; }
-echo "$APPLY_OUT" | grep -q 'semantic validation refused' || {
+echo "$APPLY_OUT" | grep -q 'refused' || {
     echo "FAIL: apply refusal not surfaced: $APPLY_OUT"; exit 1; }
+# The daemon-verbatim half of the gate (S8-c's contract): a line the
+# model passes through UNMODELED, refused by savd's own parser with
+# its line-numbered word — the daemon remains the semantic gate.
+write_canonical_unmodeled
+set +e
+UNMODELED_OUT="$(docker exec "$NAME" configd validate "$CANONICAL_UNMODELED" 2>&1)"
+UNMODELED_RC=$?
+set -e
+[ "$UNMODELED_RC" -ne 0 ] || { echo "FAIL: validate accepted the unmodeled-bad canonical"; exit 1; }
+echo "$UNMODELED_OUT" | grep -q 'semantic validation refused' || {
+    echo "FAIL: daemon refusal not surfaced: $UNMODELED_OUT"; exit 1; }
+docker exec "$NAME" sh -c "grep -q 'poll 2' /etc/savd.conf"   # file untouched
 docker exec "$NAME" sh -c "grep -q 'poll 2' /etc/savd.conf"   # file untouched
 docker exec "$NAME" sh -c "grep -q '^generation 3 ' $CONFIGD_STATUS"  # store untouched
 echo "    refused by savd's own parser, nothing written, nothing advanced"

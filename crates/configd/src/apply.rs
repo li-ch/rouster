@@ -358,15 +358,33 @@ fn apply_inner(
         return Err(ApplyError::Validation { refusal });
     }
 
-    // 2. Render every section (registry order).
+    // 1.4 (S11-a M4): bind to the YANG models, validate the trees,
+    // and RENDER FROM THE TREES — the internal source of truth. The
+    // output is byte-identical to the section-split render (pinned
+    // by tests/yang_flip.rs against the legacy renderer). The
+    // ROUSTER_CONFIGD_NO_YANG escape hatch restores the legacy path.
     let mut rendered: Vec<(Daemon, PathBuf, String)> = Vec::new();
-    for daemon in Daemon::all() {
-        if let Some(section) = parsed.section(daemon) {
-            let out = render_daemon(section);
-            let path = opts.etc_dir.join(daemon.file_name());
-            rendered.push((daemon, path, out));
+    let bound = if crate::yangmode::yang_enabled() {
+        let bound = crate::yangmode::bind(&parsed).map_err(|e| ApplyError::Validation {
+            refusal: e.to_string(),
+        })?;
+        for section in &bound.sections {
+            let out = crate::yangmode::render_daemon(section);
+            let path = opts.etc_dir.join(section.daemon.file_name());
+            rendered.push((section.daemon, path, out));
         }
-    }
+        Some(bound)
+    } else {
+        for daemon in Daemon::all() {
+            if let Some(section) = parsed.section(daemon) {
+                let out = render_daemon(section);
+                let path = opts.etc_dir.join(daemon.file_name());
+                rendered.push((daemon, path, out));
+            }
+        }
+        None
+    };
+    let _ = &bound;
 
     // 3. Atomic-write each file. A write error stops here: no
     // generation is recorded (disclosed: earlier files are replaced).
@@ -968,7 +986,9 @@ mod tests {
         let temp = Temp::new("prune");
         let opts = temp.opts();
         for i in 0..(KEEP_GENERATIONS as u64 + 3) {
-            let text = CANONICAL.replace("poll 2", &format!("poll {i}"));
+            // Distinct VALID poll values (the YANG model enforces
+            // savd's own 1-second floor one layer earlier now).
+            let text = CANONICAL.replace("poll 2", &format!("poll {}", i + 1));
             apply(
                 text.as_bytes(),
                 RollbackSource::File(PathBuf::from("/x")),
