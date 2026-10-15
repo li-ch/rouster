@@ -8,6 +8,11 @@
 //! reload time — the `--validate-config` flags that would move it
 //! earlier are §Deferred and live in the daemon crates).
 //!
+//! S12-a adds the one non-daemon stanza: top-level `restconf { … }`
+//! (restconfd's plane — the port/bind knobs, YANG-validated at bind
+//! time against `rouster-vty`'s `restconf` container, rendered
+//! nowhere: it is configd-plane config, like `router-id`).
+//!
 //! ```text
 //! ! the canonical superset (docs/protocols/config.md is the owner)
 //! router-id 198.51.100.1
@@ -45,6 +50,9 @@
 //!   grammar accepts the line yet, so emitting it would poison the
 //!   rendered file (the exact ask per daemon is §Deferred in
 //!   docs/protocols/config.md).
+//! - `restconf {` opens the restconfd stanza (S12-a): at most once,
+//!   body pass-through here, YANG-validated at bind time; rendered
+//!   nowhere (restconfd reads it at startup).
 //! - Any other top-level line outside a section is an error: the
 //!   canonical file is configd's own grammar and is strict, unlike the
 //!   tolerant run-dir status readers.
@@ -150,6 +158,20 @@ pub struct Section {
     pub body: Vec<BodyLine>,
 }
 
+/// A `restconf { … }` stanza of the canonical file (S12-a): the
+/// restconfd plane's port/bind knobs. Body pass-through at this
+/// layer; [`crate::yangmode`] validates it against the
+/// `rouster-vty` model's `restconf` container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestconfStanza {
+    /// Line number of the `restconf {` opener.
+    pub header_line: usize,
+    /// Line number of the closing `}`.
+    pub close_line: usize,
+    /// The pass-through body lines, in file order.
+    pub body: Vec<BodyLine>,
+}
+
 /// The parsed canonical `rouster.conf` (the section tree).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Canonical {
@@ -162,6 +184,8 @@ pub struct Canonical {
     pub preamble: Vec<BodyLine>,
     /// Daemon sections in file order.
     pub sections: Vec<Section>,
+    /// The `restconf { … }` stanza, if present (S12-a).
+    pub restconf: Option<RestconfStanza>,
 }
 
 impl Canonical {
@@ -197,23 +221,41 @@ fn squash(raw: &str) -> String {
 /// at reload time (disclosed in docs/protocols/config.md).
 pub fn parse(input: &str) -> Result<Canonical, ParseError> {
     let mut tree = Canonical::default();
-    // The currently open section (its daemon), if any.
-    let mut open: Option<usize> = None; // index into tree.sections
+    // Which stanza is open, if any: a daemon section (its index) or
+    // the restconf stanza (S12-a).
+    let mut open: Option<Open> = None;
+
+    /// A body line under whichever stanza is open.
+    fn push_body(tree: &mut Canonical, open: &Open, line_no: usize, text: &str) {
+        let body = BodyLine {
+            line: line_no,
+            text: text.trim_end().to_string(),
+        };
+        match open {
+            Open::Daemon(section) => tree.sections[*section].body.push(body),
+            Open::Restconf => tree
+                .restconf
+                .get_or_insert(RestconfStanza {
+                    header_line: line_no,
+                    close_line: 0,
+                    body: Vec::new(),
+                })
+                .body
+                .push(body),
+        }
+    }
 
     for (idx, raw) in input.lines().enumerate() {
         let line_no = idx + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with('!') || trimmed.starts_with('#') {
-            match open {
-                // Inside a section, comments and blanks are BODY:
+            match &open {
+                // Inside a stanza, comments and blanks are BODY:
                 // pass-through, exactly what the owning daemon's
                 // parser sees (every daemon grammar ignores them —
                 // and the operator wrote them for that file).
-                Some(section) => tree.sections[section].body.push(BodyLine {
-                    line: line_no,
-                    text: raw.trim_end().to_string(),
-                }),
-                // Outside sections they are preamble, wherever they
+                Some(which) => push_body(&mut tree, which, line_no, raw),
+                // Outside stanzas they are preamble, wherever they
                 // sit: recorded for audit output. Render consumes
                 // bodies only.
                 None => tree.preamble.push(BodyLine {
@@ -227,11 +269,20 @@ pub fn parse(input: &str) -> Result<Canonical, ParseError> {
         // Section close: a lone `}` line.
         if trimmed == "}" {
             match open.take() {
-                Some(section) => {
+                Some(Open::Daemon(section)) => {
                     tree.sections[section].close_line = Some(line_no);
                 }
+                Some(Open::Restconf) => {
+                    tree.restconf
+                        .get_or_insert(RestconfStanza {
+                            header_line: line_no,
+                            close_line: 0,
+                            body: Vec::new(),
+                        })
+                        .close_line = line_no;
+                }
                 None => {
-                    return Err(fail(line_no, "`}` outside any `daemon` section"));
+                    return Err(fail(line_no, "`}` outside any section"));
                 }
             }
             continue;
@@ -243,7 +294,7 @@ pub fn parse(input: &str) -> Result<Canonical, ParseError> {
             if open.is_some() {
                 return Err(fail(
                     line_no,
-                    "`daemon` section inside another section (close it with `}` first)",
+                    "`daemon` section inside another stanza (close it with `}` first)",
                 ));
             }
             let Some(name) = rest.strip_suffix(" {") else {
@@ -277,16 +328,33 @@ pub fn parse(input: &str) -> Result<Canonical, ParseError> {
                 close_line: None,
                 body: Vec::new(),
             });
-            open = Some(tree.sections.len() - 1);
+            open = Some(Open::Daemon(tree.sections.len() - 1));
             continue;
         }
 
-        // Body line: pass-through inside an open section.
-        if let Some(section) = open {
-            tree.sections[section].body.push(BodyLine {
-                line: line_no,
-                text: raw.trim_end().to_string(),
+        // The restconf stanza opener: `restconf {` (S12-a).
+        if squash(trimmed) == "restconf {" {
+            if open.is_some() {
+                return Err(fail(
+                    line_no,
+                    "`restconf` stanza inside another stanza (close it with `}` first)",
+                ));
+            }
+            if tree.restconf.is_some() {
+                return Err(fail(line_no, "duplicate `restconf` stanza"));
+            }
+            tree.restconf = Some(RestconfStanza {
+                header_line: line_no,
+                close_line: 0,
+                body: Vec::new(),
             });
+            open = Some(Open::Restconf);
+            continue;
+        }
+
+        // Body line: pass-through inside an open stanza.
+        if let Some(which) = &open {
+            push_body(&mut tree, which, line_no, raw);
             continue;
         }
 
@@ -308,23 +376,44 @@ pub fn parse(input: &str) -> Result<Canonical, ParseError> {
             _ => {
                 return Err(fail(
                     line_no,
-                    format!("expected `router-id <ipv4>` or `daemon <name> {{`, got `{trimmed}`"),
+                    format!(
+                        "expected `router-id <ipv4>`, `daemon <name> {{`, or `restconf {{`, got `{trimmed}`"
+                    ),
                 ));
             }
         }
     }
 
-    if let Some(section) = open {
-        return Err(fail(
-            tree.sections[section].header_line,
-            format!(
-                "`daemon {}` section opened here is never closed (missing `}}`)",
-                tree.sections[section].daemon.name()
-            ),
-        ));
+    match open {
+        Some(Open::Daemon(section)) => {
+            return Err(fail(
+                tree.sections[section].header_line,
+                format!(
+                    "`daemon {}` section opened here is never closed (missing `}}`)",
+                    tree.sections[section].daemon.name()
+                ),
+            ));
+        }
+        Some(Open::Restconf) => {
+            let header = tree.restconf.as_ref().map(|r| r.header_line).unwrap_or(0);
+            return Err(fail(
+                header,
+                "`restconf` stanza opened here is never closed (missing `}`)",
+            ));
+        }
+        None => {}
     }
 
     Ok(tree)
+}
+
+/// Which stanza the parser currently sits inside.
+#[derive(Debug, Clone, Copy)]
+enum Open {
+    /// A daemon section (index into `Canonical::sections`).
+    Daemon(usize),
+    /// The `restconf` stanza.
+    Restconf,
 }
 
 #[cfg(test)]
@@ -426,11 +515,11 @@ mod tests {
     fn rejects_orphan_close() {
         assert_eq!(
             parse("}\n").unwrap_err(),
-            fail(1, "`}` outside any `daemon` section")
+            fail(1, "`}` outside any section")
         );
         assert_eq!(
             parse("daemon savd {\n}\n}\n").unwrap_err(),
-            fail(3, "`}` outside any `daemon` section")
+            fail(3, "`}` outside any section")
         );
     }
 
@@ -441,7 +530,55 @@ mod tests {
             err,
             fail(
                 2,
-                "`daemon` section inside another section (close it with `}` first)"
+                "`daemon` section inside another stanza (close it with `}` first)"
+            )
+        );
+    }
+
+    #[test]
+    fn parses_the_restconf_stanza_with_line_numbers() {
+        let text = "restconf {\nport 8080\nbind 127.0.0.1\n}\ndaemon savd {\n}\n";
+        let tree = parse(text).unwrap();
+        let stanza = tree.restconf.expect("present");
+        assert_eq!(stanza.header_line, 1);
+        assert_eq!(stanza.close_line, 4);
+        assert_eq!(
+            stanza
+                .body
+                .iter()
+                .map(|l| (l.line, l.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "port 8080"), (3, "bind 127.0.0.1")]
+        );
+        // The daemon section after it still parses.
+        assert_eq!(tree.sections.len(), 1);
+    }
+
+    #[test]
+    fn rejects_duplicate_nested_and_unclosed_restconf() {
+        assert_eq!(
+            parse("restconf {\n}\nrestconf {\n}\n").unwrap_err(),
+            fail(3, "duplicate `restconf` stanza")
+        );
+        assert_eq!(
+            parse("restconf {\ndaemon savd {\n}\n").unwrap_err(),
+            fail(
+                2,
+                "`daemon` section inside another stanza (close it with `}` first)"
+            )
+        );
+        assert_eq!(
+            parse("daemon savd {\nrestconf {\n}\n").unwrap_err(),
+            fail(
+                2,
+                "`restconf` stanza inside another stanza (close it with `}` first)"
+            )
+        );
+        assert_eq!(
+            parse("restconf {\nport 8080\n").unwrap_err(),
+            fail(
+                1,
+                "`restconf` stanza opened here is never closed (missing `}`)"
             )
         );
     }
@@ -474,7 +611,7 @@ mod tests {
         let err = parse("ip route 203.0.113.0/24 blackhole\n").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "line 1: expected `router-id <ipv4>` or `daemon <name> {`, \
+            "line 1: expected `router-id <ipv4>`, `daemon <name> {`, or `restconf {`, \
              got `ip route 203.0.113.0/24 blackhole`"
         );
     }

@@ -36,6 +36,26 @@ module rouster-vty {
     }
   }
 
+  // ---- the RESTCONF northbound edge (S12-a M4) ----
+
+  container restconf {
+    description
+      "restconfd's plane: the canonical file's top-level `restconf { … }`
+       stanza, bound here by prepending the stanza's opener to its
+       body lines (the linebind's container-walk rule 3). Startup-only
+       knobs for restconfd itself — the vtyd bind discipline; the
+       security posture v1 (loopback default, no auth, no TLS) is
+       disclosed in docs/yang.md's implementation section.";
+    leaf port {
+      type uint16;
+      default 8080;
+    }
+    leaf bind {
+      type inet:ip-address;
+      default 127.0.0.1;
+    }
+  }
+
   // ---- the modeled config surface (session + canonical merge) ----
 
   container ip {

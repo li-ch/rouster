@@ -142,7 +142,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: u16, tag: &'static str, message: impl Into<String>) -> ApiError {
+    pub fn new(status: u16, tag: &'static str, message: impl Into<String>) -> ApiError {
         ApiError {
             status,
             tag,
@@ -157,6 +157,10 @@ impl ApiError {
 
     pub fn bad_request(message: impl Into<String>) -> ApiError {
         ApiError::new(400, "invalid-value", message)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> ApiError {
+        ApiError::new(503, "operation-not-supported", message)
     }
 
     pub fn internal(message: impl Into<String>) -> ApiError {
@@ -244,6 +248,15 @@ pub enum Target {
     Root,
     /// The configd-owned envelope leaf.
     RouterId,
+    /// The `restconf { … }` stanza (restconfd's plane — S12-a M4):
+    /// `tail` is relative to the stanza body (empty = the stanza).
+    /// The tree is the rouster-vty schema bound to the stanza when
+    /// present, else fresh (PUT may create it).
+    Restconf {
+        tail: Vec<PathSeg>,
+        exists: bool,
+        tree: DataTree,
+    },
     /// One daemon section + the path inside it (empty tail = the
     /// section root). `tree` is the section's bound tree when the
     /// section exists, else a fresh tree for the daemon's model
@@ -268,6 +281,36 @@ pub fn resolve_target(tail: &str, bound: &Bound) -> Result<Target, ApiError> {
             return Err(ApiError::not_found("`router-id` is a leaf"));
         }
         return Ok(Target::RouterId);
+    }
+    if first.keys.is_empty() && first.name == "restconf" {
+        // The stanza lives in the rouster-vty model: bind the body
+        // (with a synthetic opener, yangmode's exact walk) when the
+        // file carries it; a fresh tree otherwise (PUT creates).
+        let schema = yang::models::schema("rouster-vty");
+        let (exists, mut tree) = match &bound.restconf {
+            Some(_) => (true, stanza_tree(bound)),
+            None => (false, DataTree::empty(schema)),
+        };
+        // The tail's segments are children of the `restconf`
+        // container: walk them prefixed with it.
+        let mut walk: Vec<PathSeg> = vec![PathSeg {
+            name: "restconf".to_string(),
+            keys: Vec::new(),
+        }];
+        let mut tail: Vec<PathSeg> = Vec::new();
+        for seg in it {
+            let parents = walk.clone();
+            let filled = fill_positional(seg, &parents, &tree)?;
+            walk.push(filled.clone());
+            tail.push(filled);
+        }
+        if !tail.is_empty() {
+            walk_defs(&tree, &walk)?;
+        }
+        if exists {
+            tree = stanza_tree(bound);
+        }
+        return Ok(Target::Restconf { tail, exists, tree });
     }
     let Some(daemon) = Daemon::from_name(&first.name) else {
         return Err(ApiError::not_found(format!(
@@ -554,6 +597,32 @@ pub fn get(store: &Datastore, running: bool, tail: &str) -> Result<Reply, ApiErr
             Some((_, addr)) => Ok(Reply::json(200, format!("{{\"router-id\":\"{addr}\"}}"))),
             None => Err(ApiError::not_found("`router-id` is not set")),
         },
+        Target::Restconf { tail, .. } => {
+            let Some(settings) = &bound.restconf else {
+                return Err(ApiError::not_found(
+                    "no `restconf` stanza in the canonical config",
+                ));
+            };
+            match tail.len() {
+                0 => Ok(Reply::json(
+                    200,
+                    format!(
+                        "{{\"restconf\":{{\"port\":{},\"bind\":\"{}\"}}}}",
+                        settings.port, settings.bind
+                    ),
+                )),
+                1 if tail[0].name == "port" => {
+                    Ok(Reply::json(200, format!("{{\"port\":{}}}", settings.port)))
+                }
+                1 if tail[0].name == "bind" => Ok(Reply::json(
+                    200,
+                    format!("{{\"bind\":\"{}\"}}", settings.bind),
+                )),
+                _ => Err(ApiError::not_found(
+                    "the restconf stanza's members are `port` and `bind`",
+                )),
+            }
+        }
         Target::Section { daemon, tail, .. } => {
             let section = bound.section(daemon).ok_or_else(|| {
                 ApiError::not_found(format!(
@@ -754,6 +823,9 @@ fn mutate_data(store: &Datastore, verb: Verb, tail: &str, body: &[u8]) -> Result
             ))
         }
         Target::RouterId => (mutate_router_id(&parsed, &original, &value)?, false),
+        Target::Restconf { tail, exists, tree } => {
+            mutate_restconf(&original, &parsed, &tail, exists, tree, verb, &value)?
+        }
         Target::Section { daemon, tail, exists, tree } => {
             mutate_section(SectionEdit {
                 original: &original,
@@ -786,6 +858,14 @@ fn delete_data(store: &Datastore, tail: &str) -> Result<Reply, ApiError> {
         Target::RouterId => match parsed.router_id {
             Some((line, _)) => splice_out_lines(&original, line, line)?,
             None => return Err(ApiError::not_found("`router-id` is not set")),
+        },
+        Target::Restconf { .. } => match &parsed.restconf {
+            Some(stanza) => splice_out_lines(&original, stanza.header_line, stanza.close_line)?,
+            None => {
+                return Err(ApiError::not_found(
+                    "no `restconf` stanza in the canonical config",
+                ))
+            }
         },
         Target::Section {
             daemon, tail, tree, ..
@@ -1223,6 +1303,90 @@ fn scalar_of(value: &Json) -> Result<String, ApiError> {
         Json::Null => Ok(String::new()),
         _ => Err(ApiError::bad_request("expected a scalar value")),
     }
+}
+
+/// The stanza's bound tree (rouster-vty schema, the `restconf`
+/// subtree filled from the file — yangmode's walk, reconstructed
+/// here for subtree addressing).
+fn stanza_tree(bound: &Bound) -> DataTree {
+    let schema = yang::models::schema("rouster-vty");
+    let mut tree = DataTree::empty(schema);
+    // The settings carry everything the model defines (port, bind —
+    // defaults filled at bind time); rebuild the subtree from them.
+    if let Some(settings) = &bound.restconf {
+        let base = Path::parse("/restconf").expect("literal path");
+        let _ = tree.set_container(&base);
+        let port = Path::parse("/restconf/port").expect("literal path");
+        let bind = Path::parse("/restconf/bind").expect("literal path");
+        let _ = tree.set(&port, &settings.port.to_string(), None);
+        let _ = tree.set(&bind, &settings.bind, None);
+    }
+    tree
+}
+
+/// PUT/POST on the restconf stanza: same discipline as a section —
+/// mutate (replace on stanza-level PUT), validate, render, splice.
+fn mutate_restconf(
+    original: &str,
+    parsed: &Canonical,
+    tail: &[PathSeg],
+    exists: bool,
+    tree: DataTree,
+    verb: Verb,
+    value: &Json,
+) -> Result<(String, bool), ApiError> {
+    let mut tree = tree;
+    let path = Path {
+        segs: std::iter::once(PathSeg {
+            name: "restconf".to_string(),
+            keys: Vec::new(),
+        })
+        .chain(tail.iter().cloned())
+        .collect(),
+    };
+    if verb == Verb::Put && tail.is_empty() {
+        // Stanza-level PUT replaces the whole subtree.
+        if tree.get(&path).is_some() {
+            tree.delete(&path)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        }
+    }
+    load_into(&mut tree, &path, value)?;
+    let violations = tree.validate();
+    if !violations.is_empty() {
+        let details = violations
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::new(400, "validation-failed", details));
+    }
+    // Render: modeled nodes synthesized; the leading synthesized
+    // `restconf` opener line drops (the canonical carries the real
+    // opener `restconf {`).
+    let mut rendered = render_mutated(tree, Daemon::Rousterd)?;
+    if let Some(rest) = rendered.strip_prefix("restconf\n") {
+        rendered = rest.to_string();
+    }
+    let text = match (&parsed.restconf, exists) {
+        (Some(stanza), _) => {
+            splice_body(original, stanza.header_line, stanza.close_line, &rendered)?
+        }
+        (None, _) => {
+            let mut out = original.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("restconf {\n");
+            for line in rendered.lines() {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str("}\n");
+            out
+        }
+    };
+    Ok((text, !exists))
 }
 
 // ---- canonical splicing ----
@@ -1705,6 +1869,46 @@ mod tests {
         assert!(splice_out_lines(CANONICAL, 1, 1)
             .unwrap()
             .starts_with("! operator comment"));
+    }
+
+    #[test]
+    fn restconf_stanza_get_put_and_delete() {
+        let (store, _dir) = store("restconf-target");
+        // Absent stanza: GET is a 404, PUT creates (201).
+        assert_eq!(get(&store, false, "/restconf").unwrap_err().status, 404);
+        let reply = mutate(&store, false, Verb::Put, "/restconf", b"{\"port\":8081}");
+        assert_eq!(reply.status, 201, "{}", reply.body);
+        let after = std::fs::read_to_string(&store.canonical).unwrap();
+        assert!(after.contains("restconf {"), "{after}");
+        assert!(after.contains("port 8081"), "{after}");
+        assert_eq!(
+            get(&store, false, "/restconf").unwrap().body,
+            "{\"restconf\":{\"port\":8081,\"bind\":\"127.0.0.1\"}}"
+        );
+        assert_eq!(
+            get(&store, false, "/restconf/port").unwrap().body,
+            "{\"port\":8081}"
+        );
+        // Merge changes the port; the daemon sections ride untouched.
+        let reply = mutate(&store, false, Verb::Merge, "/restconf", b"{\"port\":8082}");
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let after = std::fs::read_to_string(&store.canonical).unwrap();
+        assert!(after.contains("port 8082"), "{after}");
+        assert!(after.contains("daemon savd {"), "{after}");
+        // A bad port is a hard 400 on the JSON path (unlike the text
+        // seam's soft pass-through).
+        assert_eq!(
+            mutate(&store, false, Verb::Merge, "/restconf", b"{\"port\":99999}").status,
+            400
+        );
+        // DELETE removes the stanza.
+        assert_eq!(
+            mutate(&store, false, Verb::Delete, "/restconf", &[]).status,
+            200
+        );
+        assert!(!std::fs::read_to_string(&store.canonical)
+            .unwrap()
+            .contains("restconf {"));
     }
 
     #[test]

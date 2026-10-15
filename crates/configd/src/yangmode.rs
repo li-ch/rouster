@@ -37,9 +37,17 @@ use std::net::Ipv4Addr;
 
 use tracing::warn;
 
-use crate::tree::{BodyLine, Canonical, Daemon};
+use crate::tree::{BodyLine, Canonical, Daemon, RestconfStanza};
 use yang::line::{BindReport, LineDialect, SourceLine};
 use yang::{DataTree, Path, Violation};
+
+/// restconfd's default port (S12-a): no IANA allocation exists for
+/// RESTCONF; 8080 is the plain-HTTP convention, disclosed (the
+/// model's `default` mirrors it).
+pub const RESTCONF_DEFAULT_PORT: u16 = 8080;
+/// restconfd's default bind: loopback only — the v1 security
+/// posture (docs/yang.md's implementation section).
+pub const RESTCONF_DEFAULT_BIND: &str = "127.0.0.1";
 
 /// The env escape hatch for the YANG mode (the CLI's `--no-yang`
 /// sets it before any library call — the same pattern as
@@ -73,11 +81,26 @@ pub struct SectionBind {
 }
 
 /// The canonical file's YANG binding: the per-daemon trees plus the
-/// configd-owned router-id (validated against `rouster-common`).
+/// configd-owned router-id (validated against `rouster-common`) and
+/// the restconfd stanza (S12-a — validated against `rouster-vty`'s
+/// `restconf` container).
 #[derive(Debug)]
 pub struct Bound {
     pub sections: Vec<SectionBind>,
     pub router_id: Option<(usize, Ipv4Addr)>,
+    /// The `restconf { … }` stanza's resolved settings, when the
+    /// file carries the stanza.
+    pub restconf: Option<RestconfSettings>,
+}
+
+/// The restconfd stanza's resolved settings (model defaults filled —
+/// `rouster-vty`'s `restconf` container).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestconfSettings {
+    pub port: u16,
+    pub bind: String,
+    /// The stanza opener's line (errors point at the operator's file).
+    pub header_line: usize,
 }
 
 impl Bound {
@@ -163,9 +186,64 @@ pub fn bind(canonical: &Canonical) -> Result<Bound, YangError> {
                 reason: e.to_string(),
             })?;
     }
+    // The restconfd stanza (S12-a): bind against rouster-vty's
+    // `restconf` container by walking the opener — the body's
+    // `port`/`bind` lines land inside it by the linebind's
+    // container-walk rule.
+    let restconf = canonical.restconf.as_ref().map(bind_restconf).transpose()?;
     Ok(Bound {
         sections,
         router_id: canonical.router_id,
+        restconf,
+    })
+}
+
+/// Binds the `restconf` stanza body: a synthetic `restconf` opener
+/// line walks the linebind into rouster-vty's container, the body
+/// lines follow inside it, the filled tree yields (port, bind).
+fn bind_restconf(stanza: &RestconfStanza) -> Result<RestconfSettings, YangError> {
+    let schema = yang::models::schema("rouster-vty");
+    let mut sources = vec![SourceLine {
+        line: stanza.header_line,
+        text: "restconf".to_string(),
+    }];
+    sources.extend(
+        stanza
+            .body
+            .iter()
+            .map(|BodyLine { line, text }| SourceLine {
+                line: *line,
+                text: text.clone(),
+            }),
+    );
+    let dialect = LineDialect::default();
+    let (mut tree, _) =
+        yang::line::parse(&schema, &sources, &dialect).map_err(|e| YangError::Bind {
+            line: match &e {
+                yang::line::LineError::Line { line, .. } => *line,
+                yang::line::LineError::Data(_) => stanza.header_line,
+            },
+            reason: match &e {
+                yang::line::LineError::Line { reason, .. } => reason.clone(),
+                yang::line::LineError::Data(d) => d.to_string(),
+            },
+        })?;
+    let violations = tree.validate();
+    if !violations.is_empty() {
+        return Err(violations_error(&violations));
+    }
+    tree.default_fill();
+    let port = tree
+        .get_value(&Path::parse("/restconf/port").expect("literal path"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RESTCONF_DEFAULT_PORT);
+    let bind = tree
+        .get_value(&Path::parse("/restconf/bind").expect("literal path"))
+        .unwrap_or_else(|| RESTCONF_DEFAULT_BIND.to_string());
+    Ok(RestconfSettings {
+        port,
+        bind,
+        header_line: stanza.header_line,
     })
 }
 
@@ -218,13 +296,20 @@ pub fn render_all(bound: &Bound) -> BTreeMap<Daemon, String> {
 
 /// The JSON dump (RFC 7951 for the subset): one member per daemon
 /// section (the daemon's name — the canonical envelope's own
-/// vocabulary), defaults filled, plus the top-level `router-id` and
-/// the non-standard `#unmodeled` disclosure members.
+/// vocabulary), defaults filled, plus the top-level `router-id`,
+/// the `restconf` stanza's settings (S12-a), and the non-standard
+/// `#unmodeled` disclosure members.
 pub fn dump_json(bound: &Bound) -> String {
     let mut parts: Vec<String> = Vec::new();
     match bound.router_id {
         Some((_, addr)) => parts.push(format!("\"router-id\":\"{addr}\"")),
         None => parts.push("\"router-id\":null".to_string()),
+    }
+    if let Some(settings) = &bound.restconf {
+        parts.push(format!(
+            "\"restconf\":{{\"port\":{},\"bind\":\"{}\"}}",
+            settings.port, settings.bind
+        ));
     }
     for section in &bound.sections {
         let mut tree = section.tree.clone();
@@ -264,5 +349,68 @@ fn bind_reason(err: &yang::line::LineError) -> String {
     match err {
         yang::line::LineError::Line { reason, .. } => reason.clone(),
         yang::line::LineError::Data(e) => e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree;
+
+    fn bind_text(text: &str) -> Result<Bound, YangError> {
+        bind(&tree::parse(text).expect("parses"))
+    }
+
+    #[test]
+    fn restconf_stanza_binds_with_model_defaults_filled() {
+        let bound = bind_text("restconf {\n}\n").unwrap();
+        assert_eq!(
+            bound.restconf,
+            Some(RestconfSettings {
+                port: RESTCONF_DEFAULT_PORT,
+                bind: RESTCONF_DEFAULT_BIND.to_string(),
+                header_line: 1,
+            })
+        );
+        // Explicit values win.
+        let bound = bind_text("restconf {\nport 8443\nbind 10.0.0.9\n}\n").unwrap();
+        assert_eq!(
+            bound.restconf,
+            Some(RestconfSettings {
+                port: 8443,
+                bind: "10.0.0.9".to_string(),
+                header_line: 1,
+            })
+        );
+        // No stanza, no settings.
+        assert!(bind_text("daemon savd {\n}\n").unwrap().restconf.is_none());
+    }
+
+    #[test]
+    fn restconf_stanza_type_failures_ride_the_linebind_discipline() {
+        // A leaf's type failure is SOFT in the linebind (it retries
+        // at a shallower depth, then rides pass-through) — so a bad
+        // `port` or `bind` VALUE falls back to the model default with
+        // the bad line disclosed as unmodeled, exactly like every
+        // daemon section's seam. The JSON mutation path (restconfd's
+        // PUT/POST) sets through DataTree directly — type failures
+        // are hard 400s there.
+        let bound = bind_text("restconf {\nport 99999\n}\n").unwrap();
+        assert_eq!(bound.restconf.as_ref().unwrap().port, RESTCONF_DEFAULT_PORT);
+        let bound = bind_text("restconf {\nbind not-an-addr\n}\n").unwrap();
+        assert_eq!(bound.restconf.as_ref().unwrap().bind, "127.0.0.1");
+        // Unknown lines ride pass-through (the discipline).
+        let bound = bind_text("restconf {\nport 8081\nfrobnicate yes\n}\n").unwrap();
+        assert_eq!(bound.restconf.as_ref().unwrap().port, 8081);
+    }
+
+    #[test]
+    fn dump_json_carries_the_restconf_member() {
+        let bound = bind_text("restconf {\nport 8081\n}\ndaemon savd {\nmode strict\n}\n").unwrap();
+        let json = dump_json(&bound);
+        assert!(
+            json.contains("\"restconf\":{\"port\":8081,\"bind\":\"127.0.0.1\"}"),
+            "{json}"
+        );
     }
 }
