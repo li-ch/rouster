@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rouster — a routing protocol suite in Rust</title>
+  <meta name="description" content="Rouster is not an FRR clone. It fuses BIRD's and Holo's core architecture, keeps FRR compatibility strictly at the edge, and adds native source address validation.">
+  <link rel="icon" type="image/png" href="assets/logo.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- ================= Hero ================= -->
+  <header class="hero" id="top">
+    <div class="hero-inner">
+      <img class="hero-logo" src="assets/logo.png" width="609" height="693"
+           alt="The Rouster logo: a rooster-shaped weathervane drawn in dark indigo, with an orange-red tail and comb, on a transparent background.">
+      <div class="hero-copy">
+        <h1>Rouster</h1>
+        <p class="tagline">A routing protocol suite in Rust</p>
+        <p class="positioning">Rouster is not an FRR clone. It fuses BIRD&rsquo;s and Holo&rsquo;s
+        core architecture, keeps FRR compatibility strictly at the edge, and adds native
+        source address validation.</p>
+        <p class="hero-actions">
+          <a class="btn btn-primary" href="https://gitee.com/drchenli/rouster">Get&nbsp;started</a>
+          <a class="btn btn-secondary" href="assets/whitepaper.pdf">Read the white&nbsp;paper</a>
+        </p>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ================= 1. What it is ================= -->
+    <section aria-labelledby="what-h">
+      <div class="section-inner">
+        <h2 id="what-h">What it is</h2>
+        <p class="section-lede">One daemon family, four load-bearing ideas.</p>
+        <ul class="pillar-grid">
+          <li class="pillar">
+            <h3>A typed, multi-table core</h3>
+            <p>A BIRD-style typed multi-table RIB sitting on a Linux netlink dataplane.
+            Interfaces, addresses, routes and neighbours are mirrored from the kernel;
+            static routes program with ECMP and non-main tables; VRF devices keep their
+            own tables without leaking into main; SIGHUP reloads the config.</p>
+          </li>
+          <li class="pillar">
+            <h3>FRR compatibility, strictly at the edge</h3>
+            <p>Unmodified FRR <code>staticd</code>, <code>bgpd</code> and <code>ospfd</code>
+            attach to <code>rousterd</code> as their zebra, and their routes reach the kernel
+            through the Rust RIB. The ZAPI wire codec is byte-pinned against a real
+            FRR&nbsp;10.2.2 binary &mdash; captured from live exchanges, never guessed.</p>
+          </li>
+          <li class="pillar">
+            <h3>Native protocol daemons</h3>
+            <p><code>bgpd</code>: RFC&nbsp;4271 FSM and codec, 4-byte AS, MP-BGP
+            v4/v6, route reflection, route-server mode, graceful restart, RFC&nbsp;7606
+            error handling &mdash; with RPKI (RTR, ROV, ASPA, RFC&nbsp;9234 roles) in the
+            decision path from the start. <code>ospfd</code>: the RFC&nbsp;2328 stack
+            end-to-end, plus OSPFv3 on the same AF-generic codebase. <code>bfdd</code>:
+            RFC&nbsp;5880&ndash;5883. IS-IS joined at HEAD, after the v0.1.0 tag.</p>
+          </li>
+          <li class="pillar">
+            <h3>Source address validation, native</h3>
+            <p>The differentiator: a SAV Information Base fed from the RIB and config,
+            the IBA/IBB/PBA/PBB validation-mode rule model, uRPF-family rule generation
+            (RFC&nbsp;3704/8704), and enforcement through <code>rp_filter</code> or
+            nftables backends. Monitor-only by default &mdash; drop mode refuses without an
+            explicit opt-in. No general-purpose suite (FRR, BIRD, Holo) ships packet-plane
+            SAV today.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ================= 2. Proof, not promises ================= -->
+    <section aria-labelledby="proof-h" class="alt">
+      <div class="section-inner">
+        <h2 id="proof-h">Proof, not promises</h2>
+        <p class="section-lede">Every wire claim below was exercised against real,
+        unmodified FRR&nbsp;10.2.2 in containers.</p>
+
+        <div class="badges">
+          <a href="https://github.com/li-ch/rouster/actions/workflows/ci.yml">
+            <img src="https://github.com/li-ch/rouster/actions/workflows/ci.yml/badge.svg"
+                 alt="CI workflow badge: fmt, clippy, full test suite, smoke-script syntax"
+                 height="20"></a>
+          <a href="https://github.com/li-ch/rouster/actions/workflows/smokes.yml">
+            <img src="https://github.com/li-ch/rouster/actions/workflows/smokes.yml/badge.svg"
+                 alt="Nightly smokes workflow badge (currently red)"
+                 height="20"></a>
+        </div>
+        <p class="badge-note">Linux CI (fmt, clippy&nbsp;<code>-D warnings</code>, the full
+        test suite, smoke-script syntax) was green on its latest main run,
+        2026-10-15. The nightly container smokes have
+        <strong>no green run recorded yet</strong> &mdash; CI-parity work is in flight, so the
+        second badge is red; the interop receipts below are local, recorded runs, not CI
+        greens.</p>
+
+        <h3 class="receipts-h">Live FRR interop, per protocol</h3>
+        <ul class="receipts">
+          <li>
+            <h4>BGP</h4>
+            <p>Two real FRR&nbsp;10.2.2 <code>bgpd</code> instances peer iBGP Established
+            through <code>rousterd</code>; BGP-learned prefixes reach the kernel
+            (<code>proto bgp</code>), stable over a 60&nbsp;s soak with zero reconnects.</p>
+          </li>
+          <li>
+            <h4>OSPF / OSPFv3</h4>
+            <p>Native <code>ospfd</code> vs real FRR <code>ospfd</code>: Full adjacency,
+            each remote loopback installed <code>proto ospf</code>, both directions.
+            OSPFv3 reaches Full adjacency with real FRR <code>ospf6d</code> and exchanges
+            routes both ways.</p>
+          </li>
+          <li>
+            <h4>BFD</h4>
+            <p>RFC&nbsp;5880&ndash;5883 state machine; single-hop TTL-255 enforcement is
+            receive-side and kernel-proven on both address families, feeding
+            <code>bgpd</code>&rsquo;s fast-down path over ZAPI-BFD.</p>
+          </li>
+          <li>
+            <h4>IS-IS <span class="tag">at HEAD</span></h4>
+            <p>TLV-native link-state IGP (ISO&nbsp;10589, RFC&nbsp;1195/5301/5303/5305) with
+            FRR&nbsp;10.2.2 <code>isisd</code> as the interop oracle &mdash; the FRR interop
+            smoke is green, recorded twice.</p>
+          </li>
+          <li>
+            <h4>RPKI / RTR</h4>
+            <p>The RTR client is interop-proven against a real
+            gortr&nbsp;v0.14.7 cache, feeding RFC&nbsp;6811 ROV and ASPA verification into
+            the BGP decision path.</p>
+          </li>
+          <li>
+            <h4>The ZAPI wire itself</h4>
+            <p>Every wire format is empirically pinned against the real FRR&nbsp;10.2.2
+            binary, captured from live exchanges &mdash; never guessed.</p>
+          </li>
+        </ul>
+
+        <ul class="stats">
+          <li class="stat">
+            <p class="stat-num">1622</p>
+            <p class="stat-label">workspace tests passing, 0 failed
+            (<code>cargo test --workspace</code>, 2026-10-15)</p>
+          </li>
+          <li class="stat">
+            <p class="stat-num">37</p>
+            <p class="stat-label">container smoke scripts at HEAD &mdash; 34 at the v0.1.0
+            tag; the last recorded full-suite green is 35/35 on v0.1.0 night, with the
+            IS-IS additions recorded green individually</p>
+          </li>
+          <li class="stat">
+            <p class="stat-num">MIT</p>
+            <p class="stat-label">licensed &mdash; Copyright &copy; 2026 The Rouster
+            Authors. Suite methodology: container-based
+            (<code>scripts/run-smokes.sh</code>) against a testbed image built from the
+            in-repo recipe.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ================= 3. Status + quickstart ================= -->
+    <section aria-labelledby="status-h">
+      <div class="section-inner">
+        <h2 id="status-h">Status &amp; quickstart</h2>
+
+        <div class="status-grid">
+          <div class="release">
+            <h3>v0.1.0, tagged 2026-10-14</h3>
+            <blockquote>
+              &ldquo;The first tagged release: the ZAPI-interop core, all four SAVNET
+              slices, three native protocol daemons with live FRR-interop proof on every
+              wire, and the management plane&rsquo;s foundation &mdash; gated at 1468 tests, a
+              34-script container smoke suite, and Linux CI.&rdquo;
+            </blockquote>
+            <p>The three daemons are <code>bgpd</code>, <code>ospfd</code> and
+            <code>bfdd</code>; IS-IS followed at HEAD. The management plane&rsquo;s foundation
+            is <code>vtyd</code> (a vtysh-compatible VTY server with Cisco-style grammar),
+            <code>configd</code> (transactional config with atomic staged apply and
+            automatic rollback) and <code>rousterctl</code> (a read-only operator CLI).</p>
+            <p><a href="https://gitee.com/drchenli/rouster/releases/tag/v0.1.0">Release
+            notes for v0.1.0</a>. Since the tag, HEAD has advanced 36 commits; the current
+            gate stands at 1622 tests and 37 smoke scripts (2026-10-15).</p>
+          </div>
+
+          <div class="quickstart">
+            <h3>Quickstart</h3>
+            <p class="qs-prereq">Needs Linux (netlink); the smokes additionally need
+            Docker and a locally cached FRR&nbsp;10.2.2 test image.</p>
+            <pre><code>cargo build --release
+./target/release/rousterd --config rouster.conf
+./scripts/run-smokes.sh</code></pre>
+            <p>Full instructions, including the <code>rouster.conf</code> examples, in
+            <a href="https://gitee.com/drchenli/rouster">the repository&rsquo;s README</a>.</p>
+            <h3 class="honest-h">Where it stands, honestly</h3>
+            <ul class="honest">
+              <li>Not feature-parity with FRR, and that is explicit: treat FRR as the
+              spec/oracle, not the finish line.</li>
+              <li>YANG northbound / gNMI is not yet present &mdash; management today is
+              <code>vtyd</code> + <code>configd</code> + <code>rousterctl</code>.</li>
+              <li>Protocol remainders are deferred and tracked in the repo:
+              <a href="https://gitee.com/drchenli/rouster/blob/main/docs/protocols/isis.md">IS-IS</a>
+              (LAN circuits/DIS, LSP fragments beyond&nbsp;0, authentication wiring),
+              <a href="https://gitee.com/drchenli/rouster/blob/main/docs/protocols/ospf.md">OSPF</a>
+              (graceful restart, E-LSAs, AF instances, more),
+              <a href="https://gitee.com/drchenli/rouster/blob/main/docs/protocols/bgp.md">BGP</a>
+              (MRAI queues, runtime policy reload, ROV-informed path selection).</li>
+              <li>The nightly smokes workflow has no green run recorded yet &mdash; see the
+              badge note above.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ================= Footer ================= -->
+  <footer class="footer">
+    <div class="section-inner">
+      <p class="footer-actions">
+        <a href="https://gitee.com/drchenli/rouster">Gitee (primary repo)</a>
+        <a href="https://github.com/li-ch/rouster">GitHub (mirror)</a>
+        <a href="https://gitee.com/drchenli/rouster/releases/tag/v0.1.0">v0.1.0 release</a>
+        <a href="https://gitee.com/drchenli/rouster/blob/main/LICENSE">MIT license</a>
+      </p>
+      <p class="footer-license">MIT &mdash; Copyright &copy; 2026 The Rouster Authors.</p>
+      <p class="footer-early">Early-stage software, honestly labeled: not feature-parity
+      with FRR &mdash; FRR is the spec and the oracle, not the finish line.</p>
+    </div>
+  </footer>
+</body>
+</html>
