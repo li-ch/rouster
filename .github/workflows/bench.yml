@@ -1,0 +1,28 @@
+name: bench
+
+# D3 (docs/benchmarks.md §D, ratified 2026-10-15): nightly +
+# manual-dispatch criterion run for the E7 codec micro-benchmarks.
+# Descriptive-only: shared runners have no CPU pinning, so results
+# carry host=gh-runner semantics — trend hints, never §F-comparable
+# numbers (comparative experiments stay on pinned local hosts).
+# This job never gates anything.
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  criterion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p zapi
+      - name: Upload criterion reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-reports
+          path: target/criterion/
+          retention-days: 90
