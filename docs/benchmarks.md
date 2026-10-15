@@ -211,6 +211,53 @@ in the chat record. The "Your decision" column stays the owner's.
   ground truth stays in `tests/golden.rs`. The D3 nightly CI dispatch
   job is deliberately NOT wired (owner requests it separately).
 
+- 2026-10-15 · E1+E5 Rouster 10k-slice · host=darwin-vm (OrbStack
+  7.2.9-orbstack, macOS 27.0.1 host, SUT pinned 4-11, injector 0-3)
+  · versions: rouster repo @775fdde (rousterd+bgpd, aarch64 musl) ·
+  feed: same dump/pick/surgery as the FRR-full entry; FIRST 10,000
+  prefixes (mrt-replay --limit 10000) · runs: 6 (1 warmup + 5
+  measured) · injector paced 120 msg/s, hold-time 900 (the F7
+  mitigation — see notes; ≥2× headroom holds: injector CPU median
+  0.22 s vs SUT 593.5 s) · **wall first-UPDATE→main-table-complete:
+  median 598.3 s, p95 608.6 s (≈16.7 routes/s average; bgpd CPU
+  median 593.5 s = CPU-bound on one core for the whole run)**
+  · CPU s: rousterd 0.80, injector 0.22 · RSS: bgpd 2,072 → peak
+  18,524 KiB (median), rousterd 2,760 → 11,016 · **E5: bgpd
+  ≈1,573 B/prefix at 10k (2,072→~17,800; ≈1,626 B/prefix at the 5k
+  mark), rousterd ≈765 B/prefix** · main-table finals 9,985–10,000
+  (0–15 prefixes unaccounted per run, bgpd log clean) · raw:
+  `target/bench-logs/rouster-20261015T080356Z/` · notes: the full
+  1,126,490-prefix protocol was NOT COMPLETED — bgpd's
+  LocRib::recompute is O(table) per UPDATE (O(n²) load; profile +
+  decay curve in the program report; projected weeks per run at full
+  table); the deepest completed point is 14.6k prefixes at ~1.85/s
+  (s1-20k-v2 run-1 partial, 36 min). Rouster-side runs used the
+  pacing+hold mitigations for finding F7 (session-loop read
+  cancellation under a select! race; clean-wire tee-proxy evidence)
+  — disclosed as transport shape, identical on the FRR matched runs.
+
+- 2026-10-15 · E1+E5 matched comparison, 10k slice, identical
+  injector (120 msg/s pace, hold 900, same feed) · host=darwin-vm ·
+  per §F both directions, versions pinned above · runs 6+6:
+  | metric (10k slice) | Rouster @775fdde | FRR 10.2.2 |
+  |---|---|---|
+  | wall median (first-UPDATE→main complete) | 598.3 s | 44.3 s |
+  | wall p95 | 608.6 s | 44.4 s |
+  | speaker CPU s (median) | 593.5 (bgpd) | 0.58 (bgpd) |
+  | zebra-side CPU s (median) | 0.80 (rousterd) | 0.42 (zebra) |
+  | speaker RSS Δ (empty→peak, KiB) | 2,072→18,524 | 11,436→20,416 |
+  | zebra-side RSS Δ (KiB) | 2,760→11,016 | 8,060→13,432 |
+  | accepted prefixes | 9,985–10,000 | 10,000/10,000 |
+  | bytes/prefix (speaker, 10k) | ≈1,573 | ≈898 |
+  | bytes/prefix (zebra-side, 10k) | ≈765 | ≈537 |
+  notes: FRR's 44.3 s is the injector's pacing floor (its daemons are
+  idle — 0.58 s + 0.42 s CPU; FRR's unpaced full-table capacity is
+  the separate entry above: 1,126,490 prefixes, median 30.36 s);
+  Rouster's 598.3 s is SUT-bound (CPU-pegged, the O(n²) finding).
+  Cross-side deltas exceed 2× on wall/CPU; per §F's darwin-vm rule
+  sub-2× deltas stay unresolved — none here are. No verdicts; the
+  numbers and conditions are the deliverable.
+
 ## Where things live (conventions)
 
 - Scripts: `scripts/bench-<E#>-<name>.sh` (the smoke-suite shape;
