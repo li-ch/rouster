@@ -579,6 +579,97 @@ async fn write_file_over_the_socket_merges_and_applies() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// S11-a M5, over the real socket (the W1-c recipe): config-mode
+/// edits build YANG-tree operations against the `rouster-vty`
+/// model, and `show running-config` renders FROM the tree — the
+/// full modeled surface (statics, router bgp + AF flattened, the
+/// import-check display comment, route-map lines) in the canonical
+/// shapes the writer has always emitted.
+#[tokio::test]
+async fn config_edits_are_yang_tree_ops_and_render_from_the_tree() {
+    let dir = scratch("yang-seam");
+    let canonical = dir.join("rouster.conf");
+    std::fs::write(&canonical, "").unwrap();
+    let recorded = Arc::new(RecordingBackend {
+        written: std::sync::Mutex::new(Vec::new()),
+        reply: vec!["configd: nothing to do".into()],
+    });
+    let (port, shutdown) = spawn_server_with(&dir, &canonical, recorded.clone());
+    wait_listening(port);
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut vty = PromptReader::new(stream);
+    let _ = vty.until_prompt();
+
+    for line in [
+        "enable",
+        "conf t",
+        "hostname seam-r1",
+        "line vty",
+        "ip route 203.0.113.0/24 blackhole",
+        "ipv6 route 2001:db8:1::/48 blackhole",
+        "route-map RM-IN permit 10",
+        "router bgp 65000",
+        "bgp router-id 10.0.0.1",
+        "neighbor 192.0.2.9 remote-as 65001",
+        "address-family ipv4 unicast",
+        "network 203.0.113.0/24",
+        "redistribute static",
+        "exit",
+        "bgp network import-check",
+        "end",
+    ] {
+        vty.send(line);
+        let _ = vty.until_prompt();
+    }
+
+    vty.send("show running-config");
+    let running = vty.until_prompt();
+    // The display-only directives as the recorded `! vtyd:` comments.
+    assert!(running.contains("! vtyd: hostname seam-r1"), "{running}");
+    assert!(running.contains("! vtyd: line vty"), "{running}");
+    // The statics, both families, straight off the tree.
+    assert!(
+        running.contains("ip route 203.0.113.0/24 blackhole"),
+        "{running}"
+    );
+    assert!(
+        running.contains("ipv6 route 2001:db8:1::/48 blackhole"),
+        "{running}"
+    );
+    // The router stanza: opener, router-id, neighbor, the flattened
+    // AF lines, the import-check display comment — the canonical
+    // grammar shapes, in the tree's document order.
+    assert!(running.contains("router bgp 65000"), "{running}");
+    assert!(running.contains("bgp router-id 10.0.0.1"), "{running}");
+    assert!(
+        running.contains("neighbor 192.0.2.9 remote-as 65001"),
+        "{running}"
+    );
+    assert!(running.contains("network 203.0.113.0/24"), "{running}");
+    assert!(running.contains("! redistribute static"), "{running}");
+    assert!(running.contains("! bgp network import-check"), "{running}");
+    assert!(running.contains("route-map RM-IN permit 10"), "{running}");
+
+    // What a write hands configd is the SAME view: one merge, the
+    // tree-rendered canonical.
+    vty.send("write file");
+    let _ = vty.until_prompt();
+    let written = recorded.written.lock().unwrap();
+    assert_eq!(written.len(), 1);
+    assert!(written[0].contains("daemon bgpd {"), "{}", written[0]);
+    assert!(
+        written[0].contains("neighbor 192.0.2.9 remote-as 65001"),
+        "{}",
+        written[0]
+    );
+
+    shutdown.send(true).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A stub configd: records its argv and the staged file's content to
 /// a log, answers with one report line, exits 0.
 fn stub_configd(dir: &Path) -> PathBuf {

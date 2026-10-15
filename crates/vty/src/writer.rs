@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::{Af, AfLine, BgpLine, CfgNode, Nexthop, SessionConfig};
+use crate::config::{Af, Nexthop, SessionConfig};
 
 /// Daemon sections in canonical render order (configd's registry
 /// order: the RIB first, protocols after).
@@ -179,7 +179,7 @@ fn project_or_keep(
         "bgpd" => {
             match tokens.as_slice() {
                 ["router", "bgp", asn] => {
-                    config.bgp_mut((*asn).to_string());
+                    config.bgp_open((*asn).to_string());
                     // Track "inside the stanza" implicitly: the child
                     // match arms below only parse right after a
                     // router line opened it... but bgpd accepts
@@ -192,24 +192,23 @@ fn project_or_keep(
                 }
                 ["bgp", "router-id", id] => {
                     if let ModeledBgp::As(asn) = modeled_bgp(config) {
-                        config.bgp_mut(asn).set_router_id((*id).to_string());
+                        config.bgp_set_router_id(&asn, (*id).to_string());
                         return;
                     }
                 }
                 ["neighbor", addr, "remote-as", remote_as] => {
                     if let ModeledBgp::As(asn) = modeled_bgp(config) {
-                        config
-                            .bgp_mut(asn)
-                            .add_neighbor((*addr).to_string(), (*remote_as).to_string());
+                        config.bgp_add_neighbor(
+                            &asn,
+                            (*addr).to_string(),
+                            (*remote_as).to_string(),
+                        );
                         return;
                     }
                 }
                 ["network", prefix] => {
                     if let ModeledBgp::As(asn) = modeled_bgp(config) {
-                        config
-                            .bgp_mut(asn)
-                            .af_mut("ipv4 unicast")
-                            .push(AfLine::Network((*prefix).to_string()));
+                        config.af_add_network(&asn, (*prefix).to_string());
                         return;
                     }
                 }
@@ -217,22 +216,19 @@ fn project_or_keep(
                 // comments; load them back.
                 ["!", "bgp", "network", "import-check"] => {
                     if let ModeledBgp::As(asn) = modeled_bgp(config) {
-                        config.bgp_mut(asn).set_import_check(true);
+                        config.bgp_set_import_check(&asn, true);
                         return;
                     }
                 }
                 ["!", "no", "bgp", "network", "import-check"] => {
                     if let ModeledBgp::As(asn) = modeled_bgp(config) {
-                        config.bgp_mut(asn).set_import_check(false);
+                        config.bgp_set_import_check(&asn, false);
                         return;
                     }
                 }
                 ["!", "redistribute", "static"] => {
                     if let ModeledBgp::As(asn) = modeled_bgp(config) {
-                        let af = config.bgp_mut(asn).af_mut("ipv4 unicast");
-                        if !af.iter().any(|l| matches!(l, AfLine::RedistributeStatic)) {
-                            af.push(AfLine::RedistributeStatic);
-                        }
+                        config.af_add_redistribute_static(&asn);
                         return;
                     }
                 }
@@ -249,22 +245,29 @@ fn project_or_keep(
 }
 
 /// The most recently opened modeled router-bgp stanza's AS (the
-/// projection state for bgpd child lines).
+/// projection state for bgpd child lines): the LAST bgp entry in
+/// the tree's document order.
 enum ModeledBgp {
     As(String),
     None,
 }
 
 fn modeled_bgp(config: &SessionConfig) -> ModeledBgp {
-    match config
-        .nodes
-        .iter()
-        .rev()
-        .find(|node| matches!(node, CfgNode::RouterBgp(_)))
-    {
-        Some(CfgNode::RouterBgp(bgp)) => ModeledBgp::As(bgp.asn.clone()),
-        _ => ModeledBgp::None,
+    // Walk /router's bgp list entries; the tree keeps document
+    // order, so the last entry is the most recently opened stanza.
+    let base = yang::data::Path::parse("/router/bgp").expect("literal path");
+    if let Some(node) = config.tree.get(&base) {
+        if let yang::data::NodeKind::List(entries) = &node.kind {
+            if let Some(last) = entries.last() {
+                if let yang::data::NodeKind::Entry { keys, .. } = &last.kind {
+                    if let Some((_, asn)) = keys.first() {
+                        return ModeledBgp::As(asn.clone());
+                    }
+                }
+            }
+        }
     }
+    ModeledBgp::None
 }
 
 /// A nexthop token to its modeled form (`blackhole` or an address).
@@ -291,26 +294,20 @@ fn feed_display(rest: &str, config: &mut SessionConfig) {
     }
 }
 
-/// Renders the merged canonical document: the display-only
-/// directives as `! vtyd:` comments, the unmodeled top-level lines
-/// verbatim, then one section per daemon in registry order — the
-/// session's modeled lines first, the unmodeled body verbatim after.
-/// This is what `write` writes and what `show running-config` shows:
-/// one view, the canonical one.
+/// Renders the merged canonical document FROM THE SESSION TREE
+/// (S11-a M5): the display-only directives as `! vtyd:` comments,
+/// the unmodeled top-level lines verbatim, then one section per
+/// daemon in registry order — the session's modeled lines first
+/// (walked off the YANG tree's document order), the unmodeled body
+/// verbatim after. This is what `write` writes and what `show
+/// running-config` shows: one view, the canonical one.
 pub fn render_canonical(config: &SessionConfig, doc: &CanonState) -> String {
     let mut out = String::new();
-    for node in &config.nodes {
-        match node {
-            CfgNode::FrrVersion(version) => {
-                out.push_str(&format!("! vtyd: frr version {version}\n"))
-            }
-            CfgNode::FrrDefaults(profile) => {
-                out.push_str(&format!("! vtyd: frr defaults {profile}\n"))
-            }
-            CfgNode::Hostname(name) => out.push_str(&format!("! vtyd: hostname {name}\n")),
-            CfgNode::LineVty => out.push_str("! vtyd: line vty\n"),
-            _ => {}
-        }
+    // Display-only directives, in the tree's document order (the
+    // operator's entry order).
+    for line in display_directives(config) {
+        out.push_str(&line);
+        out.push('\n');
     }
     for line in &doc.top {
         out.push_str(line);
@@ -354,62 +351,187 @@ pub fn render_canonical(config: &SessionConfig, doc: &CanonState) -> String {
     out
 }
 
-/// The session's modeled body lines for one daemon section.
+/// The `! vtyd:` display comments, in the tree's document order.
+fn display_directives(config: &SessionConfig) -> Vec<String> {
+    use yang::data::NodeKind;
+    let mut out = Vec::new();
+    let path = |segs: &str| yang::data::Path::parse(segs).expect("literal path");
+    for node in &config.tree.children {
+        match (&node.name[..], &node.kind) {
+            ("hostname", NodeKind::Leaf { value, .. }) => {
+                out.push(format!("! vtyd: hostname {value}"));
+            }
+            ("frr", NodeKind::Container(children)) => {
+                for child in children {
+                    match (&child.name[..], &child.kind) {
+                        ("version", NodeKind::Leaf { value, .. }) => {
+                            out.push(format!("! vtyd: frr version {value}"));
+                        }
+                        ("defaults", NodeKind::Leaf { value, .. }) => {
+                            out.push(format!("! vtyd: frr defaults {value}"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ("line", NodeKind::Container(children))
+                if children.iter().any(|c| c.name == "vty") =>
+            {
+                out.push("! vtyd: line vty".to_string());
+            }
+            _ => {}
+        }
+    }
+    let _ = path;
+    out
+}
+
+/// The session's modeled body lines for one daemon section — walked
+/// off the YANG tree (document order), projected to the canonical
+/// grammar shapes.
 fn modeled_body(daemon: &str, config: &SessionConfig) -> Vec<String> {
+    use yang::data::{Node, NodeKind};
+    let path = |segs: &str| yang::data::Path::parse(segs).expect("literal path");
+    fn val(n: &Node) -> Option<&String> {
+        match &n.kind {
+            NodeKind::Leaf { value, .. } => Some(value),
+            _ => None,
+        }
+    }
     let mut body = Vec::new();
     match daemon {
         "rousterd" => {
-            for node in &config.nodes {
-                if let CfgNode::StaticRoute {
-                    af,
-                    prefix,
-                    nexthop,
-                } = node
+            // Static routes: one line per (prefix, nexthop), in the
+            // tree's document order — v4 and v6 interleaved by their
+            // containers' creation order.
+            for af_container in ["ip", "ipv6"] {
+                let af = if af_container == "ip" { Af::V4 } else { Af::V6 };
+                let base = path(&format!("/{af_container}/route"));
+                if let Some(Node {
+                    kind: NodeKind::List(entries),
+                    ..
+                }) = config.tree.get(&base)
                 {
-                    body.push(format!(
-                        "{} route {prefix} {}",
-                        af.keyword(),
-                        nexthop.text()
-                    ));
+                    for entry in entries {
+                        let NodeKind::Entry { keys, children, .. } = &entry.kind else {
+                            continue;
+                        };
+                        let Some((_, prefix)) = keys.first() else {
+                            continue;
+                        };
+                        for node in children.iter().filter(|n| n.name == "nexthop") {
+                            if let NodeKind::LeafList(values) = &node.kind {
+                                for v in values {
+                                    body.push(format!(
+                                        "{} route {prefix} {}",
+                                        af.keyword(),
+                                        v.value
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         "bgpd" => {
-            for node in &config.nodes {
-                match node {
-                    CfgNode::RouterBgp(bgp) => {
-                        body.push(format!("router bgp {}", bgp.asn));
-                        for line in &bgp.lines {
-                            match line {
-                                BgpLine::ImportCheck(on) => body.push(format!(
-                                    "! {}bgp network import-check",
-                                    if *on { "" } else { "no " }
-                                )),
-                                BgpLine::RouterId(id) => body.push(format!("bgp router-id {id}")),
-                                BgpLine::Neighbor { addr, remote_as } => {
-                                    body.push(format!("neighbor {addr} remote-as {remote_as}"))
-                                }
-                                // Flattened to router level: bgpd's
-                                // grammar has no address-family
-                                // stanza (the recorded design).
-                                BgpLine::AddressFamily { lines, .. } => {
-                                    for af_line in lines {
-                                        match af_line {
-                                            AfLine::Network(prefix) => {
-                                                body.push(format!("network {prefix}"))
+            // Router stanzas in document order; route-map lines
+            // after them (the tree stores them at the root — the
+            // one ordering the flattened canonical form loses).
+            let base = path("/router/bgp");
+            if let Some(Node {
+                kind: NodeKind::List(entries),
+                ..
+            }) = config.tree.get(&base)
+            {
+                for entry in entries {
+                    let NodeKind::Entry { keys, children, .. } = &entry.kind else {
+                        continue;
+                    };
+                    let Some((_, asn)) = keys.first() else {
+                        continue;
+                    };
+                    body.push(format!("router bgp {asn}"));
+                    for node in children {
+                        match (&node.name[..], &node.kind) {
+                            ("bgp", NodeKind::Container(bgp_children)) => {
+                                for child in bgp_children {
+                                    match (&child.name[..], &child.kind) {
+                                        ("router-id", _) => {
+                                            if let Some(id) = val(child) {
+                                                body.push(format!("bgp router-id {id}"));
                                             }
-                                            AfLine::RedistributeStatic => {
-                                                body.push("! redistribute static".to_string())
+                                        }
+                                        ("network-import-check", _) => {
+                                            if let Some(v) = val(child) {
+                                                body.push(format!(
+                                                    "! {}bgp network import-check",
+                                                    if v == "true" { "" } else { "no " }
+                                                ));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ("neighbor", NodeKind::List(nbs)) => {
+                                for nb in nbs {
+                                    let NodeKind::Entry { keys, children, .. } = &nb.kind else {
+                                        continue;
+                                    };
+                                    let Some((_, addr)) = keys.first() else {
+                                        continue;
+                                    };
+                                    let remote_as = children
+                                        .iter()
+                                        .find(|c| c.name == "remote-as")
+                                        .and_then(val);
+                                    if let Some(remote_as) = remote_as {
+                                        body.push(format!("neighbor {addr} remote-as {remote_as}"));
+                                    }
+                                }
+                            }
+                            // Flattened to router level: bgpd's
+                            // grammar has no address-family stanza
+                            // (the recorded design).
+                            ("address-family", NodeKind::Container(afs)) => {
+                                for af_container in afs {
+                                    if let NodeKind::Container(families) = &af_container.kind {
+                                        for family in families {
+                                            if let NodeKind::Container(unicast) = &family.kind {
+                                                for leaf in unicast {
+                                                    match (&leaf.name[..], &leaf.kind) {
+                                                        ("network", NodeKind::LeafList(values)) => {
+                                                            for v in values {
+                                                                body.push(format!(
+                                                                    "network {}",
+                                                                    v.value
+                                                                ));
+                                                            }
+                                                        }
+                                                        ("redistribute", _)
+                                                            if val(leaf).is_some() =>
+                                                        {
+                                                            body.push(
+                                                                "! redistribute static"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+                            _ => {}
                         }
                     }
-                    CfgNode::RouteMap(rest) => body.push(format!("route-map {rest}")),
-                    _ => {}
                 }
+            }
+            for rm in config.tree.get_values(&path("/route-map")) {
+                body.push(format!("route-map {rm}"));
             }
         }
         _ => {}
@@ -628,40 +750,35 @@ daemon bgpd {
         let mut config = SessionConfig::new();
         let state = CanonState::load(&path, &mut config);
 
-        // Modeled: three statics, the bgp stanza, the route-map (in
-        // entry order — route-map lands after the stanza it rode in).
-        let statics: Vec<_> = config
-            .nodes
-            .iter()
-            .filter_map(|n| match n {
-                CfgNode::StaticRoute {
-                    af,
-                    prefix,
-                    nexthop,
-                } => Some((af.keyword().to_string(), prefix.clone(), nexthop.clone())),
-                _ => None,
-            })
-            .collect();
+        // Modeled (S11-a M5): the tree carries the statics, the bgp
+        // stanza, the route-map — asserted through the tree paths.
+        let p = |segs: &str| yang::data::Path::parse(segs).unwrap();
         assert_eq!(
-            statics,
-            vec![
-                ("ip".into(), "203.0.113.0/24".into(), Nexthop::Blackhole),
-                (
-                    "ip".into(),
-                    "198.51.100.0/24".into(),
-                    Nexthop::Addr("192.0.2.1".into())
-                ),
-                ("ipv6".into(), "2001:db8::/32".into(), Nexthop::Blackhole),
-            ]
+            config
+                .tree
+                .get_values(&p("/ip/route[prefix=203.0.113.0/24]/nexthop")),
+            vec!["blackhole".to_string()]
         );
-        assert!(matches!(
-            &config.nodes[statics.len()],
-            CfgNode::RouterBgp(bgp) if bgp.asn == "65000"
-        ));
+        assert_eq!(
+            config
+                .tree
+                .get_values(&p("/ip/route[prefix=198.51.100.0/24]/nexthop")),
+            vec!["192.0.2.1".to_string()]
+        );
+        assert_eq!(
+            config
+                .tree
+                .get_values(&p("/ipv6/route[prefix=2001:db8::/32]/nexthop")),
+            vec!["blackhole".to_string()]
+        );
         assert!(config
-            .nodes
-            .iter()
-            .any(|n| matches!(n, CfgNode::RouteMap(r) if r == "RM-IN permit 10")));
+            .tree
+            .get_value(&p("/router/bgp[local-as=65000]/bgp/router-id"))
+            .is_some());
+        assert_eq!(
+            config.tree.get_values(&p("/route-map")),
+            vec!["RM-IN permit 10".to_string()]
+        );
 
         // Kept verbatim: the top-level lines, zapi socket (original
         // indentation included), the whole savd section.
@@ -754,7 +871,7 @@ daemon bgpd {
         fs::write(&path, &text).unwrap();
         let mut reloaded = SessionConfig::new();
         CanonState::load(&path, &mut reloaded);
-        assert_eq!(reloaded.nodes, config.nodes);
+        assert_eq!(reloaded, config);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -763,7 +880,7 @@ daemon bgpd {
         let mut config = SessionConfig::new();
         let state = CanonState::load(Path::new("/nonexistent/rouster.conf"), &mut config);
         assert_eq!(state, CanonState::default());
-        assert!(config.nodes.is_empty());
+        assert!(config.tree.source_lines().is_empty());
     }
 
     #[test]
@@ -777,7 +894,10 @@ daemon bgpd {
         .unwrap();
         let mut config = SessionConfig::new();
         let state = CanonState::load(&path, &mut config);
-        assert!(config.nodes.is_empty(), "the table form is not modeled");
+        assert!(
+            config.tree.source_lines().is_empty(),
+            "the table form is not modeled"
+        );
         // Kept verbatim, original indentation included.
         assert_eq!(
             state.body("rousterd"),

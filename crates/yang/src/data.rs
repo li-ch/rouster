@@ -373,6 +373,56 @@ impl DataTree {
         self.node_at(path)
     }
 
+    /// A leaf's value (`None` when absent — defaults report their
+    /// filled value after [`DataTree::default_fill`]).
+    pub fn get_value(&self, path: &Path) -> Option<String> {
+        match &self.node_at(path)?.kind {
+            NodeKind::Leaf { value, .. } => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// A leaf-list's values in order (empty when absent).
+    pub fn get_values(&self, path: &Path) -> Vec<String> {
+        match &self.node_at(path) {
+            Some(Node {
+                kind: NodeKind::LeafList(values),
+                ..
+            }) => values.iter().map(|v| v.value.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Removes ONE value from a leaf-list (§7.7's delete); the leaf
+    /// disappears with its last value and empty ancestors prune
+    /// (the no-presence rule).
+    pub fn delete_value(&mut self, path: &Path, value: &str) -> Result<(), DataError> {
+        let node = self
+            .node_at(path)
+            .cloned()
+            .ok_or_else(|| derr(path, "leaf-list does not exist"))?;
+        let NodeKind::LeafList(values) = &node.kind else {
+            return Err(derr(path, "node is not a leaf-list"));
+        };
+        if !values.iter().any(|v| v.value == value) {
+            return Err(derr(path, format!("value `{value}` not present")));
+        }
+        let Some((_, parent)) = path.segs.split_last() else {
+            return Err(derr(path, "cannot delete at the root"));
+        };
+        if let Some(siblings) = self.children_of_mut_at(parent) {
+            for sibling in siblings.iter_mut() {
+                if sibling.name == node.name {
+                    if let NodeKind::LeafList(values) = &mut sibling.kind {
+                        values.retain(|v| v.value != value);
+                    }
+                }
+            }
+        }
+        self.prune_empty(parent);
+        Ok(())
+    }
+
     /// Deletes the node at `path` (a leaf, a whole list entry, a
     /// container, or a keyless list); empty ancestors are pruned
     /// (§7.5.1: a non-presence container exists iff it has

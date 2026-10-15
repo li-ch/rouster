@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::commands;
-use crate::config::{Af, AfLine, Nexthop, SessionConfig};
+use crate::config::{Af, Nexthop, SessionConfig};
 use crate::protocol;
 use crate::render;
 use crate::tree::{Action, Help, WordTree};
@@ -334,72 +334,68 @@ impl Session {
             }
             Action::RouterBgp => {
                 let asn = params[0].clone();
-                self.config.bgp_mut(asn.clone());
+                self.config.bgp_open(asn.clone());
                 self.modes.push(Mode::ConfigRouter { asn });
                 Outcome::empty()
             }
             Action::BgpImportCheck => {
-                self.with_router_bgp(|bgp| bgp.set_import_check(true));
+                if let Some(asn) = self.router_asn() {
+                    self.config.bgp_set_import_check(&asn, true);
+                }
                 Outcome::empty()
             }
             Action::NoBgpImportCheck => {
-                self.with_router_bgp(|bgp| bgp.set_import_check(false));
+                if let Some(asn) = self.router_asn() {
+                    self.config.bgp_set_import_check(&asn, false);
+                }
                 Outcome::empty()
             }
             Action::BgpRouterId => {
                 let id = params[0].clone();
-                self.with_router_bgp(|bgp| bgp.set_router_id(id));
+                if let Some(asn) = self.router_asn() {
+                    self.config.bgp_set_router_id(&asn, id);
+                }
                 Outcome::empty()
             }
             Action::BgpNeighbor => {
                 let (addr, remote_as) = (params[0].clone(), params[1].clone());
-                self.with_router_bgp(|bgp| bgp.add_neighbor(addr, remote_as));
+                if let Some(asn) = self.router_asn() {
+                    self.config.bgp_add_neighbor(&asn, addr, remote_as);
+                }
                 Outcome::empty()
             }
             Action::AddressFamily => {
                 if let Mode::ConfigRouter { asn } = self.mode() {
                     let asn = asn.clone();
                     let family = "ipv4 unicast".to_string();
-                    self.config.bgp_mut(asn.clone()).af_mut(&family);
+                    self.config.af_open(&asn, &family);
                     self.modes.push(Mode::ConfigRouterAf { asn, family });
                 }
                 Outcome::empty()
             }
             Action::AfNetwork => {
                 let prefix = params[0].clone();
-                self.with_af_lines(|lines| lines.push(AfLine::Network(prefix)));
+                if let Some(asn) = self.router_asn() {
+                    self.config.af_add_network(&asn, prefix);
+                }
                 Outcome::empty()
             }
             Action::AfRedistributeStatic => {
-                self.with_af_lines(|lines| {
-                    if !lines
-                        .iter()
-                        .any(|l| matches!(l, AfLine::RedistributeStatic))
-                    {
-                        lines.push(AfLine::RedistributeStatic);
-                    }
-                });
+                if let Some(asn) = self.router_asn() {
+                    self.config.af_add_redistribute_static(&asn);
+                }
                 Outcome::empty()
             }
         }
     }
 
-    /// Mutates the router-bgp node the current mode selects
-    /// (`bgp_mut` re-creates it if a previous action removed it,
-    /// which none can — mode stack and config stay in lockstep).
-    fn with_router_bgp(&mut self, f: impl FnOnce(&mut crate::config::BgpNode)) {
-        if let Mode::ConfigRouter { asn } | Mode::ConfigRouterAf { asn, .. } = self.mode() {
-            let asn = asn.clone();
-            f(self.config.bgp_mut(asn));
-        }
-    }
-
-    /// Mutates the address-family lines the current mode selects.
-    fn with_af_lines(&mut self, f: impl FnOnce(&mut Vec<AfLine>)) {
-        if let Mode::ConfigRouterAf { asn, family } = self.mode() {
-            let (asn, family) = (asn.clone(), family.clone());
-            let bgp = self.config.bgp_mut(asn);
-            f(bgp.af_mut(&family));
+    /// The router-bgp AS the current mode selects (the node
+    /// re-creates if absent — mode stack and config stay in
+    /// lockstep). Every caller builds a YANG-tree operation.
+    fn router_asn(&mut self) -> Option<String> {
+        match self.mode() {
+            Mode::ConfigRouter { asn } | Mode::ConfigRouterAf { asn, .. } => Some(asn.clone()),
+            _ => None,
         }
     }
 }

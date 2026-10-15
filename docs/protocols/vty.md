@@ -87,13 +87,19 @@ the B7 observed grammar subset (below), `exit` (pop one mode),
 - No enable password in v1 (disclosed: nobody has designed
   aaa/enable-secret integration; the one-shot client relies on it).
 
-## Config mode — the B7 grammar, the canonical merge (S8-c)
+## Config mode — the B7 grammar, the canonical merge (S8-c), the YANG translator seam (S11-a M5)
 
 `configure terminal` accepts the **quarantine-B7 observed frr.conf
-grammar subset** into a session config tree; the tree is the
-modeled half of the canonical merge — the other half is everything
-in the canonical `rouster.conf` the grammar cannot speak, loaded
-verbatim at connection start (`vty::writer`):
+grammar subset**; the vtysh-shaped grammar is the EDGE, and since
+S11-a M5 every config-mode edit builds a **YANG-tree operation** —
+the session config IS a `yang::DataTree` bound to the
+`rouster-vty` model (`yang/rouster-vty.yang`, the same paths
+configd's bind uses), so `show running-config` and `write file`
+render FROM the tree (invariant 5: a translator, never a second
+source of truth; the grammar stays the vtysh-compatible surface).
+The merge's other half is everything in the canonical `rouster.conf`
+the grammar cannot speak, loaded verbatim at connection start
+(`vty::writer`):
 
 - `frr version <s>` · `frr defaults <s>` · `line vty` (B7 §1)
 - `hostname <word>` — also changes the prompt

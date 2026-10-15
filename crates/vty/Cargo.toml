@@ -20,3 +20,7 @@ thiserror.workspace = true
 # pre-existing workspace member — no new crates, no new lock
 # entries beyond the vty package's own dependency edges.
 tracing-subscriber.workspace = true
+# S11-a M5: the session config tree is a yang::DataTree bound to
+# the embedded rouster-vty model — the translator seam (invariant
+# 5). A pre-existing workspace member; no new external crates.
+yang = { path = "../yang" }
