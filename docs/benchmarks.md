@@ -293,6 +293,37 @@ in the chat record. The "Your decision" column stays the owner's.
   §F's darwin-vm rule. No verdict prose; F8 goes to the owner
   decision list.
 
+- 2026-10-15/16 · E1+E5 Rouster full-table, POST-F8 (commit
+  `5afbba6`: pipelined route programming, dirty-key reconcile, tick
+  Delay) · host=darwin-vm (same rig, same feed, sha256 above) ·
+  runs: 6 (1 warmup + 5 measured), unpaced, hold-time 90 ·
+  **wall first-UPDATE→main-table-complete: median 17.1 s, p95 17.1 s,
+  min 17.0 s (3 of 5 measured runs reached main = feed−9 =
+  1,126,481 — full table in-kernel every run that completed its
+  poll; malformed 0, rejected 0 on all six runs)** · EOR wall
+  median 6.07 s (p95 6.38) — higher than the pre-F8 4.73 s because
+  rousterd's pipelined installs now overlap bgpd's ingest instead
+  of queueing behind it; total SUT CPU is what dropped: **bgpd
+  10.37 s + rousterd 10.90 s = 21.3 CPU-s (pre-F8: 9.14 + 235.08;
+  FRR's ledgered pair: 11.03 + 9.67 = 20.7)** · rousterd programming
+  rate ≈65k routes/s effective (was ≈4.8k) · **E5: bgpd ≈1,679
+  B/prefix final (RSS 1,848,588 KiB median), rousterd ≈784 B/prefix
+  (865,480 KiB)** · raw: `target/bench-logs/rouster-20261015T141901Z/`
+  (summary mirrored at away/2026-10-15/bench/e1-f8-summary.json) ·
+  notes (disclosed): measured-run wall statistics cover the three
+  runs whose main-table poll completed — runs 4 and 5 lost their
+  poll side (run 4: zero samples, run 5: stopped at 625,462) with
+  the SUT otherwise healthy; hypothesis: the poll's netlink
+  route-dump (`ip route` via docker exec) starves under the 512-
+  in-flight install storm on a 17 s run (dump-vs-churn RTNL
+  contention). Harness follow-up, not a SUT finding; the harness
+  should poll the rousterd status socket instead of dumping the
+  kernel table. Cross-side: end-to-end 17.1 s vs FRR's 30.36 s is a
+  1.78× delta — sub-2×, so even this stays unresolved for
+  comparative claims under §F's darwin-vm rule; the descriptive
+  claim ("full table in-kernel in 17.1 s median on this rig") is
+  licensed. No verdict prose.
+
 ## Where things live (conventions)
 
 - Scripts: `scripts/bench-<E#>-<name>.sh` (the smoke-suite shape;

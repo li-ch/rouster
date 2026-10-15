@@ -488,3 +488,22 @@ The phase text above is unchanged; this block is status only.
   bench job landed (`bench.yml`). The in-repo mrt-replay injector
   (225k routes/s, zero new deps) is a keeper dev tool. Evidence:
   away/2026-10-15/bench/ (REPORT.md + state + captures).
+
+- 2026-10-15/16 (night, F8 fix round) — **F8 FIXED** (`5afbba6`,
+  owner-authorized after the diagnosis): pipelined route
+  programming (Dataplane batch methods with sequential defaults;
+  netlink-dp overrides at 512-in-flight, every ACK verified,
+  ordered results), dirty-key reconcile on the ZAPI hot path
+  (O(batch); tick/events/SIGHUP keep the full pass), inline
+  scan-and-diff (no desired-state map), reconcile-tick
+  MissedTickBehavior::Delay. Gate: fmt + clippy (host + musl)
+  clean, workspace 1770/0 (M3 partition properties unchanged).
+  §R post-F8 entry: **full table in-kernel 17.1 s median (was
+  247.8 s; FRR 30.36 s)**, total SUT CPU 21.3 s (FRR's ledgered
+  20.7), EOR 6.07 s with installs overlapping the ingest, 0
+  malformed / 0 rejected on all six runs. rousterd ≈65k routes/s
+  effective (was ≈4.8k). Harness follow-up recorded: the
+  main-table poll's netlink dump starves on short install-storm
+  runs — poll the status socket instead. Comparative claims stay
+  closed on darwin-vm (17.1 vs 30.36 = 1.78×, under the 2× rule);
+  the descriptive claim is licensed.

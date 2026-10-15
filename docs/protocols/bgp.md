@@ -503,12 +503,18 @@ Receipts (§R, post-fix entry): full 1,126,490-prefix table at EOR in
 unpaced at hold 90 — where the pre-fix reader desynced at 120 msg/s
 paced.
 
-- **F8 — OPEN (rousterd, not bgpd): the FIB programming path.**
-  Post-fix, the end-to-end wall (main-table complete, median
-  247.8 s) is dominated by rousterd programming ~1.12M routes at
-  ≈4.8k routes/s (235 CPU-s; FRR zebra's ledgered cost: 9.67 CPU-s).
-  Owner decision pending: batched/netlink-merge work on the
-  rousterd side is the next performance unlock.
+- **F8 — FIXED (commit `5afbba6`, same day): the FIB programming
+  path.** The Dataplane trait gained `route_replace_batch`/
+  `route_delete_batch` (sequential defaults; netlink-dp overrides
+  with 512-in-flight pipelined requests, every ACK still verified,
+  ordered results), the ZAPI hot path reconciles dirty keys only
+  (O(batch); the 10 s tick, dataplane events, and SIGHUP keep the
+  full pass), and the reconcile tick uses `MissedTickBehavior::Delay`.
+  Post-fix §R entry: full table in-kernel **17.1 s median**
+  (rousterd 10.9 CPU-s, was 235; total SUT CPU 21.3 s vs FRR's
+  20.7), EOR 6.07 s with installs overlapping the ingest. Harness
+  follow-up noted: the main-table poll's netlink dump starves under
+  the install storm on short runs — poll the status socket instead.
 - Also recorded by the round (not fixed): first-AS enforcement is
   absent (FRR rejects AS_PATHs that do not open with the peer AS,
   RFC 4271 §6.3; the bench feed prepends symmetrically to stay
