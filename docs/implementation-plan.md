@@ -438,3 +438,16 @@ The phase text above is unchanged; this block is status only.
   (green runs raced FRR's 5s refresh); fixed with the v2-parity
   mark-dirty + regression test (4e0910a). Gate 1623/0, smokes
   37/37 in 1392 s.
+
+- 2026-10-15 (later) — S11 round GREEN, invariant 5 landed: the YANG
+  core (pure-Rust RFC 7950 subset — parser/types/tree/validator,
+  72 RFC-cited tests + the property suite), the seven-model set in
+  yang/*.yang with the conformance corpus, configd's FLIP (the YANG
+  tree is the internal source of truth; text grammar remains the
+  edge; renders byte-identical, pinned against the legacy
+  renderer), the vtyd translator seam (config edits = tree ops,
+  show running-config renders from the tree), and the gNMI
+  transport evaluation in docs/yang.md (options A-D, recommendation
+  C RESTCONF-shaped edge, OWNER DECISION BLOCK unfilled). Gate
+  1715/0 (+92), fmt/clippy clean incl. an integration sweep over a
+  concurrent session's mrt-replay tail.
