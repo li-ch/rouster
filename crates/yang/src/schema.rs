@@ -1023,10 +1023,20 @@ fn resolve_spec(
             }
             let (def_module_name, tname) = match qname.split_once(':') {
                 Some((prefix, name)) => {
-                    let target = imports.get(prefix).ok_or_else(|| {
-                        err(line, format!("prefix `{prefix}` is not imported (§7.1.5)"))
-                    })?;
-                    (target.clone(), name.to_string())
+                    // The module's own prefix is a valid self
+                    // reference (§5.4: definitions may be referenced
+                    // with the local prefix).
+                    let target = if prefix == module.prefix.as_str() {
+                        module.name.clone()
+                    } else {
+                        imports
+                            .get(prefix)
+                            .ok_or_else(|| {
+                                err(line, format!("prefix `{prefix}` is not imported (§7.1.5)"))
+                            })?
+                            .clone()
+                    };
+                    (target, name.to_string())
                 }
                 None => (module.name.clone(), qname.clone()),
             };

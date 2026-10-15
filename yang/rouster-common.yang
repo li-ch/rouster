@@ -1,0 +1,147 @@
+// rouster-common — the shared types and the common/rousterd config
+// surface (S11-a M3). The type library every per-daemon module
+// imports; the data tree doubles as rousterd's own section model
+// (rousterd's grammar IS the common grammar: static routes, the
+// zapi socket, and the configd-owned router-id the daemons grow
+// consumers for one by one — docs/protocols/config.md §5's ledger).
+//
+// The subset this parses: crates/yang (RFC 7950 §7.1/§7.3/§7.4/§9,
+// the S11-a declaration). grouping/uses are NOT in the subset, so
+// shapes shared across modules (zapi socket, static routes) are
+// re-declared per module — the disclosed cost of §7.12/§7.13 being
+// §Deferred.
+module rouster-common {
+  yang-version 1.1;
+  namespace "urn:rouster:common";
+  prefix rc;
+
+  description
+    "Shared typedefs and the common (rousterd-section) config:
+     router-id, the interface list, static routes v4/v6.";
+
+  revision 2026-10-15;
+
+  typedef interface-name {
+    description
+      "A Linux interface name: at most IFNAMSIZ-1 = 15 characters
+       (the kernel cannot have a longer one, so the config line can
+       never match anything — savd's rule, shared).";
+    type string {
+      length 1..15;
+    }
+  }
+
+  typedef area-id {
+    description
+      "An OSPF area ID as a dotted quad without leading zeros
+       (ospfd accepts the plain-integer form too — §Deferred in
+       docs/yang.md; the corpus is dotted).";
+    type string {
+      pattern
+        '(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))'
+      + '(\.(0|[1-9][0-9]*))(\.(0|[1-9][0-9]*))';
+    }
+  }
+
+  typedef isis-net {
+    description
+      "An IS-IS NET: dotted hex groups ending in the zero NSEL
+       (RFC 1195; isisd's 8..=20-octet total-length check is at the
+       daemon — the model checks the lexical shape).";
+    type string {
+      pattern '([0-9a-fA-F]+\.)*[0-9a-fA-F]+\.00';
+    }
+  }
+
+  typedef seconds {
+    type uint32 {
+      range 1..max;
+    }
+  }
+
+  typedef as-number {
+    type uint32;
+  }
+
+  typedef milliseconds-1-60000 {
+    description "bfdd's interval window (RFC 5880 operational range).";
+    type uint32 {
+      range 1..60000;
+    }
+  }
+
+  // The configd-owned directive: validated, recorded, rendered
+  // nowhere until a daemon's grammar grows a consumer.
+  leaf router-id {
+    type inet:ipv4-address;
+  }
+
+  container interfaces {
+    description
+      "The common interface list — today the shared SHAPE only
+       (per-daemon interface stanzas live in their own modules,
+       keyed by name with the daemon's knobs)";
+    list interface {
+      key "name";
+      leaf name {
+        type rc:interface-name;
+      }
+    }
+  }
+
+  container ip {
+    description "Static routes, IPv4 (`ip route <p> <gw>...|blackhole [table <n>]`).";
+    list route {
+      key "prefix";
+      leaf prefix {
+        type inet:ipv4-prefix;
+      }
+      leaf-list nexthop {
+        description
+          "Gateways (>= 2 on a line = ECMP) or `blackhole`. The
+           line-binding's positional leaf-list.";
+        type union {
+          type inet:ipv4-address;
+          type enumeration {
+            enum blackhole;
+          }
+        }
+      }
+      leaf table {
+        type uint32 {
+          range 1..max;
+        }
+      }
+    }
+  }
+
+  container ipv6 {
+    description "Static routes, IPv6 — the AF-generic twin.";
+    list route {
+      key "prefix";
+      leaf prefix {
+        type inet:ipv6-prefix;
+      }
+      leaf-list nexthop {
+        type union {
+          type inet:ipv6-address;
+          type enumeration {
+            enum blackhole;
+          }
+        }
+      }
+      leaf table {
+        type uint32 {
+          range 1..max;
+        }
+      }
+    }
+  }
+
+  container zapi {
+    description "The daemon-bus socket path (startup-only knob).";
+    leaf socket {
+      type string;
+    }
+  }
+}

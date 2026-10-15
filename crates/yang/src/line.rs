@@ -194,7 +194,7 @@ fn walk_line(
             continue; // try a shallower depth
         }
         // A match: walk it.
-        let result = walk_tokens(
+        let result = match walk_tokens(
             tree,
             &base_segs,
             &base_defs,
@@ -202,7 +202,15 @@ fn walk_line(
             tokens,
             source,
             dialect,
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(fail) => {
+                if fail.soft && depth > 0 {
+                    continue; // the value does not fit HERE — a full-form grammar may own it shallower
+                }
+                return Err(fail.err);
+            }
+        };
         match result {
             Some(new_ctx) => {
                 *ctx = new_ctx;
@@ -216,6 +224,22 @@ fn walk_line(
     Ok(WalkOutcome::Unmodeled)
 }
 
+/// A failed walk: `soft` marks a trailing-value type mismatch (the
+/// line may belong to a shallower, full-form grammar — bgpd's
+/// router-level `graceful-restart deferral` vs the neighbor's
+/// `graceful-restart <secs>`); everything else is hard.
+struct WalkFailure {
+    err: LineError,
+    soft: bool,
+}
+
+fn hard(e: LineError) -> WalkFailure {
+    WalkFailure {
+        err: e,
+        soft: false,
+    }
+}
+
 /// Walks the tokens from a matched start. Returns the new context
 /// (Some) or None when the shape did not fit (disclosed unmodeled).
 #[allow(clippy::type_complexity)]
@@ -227,7 +251,7 @@ fn walk_tokens(
     tokens: &[&str],
     source: &SourceLine,
     _dialect: &LineDialect,
-) -> Result<Option<Vec<(PathSeg, DataDef)>>, LineError> {
+) -> Result<Option<Vec<(PathSeg, DataDef)>>, WalkFailure> {
     let origin = || {
         Some(Origin {
             line: source.line,
@@ -279,8 +303,9 @@ fn walk_tokens(
                             idx += 1;
                         }
                         Some(t) if is_boolean && !names_child(&current_defs, t) => {
-                            let v = bool_from_word(t)
-                                .ok_or_else(|| lerr(source.line, format!("bad boolean `{t}`")))?;
+                            let v = bool_from_word(t).ok_or_else(|| {
+                                hard(lerr(source.line, format!("bad boolean `{t}`")))
+                            })?;
                             keys.push((key.clone(), v));
                             idx += 1;
                         }
@@ -294,19 +319,19 @@ fn walk_tokens(
                             keys.push((key.clone(), "false".to_string()));
                         }
                         Some(t) => {
-                            return Err(lerr(
+                            return Err(hard(lerr(
                                 source.line,
                                 format!("`{t}` does not fit list `{tok}`'s key `{key}`"),
-                            ));
+                            )));
                         }
                         None if is_boolean => {
                             keys.push((key.clone(), "false".to_string()));
                         }
                         None => {
-                            return Err(lerr(
+                            return Err(hard(lerr(
                                 source.line,
                                 format!("list `{tok}` misses key `{key}`"),
-                            ));
+                            )));
                         }
                     }
                 }
@@ -334,7 +359,7 @@ fn walk_tokens(
         // intermediate containers render synthesized (or nothing).
         let node_origin = if depth == segs.len() { origin() } else { None };
         tree.set_container_with_origin(&prefix, node_origin)
-            .map_err(|e| lerr(source.line, e.to_string()))?;
+            .map_err(|e| hard(lerr(source.line, e.to_string())))?;
     }
     // Key leaves are members too (RFC 7951 §5.4) — set them without
     // origins (the opener line renders once, from the entry).
@@ -345,8 +370,10 @@ fn walk_tokens(
                     segs: segs[..=i].to_vec(),
                 };
                 p.segs.push(seg_plain(k));
-                tree.set(&p, v, None)
-                    .map_err(|e| lerr(source.line, e.to_string()))?;
+                tree.set(&p, v, None).map_err(|e| WalkFailure {
+                    err: lerr(source.line, e.to_string()),
+                    soft: false,
+                })?;
             }
         }
     }
@@ -367,10 +394,47 @@ fn walk_tokens(
     };
     let mut tail_defs: Vec<DataDef> = current_defs.clone();
     let mut tail_segs: Vec<PathSeg> = segs.clone();
+    // The def of the node trailing statements sit in (rule 4c).
+    let mut tail_base_def: Option<DataDef> = defs.last().cloned();
     while idx < tokens.len() {
         let tok = tokens[idx];
         let Some(def) = tail_defs.iter().find(|d| d.name() == tok).cloned() else {
             let Some(ll_name) = &positional else {
+                // Rule 4c: positional leafs in a CONTAINER — bare
+                // values assign to the container's leafs in
+                // declaration order (`send-lifetime 0 infinite`).
+                if let Some(DataDef::Container(c)) = &tail_base_def {
+                    let leafs: Vec<_> = c
+                        .children
+                        .iter()
+                        .filter_map(|d| match d {
+                            DataDef::Leaf(l) => Some(l.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !leafs.is_empty() {
+                        let mut assigned = false;
+                        for leaf in &leafs {
+                            let Some(t) = tokens.get(idx) else { break };
+                            if names_child(&tail_defs, t) {
+                                break;
+                            }
+                            let mut path = Path {
+                                segs: tail_segs.clone(),
+                            };
+                            path.segs.push(seg_plain(&leaf.name));
+                            tree.set(&path, t, origin()).map_err(|e| WalkFailure {
+                                err: lerr(source.line, e.to_string()),
+                                soft: true,
+                            })?;
+                            idx += 1;
+                            assigned = true;
+                        }
+                        if assigned {
+                            continue;
+                        }
+                    }
+                }
                 return Ok(None); // shape does not fit — disclosed unmodeled
             };
             let mut path = Path {
@@ -382,7 +446,10 @@ fn walk_tokens(
                     break;
                 }
                 tree.set_leaf_list(&path, t, origin())
-                    .map_err(|e| lerr(source.line, e.to_string()))?;
+                    .map_err(|e| WalkFailure {
+                        err: lerr(source.line, e.to_string()),
+                        soft: true,
+                    })?;
                 idx += 1;
             }
             continue;
@@ -401,7 +468,10 @@ fn walk_tokens(
                     match tokens.get(idx) {
                         Some(t) if !names_child(&tail_defs, t) => {
                             let v = bool_from_word(t).ok_or_else(|| {
-                                lerr(source.line, format!("`{tok}` wants yes|no, got `{t}`"))
+                                hard(lerr(
+                                    source.line,
+                                    format!("`{tok}` wants yes|no, got `{t}`"),
+                                ))
                             })?;
                             idx += 1;
                             v
@@ -411,13 +481,15 @@ fn walk_tokens(
                     }
                 } else {
                     let Some(t) = tokens.get(idx) else {
-                        return Err(lerr(source.line, format!("`{tok}` needs a value")));
+                        return Err(hard(lerr(source.line, format!("`{tok}` needs a value"))));
                     };
                     idx += 1;
                     (*t).to_string()
                 };
-                tree.set(&path, &value, origin())
-                    .map_err(|e| lerr(source.line, e.to_string()))?;
+                tree.set(&path, &value, origin()).map_err(|e| WalkFailure {
+                    err: lerr(source.line, e.to_string()),
+                    soft: true,
+                })?;
             }
             DataDef::LeafList(_) => {
                 idx += 1;
@@ -430,7 +502,10 @@ fn walk_tokens(
                         break;
                     }
                     tree.set_leaf_list(&path, t, origin())
-                        .map_err(|e| lerr(source.line, e.to_string()))?;
+                        .map_err(|e| WalkFailure {
+                            err: lerr(source.line, e.to_string()),
+                            soft: true,
+                        })?;
                     idx += 1;
                 }
             }
@@ -438,23 +513,27 @@ fn walk_tokens(
                 idx += 1;
                 tail_segs.push(seg_plain(tok));
                 tail_defs = children_defs(&def).cloned().unwrap_or_default();
+                tail_base_def = Some(def.clone());
                 tree.set_container_with_origin(
                     &Path {
                         segs: tail_segs.clone(),
                     },
                     origin(),
                 )
-                .map_err(|e| lerr(source.line, e.to_string()))?;
+                .map_err(|e| WalkFailure {
+                    err: lerr(source.line, e.to_string()),
+                    soft: true,
+                })?;
             }
             DataDef::List(list_def) => {
                 idx += 1;
                 let mut keys = Vec::new();
                 for key in &list_def.keys {
                     let Some(t) = tokens.get(idx) else {
-                        return Err(lerr(
+                        return Err(hard(lerr(
                             source.line,
                             format!("list `{tok}` misses key `{key}`"),
-                        ));
+                        )));
                     };
                     keys.push((key.clone(), (*t).to_string()));
                     idx += 1;
@@ -471,7 +550,10 @@ fn walk_tokens(
                     },
                     origin(),
                 )
-                .map_err(|e| lerr(source.line, e.to_string()))?;
+                .map_err(|e| WalkFailure {
+                    err: lerr(source.line, e.to_string()),
+                    soft: true,
+                })?;
                 // The entry's key leaves (RFC 7951 §5.4).
                 for (k, v) in &entry_seg.keys {
                     let mut p = Path {
@@ -481,8 +563,10 @@ fn walk_tokens(
                     // Route through the keyed entry, not the keyless list.
                     p.segs.last_mut().expect("nonempty").keys = entry_seg.keys.clone();
                     p.segs.push(seg_plain(k));
-                    tree.set(&p, v, None)
-                        .map_err(|e| lerr(source.line, e.to_string()))?;
+                    tree.set(&p, v, None).map_err(|e| WalkFailure {
+                        err: lerr(source.line, e.to_string()),
+                        soft: false,
+                    })?;
                 }
             }
         }

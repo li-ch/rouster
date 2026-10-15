@@ -54,6 +54,7 @@ pub mod data;
 pub mod json;
 pub mod lexer;
 pub mod line;
+pub mod models;
 pub mod must;
 pub mod regex;
 pub mod schema;

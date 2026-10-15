@@ -1,0 +1,137 @@
+// rouster-savd — savd's config surface, exactly what
+// crates/sav/src/savd.rs's parser accepts today (S11-a M3).
+module rouster-savd {
+  yang-version 1.1;
+  namespace "urn:rouster:savd";
+  prefix savd;
+
+  import rouster-common {
+    prefix rc;
+  }
+
+  revision 2026-10-15;
+
+  description
+    "mode/action/poll/hysteresis/collision-policy/backend globals
+     (each at most once — the duplicate refusal is savd's; the
+     tree's last-wins merge is disclosed in docs/yang.md), the
+     per-interface uRPF/BAR-SAV stanzas, operator bindings, and the
+     BAR-SAV inputs (draft-ietf-sidrops-bar-sav-10).";
+
+  leaf mode {
+    description "The global default generator mode (barsav is per-interface only).";
+    type enumeration {
+      enum strict;
+      enum loose;
+      enum fp;
+      enum efp;
+    }
+    default strict;
+  }
+
+  leaf action {
+    description "What enforcement does with invalid verdicts (monitor is the safe default).";
+    type enumeration {
+      enum monitor;
+      enum drop;
+    }
+    default monitor;
+    must "not(. = 'drop') or ../i-understand-drop-mode = 'yes'" {
+      error-message
+        "drop mode needs `i-understand-drop-mode yes` (drop can blackhole legitimate traffic)";
+      description "savd's validate() friction gate, as a schema constraint (§7.5.3 on a leaf).";
+    }
+  }
+
+  leaf i-understand-drop-mode {
+    description "The deliberate-friction acknowledgement drop mode requires.";
+    type boolean;
+    default false;
+  }
+
+  leaf poll {
+    description "RIB re-evaluation cadence in seconds.";
+    type rc:seconds;
+    default 5;
+  }
+
+  leaf hysteresis {
+    description "RFC 8704 §3.6.2 deletion-hysteresis window (A10's fixed 3 s default).";
+    type rc:seconds;
+    default 3;
+  }
+
+  leaf collision-policy {
+    description "GSC §3 collision resolution.";
+    type enumeration {
+      enum ignore;
+      enum subtract;
+    }
+    default ignore;
+  }
+
+  leaf backend {
+    description "The enforcement surface (rp_filter unchanged since W7; nft = N6).";
+    type enumeration {
+      enum rp_filter;
+      enum nft;
+    }
+    default rp_filter;
+  }
+
+  list interface {
+    key "name";
+    leaf name {
+      type rc:interface-name;
+    }
+    leaf mode {
+      description
+        "This interface's mode. `barsav` selects the per-interface
+         BAR-SAV derivation (role/remote-as complete the stanza).";
+      type enumeration {
+        enum strict;
+        enum loose;
+        enum fp;
+        enum efp;
+        enum barsav;
+      }
+    }
+    leaf role {
+      type enumeration {
+        enum customer;
+        enum peer;
+        enum provider;
+      }
+    }
+    leaf remote-as {
+      type rc:as-number;
+    }
+  }
+
+  list binding {
+    description "Position-independent operator binding: one line per prefix, >= 1 interface.";
+    key "prefix";
+    leaf prefix {
+      type inet:ip-prefix;
+    }
+    leaf-list interface {
+      type rc:interface-name;
+    }
+  }
+
+  container barsav {
+    description "The BAR-SAV inputs (M3): feed, RPKI snapshot, local AS, §8 Step 7 exemptions.";
+    leaf feed {
+      type string;
+    }
+    leaf vrp-file {
+      type string;
+    }
+    leaf local-as {
+      type rc:as-number;
+    }
+    leaf-list provider-exempt {
+      type inet:ip-prefix;
+    }
+  }
+}

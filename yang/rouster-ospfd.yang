@@ -1,0 +1,220 @@
+// rouster-ospfd — ospfd's config surface, exactly what
+// crates/ospfd/src/config.rs's parser accepts today (S11-a M3).
+module rouster-ospfd {
+  yang-version 1.1;
+  namespace "urn:rouster:ospfd";
+  prefix ospfd;
+
+  import rouster-common {
+    prefix rc;
+  }
+
+  revision 2026-10-15;
+
+  description
+    "One `router ospf` stanza (areas with the FRR parameter
+     grammar, interfaces with the §C.3 knobs, classic network
+     bindings, ranges, virtual links), the RFC 8177 key chains at
+     frr.conf's depth-0 placement, and the v6 family switch.
+     ospfd's parser is INDENT-sensitive (depth 0/1/2/3); the
+     line-binding's stanza-context semantics cover the corpus —
+     a depth-0 stanza line while deeper context is open resolves at
+     the root (deepest-first walk-up).";
+
+  container zapi {
+    leaf socket {
+      type string;
+    }
+  }
+
+  container router {
+    container ospf {
+      leaf router-id {
+        type inet:ipv4-address;
+      }
+      leaf address-family {
+        description "`address-family ipv6-unicast`: run the OSPFv3 core (one line, v1).";
+        type enumeration {
+          enum ipv6-unicast;
+        }
+      }
+      leaf redistribute {
+        type enumeration {
+          enum static;
+        }
+      }
+      leaf rfc1583-compatibility {
+        type enumeration {
+          enum enabled;
+          enum disabled;
+        }
+        default enabled;
+      }
+      list area {
+        key "id";
+        leaf id {
+          type rc:area-id;
+        }
+        // `area <id> stub [no-summary]` and the NSSA ladder: the
+        // trailing parameters, as empty leaves.
+        leaf stub { type empty; }
+        leaf no-summary { type empty; }
+        leaf nssa { type empty; }
+        leaf default-information-originate { type empty; }
+        leaf default-cost {
+          type uint32;
+        }
+        container nssa-params {
+          description "Depth-2 NSSA translation knobs (`nssa translate-*` inside the area).";
+          leaf translate-candidate { type empty; }
+          leaf translate-always { type empty; }
+          leaf translate-stability-interval {
+            type rc:seconds;
+          }
+        }
+        list interface {
+          key "name";
+          leaf name {
+            type rc:interface-name;
+          }
+          leaf cost {
+            type uint32;
+          }
+          leaf hello-interval {
+            type uint16;
+          }
+          leaf dead-interval {
+            type uint16;
+          }
+          leaf priority {
+            type uint8;
+          }
+          leaf mtu {
+            type uint16;
+          }
+          leaf instance-id {
+            type uint32;
+          }
+          leaf ifindex {
+            type uint32;
+          }
+          leaf address {
+            description "The STATIC address source (the zapi ifdump overrides it when present).";
+            type inet:ip-prefix;
+          }
+          leaf link-local {
+            type inet:ipv6-address;
+          }
+          leaf enabled {
+            type boolean;
+          }
+          leaf disabled {
+            type boolean;
+          }
+          leaf network {
+            description "`network <type>` — the interface's network type.";
+            type enumeration {
+              enum broadcast;
+              enum point-to-point;
+              enum point-to-multipoint;
+              enum loopback;
+            }
+          }
+          container authentication {
+            leaf key-chain {
+              type string;
+            }
+            leaf message-digest { type empty; }
+          }
+          container message-digest-key {
+            description "`message-digest-key <id>` (the §C.3 auth ladder).";
+            leaf id {
+              type uint8;
+            }
+          }
+        }
+        list network {
+          description "`network <prefix> area <id>` — the classic address binding.";
+          key "prefix";
+          leaf prefix {
+            type inet:ipv4-prefix;
+          }
+          leaf area {
+            type rc:area-id;
+          }
+        }
+        list range {
+          description "`range <prefix> [advertise|not-advertise] [cost <n>]` — inter-area aggregation.";
+          key "prefix";
+          leaf prefix {
+            type inet:ipv4-prefix;
+          }
+          leaf advertise { type empty; }
+          leaf not-advertise { type empty; }
+          leaf cost {
+            type uint32;
+          }
+        }
+        list virtual-link {
+          description "`virtual-link <peer-router-id>` (§D.3/§15).";
+          key "peer";
+          leaf peer {
+            type inet:ipv4-address;
+          }
+        }
+      }
+    }
+  }
+
+  container key {
+    description "RFC 8177 key chains, FRR's `key chain <name>` depth-0 stanza.";
+    list chain {
+      key "name";
+      leaf name {
+        type string;
+      }
+      list key {
+        key "id";
+        leaf id {
+          type uint8;
+        }
+        leaf key-string {
+          type string;
+        }
+        leaf cryptographic-algorithm {
+          type enumeration {
+            enum hmac-sha-256;
+            enum hmac-sha-1;
+            enum md5;
+          }
+        }
+        container send-lifetime {
+          leaf start {
+            type uint64;
+          }
+          leaf end {
+            type union {
+              type uint64;
+              type enumeration {
+                enum infinite;
+              }
+            }
+          }
+        }
+        container accept-lifetime {
+          leaf start {
+            type uint64;
+          }
+          leaf end {
+            type union {
+              type uint64;
+              type enumeration {
+                enum infinite;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

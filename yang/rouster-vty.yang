@@ -1,0 +1,121 @@
+// rouster-vty — the vtyd session surface + the configd envelope
+// (S11-a M3/M5): exactly what crates/vty/src/config.rs models and
+// what the canonical file's top level accepts
+// (docs/protocols/config.md §1). The vtysh-compatible grammar is
+// the EDGE; this model is what config-mode edits address (the
+// translator seam — invariant 5).
+module rouster-vty {
+  yang-version 1.1;
+  namespace "urn:rouster:vty";
+  prefix vty;
+
+  import rouster-common {
+    prefix rc;
+  }
+
+  revision 2026-10-15;
+
+  // ---- display-only frr compatibility lines (B7's observed set) ----
+
+  container frr {
+    leaf version {
+      type string;
+    }
+    leaf defaults {
+      type string;
+    }
+  }
+
+  leaf hostname {
+    type string;
+  }
+
+  container line {
+    container vty {
+      description "`line vty` — display-only today.";
+    }
+  }
+
+  // ---- the modeled config surface (session + canonical merge) ----
+
+  container ip {
+    description "Static routes v4 (the writer's modeled half of the merge).";
+    list route {
+      key "prefix";
+      leaf prefix {
+        type inet:ipv4-prefix;
+      }
+      leaf-list nexthop {
+        type union {
+          type inet:ipv4-address;
+          type enumeration {
+            enum blackhole;
+          }
+        }
+      }
+    }
+  }
+
+  container ipv6 {
+    list route {
+      key "prefix";
+      leaf prefix {
+        type inet:ipv6-prefix;
+      }
+      leaf-list nexthop {
+        type union {
+          type inet:ipv6-address;
+          type enumeration {
+            enum blackhole;
+          }
+        }
+      }
+    }
+  }
+
+  leaf-list route-map {
+    description "Verbatim route-map lines (display + canonical pass-through).";
+    type string;
+  }
+
+  container router {
+    list bgp {
+      key "local-as";
+      leaf local-as {
+        type rc:as-number;
+      }
+      container bgp {
+        leaf router-id {
+          type inet:ipv4-address;
+        }
+        leaf network-import-check {
+          type boolean;
+        }
+      }
+      list neighbor {
+        key "address";
+        leaf address {
+          type inet:ipv4-address;
+        }
+        leaf remote-as {
+          type rc:as-number;
+        }
+      }
+      container address-family {
+        description "`address-family ipv4 unicast` — a two-token container walk.";
+        container ipv4 {
+          container unicast {
+            leaf-list network {
+              type inet:ipv4-prefix;
+            }
+            leaf redistribute {
+              type enumeration {
+                enum static;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

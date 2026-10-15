@@ -1,0 +1,95 @@
+// rouster-isisd — isisd's config surface, exactly what
+// crates/isisd/src/config.rs's parser accepts today (S11-a M3).
+module rouster-isisd {
+  yang-version 1.1;
+  namespace "urn:rouster:isisd";
+  prefix isisd;
+
+  import rouster-common {
+    prefix rc;
+  }
+
+  revision 2026-10-15;
+
+  description
+    "One `router isis <tag>` stanza (one NET, wide metric style,
+     the dynamic hostname, `redistribute static` for the zapi edge),
+     one p2p interface stanza per circuit.";
+
+  container zapi {
+    leaf socket {
+      type string;
+    }
+  }
+
+  container router {
+    list isis {
+      key "tag";
+      leaf tag {
+        description "The router tag (FRR's area name).";
+        type string;
+      }
+      leaf net {
+        description "The Network Entity Title — the system ID and area come from it.";
+        type rc:isis-net;
+      }
+      leaf is-type {
+        type enumeration {
+          enum level-1;
+          enum level-2;
+          enum level-1-2;
+        }
+        default level-1-2;
+      }
+      leaf metric-style {
+        description "Wide originates TLV 22/135; narrow/transition parse but originate nothing (v1, disclosed).";
+        type enumeration {
+          enum wide;
+          enum narrow;
+          enum transition;
+        }
+        default wide;
+      }
+      leaf hostname {
+        description "The dynamic hostname advertised in TLV 137 (RFC 5301).";
+        type string;
+      }
+      leaf redistribute {
+        type enumeration {
+          enum static;
+        }
+      }
+      list interface {
+        key "name";
+        leaf name {
+          type rc:interface-name;
+        }
+        leaf address {
+          description "The interface's IPv4 (the TLV 132 source and the LSP prefix).";
+          type inet:ipv4-prefix;
+        }
+        leaf circuit-type {
+          type enumeration {
+            enum level-1;
+            enum level-2;
+            enum level-1-2;
+          }
+          default level-1-2;
+        }
+        leaf hello-interval {
+          type uint16;
+          default 10;
+        }
+        leaf hello-multiplier {
+          description "Holding time = interval x multiplier (FRR's shape).";
+          type uint16;
+          default 3;
+        }
+        leaf mtu {
+          type uint16;
+          default 1500;
+        }
+      }
+    }
+  }
+}

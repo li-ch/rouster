@@ -1,0 +1,174 @@
+// rouster-bgpd — bgpd's config surface, exactly what
+// crates/bgpd/src/config.rs's parser accepts today (S11-a M3).
+// BooleanLineForm::Shorthand is this module's dialect
+// (`neighbor X passive`, bare keyword = true).
+//
+// The W1-a policy stanzas (route-map, *-list) are diverted VERBATIM
+// by bgpd's parser into the policy engine — the YANG model does not
+// cover them; those lines ride configd's Opaque pass-through and
+// the policy crate's own grammar stays the gate (disclosed in
+// docs/yang.md §Deferred).
+module rouster-bgpd {
+  yang-version 1.1;
+  namespace "urn:rouster:bgpd";
+  prefix bgpd;
+
+  import rouster-common {
+    prefix rc;
+  }
+
+  revision 2026-10-15;
+
+  container zapi {
+    leaf socket {
+      type string;
+    }
+  }
+
+  leaf aspa {
+    description
+      "ASPA verification mode (draft-ietf-sidrops-aspa-verification).
+       Top-level in bgpd's grammar (no router-stanza guard).";
+    type enumeration {
+      enum advisory;
+      enum enforce;
+    }
+    default advisory;
+  }
+
+  leaf listen-port {
+    description "179 requires CAP_NET_BIND_SERVICE; an unprivileged port for tests.";
+    type uint16;
+    default 179;
+  }
+
+  leaf hold-time {
+    description "Zero or >= 3 (RFC 4271 §4.2).";
+    type uint16;
+    default 180;
+  }
+
+  container router {
+    list bgp {
+      key "local-as";
+      leaf local-as {
+        type rc:as-number;
+      }
+      container bgp {
+        description "`bgp router-id <v4>` (a unicast host address).";
+        leaf router-id {
+          type inet:ipv4-address;
+        }
+      }
+      leaf import {
+        description "`import <policy-name>` — the W1-a named policy.";
+        type string;
+      }
+      leaf export {
+        type string;
+      }
+      container graceful-restart {
+        description "`graceful-restart deferral <secs>` — RFC 4724 §4.1's Selection_Deferral_Timer, 1..=3600.";
+        leaf deferral {
+          type uint32 {
+            range 1..3600;
+          }
+        }
+      }
+      leaf-list network {
+        type inet:ip-prefix;
+      }
+      list neighbor {
+        key "address";
+        leaf address {
+          type inet:ip-address;
+        }
+        leaf remote-as {
+          type rc:as-number;
+        }
+        leaf passive {
+          type boolean;
+          default false;
+        }
+        leaf-list timers {
+          description "`timers <keepalive> <hold>`; keepalive*3 <= hold (RFC 4271).";
+          type uint16;
+        }
+        leaf mrai {
+          type uint64;
+          default 0;
+        }
+        leaf role {
+          description "RFC 9234 §4 roles.";
+          type enumeration {
+            enum customer;
+            enum peer;
+            enum provider;
+          }
+        }
+        leaf update-error-handling {
+          type enumeration {
+            enum rfc7606;
+          }
+        }
+        leaf route-server {
+          type boolean;
+          default false;
+        }
+        leaf route-reflector-client {
+          type boolean;
+          default false;
+        }
+        leaf graceful-restart {
+          description "`helper` or the restart time 1..=4095 (RFC 4724 §3's 12-bit field).";
+          type union {
+            type enumeration {
+              enum helper;
+            }
+            type uint16 {
+              range 1..4095;
+            }
+          }
+        }
+        leaf addpath {
+          description "RFC 7911: rx = Send/Receive 1, tx = 2, both = 3.";
+          type enumeration {
+            enum rx;
+            enum tx;
+            enum both;
+          }
+        }
+      }
+    }
+  }
+
+  container rpki {
+    description "`rpki` stanza: one cache (RFC 8210 RTR) or one static vrp-file, never both.";
+    container cache {
+      leaf host {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+    }
+    leaf vrp-file {
+      type string;
+    }
+    leaf reject-invalid {
+      description "Reject ROV-Invalid at import (RFC 6811 §2's recommended policy).";
+      type boolean;
+      default true;
+    }
+    must "not(cache) or not(vrp-file)" {
+      error-message "rpki cache and vrp-file are mutually exclusive";
+    }
+  }
+
+  container barsav {
+    description "The BAR-SAV feed stanza (S9-a M3): bgpd publishes its read-only Adj-RIB-In view.";
+    leaf feed {
+      type string;
+    }
+  }
+}

@@ -1086,6 +1086,17 @@ fn validate_children(
     for def in defs {
         match def {
             DataDef::Leaf(leaf) => {
+                // §7.5.3 on a leaf: the XPath context is the leaf
+                // itself (`.` is its value, `../x` a sibling).
+                if !def.musts().is_empty() {
+                    for node in nodes.iter().filter(|n| n.name == leaf.name) {
+                        if matches!(node.kind, NodeKind::Leaf { .. }) {
+                            path.push(leaf.name.clone());
+                            check_musts(def, path, node, out, tree);
+                            path.pop();
+                        }
+                    }
+                }
                 if !leaf.mandatory {
                     continue;
                 }

@@ -1,0 +1,80 @@
+// rouster-bfdd — bfdd's config surface, exactly what
+// crates/bfdd/src/daemon.rs's parser accepts today (S11-a M3).
+module rouster-bfdd {
+  yang-version 1.1;
+  namespace "urn:rouster:bfdd";
+  prefix bfdd;
+
+  import rouster-common {
+    prefix rc;
+  }
+
+  revision 2026-10-15;
+
+  description
+    "One `peer` list: the (address, multihop) pair is the session
+     identity (RFC 5882 §2 — one session per data protocol path);
+     `multihop` is the FRR boolean-key shorthand (bare keyword =
+     true, absent = false). Stanza lines set the entry's knobs at
+     their documented defaults.";
+
+  list peer {
+    key "address multihop";
+    leaf address {
+      type inet:ip-address;
+    }
+    leaf multihop {
+      type boolean;
+      default false;
+    }
+    leaf local-address {
+      type inet:ip-address;
+      description "Family must match the peer (bfdd's check — the model checks the address shape only).";
+    }
+    leaf transmit-interval {
+      type rc:milliseconds-1-60000;
+      default 300;
+    }
+    leaf receive-interval {
+      type rc:milliseconds-1-60000;
+      default 300;
+    }
+    leaf echo-interval {
+      type rc:milliseconds-1-60000;
+      default 300;
+    }
+    leaf detect-multiplier {
+      type uint8 {
+        range 1..max;
+      }
+      default 3;
+    }
+    leaf echo {
+      type boolean;
+      default false;
+    }
+    leaf passive {
+      type boolean;
+      default false;
+    }
+    leaf demand {
+      type boolean;
+      default false;
+    }
+    leaf version-negotiation {
+      type boolean;
+      default false;
+    }
+    container password {
+      description "`password <key-id> <secret>` (RFC 5880 §6.7.2: secret 1..=16 octets).";
+      leaf key-id {
+        type uint8;
+      }
+      leaf secret {
+        type string {
+          length 1..16;
+        }
+      }
+    }
+  }
+}
