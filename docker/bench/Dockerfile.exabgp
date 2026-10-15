@@ -1,0 +1,8 @@
+# The E1 injector (D1(c) first leg): exabgp 5.0.14 on alpine.
+# Built by scripts/bench-e1-ingest.sh as bench-exabgp:local.
+FROM alpine:3.20
+RUN apk add --no-cache python3 py3-pip
+RUN pip install --no-cache-dir --break-system-packages exabgp==5.0.14
+COPY replay-driver.py /usr/local/bin/replay-driver
+RUN chmod +x /usr/local/bin/replay-driver
+ENTRYPOINT ["exabgp", "server"]

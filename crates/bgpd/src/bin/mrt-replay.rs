@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rate: f64 = 0.0;
     let mut hold: u16 = 90;
     let mut pack: usize = 64;
+    let mut linger: u64 = 3600;
 
     fn need(it: &mut impl Iterator<Item = String>, k: &str) -> String {
         it.next().unwrap_or_else(|| panic!("{k} requires a value"))
@@ -69,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--rate" => rate = need(&mut it, "--rate").parse().unwrap(),
             "--hold" => hold = need(&mut it, "--hold").parse().unwrap(),
             "--pack" => pack = need(&mut it, "--pack").parse().unwrap(),
+            "--linger" => linger = need(&mut it, "--linger").parse().unwrap(),
             other => panic!("unknown argument {other}"),
         }
     }
@@ -94,6 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate,
         hold,
         pack,
+        linger,
     ))
 }
 
@@ -149,9 +152,10 @@ fn rewrite_next_hop(attrs: &mut [u8], nh: Ipv4Addr) {
             p += 2;
             l
         } else {
-            attrs[p] as usize
+            let l = attrs[p] as usize;
+            p += 1;
+            l
         };
-        p += 1;
         if atype == 3 && alen == 4 && p + 4 <= attrs.len() {
             attrs[p..p + 4].copy_from_slice(&nh.octets());
         }
@@ -176,9 +180,10 @@ fn prepend_as_path(attrs: &mut Vec<u8>, asn: u32) {
             p += 2;
             l
         } else {
-            attrs[p] as usize
+            let l = attrs[p] as usize;
+            p += 1;
+            l
         };
-        p += 1;
         if p + alen > attrs.len() {
             return; // malformed tail: leave untouched
         }
@@ -188,14 +193,17 @@ fn prepend_as_path(attrs: &mut Vec<u8>, asn: u32) {
     let mut out = Vec::with_capacity(attrs.len() + 4);
     for (flags, atype, body) in parts {
         let body = if atype == 2 && !body.is_empty() {
-            let mut rebuilt = Vec::with_capacity(body.len() + 4);
-            if body[0] == 2 && body.len() >= 2 {
+            let mut rebuilt = Vec::with_capacity(body.len() + 6);
+            if body[0] == 2 && body.len() >= 2 && body[1] < 255 {
+                // room in the first AS_SEQUENCE: prepend into it
                 let seg_len = body[1] as usize;
                 rebuilt.push(2);
-                rebuilt.push((seg_len + 1).min(255) as u8);
+                rebuilt.push((seg_len + 1) as u8);
                 rebuilt.extend_from_slice(&asn.to_be_bytes());
                 rebuilt.extend_from_slice(&body[2..]);
             } else {
+                // AS_SET opens the path, or a full 255-ASN segment:
+                // a fresh one-ASN segment goes in front instead
                 rebuilt.push(2);
                 rebuilt.push(1);
                 rebuilt.extend_from_slice(&asn.to_be_bytes());
@@ -208,7 +216,6 @@ fn prepend_as_path(attrs: &mut Vec<u8>, asn: u32) {
         out.push(flags);
         out.push(atype);
         if body.len() > 255 || flags & 0x10 != 0 {
-            out.push(flags | 0x10); // extended length
             out.extend_from_slice(&(body.len() as u16).to_be_bytes());
         } else {
             out.push(body.len() as u8);
@@ -327,6 +334,7 @@ async fn run(
     rate: f64,
     hold: u16,
     pack: usize,
+    linger: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "REPLAY-START wall={:.6} mono={:.6} mrt={} peer={}",
@@ -496,9 +504,9 @@ async fn run(
         now_wall(),
         tokio::time::Instant::now().elapsed().as_secs_f64()
     );
-    ka.abort();
-    // hold the session briefly so the SUT's EOR-side work settles
-    sleep(Duration::from_secs(10)).await;
-    reader.abort();
+    // Hold the session (keepalives) so the SUT's table survives to be
+    // measured: an abrupt close or Cease makes both SUTs flush the
+    // learned routes. The harness kills the injector at run end.
+    sleep(Duration::from_secs(linger)).await;
     Ok(())
 }
