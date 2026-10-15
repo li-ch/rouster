@@ -457,3 +457,15 @@ The phase text above is unchanged; this block is status only.
   tree ops + RFC 7951 dump, no new dependencies; gNMI remains the
   documented next step (A's datastore semantics map identically).
   Dispatched as the S12 stream.
+
+- 2026-10-15 (night) — S12 round GREEN, invariant 5 COMPLETE: the
+  RESTCONF-shaped HTTP/1.1 edge (gNMI decision C) — hand-rolled
+  HTTP core over tokio, the RFC 8040-subset resource map on the
+  YANG tree (GET/PUT/POST/PATCH/DELETE in RFC 7951 JSON,
+  validate-first mutations riding the apply/auto-rollback
+  pipeline), the /data-vs-/running datastore split, the restconfd
+  binary + restconf stanza + dry-run mode, the disclosed loopback/
+  no-auth v1 posture, and the gNMI mapping table (option A's path
+  preserved). One real bug fixed en route (linebind stale-origin
+  preference after tree mutation). Gate 1769/0 (+54), both new +
+  existing smokes green (38 scripts).
