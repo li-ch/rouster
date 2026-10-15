@@ -287,6 +287,12 @@ async fn main() -> std::io::Result<()> {
 
     let mut hangup = signal(SignalKind::hangup())?;
     let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
+    // F8 hygiene: default Burst behavior fires every tick missed
+    // during a long await immediately back-to-back — under a mass
+    // import that stacks extra full-table reconciles behind each
+    // batch. Delay collapses missed ticks into one, a full interval
+    // apart.
+    reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {

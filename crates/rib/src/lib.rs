@@ -769,8 +769,10 @@ impl Rib {
     /// Per-route errors are logged, not fatal — reconcile is periodic, so
     /// a failed route is retried on the next pass.
     #[instrument(skip(self, dp))]
-    pub async fn reconcile<D: Dataplane>(&mut self, dp: &D) {
-        let mut desired: BTreeMap<(TableId, IpPrefix), RouteEntry> = BTreeMap::new();
+    pub async fn reconcile<D: Dataplane + Sync>(&mut self, dp: &D) {
+        let mut to_install: Vec<((TableId, IpPrefix), RouteEntry)> = Vec::new();
+        let mut desired_keys: std::collections::HashSet<(TableId, IpPrefix)> =
+            std::collections::HashSet::new();
         for (&table_id, table) in &self.tables {
             for (prefix, _) in table.iter() {
                 // A connected candidate MASKS the prefix (distance 0,
@@ -792,7 +794,11 @@ impl Rib {
                 };
                 match self.resolved_programming_form(best) {
                     Some(form) => {
-                        desired.insert((table_id, *prefix), form);
+                        let key = (table_id, *prefix);
+                        desired_keys.insert(key);
+                        if self.programmed.get(&key) != Some(&form) {
+                            to_install.push((key, form));
+                        }
                     }
                     None => debug!(
                         prefix = %best.prefix,
@@ -802,47 +808,113 @@ impl Rib {
                 }
             }
         }
+        let unchanged = desired_keys.len() - to_install.len();
+        let stale_keys: Vec<(TableId, IpPrefix)> = self
+            .programmed
+            .keys()
+            .filter(|key| !desired_keys.contains(key))
+            .copied()
+            .collect();
+        self.reconcile_delta(dp, to_install, stale_keys, unchanged)
+            .await;
+    }
 
-        let mut installed = 0usize;
-        let mut unchanged = 0usize;
-        for (key, best) in &desired {
-            if self.programmed.get(key) == Some(best) {
-                unchanged += 1;
+    /// The dirty-keys half of [`Self::reconcile`] — bench F8's hot
+    /// path: the same desired-form/diff/install/withdraw logic
+    /// restricted to exactly the prefixes a command batch touched,
+    /// O(batch) instead of O(table). The full pass stays the safety
+    /// net on its own triggers (tick, dataplane events, SIGHUP).
+    pub async fn reconcile_keys<D: Dataplane + Sync>(
+        &mut self,
+        dp: &D,
+        keys: &std::collections::BTreeSet<(TableId, IpPrefix)>,
+    ) {
+        let mut to_install: Vec<((TableId, IpPrefix), RouteEntry)> = Vec::new();
+        let mut desired_keys: std::collections::HashSet<(TableId, IpPrefix)> =
+            std::collections::HashSet::new();
+        for &(table_id, prefix) in keys {
+            // Connected-masked keys are desired-nothing: a previously
+            // programmed route for them withdraws below.
+            if self
+                .connected
+                .get(&table_id)
+                .is_some_and(|t| t.best(&prefix).is_some())
+            {
                 continue;
             }
-            match dp.route_replace(best).await {
-                Ok(()) => {
-                    debug!(prefix = %best.prefix, table_id = best.table, "installed best route");
-                    self.programmed.insert(*key, best.clone());
-                    installed += 1;
+            if let Some(best) = self.tables.get(&table_id).and_then(|t| t.best(&prefix)) {
+                if let Some(form) = self.resolved_programming_form(best) {
+                    desired_keys.insert((table_id, prefix));
+                    if self.programmed.get(&(table_id, prefix)) != Some(&form) {
+                        to_install.push(((table_id, prefix), form));
+                    }
                 }
-                Err(e) => {
-                    warn!(prefix = %best.prefix, table_id = best.table, %e, "route install failed; will retry")
+            }
+        }
+        let unchanged = desired_keys.len() - to_install.len();
+        let stale_keys: Vec<(TableId, IpPrefix)> = keys
+            .iter()
+            .filter(|key| !desired_keys.contains(*key) && self.programmed.contains_key(key))
+            .copied()
+            .collect();
+        self.reconcile_delta(dp, to_install, stale_keys, unchanged)
+            .await;
+    }
+
+    /// The shared diff-apply phase: one pipelined install batch and
+    /// one pipelined withdraw batch (bench F8 — no per-route
+    /// round-trip waits), beliefs updated from the per-entry results:
+    /// an install failure leaves no belief (retry next pass), a
+    /// delete failure restores the withdrawn belief (retry next
+    /// pass).
+    async fn reconcile_delta<D: Dataplane + Sync>(
+        &mut self,
+        dp: &D,
+        to_install: Vec<((TableId, IpPrefix), RouteEntry)>,
+        stale_keys: Vec<(TableId, IpPrefix)>,
+        unchanged: usize,
+    ) {
+        let mut installed = 0usize;
+        if !to_install.is_empty() {
+            let entries: Vec<RouteEntry> =
+                to_install.iter().map(|(_, entry)| entry.clone()).collect();
+            let results = dp.route_replace_batch(&entries).await;
+            for ((key, entry), result) in to_install.into_iter().zip(results) {
+                match result {
+                    Ok(()) => {
+                        debug!(prefix = %entry.prefix, table_id = entry.table, "installed best route");
+                        self.programmed.insert(key, entry);
+                        installed += 1;
+                    }
+                    Err(e) => {
+                        warn!(prefix = %entry.prefix, table_id = entry.table, %e, "route install failed; will retry")
+                    }
                 }
             }
         }
 
         let mut withdrawn = 0usize;
-        let stale: Vec<(TableId, IpPrefix)> = self
-            .programmed
-            .keys()
-            .filter(|key| !desired.contains_key(key))
-            .copied()
+        // Belief removal precedes the delete so a failed delete is
+        // restorable (the belief re-inserts below).
+        let pairs: Vec<((TableId, IpPrefix), RouteEntry)> = stale_keys
+            .into_iter()
+            .filter_map(|key| self.programmed.remove(&key).map(|entry| (key, entry)))
             .collect();
-        for key in stale {
-            let Some(entry) = self.programmed.remove(&key) else {
-                continue;
-            };
-            match dp.route_delete(&entry).await {
-                Ok(()) => {
-                    debug!(prefix = %entry.prefix, table_id = entry.table, "withdrawn stale route");
-                    withdrawn += 1;
-                }
-                Err(e) => {
-                    // The kernel most likely still holds the route; keep the
-                    // belief so the next pass tries the withdrawal again.
-                    warn!(prefix = %entry.prefix, table_id = entry.table, %e, "route withdrawal failed; will retry");
-                    self.programmed.insert(key, entry);
+        if !pairs.is_empty() {
+            let entries: Vec<RouteEntry> = pairs.iter().map(|(_, entry)| entry.clone()).collect();
+            let results = dp.route_delete_batch(&entries).await;
+            for ((key, entry), result) in pairs.into_iter().zip(results) {
+                match result {
+                    Ok(()) => {
+                        debug!(prefix = %entry.prefix, table_id = entry.table, "withdrawn stale route");
+                        withdrawn += 1;
+                    }
+                    Err(e) => {
+                        // The kernel most likely still holds the route; keep the
+                        // belief so the next pass tries the withdrawal again.
+                        warn!(prefix = %entry.prefix, table_id = entry.table, %e, "route withdrawal failed; will retry");
+                        self.programmed.insert(key, entry);
+                    }
                 }
             }
         }

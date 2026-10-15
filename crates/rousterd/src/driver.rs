@@ -58,6 +58,11 @@ struct NhtReg {
 /// RIB plus the driver-side registration state ZAPI sessions feed.
 pub struct RibDriver {
     pub rib: Rib,
+    /// Bench F8's hot-path dirty set: every (table, prefix) whose best
+    /// changed since the last drain. `drain` reconciles exactly these
+    /// keys (`Rib::reconcile_keys`, O(batch)); the tick/dataplane-
+    /// event paths keep the full pass as the safety net.
+    dirty: BTreeSet<(TableId, IpPrefix)>,
     /// Push channel per attached session, keyed by the server-assigned
     /// owner id. Attached at accept time (`RibCommand::AttachSession`);
     /// pruned when a push finds the session gone.
@@ -143,6 +148,7 @@ impl RibDriver {
     pub fn new() -> Self {
         Self {
             rib: Rib::new(),
+            dirty: BTreeSet::new(),
             sessions: HashMap::new(),
             nht_registrations: HashMap::new(),
             redistributes: HashMap::new(),
@@ -792,6 +798,9 @@ impl RibDriver {
         if after == before {
             return;
         }
+        // The best changed: the programming surface for this key is
+        // potentially stale — drain's incremental reconcile consumes it.
+        self.dirty.insert((table, prefix));
         // The transition DEL: the old best lost selection to a DIFFERENT
         // (afi, type) family (the gone-entirely case is handled below).
         if let (Some(old), Some(new)) = (&before, &after) {
@@ -998,7 +1007,7 @@ impl RibDriver {
     /// performs. Blocking on the first receive is what lets reply-carrying
     /// commands (NEXTHOP_REGISTER blocks its session until answered) run
     /// concurrently with the sending session.
-    pub async fn drive<D: Dataplane>(
+    pub async fn drive<D: Dataplane + Sync>(
         &mut self,
         rx: &mut mpsc::Receiver<RibCommand>,
         dp: &D,
@@ -1015,7 +1024,7 @@ impl RibDriver {
 
     /// Applies whatever commands are already queued, reconciling if routes
     /// changed. Never blocks.
-    pub async fn drain<D: Dataplane>(
+    pub async fn drain<D: Dataplane + Sync>(
         &mut self,
         rx: &mut mpsc::Receiver<RibCommand>,
         dp: &D,
@@ -1025,7 +1034,10 @@ impl RibDriver {
             changed |= self.apply(command);
         }
         if changed {
-            self.rib.reconcile(dp).await;
+            // F8: reconcile exactly the keys this batch touched (O(batch)),
+            // never the full table per batch — the tick keeps the full pass.
+            let dirty = std::mem::take(&mut self.dirty);
+            self.rib.reconcile_keys(dp, &dirty).await;
         }
         changed
     }

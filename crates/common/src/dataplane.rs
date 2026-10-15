@@ -471,6 +471,50 @@ pub trait Dataplane {
         entry: &RouteEntry,
     ) -> impl Future<Output = Result<(), DataplaneError>> + Send;
 
+    /// Pipelined bulk installs (bench F8): backends override to
+    /// amortize per-route round-trips; results align by index with
+    /// `entries`. The default is the sequential per-route loop, so
+    /// test mocks and route-only backends keep their behavior.
+    fn route_replace_batch(
+        &self,
+        entries: &[RouteEntry],
+    ) -> impl Future<Output = Vec<Result<(), DataplaneError>>> + Send
+    where
+        Self: Sync,
+    {
+        // Own the entries: the returned future cannot borrow the
+        // argument slice (the clone is default-path only — the
+        // pipelined override takes its own reference).
+        let entries = entries.to_vec();
+        async move {
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                out.push(self.route_replace(entry).await);
+            }
+            out
+        }
+    }
+
+    /// Pipelined bulk withdrawals (bench F8) — the delete-side twin
+    /// of [`Self::route_replace_batch`], same index alignment and
+    /// sequential default.
+    fn route_delete_batch(
+        &self,
+        entries: &[RouteEntry],
+    ) -> impl Future<Output = Vec<Result<(), DataplaneError>>> + Send
+    where
+        Self: Sync,
+    {
+        let entries = entries.to_vec();
+        async move {
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                out.push(self.route_delete(entry).await);
+            }
+            out
+        }
+    }
+
     /// Install or replace a SAV program (replace semantics: interfaces
     /// covered by the previous program but not this one are reverted to
     /// their pre-SAV state).

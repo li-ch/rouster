@@ -9,6 +9,7 @@ use common::{
     NeighbourCacheInfo, NeighbourEntry, NeighbourProtocol, Nexthop, RouteEntry, RouteProtocol,
     SavMonitorCounts, SavProgram, SavProgramOp,
 };
+use futures::stream::StreamExt;
 use futures::TryStreamExt;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{
@@ -752,9 +753,18 @@ impl NetlinkDataplane {
     }
 }
 
+/// How many route requests may be in flight before the next send
+/// waits (bench F8). Each `execute()` still awaits its own ACK —
+/// every route stays verified — but with a bounded pipeline the
+/// socket and the kernel work continuously instead of the caller
+/// sleeping between single-route round-trips. 512 is plenty: the
+/// netlink send buffer backpressures well below this on default
+/// `wmem_default`.
+const NL_ROUTE_PIPELINE: usize = 512;
+
 impl Dataplane for NetlinkDataplane {
     /// Installs or atomically replaces a route (RTM_NEWROUTE, NLM_F_REPLACE).
-    #[instrument(skip(self), fields(prefix = %entry.prefix))]
+    #[instrument(level = "debug", skip(self), fields(prefix = %entry.prefix))]
     async fn route_replace(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
         self.handle
@@ -768,7 +778,7 @@ impl Dataplane for NetlinkDataplane {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(prefix = %entry.prefix))]
+    #[instrument(level = "debug", skip(self), fields(prefix = %entry.prefix))]
     async fn route_delete(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
         if let Err(e) = self.handle.route().del(msg).execute().await {
@@ -789,6 +799,34 @@ impl Dataplane for NetlinkDataplane {
         }
         debug!("route deleted");
         Ok(())
+    }
+
+    /// Pipelined installs (bench F8): the per-route `execute().await`
+    /// costs a full netlink round-trip — write, sleep, ACK wake — per
+    /// route; a 1.1M-route install measured 235 CPU-s (~208 µs/route)
+    /// against FRR zebra's batched ~8.6 µs/route. Bounded in-flight
+    /// requests with ordered results (`buffered`, not
+    /// `buffer_unordered` — callers zip results back to keys by
+    /// index).
+    async fn route_replace_batch(&self, entries: &[RouteEntry]) -> Vec<Result<(), DataplaneError>> {
+        // Index-mapped, not element-mapped: the trait method's
+        // returned future borrows the element lifetime (RPITIT), and a
+        // closure cannot be higher-ranked over that — capturing the
+        // slice itself sidesteps the HRTB entirely.
+        futures::stream::iter(0..entries.len())
+            .map(|i| async move { self.route_replace(&entries[i]).await })
+            .buffered(NL_ROUTE_PIPELINE)
+            .collect()
+            .await
+    }
+
+    /// The delete-side twin of [`Self::route_replace_batch`].
+    async fn route_delete_batch(&self, entries: &[RouteEntry]) -> Vec<Result<(), DataplaneError>> {
+        futures::stream::iter(0..entries.len())
+            .map(|i| async move { self.route_delete(&entries[i]).await })
+            .buffered(NL_ROUTE_PIPELINE)
+            .collect()
+            .await
     }
 
     /// Install or replace a SAV program on the configured backend
