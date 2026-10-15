@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rouster — a routing protocol suite in Rust</title>
-  <meta name="description" content="Rouster is not an FRR clone. It fuses BIRD's and Holo's core architecture, keeps FRR compatibility strictly at the edge, and adds native source address validation.">
+  <meta name="description" content="Rouster is a routing protocol suite in memory-safe Rust. It fuses BIRD's and Holo's core architecture, keeps FRR compatibility strictly at the edge, and adds native source address validation.">
   <link rel="icon" type="image/png" href="assets/logo.png">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -19,9 +19,10 @@
       <div class="hero-copy">
         <h1>Rouster</h1>
         <p class="tagline">A routing protocol suite in Rust</p>
-        <p class="positioning">Rouster is not an FRR clone. It fuses BIRD&rsquo;s and Holo&rsquo;s
-        core architecture, keeps FRR compatibility strictly at the edge, and adds native
-        source address validation.</p>
+        <p class="positioning">Rouster is a routing protocol suite in memory-safe
+        Rust. It fuses BIRD&rsquo;s and Holo&rsquo;s core architecture, keeps FRR
+        compatibility strictly at the edge, and adds native source address
+        validation.</p>
         <p class="hero-actions">
           <a class="btn btn-primary" href="https://gitee.com/drchenli/rouster">Get&nbsp;started</a>
           <a class="btn btn-secondary" href="assets/whitepaper.pdf">Read the white&nbsp;paper</a>
@@ -36,21 +37,24 @@
     <section aria-labelledby="what-h">
       <div class="section-inner">
         <h2 id="what-h">What it is</h2>
-        <p class="section-lede">One daemon family, four load-bearing ideas.</p>
+        <p class="section-lede">One daemon family, four load-bearing ideas, all
+        in memory-safe Rust.</p>
         <ul class="pillar-grid">
           <li class="pillar">
             <h3>A typed, multi-table core</h3>
             <p>A BIRD-style typed multi-table RIB sitting on a Linux netlink dataplane.
             Interfaces, addresses, routes and neighbours are mirrored from the kernel;
             static routes program with ECMP and non-main tables; VRF devices keep their
-            own tables without leaking into main; SIGHUP reloads the config.</p>
+            own tables without leaking into main; SIGHUP reloads the config. The whole
+            suite is Rust with zero <code>unsafe</code> in protocol code (three audited
+            kernel helpers excepted), one async binary, multi-core from day one.</p>
           </li>
           <li class="pillar">
             <h3>FRR compatibility, strictly at the edge</h3>
             <p>Unmodified FRR <code>staticd</code>, <code>bgpd</code> and <code>ospfd</code>
             attach to <code>rousterd</code> as their zebra, and their routes reach the kernel
             through the Rust RIB. The ZAPI wire codec is byte-pinned against a real
-            FRR&nbsp;10.2.2 binary &mdash; captured from live exchanges, never guessed.</p>
+            FRR&nbsp;10.2.2 binary &mdash; captured from live exchanges.</p>
           </li>
           <li class="pillar">
             <h3>Native protocol daemons</h3>
@@ -63,21 +67,21 @@
           </li>
           <li class="pillar">
             <h3>Source address validation, native</h3>
-            <p>The differentiator: a SAV Information Base fed from the RIB and config,
+            <p>Unique among general-purpose suites (FRR, BIRD, Holo): a SAV Information
+            Base fed from the RIB and config,
             the IBA/IBB/PBA/PBB validation-mode rule model, uRPF-family rule generation
             (RFC&nbsp;3704/8704), and enforcement through <code>rp_filter</code> or
             nftables backends. Monitor-only by default &mdash; drop mode refuses without an
-            explicit opt-in. No general-purpose suite (FRR, BIRD, Holo) ships packet-plane
-            SAV today.</p>
+            explicit opt-in.</p>
           </li>
         </ul>
       </div>
     </section>
 
-    <!-- ================= 2. Proof, not promises ================= -->
+    <!-- ================= 2. Interop receipts ================= -->
     <section aria-labelledby="proof-h" class="alt">
       <div class="section-inner">
-        <h2 id="proof-h">Proof, not promises</h2>
+        <h2 id="proof-h">Interop receipts</h2>
         <p class="section-lede">Every wire claim below was exercised against real,
         unmodified FRR&nbsp;10.2.2 in containers.</p>
 
@@ -95,8 +99,8 @@
         test suite, smoke-script syntax) was green on its latest main run,
         2026-10-15. The nightly container smokes have
         <strong>no green run recorded yet</strong> &mdash; CI-parity work is in flight, so the
-        second badge is red; the interop receipts below are local, recorded runs, not CI
-        greens.</p>
+second badge is red; the interop receipts below are locally recorded
+runs, and CI greens are cited only where they exist.</p>
 
         <h3 class="receipts-h">Live FRR interop, per protocol</h3>
         <ul class="receipts">
@@ -134,7 +138,7 @@
           <li>
             <h4>The ZAPI wire itself</h4>
             <p>Every wire format is empirically pinned against the real FRR&nbsp;10.2.2
-            binary, captured from live exchanges &mdash; never guessed.</p>
+            binary, captured from live exchanges.</p>
           </li>
         </ul>
 
@@ -149,6 +153,12 @@
             <p class="stat-label">container smoke scripts at HEAD &mdash; 34 at the v0.1.0
             tag; the last recorded full-suite green is 35/35 on v0.1.0 night, with the
             IS-IS additions recorded green individually</p>
+          </li>
+          <li class="stat">
+            <p class="stat-num">0</p>
+            <p class="stat-label"><code>unsafe</code> blocks in protocol code &mdash; the
+            workspace invariant; three audited kernel read-back helpers excepted, each
+            documented (2026-10-15)</p>
           </li>
           <li class="stat">
             <p class="stat-num">MIT</p>
@@ -196,8 +206,8 @@
             <a href="https://gitee.com/drchenli/rouster">the repository&rsquo;s README</a>.</p>
             <h3 class="honest-h">Where it stands, honestly</h3>
             <ul class="honest">
-              <li>Not feature-parity with FRR, and that is explicit: treat FRR as the
-              spec/oracle, not the finish line.</li>
+              <li>Not feature-parity with FRR, and that is explicit: the plan
+              positions FRR as spec and oracle, with parity a stated non-goal.</li>
               <li>YANG northbound / gNMI is not yet present &mdash; management today is
               <code>vtyd</code> + <code>configd</code> + <code>rousterctl</code>.</li>
               <li>Protocol remainders are deferred and tracked in the repo:
@@ -227,8 +237,8 @@
         <a href="https://gitee.com/drchenli/rouster/blob/main/LICENSE">MIT license</a>
       </p>
       <p class="footer-license">MIT &mdash; Copyright &copy; 2026 The Rouster Authors.</p>
-      <p class="footer-early">Early-stage software, honestly labeled: not feature-parity
-      with FRR &mdash; FRR is the spec and the oracle, not the finish line.</p>
+      <p class="footer-early">Early-stage software, honestly labeled: FRR serves as
+      spec and oracle here, with parity a stated non-goal.</p>
     </div>
   </footer>
 </body>
