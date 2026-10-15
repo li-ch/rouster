@@ -8,3 +8,9 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# W5B convention (the workspace's pre-authorized property-test
+# dependency; sav + rib set the precedent). Dev-only: the runtime
+# surface of this crate stays dependency-free.
+proptest.workspace = true
