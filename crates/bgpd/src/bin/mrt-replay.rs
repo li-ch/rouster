@@ -394,7 +394,7 @@ async fn run(
 
     // reader task: answer KEEPALIVEs, watch for NOTIFICATION
     let wr2 = Arc::clone(&wr);
-    let reader = tokio::spawn(async move {
+    let _reader = tokio::spawn(async move {
         loop {
             match read_frame(&mut rd).await {
                 Ok((4, _)) => {
@@ -418,7 +418,7 @@ async fn run(
 
     // our own keepalive timer (independent of the reader's replies)
     let wr_ka = Arc::clone(&wr);
-    let ka = tokio::spawn(async move {
+    let _ka = tokio::spawn(async move {
         let period = Duration::from_secs((hold as u64 / 3).max(5));
         loop {
             sleep(period).await;
