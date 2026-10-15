@@ -57,6 +57,27 @@ trust rc):
 | `show ip route summary`, `show rib summary` | `rousterd.status` | the FRR name and the rousterctl-parity name render the same summary (every table, both AFs — the dump is AF-agnostic) |
 | `show running-config`, config mode | session + canonical file | the merged canonical view (S8-c): session edits projected into the `rouster.conf` shape over everything the canonical file carries that the vty grammar cannot speak (verbatim); `write file`/`write memory` stage it and spawn `configd apply` ([protocols/vty.md](protocols/vty.md)) |
 
+### 1.3 restconfd (the RESTCONF northbound, S12-a)
+
+The YANG tree's primary HTTP surface (the owner's gNMI decision C —
+[../yang.md §restconf](../yang.md) is the contract; plain HTTP/1.1
+on loopback by default, **no auth** — the disclosed v1 posture).
+HTTP is the transport, the verbs are the commands:
+
+| Request | What it does | Status codes |
+|---|---|---|
+| `GET /restconf/data[/path]` | the CANDIDATE — the canonical file's bound trees, RFC 7951 JSON (the `configd dump --json` shape; defaults filled, `#unmodeled` disclosed) | 200 · 404 (§7.1 error form) |
+| `GET /restconf/running[/path]` | the RUNNING tree — the last confirmed generation, read-only | 200 · 404 (before the first apply) |
+| `PUT /restconf/data/path` | replace the subtree (validate-first: a bad body is a 400 and nothing moves); accepted mutations run the `configd apply` pipeline and answer with the per-daemon ack summary | 200/201 · 400 · 409 (pipeline refusal + auto-rollback story) |
+| `POST`/`PATCH /restconf/data/path` | merge (RFC 8040 §4.6.1's plain-patch shape) | 200 · 400 · 409 |
+| `DELETE /restconf/data/path` | remove (a section-level DELETE wipes the daemon's config); answers 200 with the ack summary, not §4.7's bare 204 — disclosed | 200 · 404 |
+| `HEAD`/`OPTIONS` | GET's headers / the `Allow` set | 200 |
+| anything, in `--dry-run` | GETs/HEADs only; mutations refused (a Rouster extension, disclosed) | 503 |
+
+Server config: the canonical `restconf { port <n>; bind <addr>; }`
+stanza (flags beat it; startup-only). The `restconfd --help` text
+carries the verb table and the security posture.
+
 ## 2. The run-dir contract (who writes what)
 
 `/run/rouster/` is the workspace's sanctioned run dir. v1 reads only —
@@ -94,6 +115,7 @@ the mirrors is a separate owner call).
 | `*.sock` | rousterd (only when its config has a `zapi socket <PATH>` line — no canonical name yet) | while the ZAPI server runs | `status` (fallback candidates when no dump exists) |
 | `configd/generations/<seq>-<hash>/rouster.conf`, `configd/current`, `configd/previous` | configd apply ([protocols/config.md](protocols/config.md) §4.2 — the run-dir contract extension) | written per apply (the canonical bytes, the current pointer, the prior one); history pruned to the newest 8; `previous` appears from the second apply on; **`current` is also the auto-rollback's source** (S8-c: a refused reload re-applies the last CONFIRMED generation as a new one) | `configd rollback` (reads `previous`); the auto-rollback pass (reads `current`, pre-record) |
 | `configd.status` | configd apply (the last step of every apply, rollback and auto-rollback applies included) | refreshed per apply: generation, hash, per-daemon actuation results, and (S8-c) per-daemon `ack` verdicts — `confirmed`/`unverified`/`no-status`/`no-ack-surface` for signaled daemons; a `source auto-rollback to generation N` line marks an auto-reverted apply | `configd status` (prints it verbatim, the `savd --show` shape) |
+| `restconf.status` | restconfd (S12-a) | written at start (`mode serve\|dry-run`, `bind`, `port`, the canonical/run/etc dirs, the `security` disclosure line), removed on clean exit; only SIGKILL leaves it behind (its `pid` line makes staleness detectable) | operators, smokes (`scripts/test-restconf-smoke.sh` asserts `mode serve` + `port`) |
 
 Consequences the consumers rely on:
 
@@ -252,13 +274,15 @@ is `scripts/test-vty-smoke.sh`, auto-discovered by
 
 ## 4. Non-goals (v1/v2)
 
-No writes to the run dir, no daemon management (start/stop stay with
-the operator's process supervisor), no config editing (YANG-native
-northbound is Phase 4), no external crates — the crate stays free of
-outside dependencies by design; its single dependency is the
-workspace member `common` (the N8-consolidated run-dir reader;
-pulling in a parser or JSON crate remains an owner decision to
-record, not a patch detail). Per-route `show ip route` rows (not just
-the summary) need a dump format decision (route lines in
+No writes to the run dir (rousterctl stays read-only), no daemon
+management (start/stop stay with the operator's process supervisor),
+no external crates — the crate stays free of outside dependencies by
+design; its single dependency is the workspace member `common` (the
+N8-consolidated run-dir reader; pulling in a parser or JSON crate
+remains an owner decision to record, not a patch detail). The
+YANG-native northbound "non-goal" of v1/v2 CLOSED with S12-a:
+config editing is `restconfd`'s whole job (§1.3, the HTTP surface
+over the canonical YANG trees). Per-route `show ip route` rows (not
+just the summary) need a dump format decision (route lines in
 `rousterd.status`, or a separate dump file) — an owner decision to
 record when the demand lands.

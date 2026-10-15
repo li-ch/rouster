@@ -1,15 +1,19 @@
 # The YANG core — the model reference and the gNMI-transport decision
 
-Status: S11-a (2026-10-15). The YANG core is LANDED as the internal
-source of truth (architecture invariant 5): a pure-Rust RFC 7950
-subset (`crates/yang` — parser, data tree, validator, the line
-binding), the Rouster model set (`yang/*.yang`), configd's flip
+Status: S11-a (2026-10-15) + S12-a (2026-10-15): the YANG core is
+LANDED as the internal source of truth (architecture invariant 5)
+and now has its PRIMARY NORTHBOUND — the RESTCONF-shaped HTTP/1.1
+edge (§restconf, decision C executed): a pure-Rust RFC 7950 subset
+(`crates/yang` — parser, data tree, validator, the line binding),
+the Rouster model set (`yang/*.yang`), configd's flip
 (`docs/protocols/config.md` §1.5 — text grammar in, trees validated,
-files rendered FROM the trees), and vtyd's translator seam
-(`docs/protocols/vty.md` — config-mode edits build tree operations).
-This document is the model set's reference, the machine shapes'
-contract, and the §Deferred ledger; §gNMI-transport is the transport
-evaluation ending in an owner decision.
+files rendered FROM the trees), vtyd's translator seam
+(`docs/protocols/vty.md` — config-mode edits build tree operations),
+and `restconfd` (`crates/configd/src/restconf/` + the binary) — the
+tree's HTTP surface. This document is the model set's reference, the
+machine shapes' contract, and the §Deferred ledger;
+§gNMI-transport is the transport evaluation ending in an owner
+decision; §restconf is the decided edge's implementation section.
 
 ## The subset (what "RFC 7950 subset" means here)
 
@@ -131,8 +135,12 @@ here per the cite-what-the-RFC-says rule.)
    `message-digest-key` value sub-shapes are modeled shallowly.
 8. **Multiple `must` on one node / error-app-tag surfacing** —
    parsed, but only `error-message` reaches operators.
-9. **gNMI/RESTCONF transports** — §gNMI-transport below; the owner
-   decision gates any crate adoption.
+9. **gNMI (option A) and the full RFC 8040 surface** —
+   §gNMI-transport decided C (2026-10-15); §restconf below is what
+   LANDED and carries its own omissions table (each entry cited).
+   gNMI stays the documented next step: the §restconf mapping table
+   preserves exactly what option A needs. TLS/auth for the HTTP edge
+   is the standing owner dependency decision.
 
 ## §gNMI-transport — the evaluation (NO implementation; an owner decision)
 
@@ -231,3 +239,130 @@ pure Rust where holo binds C libyang).
 **DECIDED: C (owner, 2026-10-15).** The RESTCONF-shaped edge is
 authorized; gNMI stays the documented next step (option A's
 datastore semantics map identically when wanted).
+
+## §restconf — the implemented edge (S12-a, decision C executed)
+
+`restconfd` (`crates/configd/src/restconf/` — `http.rs` the
+hand-rolled HTTP/1.1 core, `resources.rs` the resource map and
+mutation flow, `server.rs` the tokio listener; the binary
+`restconfd`) serves the canonical config's YANG trees over
+HTTP/1.1 on loopback. **A deliberate SUBSET of RFC 8040**: the
+operations on datastore subtrees, not the full protocol — the
+omissions table below carries every cut with its citation.
+
+### The resource map
+
+The datastore IS the canonical `rouster.conf` (RFC 8040 §3.4's
+datastore resource mapped onto the file). URLs, tree targets, and
+real answers from the smoke:
+
+| Request | Tree target | Answer (real JSON) |
+|---|---|---|
+| `GET /restconf/data` | the whole datastore | `{"router-id":null,"restconf":{"port":8080,"bind":"127.0.0.1"},"savd":{"mode":"strict","action":"monitor","i-understand-drop-mode":false,"poll":2,"hysteresis":3,"collision-policy":"ignore","backend":"rp_filter"}}` — the `configd dump --json` shape (§"The JSON form" above) |
+| `GET /restconf/data/savd/poll` | a leaf | `{"poll":2}` |
+| `GET /restconf/data/bfdd/peer=192.0.2.9,false` | a list entry | `{"peer":{...}}` — positional keys (§3.5.3); the YANG predicate form `peer[address=192.0.2.9][multihop=false]` addresses it too |
+| `GET /restconf/running` | the last CONFIRMED generation (`<run>/configd/current`) | the same shape, read-only — 404 before the first apply |
+| any unknown path | — | `{"ietf-restconf:errors":{"error":[{"error-type":"application","error-tag":"invalid-value","error-message":"…"}]}}` — the §7.1/§3.9 error form |
+
+Path segments split on RAW bytes before percent-decoding, so an
+encoded `%2F` inside a key value cannot split a segment (§3.5.3's
+encoding discipline).
+
+### The verbs (§4; deviations named)
+
+- **GET** (§4.3) / **HEAD** (§4.2, GET's headers, no body) /
+  **OPTIONS** (§4.1, the `Allow` set) — pure reads, RFC 7951 JSON
+  with defaults filled (report-all).
+- **PUT** (§4.5): REPLACE the target subtree — delete + load, 201
+  on create (including a whole missing `daemon` section), 200 on
+  replace. Validate-first: JSON syntax, unknown members, type
+  checks, `must`/mandatory violations, AND the deep
+  `--validate-config` gate all run BEFORE anything is written — a
+  bad body is a **400 with per-path errors and the tree untouched**.
+- **POST = merge** — RFC 8040's POST is create/RPC-invoke (§4.4);
+  the merge is the decision-C cut. **PATCH is accepted as the same
+  merge — for that verb it is conformant** (§4.6.1 plain patch).
+  Lists merge by key (§7.8.2), leafs overwrite, leaf-lists append
+  (a duplicate append is a validate-time 400 — delete first).
+- **DELETE** (§4.7): remove; 404 on absent. Deviation: DELETE
+  answers 200 with the ack-summary body rather than §4.7's bare
+  204 — the body is the point.
+
+An accepted mutation renders the mutated section FROM the tree
+(modeled nodes synthesized — a mutated leaf's old source line would
+otherwise ride its stale origin; unmodeled lines verbatim — the
+vtyd write path's exact discipline), splices only that section's
+bytes into the canonical file, and runs the existing configd
+pipeline in-process (`apply`: bind, validate, deep gate, atomic
+writes, SIGHUP, post-signal verification, auto-rollback). The
+response carries the per-daemon ack summary in `configd.status`'s
+vocabulary:
+
+```json
+{"generation":2,"hash":"630ef1f16617d1b7","daemons":[
+  {"daemon":"savd","file":"/etc/savd.conf","bytes":19,"result":"signaled","ack":"confirmed"}]}
+```
+
+A pipeline failure after staging (a refused reload that
+auto-rolled back) is a **409** with the apply's own error story;
+the canonical file then holds the staged-but-refused bytes — the
+vtyd `write file` precedent, disclosed. The deep gate runs twice
+per mutation (pre-write, then inside the apply) — correctness over
+speed.
+
+### The server config + the surface
+
+`restconf { port <n>; bind <addr>; }` is a top-level canonical
+stanza (modeled in `rouster-vty.yang`'s `restconf` container;
+defaults port 8080 / bind 127.0.0.1; startup-only knobs — restart
+to change, the vtyd bind discipline). It is itself datastore data
+(`GET/PUT/DELETE /restconf/data/restconf`). The stanza is rendered
+nowhere (configd-plane config, the `router-id` discipline) and
+rides applies verbatim. Flags beat the stanza beat defaults.
+
+`<run-dir>/restconf.status` (house format, written at start,
+removed on clean exit): `restconfd <ver> pid <n>` / `mode
+serve|dry-run` / `bind` / `port` / `canonical` / `run-dir` /
+`etc-dir` / the security line. `--dry-run` answers GETs/HEADs and
+refuses every mutation with 503 (a Rouster extension; RFC 8040
+defines no dry-run) — the smoke-probe surface.
+
+### Security posture v1 (read this)
+
+Plain HTTP on loopback by default, **NO AUTHENTICATION**. RFC 8040
+§2 expects HTTPS with client authentication; until the owner
+decides, the port is a management surface and the binary warns on
+any non-loopback bind. The §Deferred options: TLS via rustls (an
+owner dependency decision — the no-new-deps fence is why v1 ships
+without it), or a local unix-socket alternative (no TCP at all).
+
+### The omissions table (each cut cited; all §Deferred here)
+
+| Omission | Citation | Note |
+|---|---|---|
+| Streaming notifications / event streams | RFC 8040 §6, §3.8 | needs a tree change feed that does not exist yet (the option-A evaluation's same design item) |
+| The operation resource (`:reload` and RPC invoke) | RFC 8040 §3.6 | POST-on-data is merge, not invoke (the deviation above) |
+| YANG-Patch | RFC 8040 §4.6.2 | plain-patch merge only |
+| Query parameters (`?content`, `?fields`, `?filter`) | RFC 8040 §4.8 | any query string is a 400 |
+| The API/schema resources, root discovery | RFC 8040 §3.3, §3.7, §3.1 | `/.well-known/host-meta` not served |
+| Chunked transfer encoding | RFC 9112 §7.1 | 501; Content-Length bodies only, bounded 1 MiB |
+| Keep-alive | RFC 9110 §9.3 | connection-per-request, `Connection: close` on every answer |
+| The `Date` response header | RFC 9110 §15.6.1 (SHOULD) | needs a dependency-grade formatter; clients do not miss it |
+| `ETag`/`Last-Modified`, optimistic concurrency | RFC 8040 §3.4.1 | single-flight mutation lock instead (one mutation at a time) |
+| Multiple error objects per response | RFC 8040 §3.9 | one error entry; `must` violation lists every violation in one message |
+| The savd drop-friction `must` is unsatisfiable through tree edits | `rouster-savd.yang` | the model's `must` compares `'yes'` against the boolean's canonical `'true'` (the linebind converts `yes`→`true` at bind): drop-with-acknowledgement always violates; savd's own gate stays the real friction (a model/must-engine fix, outside S12-a's lane) |
+
+### The gNMI mapping table (decision C's promise to option A)
+
+Nothing is lost when gNMI (option A) is wanted: the datastore
+semantics this edge pins are exactly what `Get`/`Set` map onto.
+
+| gNMI (gnmi.proto) | This edge | Status |
+|---|---|---|
+| `Get` (data + typed paths) | `GET /restconf/data/<path>` — same tree paths, RFC 7951 encoding | lands today |
+| `Set` `update` (merge) | `POST`/`PATCH` merge (§4.6.1) | lands today |
+| `Set` `replace` | `PUT` (§4.5) | lands today |
+| `Set` `delete` | `DELETE` (§4.7) | lands today |
+| `Capabilities` | n/a (HTTP `OPTIONS` + the docs) | trivial over gRPC |
+| `Subscribe` (on-change) | NOTHING — needs the tree change feed | the real option-A design item (same as the notifications omission) |
+| Transactions / `dry-run` extension | the apply pipeline + `--dry-run` | gNMI would ride the same single-flight pipeline |
