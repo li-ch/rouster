@@ -152,14 +152,17 @@ full-table soak tests). This plan is how that changes, honestly.
 
 ## D. Decision sheet (owner fills before the first run)
 
-| # | question | options | Your decision |
-|---|---|---|---|
-| D1 | injector for E1/E2 | (a) exabgp replaying generated announce files; (b) small in-repo Rust MRT→BGP replayer (new dev tool, more control, more work); (c) both — (a) to start, (b) if (a) bottlenecks the injector itself | ___ |
-| D2 | criterion dev-dep for E7 | (a) yes, all crates that need it; (b) one crate first (zapi) | ___ |
-| D3 | bench job in CI | (a) nightly manual-dispatch only; (b) every push, non-gating; (c) skip CI, local only | ___ |
-| D4 | host | (a) Linux box if available (best); (b) Mac Docker Desktop with `host=darwin-vm` labeling and the 2× unresolved rule | ___ |
-| D5 | comparison set | (a) FRR only (the oracle; images cached); (b) FRR + BIRD (needs a bird image added to the cached set) | ___ |
-| D6 | first claim to publish | (a) E1+E5 together (headline + memory); (b) E7 first (cheapest, no public comparative claim); (c) all at once when §R complete | ___ |
+Recommendations are the orchestrator's, 2026-10-15; reasoning lives
+in the chat record. The "Your decision" column stays the owner's.
+
+| # | question | options | recommendation | Your decision |
+|---|---|---|---|---|
+| D1 | injector for E1/E2 | (a) exabgp replaying generated announce files; (b) small in-repo Rust MRT→BGP replayer (new dev tool, more control, more work); (c) both — (a) to start, (b) if (a) bottlenecks the injector itself | **(c), expecting (b) for published numbers.** Gate: measure injector headroom first — if exabgp (Python) cannot sustain ≥2× the SUT's ingestion rate, its numbers measure the injector, and the published runs switch to the in-repo replayer. | ___ |
+| D2 | criterion dev-dep for E7 | (a) yes, all crates that need it; (b) one crate first (zapi) | **(b)** — ratify the pattern on one crate (zapi: hottest codec, pinned fixtures exist), extend to the BGP UPDATE parser once the harness shape is proven. Same class as the tokio-test-util precedent: dev-dep, reviewable increment. | ___ |
+| D3 | bench job in CI | (a) nightly manual-dispatch only; (b) every push, non-gating; (c) skip CI, local only | **(a)** — shared runners have no CPU pinning, so CI numbers are trend-noise; nightly dispatch catches gross regressions (≥2×) and keeps the benches running. Comparative experiments (E1–E6) never run in CI; CI-benched numbers are descriptive-only and labeled `host=gh-runner`. | ___ |
+| D4 | host | (a) Linux box if available (best); (b) Mac Docker Desktop with `host=darwin-vm` labeling and the 2× unresolved rule | **(b) to build and debug, (a) for published ledger entries.** If no Linux host can be obtained (even a cheap pinned-cores VPS), publish under `darwin-vm` labels and honor the 2× rule. | ___ |
+| D5 | comparison set | (a) FRR only (the oracle; images cached); (b) FRR + BIRD (needs a bird image added to the cached set) | **(a) for the first ledger entries; extend to (b) for E1+E5 once the harness is proven.** BIRD matters most for E5 (memory, where BIRD is historically lean — the strongest test of the claim), but the FRR harness reuses everything the interop suite already pinned. | ___ |
+| D6 | first claim to publish | (a) E1+E5 together (headline + memory); (b) E7 first (cheapest, no public comparative claim); (c) all at once when §R complete | **(a)** — one run session yields both (E5 rides E1's RSS logs), and they are exactly what the site/paper need to move from design facts to measured facts. E7 publishes alongside when ready; (c) delays everything to the slowest experiment. | ___ |
 
 ## R. Results ledger (append-only)
 
