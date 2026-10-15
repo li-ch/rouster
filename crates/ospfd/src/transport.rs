@@ -163,12 +163,29 @@ pub struct OspfRawSocket {
     joined_dr: std::sync::atomic::AtomicBool,
 }
 
+/// §A.1 scopes the TTL-1 mandate to the multicast addresses; §15's
+/// virtual-link packets are IP-ROUTED through the transit area and
+/// MUST survive the hops — the conventional routed TTL.
+pub const VLINK_TTL: u32 = 64;
+
 impl OspfRawSocket {
     /// Open and arm the socket on `ifaddr`: proto 89, AllSPFRouters
     /// membership, egress interface, TTL 1 on both arms, multicast
     /// loopback off (§A.1's link-local intent; self-originated
     /// packets are dropped by Router ID at dispatch anyway).
     pub fn open(ifaddr: Ipv4Addr) -> io::Result<Self> {
+        Self::open_with_ttl(ifaddr, OSPF_TTL)
+    }
+
+    /// The §15 form: a virtual link's socket carries a ROUTED TTL
+    /// ("the virtual link is an unnumbered point-to-point link whose
+    /// endpoints ... IP packets are routed through the transit
+    /// area") — TTL 1 would die at the first transit hop.
+    pub fn open_vlink(ifaddr: Ipv4Addr) -> io::Result<Self> {
+        Self::open_with_ttl(ifaddr, VLINK_TTL)
+    }
+
+    fn open_with_ttl(ifaddr: Ipv4Addr, ttl: u32) -> io::Result<Self> {
         let socket = Socket::new(
             Domain::IPV4,
             Type::RAW,
@@ -178,7 +195,7 @@ impl OspfRawSocket {
         socket.set_multicast_if_v4(&ifaddr)?;
         socket.set_multicast_ttl_v4(OSPF_TTL)?;
         socket.set_multicast_loop_v4(false)?;
-        socket.set_ttl_v4(OSPF_TTL)?;
+        socket.set_ttl_v4(ttl)?;
         socket.set_nonblocking(true)?;
         // The safe-I/O seam (module note): dup the armed fd into a
         // tokio UdpSocket — same kernel socket, safe recv/send.

@@ -62,10 +62,13 @@ pub struct InterfaceAdv {
     pub transit_adjacent: bool,
     /// A virtual link endpoint (§15/§D.3): the adjacency rides the
     /// transit area but the LSA is the BACKBONE's — one unnumbered
-    /// type-4 link per fully adjacent endpoint. v1 Link Data: our
-    /// own address on the transit network (RFC 2328 §12.4.1 names
-    /// the MIB-II ifIndex for the unnumbered form — disclosed).
+    /// type-4 link per fully adjacent endpoint. Link Data: the
+    /// transit outgoing interface's address (§16.1 step 4), or the
+    /// synthetic MIB-II ifIndex in the unnumbered form (§12.4.1.1's
+    /// convention).
     pub virtual_link: bool,
+    /// The synthetic MIB-II ifIndex (the unnumbered-form Link Data).
+    pub ifindex: u32,
 }
 
 /// Build the router-LSA (§12.4.1). `e_bit` mirrors §12.4.4: set when
@@ -91,10 +94,19 @@ pub fn build_router_lsa(
             // §D.3: the virtual link is an unnumbered point-to-point
             // link (type 4) in the backbone's router-LSA — Link ID =
             // the other endpoint's Router ID, one per Full endpoint.
+            // §12.4.1.3/§16.1 step 4: the Link Data is the virtual
+            // interface's address (= the transit outgoing interface's);
+            // the UNNUMBERED form (no transit address) carries the
+            // MIB-II ifIndex — §12.4.1.1's unnumbered convention.
+            let link_data = if iface.address == Ipv4Addr::UNSPECIFIED {
+                iface.ifindex
+            } else {
+                u32::from(iface.address)
+            };
             for nbr in &iface.p2p_neighbors_full {
                 links.push(RouterLink {
                     link_id: LinkStateId(nbr.0),
-                    link_data: u32::from(iface.address),
+                    link_data,
                     link_type: LinkType::Virtual,
                     metric: iface.cost,
                     tos: vec![],
@@ -321,6 +333,7 @@ mod tests {
 
     fn iface(p2p: bool, addr: &str, mask: &str, cost: u16) -> InterfaceAdv {
         InterfaceAdv {
+            ifindex: 0,
             state: PointToPoint,
             p2p,
             address: ip(addr),

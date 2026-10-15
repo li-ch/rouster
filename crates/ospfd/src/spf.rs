@@ -128,6 +128,12 @@ pub struct SpfResult {
     pub router_flags: HashMap<RouterId, RouterFlags>,
     /// Distance to every reachable transit vertex.
     pub distances: HashMap<Vertex, u32>,
+    /// §16.1 step 4's virtual-link endpoint addresses: for every
+    /// router X on the tree, X's interface address "that points back
+    /// to Router X's parent vertex on the shortest-path tree" (from
+    /// X's router-LSA link toward the parent — numbered links carry
+    /// the address in Link Data).
+    pub vlink_endpoint_addr: HashMap<RouterId, Ipv4Addr>,
     /// The intra-area routes, deterministically ordered.
     pub routes: Vec<Route>,
 }
@@ -154,6 +160,9 @@ struct TreeEntry {
     /// attached to this network (§16.1.1's "network that directly
     /// connects the calculating router" case).
     root_if: Option<Ipv4Addr>,
+    /// The tree parent (§16.1's tree structure — the §16.1 step-4
+    /// virtual-link endpoint resolution walks it).
+    parent: Option<Vertex>,
 }
 
 /// A pending candidate (the §16.1 candidate list entry).
@@ -166,6 +175,8 @@ struct Cand {
     hops: Vec<NextHop>,
     /// Root's interface, when the root is directly attached (networks).
     root_if: Option<Ipv4Addr>,
+    /// The candidate's tree parent so far.
+    parent: Option<Vertex>,
     /// Insertion sequence — the FIFO tiebreak among equal candidates.
     seq: u64,
 }
@@ -218,6 +229,7 @@ pub fn calculate(root: RouterId, lsdb: &Lsdb) -> SpfResult {
             route_hops: vec![],
             hops: vec![],
             root_if: None,
+            parent: None,
         },
     );
 
@@ -327,6 +339,7 @@ pub fn calculate(root: RouterId, lsdb: &Lsdb) -> SpfResult {
                 route_hops: cand.route_hops.clone(),
                 hops: cand.hops.clone(),
                 root_if: cand.root_if,
+                parent: cand.parent,
             },
         );
         result.distances.insert(v, cand.distance);
@@ -335,6 +348,36 @@ pub fn calculate(root: RouterId, lsdb: &Lsdb) -> SpfResult {
         // Step 2: examine the LSA of the vertex just added.
         expand(v, &mut tree, &mut result, &mut candidates, &mut insert_seq);
     }
+
+    // §16.1 step 4: for every router X on the tree, the address of
+    // X's interface pointing back at X's parent ("the virtual
+    // neighbor's IP address is set to Router X's interface address
+    // (contained in Router X's router-LSA) that points back to ...
+    // Router X's parent vertex on the shortest-path tree") — the
+    // numbered forms carry it in Link Data.
+    let mut vlink_endpoint_addr: HashMap<RouterId, Ipv4Addr> = HashMap::new();
+    for (v, entry) in &tree {
+        let Vertex::Router(x) = *v else {
+            continue;
+        };
+        let Some(parent) = entry.parent else {
+            continue;
+        };
+        let Some(x_lsa) = router_lsas.get(&x) else {
+            continue;
+        };
+        let back = x_lsa.links.iter().find(|l| match parent {
+            Vertex::Router(p) => {
+                matches!(l.link_type, LinkType::PointToPoint | LinkType::Virtual)
+                    && l.link_id.0 == p.0
+            }
+            Vertex::Network(net) => l.link_type == LinkType::Transit && l.link_id.0 == net,
+        });
+        if let Some(link) = back {
+            vlink_endpoint_addr.insert(x, Ipv4Addr::from(link.link_data));
+        }
+    }
+    result.vlink_endpoint_addr = vlink_endpoint_addr;
 
     // Step 4: routing table entries for the transit vertices, in tree
     // order (already deterministic via the pick order); we emit at the
@@ -617,6 +660,7 @@ fn relax(
             c.route_hops = route_hops;
             c.hops = hops;
             c.root_if = root_if;
+            c.parent = Some(*v);
         }
         // New candidate.
         None => {
@@ -628,6 +672,7 @@ fn relax(
                     route_hops,
                     hops,
                     root_if,
+                    parent: Some(*v),
                     seq: *insert_seq,
                 },
             );

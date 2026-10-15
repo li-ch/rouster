@@ -92,6 +92,11 @@ pub struct Interface {
     /// area is the BACKBONE (the link extends area 0); `transit_area`
     /// names the area the packets ride.
     pub virtual_link: bool,
+    /// The vlink's synthetic MIB-II ifIndex (§12.4.1.1's unnumbered
+    /// convention applied to the type-4 Link Data when no transit
+    /// interface address exists; allocated 0x6600_0000 + n, stable
+    /// across restarts — disclosed synthetic, we manage no MIB).
+    pub vlink_ifindex: u32,
     pub transit_area: Option<u32>,
     /// The other endpoint's Router ID.
     pub peer_router: Option<RouterId>,
@@ -463,6 +468,7 @@ impl Ospfd {
                 interfaces.push(Interface {
                     name: name.clone(),
                     area: area.id,
+                    vlink_ifindex: 0,
                     // The concrete send view at t=0 (the tick refreshes
                     // it — chain rollover advances within one tick).
                     live_auth: icfg.auth.live_send_view(0),
@@ -493,7 +499,9 @@ impl Ospfd {
                 vlinks.push((area.id, *peer));
             }
         }
-        for (transit, peer) in vlinks {
+        for (n, (transit, peer)) in vlinks.iter().enumerate() {
+            let (transit, peer) = (*transit, *peer);
+            let vlink_ifindex = 0x6600_0000 + n as u32;
             let addr = interfaces
                 .iter()
                 .find(|i| i.area == transit)
@@ -504,6 +512,7 @@ impl Ospfd {
             interfaces.push(Interface {
                 name: format!("vl-{peer}"),
                 area: 0,
+                vlink_ifindex,
                 live_auth: crate::auth::AuthConfig::None,
                 cfg: InterfaceConfig::defaults(),
                 addr,
@@ -704,6 +713,7 @@ impl Ospfd {
                 InterfaceAdv {
                     state: i.fsm.state,
                     p2p: i.p2p,
+                    ifindex: i.vlink_ifindex,
                     address: i.addr,
                     mask: i.mask,
                     cost: i.cfg.cost,
@@ -889,6 +899,7 @@ impl Ospfd {
         let adv = InterfaceAdv {
             state,
             p2p: false,
+            ifindex: 0,
             virtual_link: false,
             address: addr,
             mask,
@@ -1609,7 +1620,15 @@ impl Ospfd {
         // mandate). The check precedes authentication, the RFC
         // 5881 §5-style early discard (cheap; no crypto on doomed
         // packets).
-        if !is_multicast_dst(received.dst) && !unicast_ttl_ok(received.ttl) {
+        //
+        // §15's exemption: virtual-link packets are IP-ROUTED through
+        // the transit area and legitimately arrive with a degraded
+        // TTL ("the two endpoints ... are joined by a path through
+        // the transit area") — a vlink endpoint (or a router whose
+        // only area-0 member IS the vlink) exempts the check; the
+        // single-hop rule's intent does not cover routed tunnels.
+        let vlink_endpoint = self.interfaces.iter().any(|i| i.virtual_link);
+        if !vlink_endpoint && !is_multicast_dst(received.dst) && !unicast_ttl_ok(received.ttl) {
             self.dropped_degraded_ttl += 1;
             info!(
                 src = %received.src,
@@ -1893,6 +1912,21 @@ impl Ospfd {
         report: &ConversationReport,
         now: u64,
     ) {
+        // The interop trace (the v3 daemon's convention): every
+        // foreign LSA that landed, one line each.
+        if std::env::var_os("ROUSTER_OSPF_TRACE").is_some() {
+            let area = self.interfaces[iface_idx].area;
+            for key in &report.changed {
+                if key.adv_router != self.router_id {
+                    info!(
+                        lsa = key.ls_type.name(),
+                        adv = %key.adv_router,
+                        area,
+                        "ospfd: peer LSA installed"
+                    );
+                }
+            }
+        }
         let area = self.interfaces[iface_idx].area;
         // The SAVNET reports (experimental-savnet): adjacency
         // transitions and changed LSAs, in-process and monitor-only.
@@ -2587,12 +2621,15 @@ impl Ospfd {
             }
         }
 
-        // ---- §15: virtual-link endpoint resolution ----
+        // ---- §15/§16.1 step 4: virtual-link endpoint resolution ----
         // "The other endpoint of the virtual link is discovered by
         // looking up the virtual link's neighbor router ID in the
-        // routing table" — the transit area's intra-area path to the
-        // peer; the first next-hop router address is the endpoint's
-        // own address in the directly-connected shape.
+        // routing table" — and §16.1 step 4 fixes the address: "the
+        // virtual neighbor's IP address is set to Router X's
+        // interface address (contained in Router X's router-LSA) that
+        // points back to ... Router X's parent vertex on the
+        // shortest-path tree" — the multi-hop transit shape resolves
+        // X's OWN address, not the first-hop gateway (v1's interim).
         for (area, result) in &results {
             let vlinks: Vec<usize> = self
                 .interfaces
@@ -2605,19 +2642,18 @@ impl Ospfd {
                 let Some(peer) = self.interfaces[idx].peer_router else {
                     continue;
                 };
-                let resolved = result.routes.iter().find_map(|r| {
-                    match r.destination {
+                let resolved = result.vlink_endpoint_addr.get(&peer).copied().or_else(|| {
+                    // The v1 fallback (the directly-connected
+                    // unnumbered shape, or an LSA gap): the first
+                    // next-hop router address toward the peer.
+                    result.routes.iter().find_map(|r| match r.destination {
                         Destination::Router(rid) if rid == peer => {
                             r.next_hops.first().and_then(|nh| {
-                                nh.router.or_else(|| {
-                                    // A p2p first hop: the adjacency's
-                                    // peer address on that interface.
-                                    self.p2p_peer_address(nh.interface)
-                                })
+                                nh.router.or_else(|| self.p2p_peer_address(nh.interface))
                             })
                         }
                         _ => None,
-                    }
+                    })
                 });
                 if resolved != self.interfaces[idx].vlink_peer_ip {
                     self.interfaces[idx].vlink_peer_ip = resolved;
@@ -3881,11 +3917,20 @@ pub async fn run(
                 let Some((idx, received)) = inbound else { break };
                 // The demultiplex fence: process only on the interface
                 // whose subnet contains the source (each raw socket
-                // delivers every proto-89 datagram).
+                // delivers every proto-89 datagram) — with §15's
+                // virtual-link exemption: a resolved vlink peer's
+                // address is NOT on-link (the packets arrive IP-routed
+                // through the transit area), so the fence also accepts
+                // the resolved peer addresses (on_packet's area demux
+                // then routes the backbone-area packet to the vlink).
                 let iface = &core.interfaces[idx];
                 let src = u32::from(received.src);
                 let mask = u32::from(iface.mask);
-                if src & mask != u32::from(iface.addr) & mask {
+                let on_link = src & mask == u32::from(iface.addr) & mask;
+                let vlink_peer = core.interfaces.iter().any(|i| {
+                    i.virtual_link && i.vlink_peer_ip.is_some_and(|p| u32::from(p) == src)
+                });
+                if !on_link && !vlink_peer {
                     continue;
                 }
                 let now = start.elapsed().as_secs();
@@ -3943,6 +3988,20 @@ async fn flush_wire(sockets: &[Arc<OspfRawSocket>], core: &Ospfd, out: Vec<WireO
         };
         if let Err(e) = result {
             warn!(error = %e, iface = %core.interfaces[wire.iface].name, "ospfd: send failed");
+        }
+        if std::env::var_os("ROUSTER_OSPF_TRACE").is_some()
+            && !matches!(wire.packet.body, PacketBody::Hello(_))
+        {
+            tracing::info!(
+                iface = %core.interfaces[wire.iface].name,
+                kind = wire.packet.header.packet_type,
+                to = %match wire.to {
+                    WireTo::Multicast => "mcast".to_string(),
+                    WireTo::AllDRouters => "alldr".to_string(),
+                    WireTo::Unicast(d) => format!("u:{d}"),
+                },
+                "ospfd: wire send"
+            );
         }
     }
 }
@@ -7568,6 +7627,144 @@ key chain kc1
                 .map(|c| c.state()),
             Some(NeighborState::Full),
             "B-C adjacency re-formed after the DR loss"
+        );
+    }
+
+    /// §15/§16.1 step 4 over a MULTI-HOP transit: the vlink's peer
+    /// address is R2's OWN interface address pointing back at its
+    /// tree parent (the middle transit router's link), NOT the
+    /// first-hop gateway (v1's interim) — and the partitioned
+    /// backbone routes across it.
+    #[test]
+    fn virtual_link_resolves_the_multihop_endpoint_address() {
+        // R1 -- area1 -- RM -- area1 -- R2, with area 0 split between
+        // R1 and R2 (the vlink rides the two-hop transit area).
+        let mut cores = vec![
+            vlabr("10.255.1.1", "10.10.0.1", "10.20.0.1", "10.255.2.1"), // R1
+            vlabr("10.255.2.1", "10.30.0.1", "10.21.0.2", "10.255.1.1"), // R2
+            // RM: the transit middle router (area 1 only).
+            Ospfd::new(&parse_config(
+                "router ospf\n router-id 10.255.9.1\n area 0.0.0.1\n  interface eth0\n                    address 10.20.0.2/30\n   network-type point-to-point\n   hello-interval 1\n                   dead-interval 4\n  interface eth1\n   address 10.21.0.1/30\n                    network-type point-to-point\n   hello-interval 1\n   dead-interval 4\n",
+            )
+            .unwrap())
+            .unwrap(),
+            // R4 off R2's backbone half.
+            Ospfd::new(&parse_config(
+                "router ospf\n router-id 10.255.4.1\n area 0.0.0.0\n  interface eth0\n                     address 10.30.0.2/30\n   network-type point-to-point\n   hello-interval 1\n                   dead-interval 4\n",
+            )
+            .unwrap())
+            .unwrap(),
+        ];
+        // Settle (the deliver_vl shape: unicast by destination
+        // address across any core — the vlink packets model the
+        // IP-routed path through RM).
+        fn deliver_vl(
+            cores: &mut [Ospfd],
+            from: usize,
+            outs: &[WireOut],
+            now: u64,
+            queue: &mut Vec<(usize, Vec<WireOut>)>,
+        ) {
+            for w in outs {
+                let src = cores[from].interfaces[w.iface].addr;
+                let payload = crate::auth::encode_for_wire(
+                    &w.packet,
+                    &cores[from].interfaces[w.iface].cfg.auth,
+                );
+                let pkt_area = w.packet.header.area_id;
+                let dst = match w.to {
+                    WireTo::Unicast(d) => Some(d),
+                    _ => None,
+                };
+                for (i, core) in cores.iter_mut().enumerate() {
+                    if i == from {
+                        continue;
+                    }
+                    let Some(rx) = core.interfaces.iter().position(|x| match dst {
+                        Some(d) => x.addr == d,
+                        None => x.area == pkt_area,
+                    }) else {
+                        continue;
+                    };
+                    let replies = core.on_packet(
+                        rx,
+                        &crate::transport::Received {
+                            src,
+                            dst: crate::packet::ALL_SPF_ROUTERS,
+                            payload: payload.clone(),
+
+                            ttl: 1,
+                        },
+                        now,
+                    );
+                    if !replies.is_empty() {
+                        queue.push((i, replies));
+                    }
+                }
+            }
+        }
+        let mut zap = Vec::new();
+        for now in 0..40u64 {
+            let mut outs: Vec<Vec<WireOut>> = cores.iter_mut().map(|_| Vec::new()).collect();
+            for (i, o) in outs.iter_mut().enumerate() {
+                cores[i].tick(now, o, &mut zap);
+            }
+            let mut queue: Vec<(usize, Vec<WireOut>)> = Vec::new();
+            for (i, o) in outs.iter().enumerate() {
+                if !o.is_empty() {
+                    deliver_vl(&mut cores, i, o, now, &mut queue);
+                }
+            }
+            while !queue.is_empty() {
+                let batch = std::mem::take(&mut queue);
+                for (from, o) in batch {
+                    deliver_vl(&mut cores, from, &o, now, &mut queue);
+                }
+            }
+        }
+        // The §16.1 step-4 resolution: the vlink peer address is R2's
+        // OWN address on the RM-R2 link — not RM's first-hop address.
+        let vlink = cores[0]
+            .interfaces
+            .iter()
+            .find(|i| i.virtual_link)
+            .expect("R1's vlink interface");
+        assert_eq!(
+            vlink.vlink_peer_ip,
+            Some(ip("10.21.0.2")),
+            "the multi-hop endpoint resolves to R2's own transit-facing address (16.1 step 4)"
+        );
+        // The vlink adjacency is Full, and R1's backbone router-LSA
+        // carries the type-4 link.
+        let peer = cores[1].router_id;
+        assert_eq!(
+            vlink.neighbors.get(&peer).map(|c| c.state()),
+            Some(NeighborState::Full),
+            "the vlink adjacency formed over the two-hop transit"
+        );
+        let r1_router = lsdb_of(&cores[0])
+            .get(&LsaKey {
+                ls_type: LsaType::ROUTER,
+                link_state_id: crate::lsa::LinkStateId(cores[0].router_id.0),
+                adv_router: cores[0].router_id,
+            })
+            .map(|e| e.lsa.clone())
+            .expect("R1's backbone router-LSA");
+        let crate::lsa::LsaBody::Router(body) = r1_router.body else {
+            panic!()
+        };
+        assert!(
+            body.links
+                .iter()
+                .any(|l| l.link_type == crate::lsa::LinkType::Virtual && l.link_id.0 == peer.0),
+            "the type-4 virtual link in the backbone router-LSA"
+        );
+        // And the partitioned backbone routes: R4's stub reachable
+        // from R1 through the vlink.
+        assert!(
+            cores[0].routes.contains_key("10.30.0.0/30"),
+            "R1 routes R2's backbone half through the multi-hop vlink: {:?}",
+            cores[0].routes.keys().collect::<Vec<_>>()
         );
     }
 

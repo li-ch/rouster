@@ -100,7 +100,12 @@ pub struct Conversation {
     /// §10.9: the Link State Request list.
     pub requests: Vec<LsRequestId>,
     /// §13.3: the retransmission list (LSAs sent, not yet acked).
-    pub rxmt: Vec<(LsaKey, Vec<u8>)>,
+    /// (key, the queued instance's sequence number, encoded bytes) —
+    /// §13.5's sequence-aware clearing: an ack for an OLDER instance
+    /// must not retire a newer queued retransmission (the MinLSArrival
+    /// discard case: the peer treats the too-fresh instance "as if the
+    /// same instance" and may acknowledge its DATABASE copy).
+    pub rxmt: Vec<(LsaKey, u32, Vec<u8>)>,
     rxmt_deadline: Option<u64>,
     dd_deadline: Option<u64>,
     last_dd_sent: Option<DbDescription>,
@@ -489,7 +494,7 @@ impl Conversation {
                 self.requests
                     .retain(|r| !Self::request_matches(r, &lsa.header));
             }
-            let on_rxmt = self.rxmt.iter().any(|(k, _)| *k == key);
+            let on_rxmt = self.rxmt.iter().any(|(k, _, _)| *k == key);
             let action = flood_step(
                 &lsa.encode(),
                 lsdb,
@@ -555,8 +560,14 @@ impl Conversation {
     /// §13.5/§13.6: one received Link State Acknowledgment — direct
     /// acks clear the retransmission list.
     pub fn handle_lsack(&mut self, headers: &[LsaHeader]) {
-        let keys: Vec<LsaKey> = headers.iter().map(LsaKey::from_header).collect();
-        self.rxmt.retain(|(k, _)| !keys.contains(k));
+        // §13.5: a DIRECT ack retires the retransmission only when it
+        // covers the queued instance (an ack for an older instance —
+        // the MinLSArrival same-instance treatment — does not).
+        for h in headers {
+            let key = LsaKey::from_header(h);
+            self.rxmt
+                .retain(|(k, seq, _)| *k != key || (h.seq as i32) < (*seq as i32));
+        }
         if self.rxmt.is_empty() {
             self.rxmt_deadline = None;
         }
@@ -565,8 +576,10 @@ impl Conversation {
     /// §13.3's implied acknowledgment: an LSU carrying an instance we
     /// flooded to this neighbor.
     pub fn implied_ack(&mut self, header: &LsaHeader) {
+        // The same sequence-aware rule as the direct acks.
         let key = LsaKey::from_header(header);
-        self.rxmt.retain(|(k, _)| *k != key);
+        self.rxmt
+            .retain(|(k, seq, _)| *k != key || (header.seq as i32) < (*seq as i32));
         if self.rxmt.is_empty() {
             self.rxmt_deadline = None;
         }
@@ -576,8 +589,14 @@ impl Conversation {
     /// retransmission list (unacked until LSAck/implied ack).
     pub fn queue_retransmit(&mut self, lsa: &Lsa, now: u64) {
         let key = lsa.key();
-        if !self.rxmt.iter().any(|(k, _)| *k == key) {
-            self.rxmt.push((key, lsa.encode()));
+        if let Some((_, seq, bytes)) = self.rxmt.iter_mut().find(|(k, _, _)| *k == key) {
+            // A newer instance supersedes the queued one.
+            if lsa.header.seq as i32 > *seq as i32 {
+                *seq = lsa.header.seq;
+                *bytes = lsa.encode();
+            }
+        } else {
+            self.rxmt.push((key, lsa.header.seq, lsa.encode()));
         }
         self.rxmt_deadline = Some(now + self.params.rxmt_interval);
     }
@@ -636,7 +655,7 @@ impl Conversation {
                 let lsas: Vec<Lsa> = self
                     .rxmt
                     .iter()
-                    .filter_map(|(_, bytes)| Lsa::decode(bytes).ok())
+                    .filter_map(|(_, _, bytes)| Lsa::decode(bytes).ok())
                     .collect();
                 if !lsas.is_empty() {
                     sends.push(self.send(PacketBody::LsUpdate(LsUpdate { lsas })));
@@ -691,6 +710,7 @@ mod tests {
             false,
             &[InterfaceAdv {
                 state: InterfaceState::PointToPoint,
+                ifindex: 0,
                 p2p: true,
                 address: Ipv4Addr::new(10, 0, (n % 250) as u8, 1),
                 mask: "255.255.255.252".parse().unwrap(),

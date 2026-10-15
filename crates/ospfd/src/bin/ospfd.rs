@@ -231,7 +231,14 @@ fn main() {
         // (merged) interface address.
         let mut sockets = Vec::new();
         for iface in &core.interfaces {
-            match OspfRawSocket::open(iface.addr) {
+            // §15: a virtual link's socket carries the ROUTED TTL
+            // (its packets transit the area's routers).
+            let open = if iface.virtual_link {
+                OspfRawSocket::open_vlink
+            } else {
+                OspfRawSocket::open
+            };
+            match open(iface.addr) {
                 Ok(sock) => {
                     info!(iface = %iface.name, addr = %iface.addr, "ospfd: raw socket open");
                     sockets.push(Arc::new(sock));
