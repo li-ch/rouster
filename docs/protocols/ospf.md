@@ -912,6 +912,29 @@ ranges still installs).
   and its up-state rides zebra NHT our zapi server does not feed) —
   both endpoints run ours; the FRR-endpoint form stays §Deferred.
 
+## The S10-e round (2026-10-15): the v3 interop REDIST-IN flake
+
+The `test-ospfv3-frr-interop.sh` REDIST-IN machine check ("our ospfd
+installed FRR's external route") failed ~half the runs after S10-b
+landed. Root cause (ours, `daemon_v3`): the own router-LSA
+re-origination at adjacency FULL is MinLSInterval-deferred (FULL
+arrives <5 s after the t=0 startup origination) and lands later from
+the tick retry — and that landing did not re-dirty the SPF. The cached
+§4.8 result therefore kept the pre-adjacency graph (`routers=[]`)
+forever whenever the peer sent no post-Full router-LSA refresh (FRR
+refreshes ~5 s after ITS Full — its LSA min-arrival — so whether the
+refresh re-dirtied our SPF before the external arrived was a pure
+race); every §16.4 external then resolved its ASBR against an empty
+routers set and never installed. The green runs were green only via
+FRR's refresh. Fix: `originate_router_lsa` marks the SPF dirty when a
+landed instance changed contents — the parity the v2 seam always had
+(`daemon.rs` marks on every own router-LSA origination). Pinned by
+`deferred_own_router_lsa_landing_reruns_spf_and_installs_external`
+(the silent-peer shape; it fails exactly on the field symptom without
+the fix) and six consecutive green interop runs. Riding along: the
+§16.4 skip reasons and the SPF-ran router set now log under
+`ROUSTER_OSPFV3_TRACE` (the instrumentation that caught it).
+
 ## §Deferred (updated S10-b, 2026-10-15)
 
 - §16.3 (transit areas' summary-LSAs — the V-bit lands with the

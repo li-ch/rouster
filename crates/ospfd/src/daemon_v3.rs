@@ -1624,6 +1624,16 @@ impl OspfdV3 {
                 &self.lsdb,
                 &links,
             ));
+            if std::env::var_os("ROUSTER_OSPFV3_TRACE").is_some() {
+                info!(
+                    routers = ?self
+                        .last_spf
+                        .as_ref()
+                        .map(|s| s.routers.iter().map(|r| r.router).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                    "ospfv3: SPF ran"
+                );
+            }
         }
         if recompute || self.table_dirty {
             self.table_dirty = false;
@@ -2056,11 +2066,30 @@ impl OspfdV3 {
     fn originate_router_lsa(&mut self, now: u64, out: &mut Vec<WireOutV3>) {
         let lsa = self.build_router_lsa();
         let key = lsa.key();
-        if self.lsdb.originate(lsa, now).is_ok() {
-            self.router_lsa_dirty = false;
-            let stored = self.lsdb.get(&key).map(|e| e.lsa.clone());
-            if let Some(lsa) = stored {
-                self.flood_own(&lsa, now, out);
+        match self.lsdb.originate(lsa, now) {
+            Ok(outcome) => {
+                self.router_lsa_dirty = false;
+                let stored = self.lsdb.get(&key).map(|e| e.lsa.clone());
+                if let Some(lsa) = stored {
+                    self.flood_own(&lsa, now, out);
+                }
+                // §16.5 (the v2 seam's parity — daemon.rs marks the
+                // area dirty on every landed own router-LSA): a landed
+                // instance with changed contents is an area-topology
+                // change. The MinLSInterval deferral makes this
+                // load-bearing — adjacency FULL inside 5 s of the
+                // startup origination is rejected here and retried
+                // from tick, and THAT landing must rerun the §4.8
+                // walk or the cached result keeps the pre-adjacency
+                // graph forever (every later §16.4 external then
+                // resolves its ASBR against an empty routers set).
+                if matches!(outcome, InstallOutcome::Installed { changed: true }) {
+                    self.mark_spf_dirty(now);
+                }
+            }
+            Err(_) => {
+                // MinLSInterval not elapsed — keep the dirty flag;
+                // tick retries until the instance lands.
             }
         }
     }
@@ -2266,6 +2295,7 @@ impl OspfdV3 {
             want.insert(route.prefix.to_string(), entry);
         }
         // ---- the external routes (4.8.5 = 16.4) ----
+        let trace = std::env::var_os("ROUSTER_OSPFV3_TRACE").is_some();
         for entry in self.lsdb.all() {
             if entry.lsa.header.ls_type != V3_AS_EXTERNAL || entry.lsa.header.is_max_age() {
                 continue;
@@ -2278,6 +2308,13 @@ impl OspfdV3 {
                 continue;
             };
             if body.metric >= crate::LS_INFINITY {
+                if trace {
+                    info!(
+                        adv = %entry.lsa.header.adv_router,
+                        metric = body.metric,
+                        "ospfv3: external skipped: metric infinity"
+                    );
+                }
                 continue; // §16.4 step (5): unreachable
             }
             // (3) the ASBR distance from the SPF's router entries.
@@ -2290,6 +2327,13 @@ impl OspfdV3 {
                 .iter()
                 .find(|r| r.router == entry.lsa.header.adv_router)
             else {
+                if trace {
+                    info!(
+                        adv = %entry.lsa.header.adv_router,
+                        routers = ?spf.routers.iter().map(|r| r.router).collect::<Vec<_>>(),
+                        "ospfv3: external skipped: ASBR not in SPF routers"
+                    );
+                }
                 continue; // ASBR unreachable
             };
             // (3b) the forwarding address: the F bit (4.8.5's rule —
@@ -2303,6 +2347,9 @@ impl OspfdV3 {
                     .filter(|r| r.prefix.prefix_len() > 0 && r.prefix.contains(fa))
                     .max_by_key(|r| r.prefix.prefix_len());
                 let Some(fa_path) = fa_path else {
+                    if trace {
+                        info!(fa = %fa, "ospfv3: external skipped: FA without intra path");
+                    }
                     continue; // FA must have an intra-area path
                 };
                 (fa_path.cost, fa_path.next_hops.clone())
@@ -2324,6 +2371,13 @@ impl OspfdV3 {
             }
             let group = self.hops_to_group(&hops);
             if group.is_empty() {
+                if trace {
+                    info!(
+                        adv = %entry.lsa.header.adv_router,
+                        hops = ?hops,
+                        "ospfv3: external skipped: no decorated nexthop"
+                    );
+                }
                 continue;
             }
             let route = RouteEntry::new(IpPrefix::V6(prefix), RouteProtocol::Ospf, group, cost);
@@ -3022,6 +3076,165 @@ mod tests {
         a.on_redistribute_del(&route, 110, &mut out);
         assert!(a.externals.is_empty());
         assert!(!a.asbr, "no longer an ASBR");
+    }
+
+    /// S10-e regression (the interop REDIST-IN flake): the
+    /// MinLSInterval-deferred own router-LSA re-origination must
+    /// re-dirty the SPF when it lands from the tick retry. The field
+    /// shape: adjacency FULL arrives <5 s after the t=0 startup
+    /// origination, so the with-link instance is rejected here and
+    /// retried later; the peer's exchange-time router-LSA already
+    /// carried the back-link, and the peer sends NO post-Full refresh
+    /// (the FRR runs that fail). Without the landing-side re-dirty the
+    /// cached SPF keeps the pre-adjacency graph (routers=[]) forever
+    /// and every §16.4 external resolves its ASBR against nothing —
+    /// the "route installed" that never came.
+    #[test]
+    fn deferred_own_router_lsa_landing_reruns_spf_and_installs_external() {
+        let ll_a: Ipv6Addr = "fe80::aa".parse().unwrap();
+        let ll_b: Ipv6Addr = "fe80::bb".parse().unwrap();
+        let mut a = core_v3(0x0a00_0001, ll_a, 11, 0);
+        let mut b = core_v3(0x0a00_0002, ll_b, 22, 0);
+        // Bring-up to Full WITHOUT run_to_full's settle drain: stop at
+        // the first Full (inside MinLSInterval of the t=0 startup
+        // origination), and never tick the peer again afterward — the
+        // silent-peer shape that unmasks the deferral.
+        let is_full = |c: &OspfdV3| {
+            c.neighbor_states()
+                .iter()
+                .any(|(_, _, s)| *s == NeighborState::Full)
+        };
+        let mut now = 0;
+        for _ in 0..10 {
+            let mut out_a = Vec::new();
+            let mut out_b = Vec::new();
+            a.tick(now, &mut out_a);
+            b.tick(now, &mut out_b);
+            let mut queue: Vec<(bool, Vec<WireOutV3>)> = vec![(true, out_a), (false, out_b)];
+            for _ in 0..128 {
+                match queue.pop() {
+                    Some((_, drained)) if drained.is_empty() => continue,
+                    Some((to_b, drained)) => {
+                        let replies = if to_b {
+                            deliver(&mut a, &mut b, drained, now)
+                        } else {
+                            deliver(&mut b, &mut a, drained, now)
+                        };
+                        queue.push((!to_b, replies));
+                    }
+                    None => break,
+                }
+            }
+            now += 1;
+            assert!(now < 10, "no Full within 10 s");
+            if is_full(&a) && is_full(&b) {
+                break;
+            }
+        }
+        assert!(now < 5, "Full inside MinLSInterval (was t={now})");
+        assert!(
+            a.router_lsa_dirty,
+            "the with-link re-origination is deferred (MinLSInterval)"
+        );
+        // B's post-Full router-LSA lands straight in A's database (the
+        // exchange-carried-with-link shape) and dirties the SPF — as
+        // the LSU arrival did in the field.
+        let b_rtr = LsaV3 {
+            header: LsaHeaderV3 {
+                ls_age: 1,
+                ls_type: V3_ROUTER,
+                link_state_id: LinkStateId(0),
+                adv_router: RouterId(0x0a00_0002),
+                seq: 0x8000_0002,
+                checksum: 0,
+                length: 0,
+            },
+            body: LsaBodyV3::Router(RouterLsaV3 {
+                nt_bit: false,
+                v_bit: false,
+                e_bit: true,
+                b_bit: false,
+                options: our_options(),
+                links: vec![RouterLinkV3 {
+                    link_type: LinkTypeV3::PointToPoint,
+                    metric: 1,
+                    interface_id: 22,
+                    neighbor_interface_id: 11,
+                    neighbor_router_id: RouterId(0x0a00_0001),
+                }],
+            }),
+        };
+        a.lsdb.install(b_rtr, false, now);
+        a.mark_spf_dirty(now);
+        a.maybe_spf(now + 1);
+        assert!(
+            a.last_spf.as_ref().is_some_and(|s| s.routers.is_empty()),
+            "the cached SPF is still the pre-adjacency graph (A's own \
+             router-LSA has no links yet)"
+        );
+        // The deferred instance lands at t=5 (tick retry). From there
+        // the SPF must rerun within a bounded wait — the landing itself
+        // re-dirties it.
+        let mut healed = false;
+        for t in 5..12u64 {
+            let mut out = Vec::new();
+            a.tick(t, &mut out);
+            if a.last_spf.as_ref().is_some_and(|s| !s.routers.is_empty()) {
+                assert_eq!(
+                    a.last_spf.as_ref().unwrap().routers[0].router,
+                    RouterId(0x0a00_0002),
+                    "the peer became reachable once our own link landed"
+                );
+                healed = true;
+                break;
+            }
+        }
+        assert!(healed, "the landed router-LSA never reran the SPF");
+        // The §16.4 leg: B's external arrives (table-only class) and
+        // now resolves its ASBR through the healthy cached SPF.
+        let ext = LsaV3 {
+            header: LsaHeaderV3 {
+                ls_age: 1,
+                ls_type: V3_AS_EXTERNAL,
+                link_state_id: LinkStateId(0),
+                adv_router: RouterId(0x0a00_0002),
+                seq: 0x8000_0001,
+                checksum: 0,
+                length: 0,
+            },
+            body: LsaBodyV3::AsExternal(AsExternalLsaV3 {
+                e_bit: true,
+                f_bit: false,
+                t_bit: false,
+                metric: 20,
+                prefix: Prefix {
+                    len: 64,
+                    options: Default::default(),
+                    addr: prefix_bytes(&"2001:db8:88::/64".parse().unwrap()),
+                },
+                referenced_ls_type: 0,
+                forwarding_address: None,
+                external_route_tag: None,
+                referenced_link_state_id: None,
+            }),
+        };
+        a.lsdb.install(ext, false, 12);
+        a.table_dirty = true;
+        a.maybe_spf(12);
+        let routes = a.installed_routes();
+        assert_eq!(routes.len(), 1, "the external installed: {:?}", routes);
+        assert_eq!(
+            routes[0].prefix,
+            IpPrefix::V6("2001:db8:88::/64".parse().unwrap())
+        );
+        assert_eq!(routes[0].metric, 20, "type-2 metric as-is");
+        match routes[0].nexthops.hops()[0].0 {
+            Nexthop::Ipv6If(gw, ifindex) => {
+                assert_eq!(gw, ll_b, "gateway is B's link-local (2.5)");
+                assert_eq!(ifindex, 11, "A's interface");
+            }
+            other => panic!("wrong nexthop shape: {other:?}"),
+        }
     }
 
     #[test]
