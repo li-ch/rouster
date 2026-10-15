@@ -228,4 +228,6 @@ pure Rust where holo binds C libyang).
   identical, so nothing is thrown away when gNMI is wanted.
 - **D** — defer; revisit when an operator asks.
 
-Decide: ____
+**DECIDED: C (owner, 2026-10-15).** The RESTCONF-shaped edge is
+authorized; gNMI stays the documented next step (option A's
+datastore semantics map identically when wanted).

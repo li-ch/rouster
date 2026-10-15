@@ -53,35 +53,27 @@ fn unhex(s: &str) -> Vec<u8> {
 
 fn corpus() -> Vec<(&'static str, Vec<FixtureMessage>)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    [
-        "staticd-10.2.2.log",
-        "bgpd-10.2.2.log",
-        "ospfd-10.2.2.log",
-    ]
-    .iter()
-    .map(|f| {
-        let msgs = parse_fixture(&dir.join(f));
-        (*f, msgs)
-    })
-    .collect()
+    ["staticd-10.2.2.log", "bgpd-10.2.2.log", "ospfd-10.2.2.log"]
+        .iter()
+        .map(|f| {
+            let msgs = parse_fixture(&dir.join(f));
+            (*f, msgs)
+        })
+        .collect()
 }
 
 fn bench_decode(c: &mut Criterion) {
     for (name, msgs) in corpus() {
-        c.bench_with_input(
-            BenchmarkId::new("zapi_decode", name),
-            &msgs,
-            |b, msgs| {
-                b.iter(|| {
-                    for m in msgs {
-                        let _ = ZapiMessage::decode(
-                            criterion::black_box(m.cmd),
-                            criterion::black_box(&m.body),
-                        );
-                    }
-                })
-            },
-        );
+        c.bench_with_input(BenchmarkId::new("zapi_decode", name), &msgs, |b, msgs| {
+            b.iter(|| {
+                for m in msgs {
+                    let _ = ZapiMessage::decode(
+                        criterion::black_box(m.cmd),
+                        criterion::black_box(&m.body),
+                    );
+                }
+            })
+        });
     }
 }
 
@@ -89,7 +81,12 @@ fn bench_encode(c: &mut Criterion) {
     for (name, msgs) in corpus() {
         let decoded: Vec<(u16, ZapiMessage)> = msgs
             .iter()
-            .map(|m| (m.cmd, ZapiMessage::decode(m.cmd, &m.body).expect("fixture decodes")))
+            .map(|m| {
+                (
+                    m.cmd,
+                    ZapiMessage::decode(m.cmd, &m.body).expect("fixture decodes"),
+                )
+            })
             .collect();
         c.bench_with_input(
             BenchmarkId::new("zapi_encode_body", name),

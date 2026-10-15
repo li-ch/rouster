@@ -451,3 +451,9 @@ The phase text above is unchanged; this block is status only.
   C RESTCONF-shaped edge, OWNER DECISION BLOCK unfilled). Gate
   1715/0 (+92), fmt/clippy clean incl. an integration sweep over a
   concurrent session's mrt-replay tail.
+
+- 2026-10-15 (evening) — Owner decision (docs/yang.md §gNMI-transport):
+  **C adopted** — the RESTCONF-shaped HTTP/1.1 edge on the landed
+  tree ops + RFC 7951 dump, no new dependencies; gNMI remains the
+  documented next step (A's datastore semantics map identically).
+  Dispatched as the S12 stream.
