@@ -374,9 +374,7 @@ fn display_directives(config: &SessionConfig) -> Vec<String> {
                     }
                 }
             }
-            ("line", NodeKind::Container(children))
-                if children.iter().any(|c| c.name == "vty") =>
-            {
+            ("line", NodeKind::Container(children)) if children.iter().any(|c| c.name == "vty") => {
                 out.push("! vtyd: line vty".to_string());
             }
             _ => {}
@@ -513,8 +511,7 @@ fn modeled_body(daemon: &str, config: &SessionConfig) -> Vec<String> {
                                                             if val(leaf).is_some() =>
                                                         {
                                                             body.push(
-                                                                "! redistribute static"
-                                                                    .to_string(),
+                                                                "! redistribute static".to_string(),
                                                             );
                                                         }
                                                         _ => {}
