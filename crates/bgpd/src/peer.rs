@@ -245,6 +245,10 @@ impl SessionShared {
 /// One live BGP session over an established stream.
 pub struct PeerSession<IO> {
     io: IO,
+    /// F7: the session's persistent read buffer. Frames are drained
+    /// from it synchronously after every select cycle; a cancelled
+    /// refill can never lose mid-frame bytes (see [`read_append`]).
+    read_pending: Vec<u8>,
     fsm: Fsm,
     local_as: u32,
     local_hold: u16,
@@ -371,6 +375,7 @@ where
         let now = tokio::time::Instant::now();
         Self {
             io,
+            read_pending: Vec::new(),
             fsm: Fsm::new(local.clone()),
             local_as: local.local_as,
             local_hold: local.hold_time,
@@ -645,29 +650,54 @@ where
             let asn4 = self.fsm.negotiated().is_none_or(|n| n.asn4);
             let handling = self.current_update_handling();
             let add_path = self.current_add_path_ctx();
+            // F7: drain every complete frame already buffered before
+            // waiting again. Bytes reach `read_pending` through a
+            // single bounded `read`, which consumes socket bytes only
+            // when its poll returns Ready — and Ready selects this
+            // branch — so no mid-frame state can be lost to a dropped
+            // future. The old multi-`read_exact` reader could lose an
+            // already-consumed header or body half exactly when a
+            // timer branch won the select, desyncing the stream
+            // ("marker is not all ones", §6.1).
+            while let FrameTake::Frame(read) =
+                take_frame(&mut self.read_pending, asn4, handling, add_path)
+            {
+                match read {
+                    Ok(decoded) => {
+                        if let Some(end) = self.on_message(decoded, sink).await {
+                            return end;
+                        }
+                    }
+                    Err(bgp_err) => {
+                        // Route the malformed message to the right
+                        // FSM error event by class (§6.1-§6.3).
+                        let event = match bgp_err.notification {
+                            Some((1, sub)) => Event::BgpHeaderErr(1, sub),
+                            Some((2, sub)) => Event::BgpOpenMsgErr(2, sub),
+                            // §6.3: the prescribed subcode rides the
+                            // NOTIFICATION (previously flattened to 1).
+                            other => Event::UpdateMsgErr(3, other.map(|(_, s)| s).unwrap_or(1)),
+                        };
+                        warn!(?bgp_err, peer = %self.peer.address, "bgpd: malformed message");
+                        if let Some(end) = self.step(event, sink).await {
+                            return end;
+                        }
+                    }
+                }
+            }
             tokio::select! {
-                read = read_frame_with(&mut self.io, asn4, handling, add_path) => {
+                read = read_append(&mut self.io, &mut self.read_pending) => {
                     match read {
-                        Ok(Ok(decoded)) => {
-                            if let Some(end) = self.on_message(decoded, sink).await {
-                                return end;
-                            }
+                        Ok(0) => {
+                            // EOF: the peer closed the socket.
+                            let actions = self.fsm.fire(Event::TcpConnectionFails);
+                            let _ = self.perform_all(actions, sink).await;
+                            #[cfg(feature = "experimental-savnet")]
+                            self.sav_adjacency_down();
+                            self.end = Some(SessionEnd::Transport("connection closed".into()));
+                            return self.end.clone().unwrap();
                         }
-                        Ok(Err(bgp_err)) => {
-                            // Route the malformed message to the right
-                            // FSM error event by class (§6.1-§6.3).
-                            let event = match bgp_err.notification {
-                                Some((1, sub)) => Event::BgpHeaderErr(1, sub),
-                                Some((2, sub)) => Event::BgpOpenMsgErr(2, sub),
-                                // §6.3: the prescribed subcode rides the
-                                // NOTIFICATION (previously flattened to 1).
-                                other => Event::UpdateMsgErr(3, other.map(|(_, s)| s).unwrap_or(1)),
-                            };
-                            warn!(?bgp_err, peer = %self.peer.address, "bgpd: malformed message");
-                            if let Some(end) = self.step(event, sink).await {
-                                return end;
-                            }
-                        }
+                        Ok(_) => {}
                         Err(io_err) => {
                             let actions = self.fsm.fire(Event::TcpConnectionFails);
                             let _ = self.perform_all(actions, sink).await;
@@ -942,12 +972,13 @@ where
                     warn!(peer = %self.peer.address, "bgpd: UPDATE rejected, own AS in AS_PATH (§9.5)");
                     return self.step(Event::UpdateMsg, sink).await;
                 }
-                let announced: Vec<String> =
-                    update.announced().iter().map(|p| p.to_string()).collect();
                 let withdrawn = update.withdrawn_all();
+                // F5: counts, never the full prefix list — building
+                // the string list was O(prefixes) per UPDATE on the
+                // hot path.
                 info!(
                     peer = %self.peer.address,
-                    announced = announced.join(","),
+                    announced = update.announced().len(),
                     withdrawn = withdrawn.len(),
                     "bgpd: UPDATE received"
                 );
@@ -1334,6 +1365,72 @@ pub async fn read_frame_with<IO: AsyncRead + Unpin>(
             },
         ),
     )
+}
+
+/// What [`take_frame`] extracted from the session read buffer.
+enum FrameTake {
+    /// A complete frame was consumed (decoded, or failed the §6.1
+    /// header checks exactly as the wire path would).
+    Frame(BgpResult<DecodedFrame>),
+    /// No complete frame is buffered yet — wait for more bytes.
+    Incomplete,
+}
+
+/// The synchronous half of the F7 fix: extract one complete frame
+/// from the session's persistent read buffer, applying the same
+/// header validation [`read_frame_with`] applies on the wire. The
+/// buffer is only ever cleared on a header error — §6.1 prescribes
+/// the NOTIFICATION and no resynchronization.
+fn take_frame(
+    buf: &mut Vec<u8>,
+    asn4: bool,
+    handling: UpdateHandling,
+    add_path: AddPathCtx,
+) -> FrameTake {
+    if buf.len() < BGP_HEADER_LEN as usize {
+        return FrameTake::Incomplete;
+    }
+    if buf[..16] != BGP_MARKER {
+        buf.clear();
+        return FrameTake::Frame(Err(BgpError::notify(
+            error::error_code::MESSAGE_HEADER,
+            error::header_subcode::CONNECTION_NOT_SYNCHRONIZED,
+            "marker is not all ones (§6.1)",
+        )));
+    }
+    let length = u16::from_be_bytes([buf[16], buf[17]]);
+    if !(BGP_HEADER_LEN..=BGP_MAX_MESSAGE_LEN).contains(&length) {
+        buf.clear();
+        return FrameTake::Frame(Err(BgpError::notify(
+            error::error_code::MESSAGE_HEADER,
+            error::header_subcode::BAD_MESSAGE_LENGTH,
+            format!("length {length} outside 19..=4096"),
+        )));
+    }
+    if buf.len() < length as usize {
+        return FrameTake::Incomplete;
+    }
+    let frame: Vec<u8> = buf.drain(..length as usize).collect();
+    FrameTake::Frame(
+        BgpMessage::decode_with_handling(&frame, asn4, handling, add_path).map(
+            |(message, outcome)| DecodedFrame {
+                message,
+                outcome,
+                frame,
+            },
+        ),
+    )
+}
+
+/// The cancel-safe refill half of the F7 fix: one bounded `read`
+/// appending to the session's persistent buffer. A dropped pending
+/// read has consumed nothing from the socket; a completed read's
+/// bytes are already in `buf` whichever branch the select takes.
+async fn read_append<IO: AsyncRead + Unpin>(io: &mut IO, buf: &mut Vec<u8>) -> io::Result<usize> {
+    let mut chunk = [0u8; 16384];
+    let n = io.read(&mut chunk).await?;
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(n)
 }
 
 /// The v1 Adj-RIB-Out source: the `network` lines from the config,

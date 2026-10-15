@@ -514,6 +514,8 @@ impl LocRib {
     /// candidate — "the procedures for adding, deleting, and
     /// advertising routes are unchanged" apart from the widened key —
     /// and the Loc-RIB still elects exactly one best per prefix.
+    /// Session-level events (peer clear, stale flush, soft reset);
+    /// the per-UPDATE hot path is [`Self::recompute_prefix`].
     pub fn recompute(&mut self) -> Vec<BestChange> {
         // Union of the candidates' prefixes and the current best
         // table: a prefix whose every candidate vanished must still
@@ -528,28 +530,50 @@ impl LocRib {
         prefixes.dedup();
         let mut changes = Vec::new();
         for prefix in prefixes {
-            let candidates: Vec<Route> = self
-                .adj_in
-                .values()
-                .flat_map(|rib| rib.values().filter(|r| r.prefix == prefix))
-                .cloned()
-                .collect();
-            let new_best = best_path(&candidates).cloned();
-            let old_best = self.best.get(&prefix).cloned();
-            if new_best.as_ref() != old_best.as_ref() {
-                if let Some(route) = &new_best {
-                    self.best.insert(prefix, route.clone());
-                } else {
-                    self.best.remove(&prefix);
-                }
-                changes.push(BestChange {
-                    prefix,
-                    best: new_best,
-                    old: old_best,
-                });
-            }
+            changes.extend(self.recompute_prefix(prefix));
         }
         changes
+    }
+
+    /// The one-prefix half of [`Self::recompute`]: elect the best
+    /// path for exactly one prefix and return its change, if any.
+    /// The §9.1 decision process is per-prefix, so this is
+    /// semantically identical to the bulk walk restricted to that
+    /// prefix — and costs O(log n) candidate lookup (the Nlri key
+    /// orders by prefix first, so each peer's Adj-RIB-In is range-
+    /// scanned, never flattened). The UPDATE hot path calls this for
+    /// exactly the prefixes a message touched (bench F1: the old
+    /// full-table recompute per UPDATE made ingestion O(n²)).
+    pub fn recompute_prefix(&mut self, prefix: IpPrefix) -> Vec<BestChange> {
+        let lo = Nlri {
+            prefix,
+            path_id: u32::MIN,
+        };
+        let hi = Nlri {
+            prefix,
+            path_id: u32::MAX,
+        };
+        let candidates: Vec<Route> = self
+            .adj_in
+            .values()
+            .flat_map(|rib| rib.range(lo..=hi).map(|(_, r)| r))
+            .cloned()
+            .collect();
+        let new_best = best_path(&candidates).cloned();
+        let old_best = self.best.get(&prefix).cloned();
+        if new_best.as_ref() == old_best.as_ref() {
+            return Vec::new();
+        }
+        if let Some(route) = &new_best {
+            self.best.insert(prefix, route.clone());
+        } else {
+            self.best.remove(&prefix);
+        }
+        vec![BestChange {
+            prefix,
+            best: new_best,
+            old: old_best,
+        }]
     }
 
     pub fn best_routes(&self) -> impl Iterator<Item = &Route> {
@@ -639,14 +663,22 @@ impl RibSink {
 impl RouteSink for RibSink {
     fn announce(&mut self, peer: &PeerInfo, update: &BgpUpdate) {
         let mut rib = self.rib.lock().unwrap();
+        // Per-prefix recompute for exactly the touched prefixes (F1):
+        // a rejected-by-policy prefix simply elects its unchanged
+        // best and yields no change.
+        let touched: Vec<IpPrefix> = update.announced().into_iter().map(|n| n.prefix).collect();
         rib.announce(peer, update);
-        self.changes.extend(rib.recompute());
+        for prefix in touched {
+            self.changes.extend(rib.recompute_prefix(prefix));
+        }
     }
 
     fn withdraw(&mut self, peer: &PeerInfo, nlris: &[Nlri]) {
         let mut rib = self.rib.lock().unwrap();
         rib.withdraw(peer, nlris);
-        self.changes.extend(rib.recompute());
+        for nlri in nlris {
+            self.changes.extend(rib.recompute_prefix(nlri.prefix));
+        }
     }
 
     fn clear_peer(&mut self, peer: &PeerInfo) {
@@ -1247,6 +1279,76 @@ mod tests {
     #[test]
     fn best_path_empty_is_none() {
         assert!(best_path(&[]).is_none());
+    }
+
+    #[test]
+    fn incremental_recompute_matches_bulk() {
+        // F1's equivalence bar: driving the UPDATE hot path through
+        // recompute_prefix (per touched prefix) lands the same best
+        // table and the same change stream as the bulk recompute.
+        let mut bulk = LocRib::new(65000);
+        let mut incr = LocRib::new(65000);
+        let p1 = peer("192.0.2.1", 65001, 1);
+        let p2 = peer("192.0.2.2", 65002, 2);
+        let px: Vec<IpPrefix> = ["203.0.113.0/24", "198.51.100.0/24", "192.0.2.128/25"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        let mut bulk_changes = Vec::new();
+        let mut incr_changes = Vec::new();
+
+        // Step 1: p1 announces all three.
+        let u1 = BgpUpdate {
+            attrs: base_attrs(vec![65001], None),
+            nlri: px.iter().map(|p| Nlri::from(*p)).collect(),
+            ..Default::default()
+        };
+        bulk.announce(&p1, &u1);
+        bulk_changes.extend(bulk.recompute());
+        incr.announce(&p1, &u1);
+        for p in &px {
+            incr_changes.extend(incr.recompute_prefix(*p));
+        }
+
+        // Step 2: p2 announces a shorter path for the middle prefix.
+        let u2 = BgpUpdate {
+            attrs: base_attrs(vec![], None),
+            nlri: vec![Nlri::from(px[1])],
+            ..Default::default()
+        };
+        bulk.announce(&p2, &u2);
+        bulk_changes.extend(bulk.recompute());
+        incr.announce(&p2, &u2);
+        incr_changes.extend(incr.recompute_prefix(px[1]));
+
+        // Step 3: p2 withdraws → the best falls back to p1.
+        let nlri2 = Nlri::from(px[1]);
+        bulk.withdraw(&p2, &[nlri2]);
+        bulk_changes.extend(bulk.recompute());
+        incr.withdraw(&p2, &[nlri2]);
+        incr_changes.extend(incr.recompute_prefix(px[1]));
+
+        // Step 4: p1 withdraws everything → all prefixes vanish.
+        let nlris: Vec<Nlri> = px.iter().map(|p| Nlri::from(*p)).collect();
+        bulk.withdraw(&p1, &nlris);
+        bulk_changes.extend(bulk.recompute());
+        incr.withdraw(&p1, &nlris);
+        for p in &px {
+            incr_changes.extend(incr.recompute_prefix(*p));
+        }
+
+        assert_eq!(bulk.best, incr.best, "same best table");
+        // The streams carry the same changes; within one batch the
+        // bulk walk yields them in sorted-prefix order while the
+        // incremental path follows message order — no consumer
+        // observes within-batch ordering, so compare canonically.
+        let mut bulk_sorted = bulk_changes;
+        let mut incr_sorted = incr_changes;
+        bulk_sorted.sort_by_key(|c| c.prefix);
+        incr_sorted.sort_by_key(|c| c.prefix);
+        assert_eq!(bulk_sorted, incr_sorted, "same change stream");
+        assert!(bulk.best.is_empty(), "everything withdrawn");
     }
 
     #[test]
