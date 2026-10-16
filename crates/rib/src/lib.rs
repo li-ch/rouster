@@ -589,6 +589,46 @@ impl Rib {
         Some(form)
     }
 
+    /// Whether `entry`'s resolved programming form equals `believed` —
+    /// PERF-P2's no-clone unchanged test for the reconcile passes.
+    /// Their overwhelmingly common case (the idle tick, a retried
+    /// batch) is "unchanged", and the former shape paid a RouteEntry
+    /// clone per route per pass to say so. Sound by construction: a
+    /// `true` answer implies the built form equals `believed` (scalar
+    /// fields first, then hop-by-hop — a bare gateway compares as its
+    /// CURRENT resolution, an unresolved gateway or a length mismatch
+    /// answers false and the caller falls through to the exact
+    /// build-and-compare).
+    fn form_matches(&self, entry: &RouteEntry, believed: &RouteEntry) -> bool {
+        if entry.prefix != believed.prefix
+            || entry.protocol != believed.protocol
+            || entry.metric != believed.metric
+            || entry.table != believed.table
+        {
+            return false;
+        }
+        let want = entry.nexthops.hops();
+        let have = believed.nexthops.hops();
+        if want.len() != have.len() {
+            return false;
+        }
+        want.iter().zip(have.iter()).all(|(&(hop, w1), &(have_hop, w2))| {
+            w1 == w2
+                && match hop {
+                    Nexthop::Ipv4(g) => {
+                        self.resolve_nexthop_recursive(IpAddr::V4(g)).as_ref() == Some(&have_hop)
+                    }
+                    Nexthop::Ipv6(g) => {
+                        self.resolve_nexthop_recursive(IpAddr::V6(g)).as_ref() == Some(&have_hop)
+                    }
+                    Nexthop::Blackhole
+                    | Nexthop::IfIndex(_)
+                    | Nexthop::Ipv4If(..)
+                    | Nexthop::Ipv6If(..) => hop == have_hop,
+                }
+        })
+    }
+
     /// Apply one dataplane event to the mirrored state.
     ///
     /// Address events for an interface we have not seen yet create a
@@ -776,11 +816,41 @@ impl Rib {
     #[instrument(skip(self, dp))]
     pub async fn reconcile<D: Dataplane + Sync>(&mut self, dp: &D) {
         let _census = cpucensus::scope(&cpucensus::RIB_DIFF_FULL);
+        // PERF-P2: a merge join, not a lookup join. The desired side
+        // (tables) and the belief side (programmed) iterate the SAME
+        // (table, prefix) total order, so one lockstep walk classifies
+        // every key — the former shape paid a per-key O(log n)
+        // programmed lookup plus a desired-keys HashSet insert per
+        // route per pass. The unchanged case is decided by
+        // [`Self::form_matches`] WITHOUT building the programming form
+        // (no clone); only a genuinely changed route pays the build.
         let mut to_install: Vec<((TableId, IpPrefix), RouteEntry)> = Vec::new();
-        let mut desired_keys: std::collections::HashSet<(TableId, IpPrefix)> =
-            std::collections::HashSet::new();
+        let mut stale_keys: Vec<(TableId, IpPrefix)> = Vec::new();
+        let mut unchanged = 0usize;
+        let mut believed = self.programmed.iter().peekable();
         for (&table_id, table) in &self.tables {
             for (prefix, _) in table.iter() {
+                let key = (table_id, *prefix);
+                // Beliefs strictly below the desired cursor are stale
+                // (their prefix is desired-nothing: gone entirely).
+                while let Some((&bkey, _)) = believed.peek() {
+                    if bkey < key {
+                        stale_keys.push(bkey);
+                        believed.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Consume the belief AT this key when present: each
+                // branch below classifies it exactly once (unchanged,
+                // replaced, or stale-because-desired-nothing), and the
+                // cursor must never re-see it.
+                let believed_entry = match believed.peek() {
+                    Some((&bkey, _)) if bkey == key => {
+                        believed.next().map(|(_, entry)| entry)
+                    }
+                    _ => None,
+                };
                 // A connected candidate MASKS the prefix (distance 0,
                 // nothing outranks it) and is itself never programmed —
                 // the kernel already holds it as `proto kernel scope
@@ -793,34 +863,49 @@ impl Rib {
                     .get(&table_id)
                     .is_some_and(|t| t.best(prefix).is_some())
                 {
+                    if believed_entry.is_some() {
+                        stale_keys.push(key);
+                    }
                     continue;
                 }
                 let Some(best) = table.best(prefix) else {
+                    if believed_entry.is_some() {
+                        stale_keys.push(key);
+                    }
                     continue;
                 };
+                if let Some(believed_entry) = believed_entry {
+                    if self.form_matches(best, believed_entry) {
+                        unchanged += 1;
+                        continue;
+                    }
+                }
                 match self.resolved_programming_form(best) {
                     Some(form) => {
-                        let key = (table_id, *prefix);
-                        desired_keys.insert(key);
-                        if self.programmed.get(&key) != Some(&form) {
+                        if believed_entry.is_some_and(|b| *b == form) {
+                            unchanged += 1;
+                        } else {
                             to_install.push((key, form));
                         }
                     }
-                    None => debug!(
-                        prefix = %best.prefix,
-                        table_id,
-                        "best route has no resolved nexthop; held in RIB, not programmed"
-                    ),
+                    None => {
+                        if believed_entry.is_some() {
+                            stale_keys.push(key);
+                        }
+                        debug!(
+                            prefix = %best.prefix,
+                            table_id,
+                            "best route has no resolved nexthop; held in RIB, not programmed"
+                        );
+                    }
                 }
             }
         }
-        let unchanged = desired_keys.len() - to_install.len();
-        let stale_keys: Vec<(TableId, IpPrefix)> = self
-            .programmed
-            .keys()
-            .filter(|key| !desired_keys.contains(key))
-            .copied()
-            .collect();
+        // Beliefs past the desired side's end: stale (their table
+        // emptied entirely).
+        for (bkey, _) in believed {
+            stale_keys.push(*bkey);
+        }
         drop(_census);
         self.reconcile_delta(dp, to_install, stale_keys, unchanged)
             .await;
@@ -851,9 +936,18 @@ impl Rib {
                 continue;
             }
             if let Some(best) = self.tables.get(&table_id).and_then(|t| t.best(&prefix)) {
+                let believed = self.programmed.get(&(table_id, prefix));
+                // PERF-P2: the unchanged test without building the
+                // form (see the full pass's merge join).
+                if let Some(believed_entry) = believed {
+                    if self.form_matches(best, believed_entry) {
+                        desired_keys.insert((table_id, prefix));
+                        continue;
+                    }
+                }
                 if let Some(form) = self.resolved_programming_form(best) {
                     desired_keys.insert((table_id, prefix));
-                    if self.programmed.get(&(table_id, prefix)) != Some(&form) {
+                    if believed != Some(&form) {
                         to_install.push(((table_id, prefix), form));
                     }
                 }
@@ -886,10 +980,17 @@ impl Rib {
         let _census = cpucensus::scope(&cpucensus::RIB_BATCH_AWAIT);
         let mut installed = 0usize;
         if !to_install.is_empty() {
+            // PERF-P2: one copy per install, not two — the keys move
+            // out alongside their entries, the entries borrow into the
+            // batch call, and the belief insert moves (never clones)
+            // what the batch just verified. (The former shape cloned
+            // every entry into a parallel `entries` Vec first.)
+            let keys: Vec<(TableId, IpPrefix)> =
+                to_install.iter().map(|(key, _)| *key).collect();
             let entries: Vec<RouteEntry> =
-                to_install.iter().map(|(_, entry)| entry.clone()).collect();
+                to_install.into_iter().map(|(_, entry)| entry).collect();
             let results = dp.route_replace_batch(&entries).await;
-            for ((key, entry), result) in to_install.into_iter().zip(results) {
+            for ((key, entry), result) in keys.into_iter().zip(entries).zip(results) {
                 match result {
                     Ok(()) => {
                         debug!(prefix = %entry.prefix, table_id = entry.table, "installed best route");
@@ -906,14 +1007,22 @@ impl Rib {
         let mut withdrawn = 0usize;
         // Belief removal precedes the delete so a failed delete is
         // restorable (the belief re-inserts below).
-        let pairs: Vec<((TableId, IpPrefix), RouteEntry)> = stale_keys
-            .into_iter()
-            .filter_map(|key| self.programmed.remove(&key).map(|entry| (key, entry)))
-            .collect();
-        if !pairs.is_empty() {
-            let entries: Vec<RouteEntry> = pairs.iter().map(|(_, entry)| entry.clone()).collect();
+        // The delete twin of the install path's single-copy form:
+        // belief removal and the batch's key/entry pairing stay in one
+        // loop, so a stale key with no belief can never misalign the
+        // zip below (both current callers pre-filter to present keys;
+        // the shape stays safe if one ever stops).
+        let mut keys: Vec<(TableId, IpPrefix)> = Vec::new();
+        let mut entries: Vec<RouteEntry> = Vec::new();
+        for key in stale_keys {
+            if let Some(entry) = self.programmed.remove(&key) {
+                keys.push(key);
+                entries.push(entry);
+            }
+        }
+        if !entries.is_empty() {
             let results = dp.route_delete_batch(&entries).await;
-            for ((key, entry), result) in pairs.into_iter().zip(results) {
+            for ((key, entry), result) in keys.into_iter().zip(entries).zip(results) {
                 match result {
                     Ok(()) => {
                         debug!(prefix = %entry.prefix, table_id = entry.table, "withdrawn stale route");
@@ -1101,6 +1210,39 @@ mod tests {
         block_on(rib.reconcile(&dp));
         assert_eq!(dp.installed_prefixes().len(), 2);
         assert_eq!(dp.removed_prefixes().len(), 1);
+    }
+
+    /// PERF-P2's merge-join regression pin: a prefix whose best
+    /// becomes connected-masked after it was programmed withdraws on
+    /// the next full pass, and unmasking reinstalls — the belief at
+    /// the key is consumed and classified exactly once per pass
+    /// (never silently kept, never double-processed).
+    #[test]
+    fn reconcile_withdraws_masked_belief_and_reinstalls_on_unmask() {
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "10.0.0.1/24", true));
+        rib.add_route(RouteEntry::new(
+            "198.51.100.0/24".parse().unwrap(),
+            RouteProtocol::Static,
+            NexthopGroup::single(Nexthop::Ipv4("10.0.0.9".parse().unwrap())),
+            0,
+        ));
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.installed_prefixes().len(), 1);
+
+        // A connected address for the same network masks the prefix:
+        // the programmed belief is stale, the route withdraws.
+        rib.apply_event(&address(2, "198.51.100.5/24", true));
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.removed_prefixes(), vec!["198.51.100.0/24".parse().unwrap()]);
+        assert_eq!(dp.installed_prefixes().len(), 1, "no re-install while masked");
+
+        // Unmask: the still-desired static route returns.
+        rib.apply_event(&address(2, "198.51.100.5/24", false));
+        block_on(rib.reconcile(&dp));
+        assert_eq!(dp.installed_prefixes().len(), 2, "reinstalled after unmask");
     }
 
     #[test]
