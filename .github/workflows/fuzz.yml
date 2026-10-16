@@ -58,6 +58,9 @@ jobs:
       - name: Seeded burst (90 s per target)
         working-directory: crates/${{ matrix.crate }}
         run: |
+          # pipefail or the tee swallows cargo-fuzz's crash exit and a
+          # found bug reads green (the first dispatch taught us this).
+          set -eo pipefail
           mkdir -p fuzz/corpus/${{ matrix.target }}
           if compgen -G 'fuzz/seeds/*.bin' > /dev/null; then
             cp fuzz/seeds/*.bin fuzz/corpus/${{ matrix.target }}/
