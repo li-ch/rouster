@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# restconfd smoke test (S12-a M6) — the RESTCONF-shaped northbound
-# edge against a REAL daemon and a refusal stand-in, in containers:
+# restconfd smoke test (S12-a M6; the S13-c v1.0 posture legs) — the
+# RESTCONF-shaped northbound edge against a REAL daemon and a
+# refusal stand-in, in containers:
 #
 #   restconfd (hand-rolled HTTP/1.1) ── GET/PUT/POST/DELETE ──> the
 #   canonical file's YANG trees; accepted mutations run the configd
@@ -9,10 +10,23 @@
 #
 # Frozen readouts (asserted via the daemons' published status files
 # and the HTTP responses themselves — never log greps alone):
-#   TREE      GET /restconf/data carries the bound trees in the
-#             dump shape (router-id, the restconf member, savd);
-#             GET of a leaf answers the wrapped member; an unknown
-#             path is the RFC 8040 §7.1 error form.
+#   SOCKET    restconfd starts with NO plane flags and serves the
+#             LOCAL UNIX SOCKET (the v1.0 default flip): the status
+#             file says listener socket, the socket file's mode is
+#             0660 (the filesystem permission IS the access
+#             control), and TCP 8080 is NOT listening (the flip is
+#             real, not additive).
+#   TOKEN     the stanza's bearer token gates every request: no
+#             Authorization header -> 401 + WWW-Authenticate:
+#             Bearer (the RFC 8040 §7.1 error form, RFC 6241's
+#             access-denied tag); a wrong token -> 401; the right
+#             token -> 200. The dump NEVER carries the token
+#             (write-only through the API).
+#   TREE      GET /restconf/data (tokened, over the socket) carries
+#             the bound trees in the dump shape (router-id, the
+#             restconf member, savd); GET of a leaf answers the
+#             wrapped member; an unknown path is the §7.1 error
+#             form.
 #   ACK       POST /restconf/data/savd/interface=veths2 (merge)
 #             returns the per-daemon ack summary; the REAL savd
 #             reloads at SIGHUP: `poll 2s interfaces 2` +
@@ -28,11 +42,17 @@
 #   BACK      A bad body (poll 0) is a 400 and NOTHING moves; the
 #             cleanup DELETE removes the staged poison and the
 #             stand-in converges on the default poll.
+#   TCP       The opt-in plane: restarted with --tcp, restconfd
+#             serves 8080 (status: listener tcp), the token still
+#             gates it (401 without, 200 with) — plain HTTP, the
+#             disclosed posture.
 #
-# The scenario runs TWICE (fresh container each time — repeatability
-# is part of the claim). Base image frr-testbed:10.2.2 (cached
-# only); busybox `nc` is the HTTP client (no curl in the image, and
-# none needed for a wire we own).
+# The scenario runs TWICE (fresh container each time —
+# repeatability is part of the claim). Base image frr-testbed:10.2.2
+# (cached only); the HTTP client is `restconf-probe` (busybox nc has
+# no -U — the zapi-probe precedent: a real socket client built from
+# the same tree, no curl in the image and none needed for a wire we
+# own).
 #
 #   scripts/test-restconf-smoke.sh
 set -euo pipefail
@@ -52,7 +72,11 @@ CANONICAL=/root/rouster.conf
 STATUS_FILE=/run/rouster/savd.status
 RESTCONF_STATUS=/run/rouster/restconf.status
 CONFIGD_STATUS=/run/rouster/configd.status
+RESTCONF_SOCK=/run/rouster/restconf.sock
 PORT=8080
+# 64 hex chars = 256 bits (the bind gate floors tokens at 32).
+TOKEN=4c1f0a9d3e7b2c845f6a1d09b3e72c5a8d4f0b6e9c2a7d3145e8b0f6c9a2d7e3
+TOKEN_WRONG=0000000000000000000000000000000000000000000000000000000000000000
 QUARANTINE="${ROUSTER_RESTCONF_QUARANTINE:-$SCRIPT_DIR/../../away/2026-10-14/quarantine/restconf}"
 
 case "$(uname -m)" in
@@ -78,12 +102,19 @@ wait_in_container() { # <desc> <attempts> <body>
     return 1
 }
 
-# One HTTP exchange over busybox nc: <method> <path> <body>
-http() {
-    local method="$1" path="$2" body="${3:-}"
+# One HTTP exchange over restconf-probe (the socket plane by
+# default; TOKEN rides --token — a client-side one-off, the probe's
+# own help explains why that is fine for a client): <token> <method>
+# <path> [body]
+probe() {
+    local token="$1" method="$2" path="$3" body="${4:-}"
     docker exec "$NAME" sh -c \
-        "printf '%s %s HTTP/1.1\r\nHost: rouster\r\nContent-Length: ${#body}\r\nConnection: close\r\n\r\n%s' \
-           '$method' '$path' '$body' | nc -w 15 127.0.0.1 $PORT"
+        "restconf-probe --socket $RESTCONF_SOCK --token '$token' '$method' '$path' '$body'"
+}
+
+# The tokened call (every functional leg uses this one).
+http() { # <method> <path> [body]
+    probe "$TOKEN" "$@"
 }
 
 capture() {
@@ -99,7 +130,7 @@ capture() {
 
 one_iteration() { # <n>
     local n="$1"
-    echo "======== iteration $n ========"
+    echo "======== iteration $n ======"
 
     echo "==> [$n] starting container + topology (the configd smoke pattern)"
     docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -116,6 +147,8 @@ one_iteration() { # <n>
     docker exec "$NAME" sh -c "printf '%s\n' \
       'restconf {' \
       'port 8080' \
+      'socket $RESTCONF_SOCK' \
+      'token $TOKEN' \
       '}' \
       'daemon rousterd {' \
       '    zapi socket $ZAPI_SOCK' \
@@ -134,24 +167,42 @@ one_iteration() { # <n>
     local SAVD_PID
     SAVD_PID="$(docker exec "$NAME" cat /run/rouster/savd.pid)"
 
-    echo "==> [$n] restconfd up (the server reads the stanza's port)"
+    echo "==> [$n] SOCKET: restconfd up with NO plane flags (the socket default)"
     docker exec -d "$NAME" sh -c \
         "restconfd --canonical $CANONICAL --run-dir /run/rouster --etc-dir /etc > $RESTCONFD_LOG 2>&1"
-    wait_in_container "[$n] restconf.status published (mode serve, port 8080)" 20 \
-        "grep -q '^mode serve$' $RESTCONF_STATUS && grep -q '^port 8080$' $RESTCONF_STATUS"
+    wait_in_container "[$n] restconf.status published (listener socket)" 20 \
+        "grep -q '^mode serve$' $RESTCONF_STATUS && grep -q '^listener socket$' $RESTCONF_STATUS && grep -q \"^socket $RESTCONF_SOCK\$\" $RESTCONF_STATUS"
+    docker exec "$NAME" sh -c "[ \"\$(stat -c %a $RESTCONF_SOCK)\" = 660 ]" || {
+        echo "FAIL: socket mode is not 0660: $(docker exec "$NAME" stat -c %a $RESTCONF_SOCK)"; return 1; }
+    if docker exec "$NAME" sh -c "nc -z -w 1 127.0.0.1 $PORT" 2>/dev/null; then
+        echo "FAIL: TCP $PORT is listening — the v1.0 default flip did not happen"; return 1
+    fi
+    echo "    the socket file is 0660; TCP 8080 is not listening (the flip is real)"
 
-    echo "==> [$n] TREE: the dump shape over HTTP"
+    echo "==> [$n] TOKEN: absent/wrong refused, right accepted"
     local resp
+    resp="$(docker exec "$NAME" restconf-probe --socket $RESTCONF_SOCK GET /restconf/data/savd/poll)"
+    grep -q 'HTTP/1.1 401' <<<"$resp" || { echo "FAIL: no-token not 401: $resp"; return 1; }
+    grep -q 'WWW-Authenticate: Bearer' <<<"$resp" || { echo "FAIL: no challenge header: $resp"; return 1; }
+    grep -q 'access-denied' <<<"$resp" || { echo "FAIL: no error form: $resp"; return 1; }
+    resp="$(probe "$TOKEN_WRONG" GET /restconf/data/savd/poll)"
+    grep -q 'HTTP/1.1 401' <<<"$resp" || { echo "FAIL: wrong token not 401: $resp"; return 1; }
+    grep -q 'invalid bearer token' <<<"$resp" || { echo "FAIL: wrong token story: $resp"; return 1; }
+    echo "    401 + WWW-Authenticate without/with a wrong token"
+
+    echo "==> [$n] TREE: the dump shape over the socket (tokened)"
     resp="$(http GET /restconf/data)"
     grep -q 'HTTP/1.1 200' <<<"$resp" || { echo "FAIL: GET data not 200: $resp"; return 1; }
     grep -q '"savd"' <<<"$resp" || { echo "FAIL: no savd member: $resp"; return 1; }
     grep -q '"restconf":{"port":8080' <<<"$resp" || { echo "FAIL: no restconf member: $resp"; return 1; }
+    grep -q "\"socket\":\"$RESTCONF_SOCK\"" <<<"$resp" || { echo "FAIL: no socket member: $resp"; return 1; }
+    grep -q "$TOKEN" <<<"$resp" && { echo "FAIL: the token leaked into the dump: $resp"; return 1; }
     resp="$(http GET /restconf/data/savd/poll)"
     grep -q '{"poll":2}' <<<"$resp" || { echo "FAIL: leaf GET: $resp"; return 1; }
     resp="$(http GET /restconf/data/savd/nope)"
     grep -q 'HTTP/1.1 404' <<<"$resp" || { echo "FAIL: unknown path not 404: $resp"; return 1; }
     grep -q 'ietf-restconf:errors' <<<"$resp" || { echo "FAIL: no error form: $resp"; return 1; }
-    echo "    GET answers the trees; 404s carry the RFC 8040 §7.1 form"
+    echo "    GET answers the trees (tokened, over the socket); the token is nowhere in the dump"
 
     echo "==> [$n] ACK: POST merges a stanza, the real savd confirms the reload"
     resp="$(http POST /restconf/data/savd/interface=veths2 '{"mode":"strict"}')"
@@ -222,9 +273,27 @@ chmod +x /root/standin-savd.sh"
     wait_in_container "[$n] stand-in converged on the default poll" 20 \
         "grep -q 'poll 5s interfaces 2' $STATUS_FILE"
     echo "    DELETE removed the staged poison; savd runs the default poll"
+
+    echo "==> [$n] TCP: the opt-in plane still answers (tokened)"
+    docker exec "$NAME" sh -c 'kill -TERM "$(pidof restconfd)" 2>/dev/null'
+    # The clean-exit contract (the savd discipline): BOTH files go.
+    # (Not pidof: the docker-exec reparenting makes process-reaping
+    # timing unfalsifiable from outside; the file clear is the
+    # documented observable.)
+    wait_in_container "[$n] socket-mode restconfd exited (socket + status cleared)" 30 \
+        "! test -e $RESTCONF_SOCK && ! test -e $RESTCONF_STATUS"
+    docker exec -d "$NAME" sh -c \
+        "restconfd --canonical $CANONICAL --run-dir /run/rouster --etc-dir /etc --tcp > $RESTCONFD_LOG 2>&1"
+    wait_in_container "[$n] restconf.status published (listener tcp, port 8080)" 20 \
+        "grep -q '^listener tcp$' $RESTCONF_STATUS && grep -q '^port 8080$' $RESTCONF_STATUS"
+    resp="$(docker exec "$NAME" restconf-probe --host 127.0.0.1 --port $PORT GET /restconf/data/savd/poll)"
+    grep -q 'HTTP/1.1 401' <<<"$resp" || { echo "FAIL: TCP no-token not 401: $resp"; return 1; }
+    resp="$(docker exec "$NAME" restconf-probe --host 127.0.0.1 --port $PORT --token "$TOKEN" GET /restconf/data/savd/poll)"
+    grep -q '{"poll":5}' <<<"$resp" || { echo "FAIL: TCP tokened GET: $resp"; return 1; }
+    echo "    --tcp arms 8080; the token gates the TCP plane too (the default poll rides from BACK)"
 }
 
-echo "==> building rousterd + savd + configd + restconfd ($MUSL_TARGET, release)"
+echo "==> building rousterd + savd + configd + restconfd + restconf-probe ($MUSL_TARGET, release)"
 mkdir -p "$QUARANTINE"
 if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
     rustup target add "$MUSL_TARGET"
@@ -233,6 +302,7 @@ cargo build --release --target "$MUSL_TARGET" --bin rousterd
 cargo build --release --target "$MUSL_TARGET" -p sav --bin savd
 cargo build --release --target "$MUSL_TARGET" -p configd --bin configd
 cargo build --release --target "$MUSL_TARGET" -p configd --bin restconfd
+cargo build --release --target "$MUSL_TARGET" -p configd --bin restconf-probe
 
 echo "==> assembling test image from $BASE_IMAGE"
 BUILD_DIR="$(mktemp -d)"
@@ -242,16 +312,18 @@ cp "target/$MUSL_TARGET/release/rousterd" "$BUILD_DIR/rousterd"
 cp "target/$MUSL_TARGET/release/savd" "$BUILD_DIR/savd"
 cp "target/$MUSL_TARGET/release/configd" "$BUILD_DIR/configd"
 cp "target/$MUSL_TARGET/release/restconfd" "$BUILD_DIR/restconfd"
+cp "target/$MUSL_TARGET/release/restconf-probe" "$BUILD_DIR/restconf-probe"
 cat > "$BUILD_DIR/Dockerfile" <<EOF
 FROM $BASE_IMAGE
 COPY rousterd /usr/local/bin/rousterd
 COPY savd /usr/local/bin/savd
 COPY configd /usr/local/bin/configd
 COPY restconfd /usr/local/bin/restconfd
+COPY restconf-probe /usr/local/bin/restconf-probe
 EOF
 docker build -q -t "$IMAGE" "$BUILD_DIR" >/dev/null
 
 one_iteration 1
 one_iteration 2
 capture
-echo "restconf smoke: PASS x2 (tree GET + real-savd ack + 409 auto-rollback + DELETE back, status-file asserted)"
+echo "restconf smoke: PASS x2 (socket default 0660 + no-TCP + token 401s + tree GET + real-savd ack + 409 auto-rollback + DELETE back + TCP opt-in, status-file asserted)"
