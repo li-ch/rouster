@@ -7,3 +7,4 @@
 cc fe859db2def41a77c8534ef2d5c2eb5d3947b017a311e31dace323aaf39147d1 # shrinks to text = "interface a\n mode strict\ninterface a\n"
 cc 26b1259b1a55e79755ddeb65ebd7ac3e468bb79fc547b81602ef082fa3ed4211 # shrinks to text = ""
 cc 08924895cd343c1c3b473be4899709b3b8a64eca8c78c4c927a79dfb1af65647 # shrinks to text = "binding 10.0.0.0/24 interface p interface p\n"
+cc 0fe75c5e0048bba579d0e1fa4cbcc94c3f744dbe04d455341e532b3e77c23181 # shrinks to text = "interface poll\n"

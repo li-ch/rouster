@@ -46,9 +46,24 @@ fn rendered_text(lines: &[SourceLine]) -> String {
     out
 }
 
-/// Interface names: non-empty, bounded, never "bad" (the must).
+/// Interface names: non-empty, bounded, never "bad" (the must), and
+/// never a schema keyword — the line dialect rejects a key value
+/// that names a sibling schema child (`interface poll` is ambiguous
+/// with the `poll` leaf; line.rs's names_child check), so the
+/// generator must stay inside the unambiguous space the binder
+/// actually accepts.
 fn iface_name() -> impl Strategy<Value = String> {
-    "[a-z]{1,4}[0-9]{0,2}".prop_filter("not `bad`", |s| s != "bad")
+    const KEYWORDS: [&str; 8] = [
+        "mode",
+        "poll",
+        "ack",
+        "mtu",
+        "imode",
+        "bad",
+        "interface",
+        "binding",
+    ];
+    "[a-z]{1,4}[0-9]{0,2}".prop_filter("not a schema keyword", |s| !KEYWORDS.contains(&s.as_str()))
 }
 
 fn mode() -> impl Strategy<Value = String> {
