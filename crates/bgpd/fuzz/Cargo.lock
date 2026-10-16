@@ -10,7 +10,7 @@ checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
 name = "bgpd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "policy",
@@ -56,7 +56,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror",
 ]
@@ -160,7 +160,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "policy"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "thiserror",
@@ -193,7 +193,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rpki"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "thiserror",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "zapi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "common",
