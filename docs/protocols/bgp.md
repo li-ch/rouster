@@ -649,6 +649,40 @@ baseline was 1,679 (FRR's ledgered 897; a 1.96× delta, sub-2× under
 orchestrator from these artifacts (target/mem-logs/
 clean-20261016T080351Z/).
 
+### M3 — RIB storage landed (2026-10-16)
+
+The post-M2 census named the keyed-map inline (~212 B/prefix, 45%):
+the `Route` stored twice per prefix (Adj-RIB-In + best). The
+storage-internal half landed: `Route.source` is `Arc<PeerInfo>` —
+one shared instance per peer behind a LocRib cache (re-pinned when a
+session's facts change, e.g. a new BGP Identifier) — Route 80→56 B
+inline, every reader derefs unchanged. The fence stopped the deeper
+cut: dropping `Route.prefix` (24 B more per map slot) would force
+prefix-threading through the `ImportPolicy`/`ExportPolicy` trait
+seams — a policy-API change, not storage internals. A Vec slab was
+rejected on the same grounds (the BTreeMap KV inline is within ~4
+B/entry of the theoretical floor for a std keyed store, and
+mid-vector inserts are O(n) memmove).
+
+Receipt (clean 100k slice): **bgpd 449 B/prefix empty→final (RSS
+2,060→45,864 KiB; HWM 652 B/prefix)** — from 476; CPU 0.61→0.53 s,
+EOR wall 0.35→0.31 s; 99,998 prefixes, zero malformed/rejected.
+Post-M3 census: unique attrs unchanged (90.7 B/prefix — M3 touches
+storage, not tuples); the map inline is now ~(24+56)×2 ≈ 165
+B/prefix of the 449; remainder ~185 B/prefix is decode/drain
+transients retained by the allocator plus bins/baseline.
+
+Full-table leg (single run): **bgpd 420 B/prefix empty→final at
+1,126,481 prefixes (RSS 2,032→464,536 KiB; HWM 590 B/prefix)** —
+cumulative 1,679→420 across M2+M3; CPU: bgpd 6.88 s (§R 10.37),
+rousterd 10.80 s (§R 10.90); EOR 4.36 s; first-route→main-complete
+10.0 s; zero malformed, zero rejected. One harness disclosure: the
+first full-feed attempt wedged at 584,208 installs (rousterd's
+netlink ACK futures hung on rcvbuf ENOBUFS — P0-b's diagnosed
+condition, commit `9131271`); the receipt runner now carries the
+same SUT rcvbuf sysctls as P0's harness, and this run is clean.
+Artifacts: `target/mem-logs/clean-20261016T083843Z/`.
+
 ## §Deferred anchors
 
 Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime

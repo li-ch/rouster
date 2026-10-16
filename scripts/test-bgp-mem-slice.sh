@@ -72,6 +72,20 @@ cargo build --release --target "$MUSL_TARGET" -p rousterctl --bin rousterctl
 cargo build --release --target "$MUSL_TARGET" -p bgpd --bin bgpd ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 cargo build --release --target "$MUSL_TARGET" -p bgpd --bin mrt-replay
 
+# P0-b harness parity (commit 9131271): the SUT container gets a
+# large netlink receive buffer — rousterd's netlink socket is
+# subscribed to the route multicast groups, so the full-table install
+# storm's notification echoes overrun the default rcvbuf (ENOBUFS);
+# dropped ACKs hang netlink-proto's timeout-less request futures and
+# freeze the install pipeline (observed once here: a full-feed run
+# wedged at 584,208 of 1,126,481 installs). Mirrors bench-e1-ingest.sh
+# symmetrically; BENCH_SUT_RMEM=0 disables for A/B runs.
+SUT_RMEM=${BENCH_SUT_RMEM:-33554432}
+SUT_SYSCTLS=""
+if [ "$SUT_RMEM" != 0 ]; then
+    SUT_SYSCTLS="--sysctl net.core.rmem_default=$SUT_RMEM --sysctl net.core.rmem_max=$((SUT_RMEM * 2))"
+fi
+
 wait_up() { # container desc attempts cmd
     for _ in $(seq 1 "$3"); do
         docker exec "$1" sh -c "$4" >/dev/null 2>&1 && return 0
@@ -83,7 +97,7 @@ wait_up() { # container desc attempts cmd
 
 start_sut() { # name
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     for b in rousterd rousterctl; do

@@ -620,7 +620,7 @@ mod tests {
         let r = route("203.0.113.0/24", vec![65001]);
         let out = AcceptAll.import(r.clone()).unwrap();
         assert_eq!(out, r);
-        let origin = r.source;
+        let origin = *r.source;
         assert!(AcceptAll.export(&r, &origin, false).is_none());
         let other = peer_info("192.0.2.10", 65002);
         assert_eq!(AcceptAll.export(&r, &other, false).unwrap(), r);

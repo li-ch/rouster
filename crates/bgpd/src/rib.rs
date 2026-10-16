@@ -51,7 +51,11 @@ pub struct Route {
     /// hash is the known art). Clones are refcount bumps; the import
     /// policy's mutations copy-on-write via `Arc::make_mut`.
     pub attrs: Arc<Vec<PathAttribute>>,
-    pub source: PeerInfo,
+    /// The learning peer, shared per-peer (PERF-M1 M3): every route
+    /// of one session points at the same `PeerInfo` — 8 B in the map
+    /// slot instead of 28 — and every reader (`route.source.address`)
+    /// derefs unchanged.
+    pub source: Arc<PeerInfo>,
     /// Learned over an internal (iBGP) session (§9.1.2.2 d).
     pub internal: bool,
     /// RFC 6811 §2 prefix-origin validity; `None` = RPKI not in use
@@ -95,7 +99,7 @@ impl Route {
         source: PeerInfo,
         internal: bool,
     ) -> Self {
-        Self::from_shared_attrs(prefix, Arc::new(attrs), source, internal)
+        Self::from_shared_attrs(prefix, Arc::new(attrs), Arc::new(source), internal)
     }
 
     /// [`Self::new`] for an already-interned, shared attribute tuple
@@ -104,7 +108,7 @@ impl Route {
     pub fn from_shared_attrs(
         prefix: IpPrefix,
         attrs: Arc<Vec<PathAttribute>>,
-        source: PeerInfo,
+        source: Arc<PeerInfo>,
         internal: bool,
     ) -> Self {
         Self {
@@ -415,6 +419,10 @@ pub struct LocRib {
     /// The interned attribute tuples every stored route shares
     /// (PERF-M1 M2).
     pub attrs: AttrInterner,
+    /// The per-peer shared PeerInfo handles (PERF-M1 M3): bounded by
+    /// the peer count, so every stored route's `source` is an 8-byte
+    /// pointer to one instance instead of a 28-byte inline copy.
+    peer_infos: BTreeMap<IpAddr, Arc<PeerInfo>>,
     /// The Phase 1 import policy (§9.2.1): typed filter + RPKI/OTC
     /// validation in W2-d; accept-all by default.
     import: Arc<dyn ImportPolicy>,
@@ -438,6 +446,7 @@ impl LocRib {
             adj_in: BTreeMap::new(),
             best: BTreeMap::new(),
             attrs: AttrInterner::default(),
+            peer_infos: BTreeMap::new(),
             import,
             rs_clients: BTreeSet::new(),
             rr_clients: BTreeSet::new(),
@@ -485,9 +494,23 @@ impl LocRib {
         let mut base = update.attrs.clone();
         reset_external_local_pref(&mut base, internal);
         let base = self.attrs.intern(base);
+        // Re-pin when the session's facts changed (a re-established
+        // peer may carry a new BGP Identifier); otherwise share.
+        let peer_info = match self.peer_infos.get(&peer.address) {
+            Some(cached) if **cached == *peer => Arc::clone(cached),
+            _ => {
+                let arc = Arc::new(*peer);
+                self.peer_infos.insert(peer.address, Arc::clone(&arc));
+                arc
+            }
+        };
         for nlri in update.announced() {
-            let mut route =
-                Route::from_shared_attrs(nlri.prefix, Arc::clone(&base), *peer, internal);
+            let mut route = Route::from_shared_attrs(
+                nlri.prefix,
+                Arc::clone(&base),
+                Arc::clone(&peer_info),
+                internal,
+            );
             route.rs_client = rs_client;
             route.rr_client = rr_client;
             route.path_id = nlri.path_id;
@@ -1356,17 +1379,17 @@ mod tests {
         // Identical IDs (different ASes, equal paths): lowest peer
         // address (§9.1.2.2 g).
         let same_id_a = Route {
-            source: PeerInfo {
+            source: Arc::new(PeerInfo {
                 bgp_id: Some(Ipv4Addr::new(10, 1, 1, 5)),
-                ..a.source
-            },
+                ..*a.source
+            }),
             ..a
         };
         let same_id_b = Route {
-            source: PeerInfo {
+            source: Arc::new(PeerInfo {
                 bgp_id: Some(Ipv4Addr::new(10, 1, 1, 5)),
-                ..b.source
-            },
+                ..*b.source
+            }),
             ..b
         };
         assert_eq!(
@@ -1599,6 +1622,37 @@ mod tests {
         Arc::make_mut(&mut forked.attrs).push(PathAttribute::Med(42));
         assert_ne!(forked.med(), r2.med(), "the fork does not leak to r2");
         assert!(Arc::ptr_eq(&r1.attrs, &r2.attrs), "originals still shared");
+    }
+
+    /// PERF-M1 M3: one shared PeerInfo per peer — every stored route
+    /// of a session points at the same instance.
+    #[test]
+    fn peer_info_is_shared_per_peer() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        let u1 = BgpUpdate {
+            attrs: base_attrs(vec![65001], Some(10)),
+            nlri: vec!["203.0.113.0/24".parse::<IpPrefix>().unwrap().into()],
+            ..Default::default()
+        };
+        let mut u2 = u1.clone();
+        u2.attrs = base_attrs(vec![65001, 65002], None);
+        u2.nlri = vec!["198.51.100.0/24".parse::<IpPrefix>().unwrap().into()];
+        rib.announce(&p, &u1);
+        rib.announce(&p, &u2);
+        let r1 = rib.adj_in[&p.address].get(&path_nlri("203.0.113.0/24", 0)).unwrap();
+        let r2 = rib.adj_in[&p.address].get(&path_nlri("198.51.100.0/24", 0)).unwrap();
+        assert!(
+            Arc::ptr_eq(&r1.source, &r2.source),
+            "routes of one peer share the PeerInfo instance"
+        );
+        assert_eq!(r1.source.address, p.address, "readers deref unchanged");
+        // A re-announcement with changed session facts (new BGP
+        // Identifier) re-pins the shared instance for new routes.
+        let renewed = PeerInfo { bgp_id: Some(Ipv4Addr::new(10, 9, 9, 9)), ..p };
+        rib.announce(&renewed, &u1);
+        let r1b = rib.adj_in[&p.address].get(&path_nlri("203.0.113.0/24", 0)).unwrap();
+        assert_eq!(r1b.source.bgp_id, Some(Ipv4Addr::new(10, 9, 9, 9)));
     }
 
     // ---- RFC 7911 ADD-PATH receive semantics (N5B) ------------------
