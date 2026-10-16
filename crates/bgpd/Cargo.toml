@@ -27,6 +27,15 @@ tracing-subscriber = { workspace = true }
 # precedent); the feature forwards into sav so the cfg-gated agent
 # items exist when the anchor hooks compile.
 sav = { workspace = true, optional = true }
+# S15-b (2026-10-16): the owner-ratified allocator A/B — mimalloc as
+# an OPTIONAL dep behind `alloc-mimalloc`, default OFF, bgpd only (the
+# D2 one-crate-first pattern). Dep tree delta (disclosed in the §R
+# entry): mimalloc 0.1.52 + libmimalloc-sys 0.1.49 (C, cc-built, no
+# transitive runtime deps; musl-static compatible). Without the
+# src-side cfg-gated `#[global_allocator]` activation point (3 lines,
+# quoted in the §R entry) the dep compiles but is linker-discarded —
+# the feature-off default build links nothing new either way.
+mimalloc = { version = "0.1.52", optional = true }
 
 [features]
 # See docs/protocols/savnet.md: in-process hooks only, no wire
@@ -40,6 +49,11 @@ experimental-savnet = ["dep:sav", "sav/experimental-savnet"]
 # headline RSS numbers come from feature-off clean runs (the census
 # walk's own transients are disclosed in the census-mode logs).
 mem-census = []
+# S15-b: opting in swaps bgpd's global allocator to mimalloc once the
+# src-side activation point (cfg-gated on this feature, in the bgpd
+# bin) lands; the measured A/B and the adoption/decline decision are
+# the §R allocator A/B entry (2026-10-16).
+alloc-mimalloc = ["dep:mimalloc"]
 
 # start_paused tokio tests + duplex sockets, dev-only (sav precedent).
 [dev-dependencies]
