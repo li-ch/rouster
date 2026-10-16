@@ -324,6 +324,81 @@ in the chat record. The "Your decision" column stays the owner's.
   claim ("full table in-kernel in 17.1 s median on this rig") is
   licensed. No verdict prose.
 
+- 2026-10-16 · P0-b harness fix — E1 poll reliability (PERF-PLAN
+  Phase 0; harness-only, no SUT change, no benchmark numbers change —
+  the v1.0.0-era figures above stand) · host=darwin-vm (same rig:
+  OrbStack, SUT pinned 4-11, injector 0-3) · harness commits 8c3eec3
+  +6279afd+9131271 · diagnosis (corrects the prior entry's
+  hypothesis): the "lost poll side" was NOT observer starvation — the
+  poll reads the rousterd status file, not the kernel table, and the
+  instrumented poll's docker-exec legs measured 33-39 ms median
+  (max 101 ms) straight through the install storm (6-run pre-fix
+  session, raw: `target/bench-logs/rouster-20261016T073357Z/`,
+  which wedged 0/6 — the defect is a race; the baseline session
+  wedged 3/6). The wedged baseline runs (raw:
+  `target/bench-logs/rouster-20261015T141901Z/` run-1/5/6) each end
+  at exactly one `netlink socket buffer full` WARN (netlink-proto
+  0.12.2 framed ENOBUFS; zero occurrences in the healthy runs), with
+  rousterd CPU flat, installs stopped mid-table, and the status file
+  frozen (run-5's stayed at startup content — prefixes 0 — while the
+  kernel held 629,228 bgp routes at teardown; run-6's froze at
+  625,462 with 860,548 in-kernel). Mechanism — new finding **F9**
+  (SUT-side, escalated to the owner list): rousterd's netlink socket
+  subscribes to the route multicast groups, so each of the ~1.12M
+  pipelined installs echoes a notification back to the same socket;
+  when the daemon's single netlink connection task is starved >~25 ms
+  under the storm, the default rcvbuf (`net.core.rmem_default`
+  212992 B) overruns and the kernel drops datagrams — including ACKs
+  for in-flight installs; netlink-proto 0.12.2 request futures carry
+  no timeout, so each dropped ACK hangs its install future, the zapi
+  drain arm of rousterd's main loop never returns (installs, the
+  reconcile tick, and the status refresh all stop), and the poll
+  faithfully reports the frozen file until timeout. The prior entry's
+  "SUT otherwise healthy" note is corrected by this entry: the SUT
+  was wedged. Fix (harness-side, symmetric on both SUT starters per
+  §F): SUT containers run with `net.core.rmem_default=32 MiB`
+  (`rmem_max=64 MiB`) — ~2 s of starvation slack vs ~25 ms
+  (`BENCH_SUT_RMEM=0` restores the prior rig for A/B); the poll CSV
+  carries a monotonic per-iteration timestamp and per-call wall
+  times; a post-EOR stall guard (`--stall-after 180`) fails a wedged
+  run fast as POLL-STALL instead of burning the timeout;
+  bench-summarize surfaces `netlink_rcvbuf_overruns` per run; rig
+  placement (net/subnet/IPs) is env-overridable for concurrent
+  sibling streams (defaults unchanged; the pre-fix session ran on
+  bench-net-p0 172.31.254.0/24 with SUT 12-16/injector 17 while
+  PERF-M1 held the default placement) · **receipt: 6/6 complete-poll
+  E1 runs on the fixed harness** — all six reach 1,126,481 (feed−9),
+  external wall 17.01-17.10 s, 0 rcvbuf overruns (raw:
+  `target/bench-logs/rouster-20261016T074332Z/`) · remaining,
+  escalated: F9's SUT-side fix (an ACK timeout or overrun-triggered
+  resync in the netlink install path — the harness fix removes the
+  trigger, not the SUT's fragility to lost ACKs); optionally, the 10 s
+  status-refresh cadence makes the per-second poll series stepwise
+  (0 → ~660k → 1.126M on a 17 s run) — adequate for completion
+  detection, coarse for ingestion curves. No verdict prose.
+
+- 2026-10-16 · P0-c profiling rig available · `scripts/bench-profile.sh`
+  (`rouster|frr <raw-mrt> [limit] [interval]`, commit b4f17d2) — the
+  no-deps path, chosen and disclosed: per-daemon `/proc/<pid>/smaps`
+  per-mapping Rss/Pss rollups + VmRSS/VmHWM + CPU jiffies sampled at
+  fixed marks (empty → 1 Hz series → final-after-settle) around a
+  pinned N-prefix ingest (default the 100k slice); artifacts under
+  `target/bench-logs/profile-<ts>/` including a PROTOCOL.txt pinning
+  repo head, image, feed sha256, binary sha256s, kernel, and CPU
+  pins — an optimization stream runs it before and after a change
+  and compares `rollup.tsv`. Validated clean on a 100k rouster slice:
+  99,998 routes in-kernel, both daemons' rollups show the anonymous
+  arena dominant (bgpd 48.5 MB, rousterd 78.8 MB final RSS; raw:
+  `target/bench-logs/profile-20261016T080132Z/`) · limits disclosed:
+  smaps names the memory consumer per mapping but attributes no
+  allocation sites; the deeper options stay owner decisions (a
+  rousterd SIGQUIT-style allocation census behind a feature flag —
+  bgpd's counterpart landed as PERF-M1's feature-gated mem-census
+  @7307053 with its own receipt runner — and a pprof/flamegraph
+  sampling build, a profiler dependency). CPU-side naming remains
+  with the E7 criterion micros until an owner-approved profiler
+  lands.
+
 ## Where things live (conventions)
 
 - Scripts: `scripts/bench-<E#>-<name>.sh` (the smoke-suite shape;
