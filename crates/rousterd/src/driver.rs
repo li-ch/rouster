@@ -277,8 +277,29 @@ impl RibDriver {
                 false
             }
             RibCommand::AddRoute(entry) => {
-                info!(prefix = %entry.prefix, protocol = ?entry.protocol, "zapi: route add");
+                // PERF-P2: the per-command add/del lines join the
+                // zapi session layer's own per-route line at debug —
+                // a mass import logged one line per route at info
+                // costs ~1-2 s of daemon CPU per million routes (the
+                // census's logging share) and buries the operator in
+                // noise FRR zebra also avoids (its route adds log at
+                // debug).
+                debug!(prefix = %entry.prefix, protocol = ?entry.protocol, "zapi: route add");
                 let (table, prefix) = (entry.table, entry.prefix);
+                // PERF-P2 fast path: with no redistribute surface
+                // registered, the best-change fan-out is provably a
+                // no-op and the before/after best-form reads (two
+                // RouteEntry clones per command) serve only the
+                // dirty-key note. Reconcile diffs idempotently, so
+                // noting the key unconditionally on a mutating
+                // command is behavior-preserving; the slow path
+                // (any interest registered) keeps the exact
+                // changed-gated form.
+                if self.redistributes.is_empty() {
+                    self.rib.add_route(entry);
+                    self.dirty.insert((table, prefix));
+                    return true;
+                }
                 let before = self.best_of(table, prefix);
                 self.rib.add_route(entry);
                 self.push_best_change(table, prefix, before);
@@ -289,6 +310,18 @@ impl RibDriver {
                 prefix,
                 protocol,
             } => {
+                // The add twin's fast path (see above).
+                if self.redistributes.is_empty() {
+                    let removed =
+                        self.rib.table_mut(table).remove(&prefix, protocol);
+                    if removed {
+                        debug!(prefix = %prefix, ?protocol, "zapi: route delete");
+                        self.dirty.insert((table, prefix));
+                    } else {
+                        debug!(prefix = %prefix, ?protocol, "zapi: route delete for absent route");
+                    }
+                    return removed;
+                }
                 let before = self.best_of(table, prefix);
                 let removed = self.rib.table_mut(table).remove(&prefix, protocol);
                 if removed {

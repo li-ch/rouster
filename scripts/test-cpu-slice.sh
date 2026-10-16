@@ -121,7 +121,9 @@ start_sut() { # name
     [ "$MODE" = census ] && CENSUS_ENV+=(-e ROUSTERD_CPU_CENSUS=1)
     docker exec -d ${CENSUS_ENV[@]+"${CENSUS_ENV[@]}"} "$1" sh -c \
         "rousterd --config /etc/rouster.conf > /var/log/rousterd.log 2>&1"
-    wait_up "$1" "rousterd zapi listening" 30 "grep -q 'zapi: listening' /var/log/rousterd.log"
+    # Socket-based wait (not the log line): the ablation runs with
+    # ROUSTERD_LOG=warn, which suppresses the info-level startup lines.
+    wait_up "$1" "rousterd zapi socket bound" 30 "test -S /run/rouster/zserv.api"
     docker exec "$1" sh -c "printf '%s\n' \
         'zapi socket /run/rouster/zserv.api' \
         'router bgp $SUT_AS' \
