@@ -20,92 +20,101 @@ first-class subsystem. The reasoning is recorded in
 [docs/architecture.md](docs/architecture.md); the phase plan lives in
 [docs/implementation-plan.md](docs/implementation-plan.md).
 
-## Status — v0.1.0
+## Status — v1.1.0
 
-Phases 0–1.5 of the plan are landed and exercised by a container-based
-smoke suite (`scripts/run-smokes.sh`). What actually runs today:
+All plan phases through Phase 5's first protocol are landed and
+exercised by a container-based smoke suite
+(`scripts/run-smokes.sh`). What actually runs today:
 
 - **zebra-equivalent core** (`rousterd`): a BIRD-style typed multi-table
   RIB with a Linux netlink dataplane — interface, address, route and
   neighbour state mirrored from the kernel, static routes programmed back
   (including ECMP and non-main tables), VRF devices and their routing
   tables mirrored and programmed without leaking into the main table.
-  SIGHUP reloads the config without bouncing anything.
+  SIGHUP reloads the config without bouncing anything. Recursive
+  multi-hop nexthop resolution; bound-ACK netlink programming with
+  overrun resync.
 - **ZAPI edge — proven against real FRR 10.2.2**: unmodified FRR daemons
-  attach to rousterd as their zebra, and their routes reach the kernel
-  through the Rust RIB (`proto static`, `proto bgp`, `proto ospf`):
-  - `staticd` installs its configured routes (`scripts/test-z4-staticd.sh`,
-    `scripts/test-z5-frr-interop.sh`);
-  - two `bgpd`s establish iBGP through rousterd and exchange routes
-    (`scripts/test-z5b-bgpd-interop.sh`);
-  - two `ospfd`s reach Full adjacency; each router's loopback is installed
-    by the other side (`scripts/test-z5c-ospfd-interop.sh`), plus
-    redistribute-connected (`…z5d…`) and nexthop-tracking / NSSA
-    default-originate (`…z5e…`) variants.
-  Results and known deviations: [docs/interop/frr-10.2-interop.md](docs/interop/frr-10.2-interop.md).
-  The wire codec is pinned against the real 10.2.2 binary in
-  [docs/interop/zapi-10.2-pinned.md](docs/interop/zapi-10.2-pinned.md).
-- **rousterctl — operator CLI**: `rousterctl show sav [--json]` reads
-  savd's published status (installed rule set, running-config summary,
-  monitor counters, pid liveness) and `rousterctl status` inventories the
-  run dir; v1 is read-only over the
-  [run-dir contract](docs/operator-surfaces.md) (`/run/rouster/`) —
-  no daemon, no IPC, the CLI never writes the run dir.
-- **savd — native source address validation**: a SAV Information Base fed
-  from the RIB and config; the IBA/IBB/PBA/PBB validation-mode rule model
-  (draft-ietf-savnet-general-sav-capabilities); uRPF-family rule
-  generation (RFC 3704/8704); enforcement behind the dataplane trait
-  with two backends (`rp_filter` and nftables —
-  `scripts/test-sav-nft.sh`); event-driven re-evaluation with RFC 8704
-  deletion hysteresis. Monitor-only by default — drop mode refuses
-  without an explicit opt-in, and spoof-block/legit-pass are exercised
-  with real traffic (`scripts/test-w7-sav.sh`,
-  `scripts/test-w8-savd.sh`). No general-purpose suite (FRR, BIRD, Holo)
-  ships packet-plane SAV today; the plan's §4 has the strategic framing.
+  (staticd, bgpd, ospfd, isisd, bfdd) attach to rousterd as their zebra,
+  and their routes reach the kernel through the Rust RIB (`proto static`,
+  `proto bgp`, `proto ospf`, `proto isis`). The wire codec is pinned
+  byte-for-byte against the real 10.2.2 binary in
+  [docs/interop/zapi-10.2-pinned.md](docs/interop/zapi-10.2-pinned.md);
+  session-establish registration replay heals reconnecting clients.
 - **native protocol daemons** — all live with real-FRR interop:
   - **bgpd** (`scripts/test-bgp-*.sh`): RFC 4271 FSM and codec,
     4-byte AS, MP-BGP v4/v6, route refresh, ADD-PATH both directions,
     route reflection, route-server mode, graceful restart
-    (helper + restarting speaker, Hard Reset), RFC 7606 revised
-    error handling — and **RPKI from the start**: an RTR client
-    (`rpki` crate, proven against a real gortr cache) feeding
-    RFC 6811 ROV, ASPA verification and RFC 9234 roles/OTC into the
-    decision path, gated by the typed policy engine
+    (helper + restarting speaker, Hard Reset), RFC 7606 revised error
+    handling, RFC 4271 §6.3 first-AS enforcement — and **RPKI from the
+    start**: an RTR client (`rpki` crate, proven against a real gortr
+    cache) feeding RFC 6811 ROV, ASPA verification and RFC 9234
+    roles/OTC into the decision path, gated by the typed policy engine
     (`policy` crate, BIRD-cited semantics + an FRR route-map
     compatibility grammar).
   - **ospfd** (`scripts/test-ospf*.sh`, `test-ospfv3-*.sh`): the
     RFC 2328 stack end-to-end — LSA database, flooding, SPF with
     back-off and partial recompute, broadcast networks and DR
-    election, inter-area summary routes, stub/NSSA areas, Appendix-D
-    authentication (MD5 + HMAC-SHA-256 key chains), virtual links —
-    and **OSPFv3 on the same AF-generic codebase**, reaching Full
-    adjacency with real FRR ospf6d and exchanging routes both ways.
+    election, inter-area summary routes, stub/NSSA areas (including
+    the RFC 3101 translator), Appendix-D authentication (MD5 +
+    HMAC-SHA-256 key chains), area ranges, virtual links — and
+    **OSPFv3 on the same AF-generic codebase**, at Full adjacency
+    with real FRR ospf6d and exchanging routes both ways.
+  - **isisd** (`scripts/test-isis-*.sh`): the RFC 1195 / ISO 10589
+    stack — TLV codec, LSPDB, per-level SPF, three-way adjacency,
+    broadcast/LAN circuits with DIS election, RFC 5302 inter-area,
+    RFC 5304 auth, LSP fragmenting, administrative knobs — at Full
+    adjacency with real FRR isisd.
   - **bfdd** (`scripts/test-bfd-*.sh`): RFC 5880–5883 — the exact
     state machine, TTL-255 single-hop enforcement on both address
     families (receive-side, kernel-proven), multihop, echo, and the
     ZAPI-BFD integration feeding bgpd's fast-down path.
-- **management plane** (Phase 4, opened):
+- **savd — native source address validation**: a SAV Information Base fed
+  from the RIB and config; the IBA/IBB/PBA/PBB validation-mode rule model
+  (draft-ietf-savnet-general-sav-capabilities); uRPF-family rule
+  generation (RFC 3704/8704); BAR-SAV allowlist derivation from
+  BGP AS_PATHs + ROA/ASPA (draft-ietf-sidrops-bar-sav); enforcement
+  behind the dataplane trait with two backends (`rp_filter` and
+  nftables — `scripts/test-sav-nft.sh`); event-driven re-evaluation
+  with RFC 8704 deletion hysteresis. Monitor-only by default — drop
+  mode refuses without an explicit opt-in, and spoof-block/legit-pass
+  are exercised with real traffic (`scripts/test-w7-sav.sh`,
+  `scripts/test-w8-savd.sh`). No general-purpose suite (FRR, BIRD,
+  Holo) ships packet-plane SAV today.
+- **management plane** (Phase 4, complete):
   - **vtyd** — a vtysh-compatible VTY server (Cisco-style grammar,
     run-dir show commands, config mode with `write file` applying
     through configd);
   - **configd** — the transactional config manager: one canonical
-    `rouster.conf`, structural + per-daemon deep validation
-    (`--validate-config` across the fleet), atomic staged apply with
-    generation tracking, and automatic rollback on daemon failure;
+    `rouster.conf`, YANG-modeled (a pure-Rust RFC 7950-subset core,
+    seven per-daemon models — the tree is the internal source of
+    truth), structural + per-daemon deep validation, atomic staged
+    apply with generation tracking, automatic rollback on daemon
+    failure, and a RESTCONF-shaped HTTP northbound
+    (`restconfd`, unix-socket default + optional bearer token).
   - **rousterctl** — the read-only operator CLI over the run-dir
     contract (`show sav` / `status` / the interface, neighbour and
     VRF views).
+- **performance** (the v1.1.0 headline, every receipt in
+  [docs/benchmarks.md](docs/benchmarks.md) §R, same rig, same feed,
+  same injector as FRR 10.2.2):
+  - full 1,126,490-prefix table in-kernel in **8.02 s median**
+    (FRR: 30.36 s — 3.79× ahead);
+  - speaker memory **449 B/prefix** (FRR: 897 — 2.1× ahead);
+  - core memory **229 B/prefix** (FRR: 519 — 2.27× ahead);
+  - CPU ahead on both processes; zero malformed/rejected messages.
 
-The full suite runs as `scripts/run-smokes.sh` (34 scripts, green —
+The full suite runs as `scripts/run-smokes.sh` (41 scripts, green —
 proven against the testbed image rebuilt from the in-repo recipe
 `docker/frr-testbed.Dockerfile`); it runs nightly in CI
-(`smokes.yml`, ~03:00 UTC) and on demand via workflow dispatch. The
-push/PR gate is `cargo fmt --check` + `clippy -D warnings` + 1400+
-unit tests.
+(`smokes.yml`) plus nightly codec fuzzing (`fuzz.yml`, whose first
+dispatch caught a real OOB in the RTR decoder). The push/PR gate is
+`cargo fmt --check` + `clippy -D warnings` (host + Linux-target
+legs) + 1859 tests.
 
-Still ahead per the plan: IS-IS and the Phase-5 breadth, the YANG
-northbound, and BAR-SAV allowlist derivation on top of the BGP/RPKI
-data.
+Still ahead per the plan: the Phase-5 breadth menu (RIPng, PIM,
+LDP/MPLS, EVPN, SRv6, FPM, BMP), and the inter-domain SAVNET
+architecture as IETF drafts mature.
 
 ## Quickstart
 
