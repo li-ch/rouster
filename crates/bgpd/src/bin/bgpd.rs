@@ -151,6 +151,14 @@ fn main() {
             );
         }
         let sink = SharedSink(Arc::new(Mutex::new(RibSink::new(Arc::clone(&loc_rib)))));
+        // PERF-M1 M1: the memory census (feature `mem-census`,
+        // runtime-gated by BGPD_MEM_CENSUS=1 so one binary serves both
+        // the clean receipt runs and the census runs). Inert otherwise:
+        // zero code without the feature, one env check with it.
+        #[cfg(feature = "mem-census")]
+        if std::env::var_os("BGPD_MEM_CENSUS").is_some() {
+            bgpd::census::spawn(Arc::clone(&loc_rib));
+        }
         // The BAR-SAV feed writer (S9-a M3, `barsav feed <path>`): a
         // read-only Adj-RIB-In snapshot publisher. It never touches
         // the decision path — it locks the Loc-RIB just long enough

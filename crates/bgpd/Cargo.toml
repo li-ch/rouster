@@ -33,6 +33,13 @@ sav = { workspace = true, optional = true }
 # protocols; default OFF (the default workspace gate exercises none of
 # it, and feature-off compiles zero hooks).
 experimental-savnet = ["dep:sav", "sav/experimental-savnet"]
+# PERF-M1 M1: the memory census — a deep-size walker over the RIB that
+# names the per-structure consumers (attrs, maps, duplication factor)
+# at table milestones. Default OFF and inert at runtime unless
+# BGPD_MEM_CENSUS=1 is set in the daemon's environment; the receipts'
+# headline RSS numbers come from feature-off clean runs (the census
+# walk's own transients are disclosed in the census-mode logs).
+mem-census = []
 
 # start_paused tokio tests + duplex sockets, dev-only (sav precedent).
 [dev-dependencies]

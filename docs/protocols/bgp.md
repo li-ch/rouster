@@ -557,6 +557,58 @@ paced.
   2026-10-15); the line now carries counts plus a bounded four-entry
   NLRI preview (path ids included) — O(1), never the full list.
 
+## Memory campaign 2026-10-16 (PERF-M1): the census
+
+The §R E5 gap (bgpd 1,679 B/prefix at the full table vs FRR's 897)
+got its target list: a feature-gated census (`bgpd --features
+mem-census`, runtime-inert unless `BGPD_MEM_CENSUS=1`) walks the
+Loc-RIB at table milestones and names the consumers. Receipt runner:
+`scripts/test-bgp-mem-slice.sh` (the E1 protocol scaled to a
+`--limit 100000` slice, P0's poller reused read-only; clean-mode
+builds carry no census code — the headline numbers).
+
+Baseline (HEAD `01ff962` + P0's harness commits, clean 100k slice,
+99,998 prefixes in the main table, 46,424 UPDATEs, zero
+malformed/rejected): **bgpd 1,882 B/prefix empty→final (RSS
+2,032→185,852 KiB; HWM 2066 B/prefix)**, bgpd CPU 0.88 s, EOR wall
+0.42 s. The full-table §R numbers (1,679 at 1.126M) sit below this —
+per-prefix overhead is amortized at larger tables; the slice is the
+campaign's like-for-like yardstick.
+
+The census table at 100k (census-mode run; its own walk perturbs RSS
+by <2%, `vm_rss_after` disclosed per dump):
+
+| consumer | bytes | B/prefix | of RSS |
+|---|---|---|---|
+| Adj-RIB-In attr model (Vec buffers 530 + AS_PATH 51 + COMMUNITIES 8 + unknown 0.1) | 58.92 MB | 589 | 31% |
+| best-table deep copy of the same | 38.84 MB | 388 | 21% |
+| keyed-map inline (adj Nlri+Route 104 B + best IpPrefix+Route ~104 B, node headers ~4 B) | ~20.9 MB | ~210 | 11% |
+| allocator slack + ingest churn (decoder Vecs, recompute clones, freed-but-retained) | ~67.5 MB | ~695 | 37% |
+
+Inline constants measured: Route 80, Nlri 24, IpPrefix 18,
+PathAttribute 64, AsSegment 32, PeerInfo 28, BestChange 184. Per
+route the attr model makes ~4 allocations (attrs Vec + segments Vec +
+ASN Vec + communities Vec, `attr_allocs_centi=397`).
+
+**The verdict the table names: duplication.** Only **16,621 distinct
+attribute tuples across 99,998 routes (6.02× duplication; 14,369
+distinct AS_PATHs; 2,707 distinct tuples with the AS_PATH removed)**
+— FRR's `bgp_attr` intern hash is the known art, and the census says
+it applies here with force. Second: the `best` table stores a deep
+clone of every elected route (`recompute_prefix` clones candidates,
+winner, and old-best; the stored winner duplicates the Adj-RIB-In
+copy). Third: the map inline is `Route`-sized twice per prefix.
+99,981/99,998 paths are a single AS_SEQUENCE (the AsPath double-Vec
+shape carries ~72 B of structural slack per *unique* path — small
+post-intern). The churn share (37%) is expected to collapse with
+interning: Arc clones allocate nothing, and the election's transient
+copies stop being deep.
+
+Campaign order (PERF-PLAN Phase 1): M2 the intern table + Arc-shared
+attrs (bar ≤1,200 B/prefix), M3 the map inline (≤1,000), M4 the
+census-named remainder (≤800). Each lands with a clean-mode 100k
+slice receipt (RSS series + B/prefix) and the wall/CPU gate.
+
 ## §Deferred anchors
 
 Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime

@@ -18,6 +18,8 @@
 
 pub mod attr;
 pub mod capability;
+#[cfg(feature = "mem-census")]
+pub mod census;
 pub mod config;
 pub mod daemon;
 pub mod error;

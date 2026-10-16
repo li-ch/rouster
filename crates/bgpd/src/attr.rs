@@ -168,7 +168,9 @@ impl AsPath {
         }
     }
 
-    fn encode(&self, out: &mut Vec<u8>, asn4: bool) {
+    /// Encodes the path's wire form (PERF-M1's census hashes it for
+    /// the duplication factor; crate-visible for that walk only).
+    pub(crate) fn encode(&self, out: &mut Vec<u8>, asn4: bool) {
         for seg in &self.segments {
             let asns = match seg {
                 AsSegment::Set(v) => v,

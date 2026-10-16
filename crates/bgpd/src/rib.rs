@@ -582,6 +582,20 @@ impl LocRib {
         self.best.values()
     }
 
+    /// PERF-M1's census view (feature `mem-census`): every Adj-RIB-In
+    /// route, read-only. Feature-gated so the ungated public surface
+    /// is unchanged; the census module is the only caller.
+    #[cfg(feature = "mem-census")]
+    pub fn census_adj_routes(&self) -> impl Iterator<Item = &Route> {
+        self.adj_in.values().flat_map(|rib| rib.values())
+    }
+
+    /// PERF-M1's census view: the peer count (the adj_in fan-out).
+    #[cfg(feature = "mem-census")]
+    pub fn census_peer_count(&self) -> usize {
+        self.adj_in.len()
+    }
+
     pub fn route_count(&self) -> usize {
         self.adj_in.values().map(|rib| rib.len()).sum()
     }
