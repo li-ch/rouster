@@ -1,0 +1,27 @@
+[package]
+name = "bgpd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bgpd]
+path = ".."
+
+# Independent workspace: the fuzz crate builds outside the Rouster
+# workspace (no root-manifest membership; the codec crates' workspace
+# inheritance resolves through their own root manifest).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "bgp_decode"
+path = "fuzz_targets/bgp_decode.rs"
+test = false
+doc = false
+bench = false
