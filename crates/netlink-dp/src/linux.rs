@@ -363,6 +363,12 @@ const RT_TABLE_COMPAT: u8 = 252;
 /// and the mirror keeps the rest (LOOPBACK, BROADCAST, MULTICAST,
 /// RUNNING, …) for consumers that gate on them (the ZAPI interface
 /// mirror relays the word verbatim, like zebra).
+///
+/// Hardware address: `IFLA_ADDRESS` ([`LinkAttribute::Address`]) maps to
+/// the event's `hw_addr` only at Ethernet size (6 bytes) — the LAN SNPA
+/// shape. Other lengths stay `None`: tun carries no address, sit/ipip a
+/// 4-byte one, InfiniBand 20; consumers must see "no SNPA" for those,
+/// not a truncated guess.
 fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
     let name = msg.attributes.iter().find_map(|a| match a {
         LinkAttribute::IfName(n) => Some(n.clone()),
@@ -370,9 +376,15 @@ fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
     })?;
     let mut vrf_table = None;
     let mut master_ifindex = None;
+    let mut hw_addr = None;
     for attr in &msg.attributes {
         match attr {
             LinkAttribute::Controller(ix) => master_ifindex = Some(*ix),
+            LinkAttribute::Address(bytes) => {
+                if let Some(mac) = ethernet_mac(bytes) {
+                    hw_addr = Some(mac);
+                }
+            }
             LinkAttribute::LinkInfo(infos) => {
                 for info in infos {
                     if let LinkInfo::Data(InfoData::Vrf(nlas)) = info {
@@ -395,7 +407,15 @@ fn link_event(msg: &LinkMessage, _is_new: bool) -> Option<DataplaneEvent> {
         flags: common::LinkFlags::from_bits(msg.header.flags.bits()),
         vrf_table,
         master_ifindex,
+        hw_addr,
     })
+}
+
+/// An `IFLA_ADDRESS` payload as a 6-byte MAC, when it is exactly that
+/// (see `link_event`'s hardware-address note for the other lengths).
+fn ethernet_mac(bytes: &[u8]) -> Option<[u8; 6]> {
+    let mac: &[u8; 6] = bytes.try_into().ok()?;
+    Some(*mac)
 }
 
 /// Maps a kernel address message to an `AddressNew`/`AddressDel` event.
@@ -1444,6 +1464,43 @@ mod tests {
             rp_filter_path("vethspoof"),
             "/proc/sys/net/ipv4/conf/vethspoof/rp_filter"
         );
+    }
+
+    /// IFLA_ADDRESS rides the LinkNew event at Ethernet size — the LAN
+    /// SNPA hop of the hw_addr chain — and stays absent for non-MAC
+    /// shapes (tun's nothing, sit's 4 bytes, InfiniBand's 20).
+    #[test]
+    fn link_event_carries_the_ethernet_hw_address() {
+        fn link_with_addr(bytes: Option<Vec<u8>>) -> LinkMessage {
+            let mut link = LinkMessage::default();
+            link.header.index = 2;
+            link.attributes.push(LinkAttribute::IfName("eth0".into()));
+            if let Some(bytes) = bytes {
+                link.attributes.push(LinkAttribute::Address(bytes));
+            }
+            link
+        }
+        match link_event(
+            &link_with_addr(Some(vec![0x02, 0x42, 0xac, 0x11, 0x00, 0x02])),
+            true,
+        ) {
+            Some(DataplaneEvent::LinkNew { hw_addr, .. }) => {
+                assert_eq!(hw_addr, Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02]));
+            }
+            other => panic!("expected a LinkNew event, got {other:?}"),
+        }
+        for absent in [
+            None,                               // tun-style: no IFLA_ADDRESS
+            Some(vec![0x0a, 0x00, 0x00, 0x01]), // sit/ipip 4-byte
+            Some(vec![0u8; 20]),                // InfiniBand 20-byte
+        ] {
+            match link_event(&link_with_addr(absent), true) {
+                Some(DataplaneEvent::LinkNew { hw_addr, .. }) => {
+                    assert_eq!(hw_addr, None, "non-Ethernet address must not map");
+                }
+                other => panic!("expected a LinkNew event, got {other:?}"),
+            }
+        }
     }
 
     // ---- F9: the bounded ACK + resync --------------------------------

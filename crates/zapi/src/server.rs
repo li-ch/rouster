@@ -237,6 +237,14 @@ pub struct InterfaceMirror {
     /// zebra does; the pinned `iff` bits document why: ospfd gates on
     /// UP|RUNNING/BROADCAST|MULTICAST and treats LOOPBACK as a stub).
     pub flags: LinkFlags,
+    /// The link's hardware address (`IFLA_ADDRESS` at Ethernet size),
+    /// encoded into the body's `hw_addr_len` + `hw_addr` fields — the
+    /// LAN SNPA FRR's IS-IS broadcast circuits read off the dump (the
+    /// M4 oracle capture shows real zebra emitting it: the vrf-test
+    /// device dumped with a 6-byte hw_addr). `None` encodes length 0,
+    /// matching links the kernel gives no address (tun) — exactly the
+    /// zeros-SNPA case real zebra would also report.
+    pub hw_addr: Option<[u8; 6]>,
     /// Configured addresses (host prefixes) — sent as
     /// INTERFACE_ADDRESS_ADD per address.
     pub addresses: Vec<IpPrefix>,
@@ -691,6 +699,15 @@ impl ZapiSession {
                     // zebra does (A12; no name-based synthesis — the
                     // mirror's word is the truth, W1B deviation 1 retired).
                     wire.flags = u64::from(intf.flags.bits());
+                    // The hardware address (hw_addr chain's wire hop): a
+                    // length-prefixed field per the pinned layout, filled
+                    // only when the dataplane reported an Ethernet-sized
+                    // one. FRR's IS-IS LAN circuits read their SNPA here —
+                    // the broadcast interop smoke's long-standing blocker.
+                    if let Some(mac) = intf.hw_addr {
+                        wire.hw_addr_len = mac.len() as u32;
+                        wire.hw_addr = mac.to_vec();
+                    }
                     // M4 pin: an enslaved interface's frames carry the
                     // enslaving VRF's id in the HEADER (vrf_id = the vrf
                     // device's ifindex, observed live); the body's
@@ -2340,6 +2357,7 @@ mod tests {
                 vrf_id: 0,
                 master_ifindex: None,
                 flags: common::LinkFlags::up_broadcast(),
+                hw_addr: Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02]),
                 addresses: vec!["10.0.0.1/24".parse().unwrap()],
             },
             InterfaceMirror {
@@ -2349,6 +2367,7 @@ mod tests {
                 vrf_id: 3,
                 master_ifindex: None,
                 flags: common::LinkFlags::UP,
+                hw_addr: None,
                 addresses: vec![],
             },
             InterfaceMirror {
@@ -2358,19 +2377,30 @@ mod tests {
                 vrf_id: 3,
                 master_ifindex: Some(3),
                 flags: common::LinkFlags::up_broadcast(),
+                hw_addr: None,
                 addresses: vec!["192.0.2.1/24".parse().unwrap()],
             },
         ]);
 
-        // eth0: header vrf 0; its ADDRESS_ADD too.
-        let (header, _) = client.read_frame().await;
+        // eth0: header vrf 0; the body carries the hardware address —
+        // the hw_addr chain's wire hop (the M4 capture's shape: real
+        // zebra emits the 6-byte MAC through the length-prefixed field;
+        // FRR's IS-IS LAN circuit SNPA reads exactly this).
+        let (header, body) = client.read_frame().await;
         assert_eq!(header.vrf_id, 0);
+        let dumped = crate::ZapiInterface::decode(&body).unwrap();
+        assert_eq!(dumped.hw_addr_len, 6);
+        assert_eq!(dumped.hw_addr, vec![0x02, 0x42, 0xac, 0x11, 0x00, 0x02]);
         let (header, _) = client.read_frame().await;
         assert_eq!(header.command, 2, "eth0 address");
         assert_eq!(header.vrf_id, 0);
-        // vrf-test itself: header vrf 3.
-        let (header, _) = client.read_frame().await;
+        // vrf-test itself: header vrf 3, and no hw_addr on the wire
+        // (length 0 — the None encoding).
+        let (header, body) = client.read_frame().await;
         assert_eq!(header.vrf_id, 3, "the vrf device dumps under its own id");
+        let dumped = crate::ZapiInterface::decode(&body).unwrap();
+        assert_eq!(dumped.hw_addr_len, 0);
+        assert!(dumped.hw_addr.is_empty());
         // dummy0 (slave): INTERFACE_ADD and its address both vrf 3.
         let (header, _) = client.read_frame().await;
         assert_eq!(header.vrf_id, 3, "the slave dumps under the vrf's id");
@@ -2834,6 +2864,7 @@ mod tests {
                     vrf_id: 0,
                     master_ifindex: None,
                     flags: LinkFlags::up_broadcast(),
+                    hw_addr: None,
                     addresses: vec!["192.0.2.1/24".parse().unwrap()],
                 },
                 InterfaceMirror {
@@ -2843,6 +2874,7 @@ mod tests {
                     vrf_id: 0,
                     master_ifindex: None,
                     flags: LinkFlags::up_loopback(),
+                    hw_addr: None,
                     addresses: vec!["127.0.0.1/8".parse().unwrap()],
                 },
                 InterfaceMirror {
@@ -2854,6 +2886,7 @@ mod tests {
                     // Kernel realism: an admin-down eth keeps its static
                     // capability bits, drops UP|RUNNING.
                     flags: LinkFlags::BROADCAST | LinkFlags::MULTICAST,
+                    hw_addr: None,
                     addresses: vec![],
                 },
             ],
@@ -2916,6 +2949,7 @@ mod tests {
                     vrf_id: 0,
                     master_ifindex: None,
                     flags: LinkFlags::UP | LinkFlags::RUNNING | LinkFlags::BROADCAST,
+                    hw_addr: None,
                     addresses: vec![],
                 },
                 InterfaceMirror {
@@ -2927,6 +2961,7 @@ mod tests {
                     flags: LinkFlags::from_bits(
                         LinkFlags::up_loopback().bits() | LinkFlags::MULTICAST.bits() | 0x80,
                     ),
+                    hw_addr: None,
                     addresses: vec![],
                 },
             ],

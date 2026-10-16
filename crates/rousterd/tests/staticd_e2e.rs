@@ -133,6 +133,7 @@ async fn staticd_e2e_install_nht_filter_and_withdrawal() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.rib.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,

@@ -339,6 +339,7 @@ fn build_mirror_rib(specs: &[IfaceSpec]) -> Rib {
             },
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         for &prefix in &spec.addresses {
             rib.apply_event(&common::DataplaneEvent::AddressNew {

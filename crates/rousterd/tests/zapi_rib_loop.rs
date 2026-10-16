@@ -181,6 +181,7 @@ fn apply_command(rib: &mut Rib, command: RibCommand) -> bool {
                     vrf_id: 0,
                     master_ifindex: iface.master_ifindex,
                     flags: iface.flags,
+                    hw_addr: iface.hw_addr,
                     addresses: iface.addresses.clone(),
                 })
                 .collect();
@@ -365,6 +366,7 @@ async fn nht_register_resolved_through_real_rib() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     rib.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -434,6 +436,7 @@ async fn interface_dump_answered_from_rib_mirror() {
         flags: LinkFlags::from_bits(LinkFlags::up_broadcast().bits() | 0x80),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     rib.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 7,
@@ -527,6 +530,7 @@ async fn nht_flip_on_address_add_pushed_over_real_socket() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -584,6 +588,7 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 3,
@@ -621,6 +626,7 @@ async fn nht_flip_on_link_down_pushed_over_real_socket() {
         flags: LinkFlags::default(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     let (header, body) = client.read_frame().await;
     assert_eq!(
@@ -667,6 +673,7 @@ async fn redistribute_route_add_pushed_over_real_socket() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -755,6 +762,7 @@ async fn redistribute_registration_dumps_existing_route_over_real_socket() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -853,6 +861,7 @@ async fn reconnect_establish_dumps_without_reregister_over_real_socket() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,
@@ -1013,6 +1022,7 @@ async fn router_id_change_pushed_over_real_socket() {
         flags: LinkFlags::up_broadcast(),
         vrf_table: None,
         master_ifindex: None,
+        hw_addr: None,
     });
     driver.apply_event(&DataplaneEvent::AddressNew {
         ifindex: 2,

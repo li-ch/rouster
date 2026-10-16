@@ -42,6 +42,12 @@ pub struct InterfaceState {
     /// Ifindex of the master device this interface is enslaved to (e.g. a
     /// VRF device); `None` when unenslaved.
     pub master_ifindex: Option<u32>,
+    /// The interface's hardware address (`IFLA_ADDRESS`) at Ethernet
+    /// size, mirrored for consumers that need the MAC — the ZAPI
+    /// INTERFACE_ADD `hw_addr` field (FRR's IS-IS LAN circuit SNPA) is
+    /// the driver. `None` for links without an Ethernet address (tun,
+    /// sit, InfiniBand).
+    pub hw_addr: Option<[u8; 6]>,
 }
 
 /// One routing table. `TableId` follows Linux numbering (254 = main).
@@ -791,6 +797,7 @@ impl Rib {
                 flags,
                 vrf_table,
                 master_ifindex,
+                hw_addr,
             } => {
                 let iface = self.interfaces.entry(*ifindex).or_default();
                 iface.name = name.clone();
@@ -802,6 +809,7 @@ impl Rib {
                 iface.flags = *flags;
                 iface.vrf_table = *vrf_table;
                 iface.master_ifindex = *master_ifindex;
+                iface.hw_addr = *hw_addr;
                 self.sync_connected();
                 self.rebuild_nht();
             }
@@ -1692,6 +1700,7 @@ mod tests {
             flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         rib.apply_event(&DataplaneEvent::AddressNew {
             ifindex: 2,
@@ -1745,6 +1754,7 @@ mod tests {
             flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         let iface = rib.interfaces().get(&5).unwrap();
         assert_eq!(iface.name, "eth1");
@@ -1768,6 +1778,7 @@ mod tests {
             flags: common::LinkFlags::from_bits(common::LinkFlags::up_loopback().bits() | 0x80),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         let iface = rib.interfaces().get(&1).unwrap();
         assert_eq!(
@@ -1786,6 +1797,7 @@ mod tests {
             flags: common::LinkFlags::LOOPBACK | common::LinkFlags::from_bits(0x80),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         let iface = rib.interfaces().get(&1).unwrap();
         assert!(!iface.is_up);
@@ -1805,6 +1817,42 @@ mod tests {
             .unwrap()
             .flags
             .contains(common::LinkFlags::UP));
+    }
+
+    /// The hardware address rides the same overwrite path as the flags
+    /// word (the A12 pattern): each RTM_NEWLINK carries the link's full
+    /// state, so a re-reported link replaces the mirrored MAC and a
+    /// report without one clears it. The hw_addr chain's RIB hop — FRR's
+    /// IS-IS LAN circuit SNPA reads it through the ZAPI mirror.
+    #[test]
+    fn link_hw_addr_mirrored_and_replaced() {
+        let mut rib = Rib::new();
+        rib.apply_event(&DataplaneEvent::LinkNew {
+            ifindex: 2,
+            name: "eth0".into(),
+            is_up: true,
+            flags: common::LinkFlags::up_broadcast(),
+            vrf_table: None,
+            master_ifindex: None,
+            hw_addr: Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02]),
+        });
+        assert_eq!(
+            rib.interfaces().get(&2).unwrap().hw_addr,
+            Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02])
+        );
+
+        // The next notification carries no IFLA_ADDRESS: cleared, not
+        // stale-kept (the mirror must not remember what the kernel no
+        // longer reports).
+        rib.apply_event(&link(2, "eth0", true));
+        assert_eq!(rib.interfaces().get(&2).unwrap().hw_addr, None);
+
+        // Placeholder (address before link) defaults to None.
+        rib.apply_event(&DataplaneEvent::AddressNew {
+            ifindex: 5,
+            prefix: "10.0.0.1/24".parse().unwrap(),
+        });
+        assert_eq!(rib.interfaces().get(&5).unwrap().hw_addr, None);
     }
 
     #[test]
@@ -1895,6 +1943,7 @@ mod tests {
             flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         rib.apply_event(&DataplaneEvent::AddressNew {
             ifindex: 2,
@@ -1981,6 +2030,7 @@ mod tests {
             flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         rib.apply_event(&DataplaneEvent::AddressNew {
             ifindex: 3,
@@ -2217,6 +2267,7 @@ mod tests {
             },
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 
@@ -2776,6 +2827,7 @@ mod tests {
             flags: common::LinkFlags::UP,
             vrf_table: Some(table),
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 
@@ -2792,6 +2844,7 @@ mod tests {
             },
             vrf_table: None,
             master_ifindex: master,
+            hw_addr: None,
         }
     }
 

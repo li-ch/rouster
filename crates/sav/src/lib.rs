@@ -1015,6 +1015,7 @@ mod tests {
             },
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 

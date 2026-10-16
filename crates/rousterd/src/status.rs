@@ -276,6 +276,7 @@ mod tests {
             flags,
             vrf_table,
             master_ifindex: master,
+            hw_addr: None,
         }
     }
 

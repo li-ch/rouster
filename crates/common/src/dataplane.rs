@@ -150,6 +150,14 @@ pub enum DataplaneEvent {
         /// `IFLA_MASTER` (a VRF device in the VRF case; bridges and bonds
         /// use the same attribute); `None` when unenslaved.
         master_ifindex: Option<u32>,
+        /// The link's hardware address (`IFLA_ADDRESS`), when the kernel
+        /// reports an Ethernet-sized one: a 6-byte MAC, the LAN SNPA
+        /// IS-IS broadcast circuits key on and the ZAPI INTERFACE_ADD
+        /// `hw_addr` field relays. `None` for links without one (tun and
+        /// other software devices) or with a non-Ethernet address
+        /// (InfiniBand's 20 bytes, sit/ipip's 4) — consumers must treat
+        /// those as "no SNPA", matching what real zebra mirrors.
+        hw_addr: Option<[u8; 6]>,
     },
     LinkDel {
         ifindex: u32,
@@ -201,6 +209,15 @@ pub enum DataplaneEvent {
     },
 }
 
+/// A 6-byte MAC as colon-separated hex (`02:42:ac:11:00:02`) — the
+/// rendering the link-event line and the smokes' greps share.
+fn format_mac(mac: &[u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 impl fmt::Display for DataplaneEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -210,6 +227,7 @@ impl fmt::Display for DataplaneEvent {
                 is_up,
                 vrf_table,
                 master_ifindex,
+                hw_addr,
                 ..
             } => {
                 write!(
@@ -222,6 +240,9 @@ impl fmt::Display for DataplaneEvent {
                 }
                 if let Some(master) = master_ifindex {
                     write!(f, ", master ifindex {master}")?;
+                }
+                if let Some(mac) = hw_addr {
+                    write!(f, ", hw {}", format_mac(mac))?;
                 }
                 write!(f, ")")
             }
@@ -586,6 +607,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table,
             master_ifindex,
+            hw_addr: None,
         }
     }
 
@@ -627,8 +649,25 @@ mod tests {
             flags: LinkFlags::default(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02]),
         };
-        assert_eq!(plain.to_string(), "link new: eth0 (ifindex 2, down)");
+        assert_eq!(
+            plain.to_string(),
+            "link new: eth0 (ifindex 2, down, hw 02:42:ac:11:00:02)"
+        );
+
+        // Software devices (tun, and sit-style non-Ethernet addresses)
+        // carry no hw_addr — the rendering omits the field entirely.
+        let no_mac = DataplaneEvent::LinkNew {
+            ifindex: 7,
+            name: "tun0".into(),
+            is_up: false,
+            flags: LinkFlags::default(),
+            vrf_table: None,
+            master_ifindex: None,
+            hw_addr: None,
+        };
+        assert_eq!(no_mac.to_string(), "link new: tun0 (ifindex 7, down)");
 
         let vrf = link_new(Some(5001), None);
         assert_eq!(

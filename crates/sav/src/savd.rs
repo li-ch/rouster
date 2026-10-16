@@ -2939,6 +2939,7 @@ mod tests {
             flags: common::LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 

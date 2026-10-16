@@ -43,6 +43,7 @@ fn mirror() -> Vec<InterfaceMirror> {
             vrf_id: 0,
             master_ifindex: None,
             flags: LinkFlags::up_broadcast(),
+            hw_addr: None,
             addresses: vec![
                 "10.0.0.1/24".parse::<IpPrefix>().unwrap(),
                 "fe80::1/64".parse::<IpPrefix>().unwrap(),
@@ -55,6 +56,7 @@ fn mirror() -> Vec<InterfaceMirror> {
             vrf_id: 0,
             master_ifindex: None,
             flags: LinkFlags::default(),
+            hw_addr: None,
             addresses: vec!["10.0.1.1/30".parse::<IpPrefix>().unwrap()],
         },
     ]

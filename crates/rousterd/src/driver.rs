@@ -472,6 +472,7 @@ impl RibDriver {
                             vrf_id,
                             master_ifindex: iface.master_ifindex,
                             flags: iface.flags,
+                            hw_addr: iface.hw_addr,
                             addresses: iface.addresses.clone(),
                         }
                     })
@@ -1137,6 +1138,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 
@@ -1148,6 +1150,7 @@ mod tests {
             flags: LinkFlags::default(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 
@@ -1172,6 +1175,7 @@ mod tests {
             flags,
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         }
     }
 
@@ -2144,6 +2148,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         assert_eq!(
             driver.router_id(),
@@ -2602,6 +2607,7 @@ mod tests {
             flags: LinkFlags::UP,
             vrf_table: Some(5001),
             master_ifindex: None,
+            hw_addr: None,
         });
         driver.apply_event(&DataplaneEvent::LinkNew {
             ifindex: 4,
@@ -2610,6 +2616,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: Some(3),
+            hw_addr: None,
         });
         driver.apply_event(&DataplaneEvent::LinkNew {
             ifindex: 2,
@@ -2618,6 +2625,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02]),
         });
         driver.apply_event(&DataplaneEvent::LinkNew {
             ifindex: 6,
@@ -2626,6 +2634,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: None,
+            hw_addr: None,
         });
         driver.apply_event(&DataplaneEvent::LinkNew {
             ifindex: 7,
@@ -2634,6 +2643,7 @@ mod tests {
             flags: LinkFlags::up_broadcast(),
             vrf_table: None,
             master_ifindex: Some(6),
+            hw_addr: None,
         });
         driver.apply(RibCommand::RequestInterfaces { reply: tx });
         let mirror = rx.blocking_recv().expect("mirror");
@@ -2647,6 +2657,15 @@ mod tests {
             "a bridge slave is not vrf-scoped"
         );
         assert_eq!(by_name("dummy0").master_ifindex, Some(3));
+        // The hw_addr chain's driver hop: the RIB-mirrored MAC reaches
+        // the InterfaceMirror the zapi session encodes (eth0's SNPA),
+        // and links without one stay None (dummy0 has no Ethernet
+        // address here).
+        assert_eq!(
+            by_name("eth0").hw_addr,
+            Some([0x02, 0x42, 0xac, 0x11, 0x00, 0x02])
+        );
+        assert_eq!(by_name("dummy0").hw_addr, None);
     }
 
     /// The W1-b BFD machinery: a client registers a destination BEFORE
