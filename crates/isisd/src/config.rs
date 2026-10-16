@@ -58,6 +58,15 @@ pub struct IsisdConfig {
     /// Per-level authentication (index 0 = the area password, 1 = the
     /// domain password — ISO §7.3.7/§7.3.9).
     pub auth: [LevelAuth; 2],
+    /// `set-overload-bit`: the administrative overload knobs (ISO
+    /// §9.8's LSPDBOL — "will not be used by any decision process to
+    /// calculate routes to another IS through the originating
+    /// system").
+    pub overload: OverloadConfig,
+    /// `spf-throttle <initial-ms> <increment-ms> <max-ms>` — the
+    /// ospfd-style back-off; (0, 0, 0) computes on change (the
+    /// default).
+    pub spf_throttle: (u64, u64, u64),
     pub interface: InterfaceConfig,
 }
 
@@ -94,6 +103,20 @@ pub enum NetworkType {
     Broadcast,
 }
 
+/// The overload knobs (FRR's `set-overload-bit` shape).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OverloadConfig {
+    /// Set unconditionally.
+    pub always: bool,
+    /// Set for the first N seconds after start (the on-startup
+    /// window — a restarting IS transits no one until it converges).
+    pub on_startup: Option<u64>,
+    /// While overloaded, originate no IP prefixes at all (FRR's
+    /// suppress-prefixes; TLV 132 addresses stay, next hops need
+    /// them).
+    pub suppress_prefixes: bool,
+}
+
 /// Per-interface parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceConfig {
@@ -105,6 +128,9 @@ pub struct InterfaceConfig {
     /// The LAN priority (ISO §9.5's 7-bit DIS election input; 0..=127,
     /// FRR's default 64).
     pub priority: u8,
+    /// `prefix-suppression`: originate no TLV 135 for the connected
+    /// prefix (TLV 132 stays — next-hop resolution needs it).
+    pub prefix_suppression: bool,
     pub hello_interval: u16,
     /// holding time = interval × multiplier (FRR's shape).
     pub hello_multiplier: u16,
@@ -119,6 +145,7 @@ impl Default for InterfaceConfig {
             circuit_type: Level::Level1And2,
             network: NetworkType::PointToPoint,
             priority: 64,
+            prefix_suppression: false,
             hello_interval: 10,
             hello_multiplier: 3,
             mtu: 1500,
@@ -185,6 +212,8 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
         redistribute_static: false,
         redistribute_level2_into_l1: false,
         auth: Default::default(),
+        overload: OverloadConfig::default(),
+        spf_throttle: (0, 0, 0),
         interface: InterfaceConfig::default(),
     };
     let mut in_router = false;
@@ -272,6 +301,12 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
                     config.interface.circuit_type = parse_level(words[1]).ok_or_else(|| {
                         parse_error(line_no, &format!("bad circuit-type {:?}", words[1]))
                     })?;
+                }
+                "prefix-suppression" => {
+                    if words.len() != 1 {
+                        return Err(parse_error(line_no, "`prefix-suppression` takes no value"));
+                    }
+                    config.interface.prefix_suppression = true;
                 }
                 "priority" => {
                     if words.len() != 2 {
@@ -417,6 +452,54 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
                     },
                     snp,
                 };
+            }
+            "set-overload-bit" => {
+                let mut cfg = OverloadConfig {
+                    always: true,
+                    ..Default::default()
+                };
+                let mut i = 1;
+                while i < words.len() {
+                    match words[i] {
+                        "on-startup" => {
+                            let secs: u64 = words
+                                .get(i + 1)
+                                .and_then(|w| w.parse().ok())
+                                .ok_or_else(|| {
+                                    parse_error(line_no, "`on-startup <seconds>` is numeric")
+                                })?;
+                            cfg.on_startup = Some(secs);
+                            cfg.always = false;
+                            i += 2;
+                        }
+                        "suppress-prefixes" => {
+                            cfg.suppress_prefixes = true;
+                            i += 1;
+                        }
+                        other => {
+                            return Err(parse_error(
+                                line_no,
+                                &format!("bad set-overload-bit option {other:?}"),
+                            ))
+                        }
+                    }
+                }
+                config.overload = cfg;
+            }
+            "spf-throttle" => {
+                if words.len() != 4 {
+                    return Err(parse_error(
+                        line_no,
+                        "`spf-throttle <initial-ms> <increment-ms> <max-ms>`",
+                    ));
+                }
+                let mut nums = [0u64; 3];
+                for (slot, word) in nums.iter_mut().zip(&words[1..]) {
+                    *slot = word.parse().map_err(|_| {
+                        parse_error(line_no, "spf-throttle values are numeric (ms)")
+                    })?;
+                }
+                config.spf_throttle = (nums[0], nums[1], nums[2]);
             }
             "hostname" => {
                 if words.len() != 2 {

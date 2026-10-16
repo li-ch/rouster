@@ -58,10 +58,16 @@ pub fn fragment_tlvs(tlvs: &[Tlv], budget: usize) -> Vec<Vec<Tlv>> {
     let mut identity: Vec<Tlv> = Vec::new();
     let mut adjacency: Vec<crate::tlv::ExtIsNeighbor> = Vec::new();
     let mut prefixes: Vec<crate::tlv::WideIpReach> = Vec::new();
+    let mut narrow_adjacency: Vec<crate::tlv::OldIsNeighbor> = Vec::new();
+    let mut narrow_prefixes: Vec<crate::tlv::NarrowIpReach> = Vec::new();
     for tlv in tlvs {
         match tlv {
             Tlv::ExtIsReachability(entries) => adjacency.extend(entries.iter().cloned()),
             Tlv::ExtIpReachability(entries) => prefixes.extend(entries.iter().cloned()),
+            Tlv::IsReachability(entries) => narrow_adjacency.extend(entries.iter().cloned()),
+            Tlv::IpInternalReachability(entries) | Tlv::IpExternalReachability(entries) => {
+                narrow_prefixes.extend(entries.iter().cloned())
+            }
             other => identity.push(other.clone()),
         }
     }
@@ -83,10 +89,93 @@ pub fn fragment_tlvs(tlvs: &[Tlv], budget: usize) -> Vec<Vec<Tlv>> {
     }
 
     // Pack the adjacency entries first, then the prefix entries,
-    // opening fragments as the budget demands.
+    // opening fragments as the budget demands (wide families ahead
+    // of their narrow transition-mode twins).
     pack_ext_is(&mut fragments, &mut adjacency, budget);
     pack_ext_ip(&mut fragments, &mut prefixes, budget);
+    pack_old_is(&mut fragments, &mut narrow_adjacency, budget);
+    pack_narrow_ip(&mut fragments, &mut narrow_prefixes, budget);
     fragments
+}
+
+/// TLV 2's entries are a fixed 11 octets each.
+fn pack_old_is(
+    fragments: &mut Vec<Vec<Tlv>>,
+    entries: &mut Vec<crate::tlv::OldIsNeighbor>,
+    budget: usize,
+) {
+    let mut iter = std::mem::take(entries).into_iter().peekable();
+    while let Some(entry) = iter.next() {
+        if 2 + 11 > budget {
+            continue;
+        }
+        let current_used: usize = fragments
+            .last()
+            .map(|f| f.iter().map(tlv_wire_len).sum())
+            .unwrap_or(0);
+        if current_used + 2 + 11 > budget && open_fragment(fragments).is_none() {
+            break;
+        }
+        let mut value = vec![entry];
+        while value.len() < 23 {
+            if iter.peek().is_none() {
+                break;
+            }
+            let fragment_used: usize = fragments
+                .last()
+                .map(|f| f.iter().map(tlv_wire_len).sum())
+                .unwrap_or(0);
+            if fragment_used + 2 + 11 * (value.len() + 1) > budget {
+                break;
+            }
+            value.push(iter.next().expect("peeked"));
+        }
+        let last = fragments.last_mut().expect("fragment exists");
+        last.push(Tlv::IsReachability(value));
+    }
+}
+
+/// TLV 128/130's entries are a fixed 12 octets each.
+fn pack_narrow_ip(
+    fragments: &mut Vec<Vec<Tlv>>,
+    entries: &mut Vec<crate::tlv::NarrowIpReach>,
+    budget: usize,
+) {
+    let mut iter = std::mem::take(entries).into_iter().peekable();
+    while let Some(entry) = iter.next() {
+        if 2 + 12 > budget {
+            continue;
+        }
+        let current_used: usize = fragments
+            .last()
+            .map(|f| f.iter().map(tlv_wire_len).sum())
+            .unwrap_or(0);
+        if current_used + 2 + 12 > budget && open_fragment(fragments).is_none() {
+            break;
+        }
+        let external = entry.external;
+        let mut value = vec![entry];
+        while value.len() < 21 {
+            let Some(next) = iter.peek() else { break };
+            if next.external != external {
+                break; // never mix families inside one instance
+            }
+            let fragment_used: usize = fragments
+                .last()
+                .map(|f| f.iter().map(tlv_wire_len).sum())
+                .unwrap_or(0);
+            if fragment_used + 2 + 12 * (value.len() + 1) > budget {
+                break;
+            }
+            value.push(iter.next().expect("peeked"));
+        }
+        let last = fragments.last_mut().expect("fragment exists");
+        last.push(if external {
+            Tlv::IpExternalReachability(value)
+        } else {
+            Tlv::IpInternalReachability(value)
+        });
+    }
 }
 
 /// Open a new fragment (capped at 256 — §7.3.4's LSP number space).

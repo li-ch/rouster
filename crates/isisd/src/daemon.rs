@@ -81,6 +81,65 @@ fn refresh_threshold(id: LspId) -> u16 {
     REFRESH_BELOW - jitter
 }
 
+/// The SPF back-off throttle (the ospfd `SpfScheduler` pattern,
+/// FRR-parity shape): a change after an idle period schedules at the
+/// initial delay; back-to-back changes walk the increment up to the
+/// maximum; a run marks the cycle and the next quiet period of at
+/// least the max delay resets it. `(0, 0, 0)` — the default — leaves
+/// every change due immediately (compute-on-change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpfThrottle {
+    pub initial_ms: u64,
+    pub increment_ms: u64,
+    pub max_ms: u64,
+    last_run: Option<u64>,
+    next_due: Option<u64>,
+    current_delay_ms: u64,
+}
+
+impl SpfThrottle {
+    pub fn new(initial_ms: u64, increment_ms: u64, max_ms: u64) -> Self {
+        Self {
+            initial_ms,
+            increment_ms,
+            max_ms,
+            ..Self::default()
+        }
+    }
+
+    /// A topology change arrived at `now_ms`; returns the due time.
+    /// Never earlier than an already-set due time.
+    pub fn on_change(&mut self, now_ms: u64) -> Option<u64> {
+        let idle = self
+            .last_run
+            .is_some_and(|t| now_ms.saturating_sub(t) >= self.max_ms);
+        let delay = if self.last_run.is_none() || idle {
+            self.initial_ms
+        } else {
+            self.current_delay_ms
+                .saturating_add(self.increment_ms)
+                .min(self.max_ms)
+                .max(self.initial_ms)
+        };
+        self.current_delay_ms = delay;
+        let proposed = now_ms.saturating_add(delay);
+        self.next_due = Some(match self.next_due {
+            Some(due) => due.max(proposed),
+            None => proposed,
+        });
+        self.next_due
+    }
+
+    pub fn is_due(&self, now_ms: u64) -> bool {
+        self.next_due.is_some_and(|d| now_ms >= d)
+    }
+
+    pub fn mark_run(&mut self, now_ms: u64) {
+        self.last_run = Some(now_ms);
+        self.next_due = None;
+    }
+}
+
 /// ISO §7.3.15's circuit pacing, pure and clock-injected:
 /// §7.3.15.5's p2p rule ("the interval between two consecutive
 /// transmissions of the same LSP shall be at least
@@ -117,6 +176,63 @@ impl LspRateLimiter {
         self.sent_at.push_back(now);
         self.per_lsp_last.insert(id, now);
         true
+    }
+}
+
+fn wide_prefix(addr: Ipv4Addr, plen: u8, metric: u32) -> WideIpReach {
+    WideIpReach {
+        metric,
+        up_down: false,
+        prefix: (addr, plen),
+        sub_tlvs: vec![],
+    }
+}
+
+/// The narrow twin of one TLV 22 adjacency (the deployed 11-octet
+/// form: default metric first, the unsupported-metric S octets at
+/// 0x80).
+fn narrow_of_adjacency(n: &ExtIsNeighbor) -> crate::tlv::OldIsNeighbor {
+    let narrow = |value: u16| crate::tlv::NarrowMetric {
+        flag: false,
+        up_down: false,
+        value,
+    };
+    let unsupported = crate::tlv::NarrowMetric {
+        flag: true,
+        up_down: false,
+        value: 0,
+    };
+    crate::tlv::OldIsNeighbor {
+        id: n.id,
+        default_metric: narrow(n.metric.min(63) as u16),
+        delay_metric: unsupported,
+        expense_metric: unsupported,
+        error_metric: unsupported,
+    }
+}
+
+/// The narrow twin of one TLV 135 prefix (internal reachability, the
+/// up/down bit carried on the default-metric octet per RFC 5302 §2).
+fn narrow_of_prefix(p: &WideIpReach) -> crate::tlv::NarrowIpReach {
+    let default_metric = crate::tlv::NarrowMetric {
+        flag: false,
+        up_down: p.up_down,
+        value: p.metric.min(63) as u16,
+    };
+    let unsupported = crate::tlv::NarrowMetric {
+        flag: true,
+        up_down: false,
+        value: 0,
+    };
+    let mask = !u32::MAX.checked_shr(u32::from(p.prefix.1)).unwrap_or(0);
+    crate::tlv::NarrowIpReach {
+        default_metric,
+        delay_metric: unsupported,
+        expense_metric: unsupported,
+        error_metric: unsupported,
+        address: p.prefix.0,
+        mask: Ipv4Addr::from(mask),
+        external: false,
     }
 }
 
@@ -178,6 +294,12 @@ pub struct Daemon {
     lan: [Option<LanCircuit>; 2],
     /// The circuit's LSP pacing state (§7.3.15.5/§7.3.15.6).
     rate: LspRateLimiter,
+    /// The SPF back-off (the ospfd pattern; `(0,0,0)` = on-change).
+    spf_sched: SpfThrottle,
+    /// Whether a topology change awaits its SPF window.
+    spf_dirty: bool,
+    /// The start-of-run overload deadline (`on-startup <secs>`).
+    overload_deadline: Option<u64>,
     /// LSPs waiting for their pacing slot (drained every tick —
     /// §7.3.15.6's floor: the scan continues while there is traffic).
     tx_queue: std::collections::VecDeque<Pdu>,
@@ -246,6 +368,8 @@ impl Daemon {
                 lan[1] = build();
             }
         }
+        let config_spf_throttle = config.spf_throttle;
+        let config_overload_deadline = config.overload.on_startup;
         Ok(Self {
             system_id,
             areas,
@@ -259,6 +383,13 @@ impl Daemon {
             installed: HashMap::new(),
             lan,
             rate: LspRateLimiter::default(),
+            spf_sched: SpfThrottle::new(
+                config_spf_throttle.0,
+                config_spf_throttle.1,
+                config_spf_throttle.2,
+            ),
+            spf_dirty: false,
+            overload_deadline: config_overload_deadline,
             tx_queue: std::collections::VecDeque::new(),
             last_csnp_at: None,
             config,
@@ -411,6 +542,12 @@ impl Daemon {
         self.start.elapsed().as_secs()
     }
 
+    /// The millisecond clock (the SPF throttle's input — the ospfd
+    /// pattern runs on ms granularity).
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
     /// The levels this daemon runs, as `level2` flags (`false` = the
     /// L1 slot, `true` = the L2 slot). S13-a fix: the iterator
     /// previously yielded the slot's `is_some()` — an L1L2 daemon
@@ -429,86 +566,130 @@ impl Daemon {
 
     // ---- origination ---------------------------------------------
 
+    /// Whether the overload bit is currently on (ISO §9.8's LSPDBOL
+    /// semantics): unconditionally, or inside the on-startup window.
+    fn overload_active(&self) -> bool {
+        self.config.overload.always
+            || self
+                .overload_deadline
+                .is_some_and(|until| self.now() < until)
+    }
+
     /// The TLV set of our own LSP at `level` (pure — the test target).
     /// Own prefixes (interface + redistributed) ride every level we
     /// run; the inter-area sets are level-specific: leaked-down
     /// prefixes (up/down set, RFC 5302) only in the L1 LSP,
     /// moved-up area prefixes (up/down clear) only in the L2 LSP.
+    /// The metric-style selects the advertisement families (RFC
+    /// 1195's transition mode carries both so narrow-only and
+    /// wide-only peers can both read us); the overload and
+    /// prefix-suppression knobs gate the prefix families.
     fn own_tlvs(&self, level2: bool) -> Vec<Tlv> {
+        use crate::config::MetricStyle;
         let mut tlvs = vec![
             Tlv::AreaAddresses(self.areas.clone()),
             Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
             Tlv::Hostname(self.config.hostname.clone()),
         ];
-        match self.config.interface.network {
+        let style = self.config.metric_style;
+        let overload = self.overload_active();
+        // Overload-with-suppress originates no prefixes at all (FRR's
+        // suppress-prefixes); plain prefix-suppression omits only the
+        // connected one (TLV 132 stays either way — next hops).
+        let suppress_all = overload && self.config.overload.suppress_prefixes;
+        let suppress_interface = suppress_all || self.config.interface.prefix_suppression;
+
+        // The adjacency: the peer (p2p) or the LAN (broadcast).
+        let adjacency: Vec<ExtIsNeighbor> = match self.config.interface.network {
             NetworkType::PointToPoint => {
                 if self.adjacency.state == crate::adjacency::AdjacencyState::Up {
-                    tlvs.push(Tlv::ExtIsReachability(vec![ExtIsNeighbor {
+                    vec![ExtIsNeighbor {
                         id: NeighborId::new(self.adjacency.neighbor, 0),
                         metric: DEFAULT_CIRCUIT_METRIC,
                         sub_tlvs: vec![],
-                    }]));
+                    }]
+                } else {
+                    vec![]
                 }
             }
-            // Broadcast: the adjacency entry names the LAN — the DIS's
-            // pseudonode (§7.3.9: the set of "Intermediate system
-            // adjacency, threeWayPermit FALSE, LAN designated" ones).
-            NetworkType::Broadcast => {
-                if let Some(lan_id) = self
-                    .lan
-                    .get(usize::from(level2))
-                    .and_then(|l| l.as_ref())
-                    .and_then(|l| l.lan_id())
-                {
-                    if self
-                        .lan
+            NetworkType::Broadcast => self
+                .lan
+                .get(usize::from(level2))
+                .and_then(|l| l.as_ref())
+                .and_then(|l| l.lan_id())
+                .filter(|_| {
+                    self.lan
                         .get(usize::from(level2))
                         .and_then(|l| l.as_ref())
                         .is_some_and(|l| l.up_neighbors().next().is_some())
-                    {
-                        tlvs.push(Tlv::ExtIsReachability(vec![ExtIsNeighbor {
-                            id: lan_id,
-                            metric: DEFAULT_CIRCUIT_METRIC,
-                            sub_tlvs: vec![],
-                        }]));
-                    }
-                }
+                })
+                .map(|lan_id| {
+                    vec![ExtIsNeighbor {
+                        id: lan_id,
+                        metric: DEFAULT_CIRCUIT_METRIC,
+                        sub_tlvs: vec![],
+                    }]
+                })
+                .unwrap_or_default(),
+        };
+        if !adjacency.is_empty() {
+            if matches!(style, MetricStyle::Wide | MetricStyle::Transition) {
+                tlvs.push(Tlv::ExtIsReachability(adjacency.clone()));
+            }
+            if matches!(style, MetricStyle::Narrow | MetricStyle::Transition) {
+                tlvs.push(Tlv::IsReachability(
+                    adjacency.iter().map(narrow_of_adjacency).collect(),
+                ));
             }
         }
-        if let Some((addr, plen)) = self.config.interface.address {
+
+        if let Some((addr, _plen)) = self.config.interface.address {
             tlvs.push(Tlv::IpInterfaceAddress(vec![addr]));
-            tlvs.push(Tlv::ExtIpReachability(vec![WideIpReach {
-                metric: DEFAULT_CIRCUIT_METRIC,
-                up_down: false,
-                prefix: (addr, plen),
-                sub_tlvs: vec![],
-            }]));
         }
-        for &(addr, plen) in &self.redistributed {
-            tlvs.push(Tlv::ExtIpReachability(vec![WideIpReach {
-                metric: DEFAULT_CIRCUIT_METRIC,
-                up_down: false,
-                prefix: (addr, plen),
-                sub_tlvs: vec![],
-            }]));
+
+        // The prefix set: the interface prefix (unless suppressed),
+        // redistributed statics, and the inter-area set.
+        let mut prefixes: Vec<WideIpReach> = Vec::new();
+        if let Some((addr, plen)) = self.config.interface.address {
+            if !suppress_interface {
+                prefixes.push(wide_prefix(addr, plen, DEFAULT_CIRCUIT_METRIC));
+            }
         }
-        let inter_level: &[LeakedPrefix] = if level2 {
-            &self.moved_up
-        } else {
-            &self.leaked_down
-        };
-        for &LeakedPrefix {
-            prefix: (addr, plen),
-            metric,
-            up_down,
-        } in inter_level
-        {
-            tlvs.push(Tlv::ExtIpReachability(vec![WideIpReach {
+        if !suppress_all {
+            for &(addr, plen) in &self.redistributed {
+                prefixes.push(wide_prefix(addr, plen, DEFAULT_CIRCUIT_METRIC));
+            }
+            let inter_level: &[LeakedPrefix] = if level2 {
+                &self.moved_up
+            } else {
+                &self.leaked_down
+            };
+            for &LeakedPrefix {
+                prefix: (addr, plen),
                 metric,
                 up_down,
-                prefix: (addr, plen),
-                sub_tlvs: vec![],
-            }]));
+            } in inter_level
+            {
+                prefixes.push(WideIpReach {
+                    metric,
+                    up_down,
+                    prefix: (addr, plen),
+                    sub_tlvs: vec![],
+                });
+            }
+        }
+        if !prefixes.is_empty() {
+            if matches!(style, MetricStyle::Wide | MetricStyle::Transition) {
+                tlvs.push(Tlv::ExtIpReachability(prefixes.clone()));
+            }
+            if matches!(style, MetricStyle::Narrow | MetricStyle::Transition) {
+                // The narrow metric tops out at 63 (six bits); wider
+                // carried metrics clamp (disclosed: transition mode
+                // leaks no wide-precision distances).
+                tlvs.push(Tlv::IpInternalReachability(
+                    prefixes.iter().map(narrow_of_prefix).collect(),
+                ));
+            }
         }
         tlvs
     }
@@ -550,7 +731,7 @@ impl Daemon {
         let bits = LspBits {
             partition: false,
             attached: [false; 4],
-            overload: false,
+            overload: self.overload_active(),
             is_type: self.config.is_type,
         };
         let now = self.now();
@@ -1223,14 +1404,33 @@ impl Daemon {
         self.redistributed.contains(prefix)
     }
 
-    /// Recompute routes from all active levels and flush the diff to
-    /// zebra, per RFC 1195 §3.10.2's preference ladder: for one
-    /// prefix, "routes learned via level 1 routing" beat level 2
-    /// routes; among same-level candidates, "routes using internal
-    /// metrics only are always preferred to routes using external
-    /// metrics"; then the shortest path (equal-cost load-splitting is
-    /// permitted — v1 keeps the deterministic first next hop).
+    /// The throttled entry point every topology change goes through:
+    /// mark dirty, schedule per the back-off, run when due (the
+    /// default `(0, 0, 0)` throttle leaves every change due
+    /// immediately — compute-on-change).
     fn recompute_routes(&mut self, out: &mut Vec<Pdu>) {
+        self.spf_dirty = true;
+        self.spf_sched.on_change(self.now_ms());
+        self.maybe_run_spf(out);
+    }
+
+    fn maybe_run_spf(&mut self, out: &mut Vec<Pdu>) {
+        if self.spf_dirty && self.spf_sched.is_due(self.now_ms()) {
+            self.spf_dirty = false;
+            self.spf_sched.mark_run(self.now_ms());
+            self.run_spf(out);
+        }
+    }
+
+    /// The actual computation: recompute routes from all active
+    /// levels and flush the diff to zebra, per RFC 1195 §3.10.2's
+    /// preference ladder: for one prefix, "routes learned via level 1
+    /// routing" beat level 2 routes; among same-level candidates,
+    /// "routes using internal metrics only are always preferred to
+    /// routes using external metrics"; then the shortest path
+    /// (equal-cost load-splitting is permitted — v1 keeps the
+    /// deterministic first next hop).
+    fn run_spf(&mut self, out: &mut Vec<Pdu>) {
         let now = self.now();
         let results: Vec<(bool, SpfResult)> = self
             .active_levels()
@@ -1414,6 +1614,19 @@ impl Daemon {
                 }
             }
         }
+        // The on-startup overload window closing: re-originate
+        // without the bit (ISO §9.8's LSPDBOL; the restarted IS
+        // transits again once converged).
+        if !self.config.overload.always && self.overload_deadline.is_some_and(|until| now >= until)
+        {
+            self.overload_deadline = None;
+            info!("on-startup overload window closed");
+            for level2 in self.active_levels().collect::<Vec<_>>() {
+                out.extend(self.originate(level2));
+            }
+        }
+        // A deferred SPF window opening (the throttle).
+        self.maybe_run_spf(out);
         // Hold monitoring (ISO §8.2.5).
         if self.adjacency.hold_expired(now) {
             let action = process_hold_expired(&mut self.adjacency);
@@ -2485,6 +2698,233 @@ router isis T
         d.time_travel(5);
         d.pump(Vec::new(), &mut |p| sent.push(p));
         assert_eq!(sent.len(), 3, "the queued LSP left");
+    }
+
+    // ---- M5: the knobs ---------------------------------------------
+
+    fn knob_daemon(extra: &str) -> Daemon {
+        let conf = format!(
+            "router isis T\n net 49.0001.1921.6800.1002.00\n is-type level-2\n hostname r2\n{extra}\
+             \n interface eth0\n  address 172.16.0.2/24\n  circuit-type level-2\n"
+        );
+        Daemon::new(parse_config(&conf).unwrap()).unwrap()
+    }
+
+    /// `set-overload-bit`: the LSPDBOL rides our LSPs; the
+    /// on-startup window clears it after the configured seconds and
+    /// re-originates; suppress-prefixes originates no prefixes at
+    /// all (TLV 132 stays).
+    #[test]
+    fn overload_knobs() {
+        // Unconditional.
+        let mut d = knob_daemon(" set-overload-bit");
+        let pdus = d.originate(true);
+        let PduBody::Lsp(l) = &pdus[0].body else {
+            unreachable!()
+        };
+        assert!(l.bits.overload, "set-overload-bit rides the LSP");
+
+        // On-startup: set inside the window, cleared after.
+        let mut d = knob_daemon(" set-overload-bit on-startup 30");
+        let pdus = d.originate(true);
+        let PduBody::Lsp(l) = &pdus[0].body else {
+            unreachable!()
+        };
+        assert!(l.bits.overload);
+        d.time_travel(30);
+        let mut out = Vec::new();
+        d.tick(&mut out);
+        assert!(
+            out.iter()
+                .any(|p| matches!(&p.body, PduBody::Lsp(l) if !l.bits.overload)),
+            "re-originated without the bit once the window closed"
+        );
+
+        // suppress-prefixes: nothing in TLV 135, TLV 132 intact.
+        let mut d = knob_daemon(" set-overload-bit suppress-prefixes");
+        d.redistributed.push((Ipv4Addr::new(198, 51, 100, 0), 24));
+        let pdus = d.originate(true);
+        for pdu in &pdus {
+            let PduBody::Lsp(l) = &pdu.body else {
+                unreachable!()
+            };
+            assert!(
+                !l.tlvs
+                    .iter()
+                    .any(|t| matches!(t, Tlv::ExtIpReachability(_))),
+                "no prefixes while overloaded"
+            );
+            assert!(l.bits.overload);
+        }
+        let PduBody::Lsp(l) = &pdus[0].body else {
+            unreachable!()
+        };
+        assert!(
+            l.tlvs
+                .iter()
+                .any(|t| matches!(t, Tlv::IpInterfaceAddress(_))),
+            "TLV 132 stays (next hops)"
+        );
+    }
+
+    /// `prefix-suppression` (interface): the connected prefix leaves,
+    /// redistributed prefixes and TLV 132 stay.
+    #[test]
+    fn prefix_suppression_knob() {
+        let conf = "router isis T\n net 49.0001.1921.6800.1002.00\n is-type level-2\n hostname r2\n\
+                    \n interface eth0\n  address 172.16.0.2/24\n  circuit-type level-2\n  prefix-suppression\n";
+        let mut d = Daemon::new(parse_config(conf).unwrap()).unwrap();
+        d.redistributed.push((Ipv4Addr::new(198, 51, 100, 0), 24));
+        let pdus = d.originate(true);
+        let PduBody::Lsp(l) = &pdus[0].body else {
+            unreachable!()
+        };
+        let prefixes: Vec<(Ipv4Addr, u8)> = l
+            .tlvs
+            .iter()
+            .filter_map(|t| match t {
+                Tlv::ExtIpReachability(ps) => Some(ps.iter().map(|p| p.prefix).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !prefixes.contains(&(Ipv4Addr::new(172, 16, 0, 2), 24)),
+            "the connected prefix is suppressed"
+        );
+        assert!(
+            prefixes.contains(&(Ipv4Addr::new(198, 51, 100, 0), 24)),
+            "redistributed prefixes ride on"
+        );
+        assert!(l
+            .tlvs
+            .iter()
+            .any(|t| matches!(t, Tlv::IpInterfaceAddress(_))));
+    }
+
+    /// `metric-style narrow|transition` origination: the narrow
+    /// families ride the LSP (transition carries both).
+    #[test]
+    fn metric_style_origination() {
+        // Narrow: TLV 2 + TLV 128, no wide family.
+        let mut d = knob_daemon(" metric-style narrow");
+        let mut out = Vec::new();
+        let hello = crate::pdu::p2p_hello(
+            Level::Level2,
+            PEER,
+            30,
+            9,
+            vec![
+                Tlv::AreaAddresses(vec![vec![0x49, 0x00, 0x01]]),
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+            ],
+        );
+        d.handle_pdu(hello.clone(), [2, 0, 0, 0, 0, 1], &mut out);
+        assert!(out.iter().any(|p| matches!(&p.body,
+            PduBody::Lsp(l) if l.tlvs.iter().any(|t| matches!(t, Tlv::IsReachability(_))))));
+        assert!(
+            out.iter().any(|p| matches!(&p.body,
+            PduBody::Lsp(l) if l.tlvs.iter().any(|t| matches!(t, Tlv::IpInternalReachability(_)))))
+        );
+        assert!(!out.iter().any(|p| matches!(&p.body, PduBody::Lsp(l) if l
+                .tlvs
+                .iter()
+                .any(|t| matches!(t, Tlv::ExtIsReachability(_))))));
+
+        // Transition: both families (RFC 1195's transition mode).
+        let mut d = knob_daemon(" metric-style transition");
+        let mut out = Vec::new();
+        d.handle_pdu(hello, [2, 0, 0, 0, 0, 1], &mut out);
+        assert!(out.iter().any(|p| matches!(&p.body,
+            PduBody::Lsp(l) if l.tlvs.iter().any(|t| matches!(t, Tlv::ExtIsReachability(_))))));
+        assert!(out.iter().any(|p| matches!(&p.body,
+            PduBody::Lsp(l) if l.tlvs.iter().any(|t| matches!(t, Tlv::IsReachability(_))))));
+        assert!(
+            out.iter().any(|p| matches!(&p.body,
+            PduBody::Lsp(l) if l.tlvs.iter().any(|t| matches!(t, Tlv::IpInternalReachability(_)))))
+        );
+    }
+
+    /// The SPF back-off (the ospfd pattern): with a configured
+    /// throttle, the first change runs immediately, back-to-back
+    /// changes defer along the increment, and the deferred run lands
+    /// once the window opens.
+    #[test]
+    fn spf_throttle_backoff() {
+        // The pure scheduler ladder.
+        let mut sched = SpfThrottle::new(10, 50, 200);
+        assert_eq!(sched.on_change(1000), Some(1010), "initial delay");
+        assert!(sched.is_due(1010));
+        sched.mark_run(1010);
+        // The walk includes the initial: 10 + 50 = 60.
+        assert_eq!(sched.on_change(1011), Some(1071), "the increment");
+        assert!(!sched.is_due(1070));
+        assert!(sched.is_due(1071));
+        sched.mark_run(1071);
+        assert_eq!(sched.on_change(1072), Some(1072 + 110), "walking up");
+        sched.mark_run(1182);
+        assert_eq!(sched.on_change(1183), Some(1183 + 160), "toward the cap");
+        sched.mark_run(1343);
+        assert_eq!(sched.on_change(1344), Some(1344 + 200), "the cap");
+        // An idle period resets to the initial delay.
+        sched.mark_run(1600);
+        assert_eq!(sched.on_change(1900), Some(1910), "idle reset");
+
+        // The default computes on change.
+        let mut sched = SpfThrottle::default();
+        assert_eq!(sched.on_change(1), Some(1));
+        assert!(sched.is_due(1));
+
+        // The daemon gate: a throttled daemon defers the second
+        // change and lands it on the next tick.
+        let mut d = knob_daemon(" spf-throttle 0 5000 5000");
+        let hello = crate::pdu::p2p_hello(
+            Level::Level2,
+            PEER,
+            30,
+            9,
+            vec![
+                Tlv::AreaAddresses(vec![vec![0x49, 0x00, 0x01]]),
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+            ],
+        );
+        let mut out = Vec::new();
+        d.handle_pdu(hello, [2, 0, 0, 0, 0, 1], &mut out);
+        // The adjacency-up SPF consumed the first window; both peer
+        // LSPs land inside the back-off and defer...
+        let mut out = Vec::new();
+        d.handle_pdu(
+            peer_lsp(true, (Ipv4Addr::new(10, 90, 0, 0), 24), 10, false),
+            [2, 0, 0, 0, 0, 1],
+            &mut out,
+        );
+        assert!(
+            !d.installed.contains_key(&(Ipv4Addr::new(10, 90, 0, 0), 24)),
+            "deferred inside the back-off window"
+        );
+        // A NEWER instance of the peer LSP (the confusion case would
+        // otherwise purge it): sequence 2, both prefixes aboard.
+        let mut newer = peer_lsp(true, (Ipv4Addr::new(10, 91, 0, 0), 24), 10, false);
+        if let PduBody::Lsp(l) = &mut newer.body {
+            l.sequence_number = 2;
+            l.tlvs.push(Tlv::ExtIpReachability(vec![WideIpReach {
+                metric: 10,
+                up_down: false,
+                prefix: (Ipv4Addr::new(10, 90, 0, 0), 24),
+                sub_tlvs: vec![],
+            }]));
+        }
+        let mut out = Vec::new();
+        d.handle_pdu(newer, [2, 0, 0, 0, 0, 1], &mut out);
+        assert!(!d.installed.contains_key(&(Ipv4Addr::new(10, 91, 0, 0), 24)));
+        // ...and both land once the window opens.
+        d.time_travel(6);
+        let mut out = Vec::new();
+        d.tick(&mut out);
+        assert!(d.installed.contains_key(&(Ipv4Addr::new(10, 90, 0, 0), 24)));
+        assert!(d.installed.contains_key(&(Ipv4Addr::new(10, 91, 0, 0), 24)));
     }
 
     /// The IIH builder: circuit type, hold time, TLVs, TLV 240, and
