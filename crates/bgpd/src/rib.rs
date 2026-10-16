@@ -24,7 +24,7 @@
 //! engine plus RPKI/OTC validation implement them; the defaults stay
 //! accept-all, so an unconfigured daemon is behavior-identical).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -45,7 +45,12 @@ use crate::peer::{PeerInfo, RouteSink};
 #[derive(Debug, Clone, Eq)]
 pub struct Route {
     pub prefix: IpPrefix,
-    pub attrs: Vec<PathAttribute>,
+    /// The route's path attributes, interned and shared (PERF-M1 M2):
+    /// identical tuples across prefixes — 6.02× of the table at the
+    /// 100k census — share one allocation (FRR's `bgp_attr` intern
+    /// hash is the known art). Clones are refcount bumps; the import
+    /// policy's mutations copy-on-write via `Arc::make_mut`.
+    pub attrs: Arc<Vec<PathAttribute>>,
     pub source: PeerInfo,
     /// Learned over an internal (iBGP) session (§9.1.2.2 d).
     pub internal: bool,
@@ -87,6 +92,18 @@ impl Route {
     pub fn new(
         prefix: IpPrefix,
         attrs: Vec<PathAttribute>,
+        source: PeerInfo,
+        internal: bool,
+    ) -> Self {
+        Self::from_shared_attrs(prefix, Arc::new(attrs), source, internal)
+    }
+
+    /// [`Self::new`] for an already-interned, shared attribute tuple
+    /// (the `LocRib::announce` path — one intern per UPDATE, shared
+    /// by every prefix it carries).
+    pub fn from_shared_attrs(
+        prefix: IpPrefix,
+        attrs: Arc<Vec<PathAttribute>>,
         source: PeerInfo,
         internal: bool,
     ) -> Self {
@@ -331,6 +348,59 @@ pub struct BestChange {
     pub old: Option<Route>,
 }
 
+/// The attribute intern table (PERF-M1 M2, the census-named 6.02×
+/// duplication): one shared `Arc<Vec<PathAttribute>>` per distinct
+/// tuple — FRR's `bgp_attr` hash is the known art, and this is its
+/// Rust-shape translation: the refcount IS the pin count.
+///
+/// - `intern` returns the canonical instance for a value (found by
+///   hash+eq on the tuple itself — `Arc`'s `Hash`/`Eq` delegate to
+///   the inner `Vec`, so an owned `Vec` probes the set directly).
+/// - `sweep` drops entries nothing outside the set references
+///   (`strong_count == 1` = only the set's own pin) — the GC pass,
+///   run after the bulk Adj-RIB-In removals (peer clear, soft reset,
+///   stale flush) and every [`Self::SWEEP_EVERY`] interns, so a
+///   churning table does not accumulate dead tuples.
+#[derive(Default)]
+pub struct AttrInterner {
+    set: HashSet<Arc<Vec<PathAttribute>>>,
+    interns_since_sweep: usize,
+}
+
+impl AttrInterner {
+    const SWEEP_EVERY: usize = 65_536;
+
+    pub fn intern(&mut self, attrs: Vec<PathAttribute>) -> Arc<Vec<PathAttribute>> {
+        if let Some(hit) = self.set.get(&attrs) {
+            return Arc::clone(hit);
+        }
+        let arc = Arc::new(attrs);
+        self.set.insert(Arc::clone(&arc));
+        self.interns_since_sweep += 1;
+        if self.interns_since_sweep >= Self::SWEEP_EVERY {
+            self.interns_since_sweep = 0;
+            self.sweep();
+        }
+        arc
+    }
+
+    /// Drop entries no live route references (the set's own pin is
+    /// the only one left). O(distinct tuples).
+    pub fn sweep(&mut self) {
+        self.set.retain(|a| Arc::strong_count(a) > 1);
+    }
+
+    /// Distinct tuples currently pinned (the census surface).
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Whether the table holds nothing (tests).
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
 /// Adj-RIBs-In + Loc-RIB (§9.1's three RIBs minus Adj-RIB-Out, which
 /// the session's OutRib plays).
 pub struct LocRib {
@@ -342,6 +412,9 @@ pub struct LocRib {
     /// coexists as a sibling path). Classic sessions live under id 0.
     adj_in: BTreeMap<IpAddr, BTreeMap<Nlri, Route>>,
     best: BTreeMap<IpPrefix, Route>,
+    /// The interned attribute tuples every stored route shares
+    /// (PERF-M1 M2).
+    pub attrs: AttrInterner,
     /// The Phase 1 import policy (§9.2.1): typed filter + RPKI/OTC
     /// validation in W2-d; accept-all by default.
     import: Arc<dyn ImportPolicy>,
@@ -364,6 +437,7 @@ impl LocRib {
             local_as,
             adj_in: BTreeMap::new(),
             best: BTreeMap::new(),
+            attrs: AttrInterner::default(),
             import,
             rs_clients: BTreeSet::new(),
             rr_clients: BTreeSet::new(),
@@ -403,15 +477,20 @@ impl LocRib {
         let internal = peer.remote_as == self.local_as;
         let rs_client = self.rs_clients.contains(&peer.address);
         let rr_client = internal && self.rr_clients.contains(&peer.address);
+        // One interned tuple per UPDATE (PERF-M1 M2): the B-3
+        // LOCAL_PREF reset is per-UPDATE-identical (a session fact),
+        // so it runs once here; every prefix the UPDATE carries
+        // shares the canonical instance, and equal tuples across
+        // UPDATEs collapse to it as well.
+        let mut base = update.attrs.clone();
+        reset_external_local_pref(&mut base, internal);
+        let base = self.attrs.intern(base);
         for nlri in update.announced() {
-            let mut route = Route::new(nlri.prefix, update.attrs.clone(), *peer, internal);
+            let mut route =
+                Route::from_shared_attrs(nlri.prefix, Arc::clone(&base), *peer, internal);
             route.rs_client = rs_client;
             route.rr_client = rr_client;
             route.path_id = nlri.path_id;
-            // B-3 (RFC 4271 §5.1.5): an external peer's LOCAL_PREF is
-            // "MUST be ignored" — reset to the local default before the
-            // route (or the import policy) sees it.
-            reset_external_local_pref(&mut route.attrs, internal);
             match self.import.import(route) {
                 Some(route) => {
                     rib.insert(nlri, route);
@@ -497,6 +576,9 @@ impl LocRib {
                 info!(peer = %peer.address, routes = rib.len(), "bgpd: peer routes withdrawn");
             }
         }
+        // PERF-M1 M2: bulk removal — drop interned tuples nothing
+        // references anymore.
+        self.attrs.sweep();
     }
 
     /// The soft inbound reset (W2-d, RFC 2918 §3): drop the peer's
@@ -508,6 +590,7 @@ impl LocRib {
         if let Some(rib) = self.adj_in.remove(&peer.address) {
             info!(peer = %peer.address, routes = rib.len(), "bgpd: soft inbound reset, Adj-RIB-In cleared");
         }
+        self.attrs.sweep();
     }
 
     /// Re-run the decision process over every known prefix; returns
@@ -936,7 +1019,7 @@ impl crate::peer::OutRib for LocRibOut {
                     // NEXT_HOP/MP_REACH encoding the session layer
                     // produced (the typed model has no next-hop
                     // representation to edit).
-                    let mut attrs = exported.attrs;
+                    let mut attrs = (*exported.attrs).clone();
                     for attr in &update.attrs {
                         if matches!(attr, PathAttribute::NextHop(_) | PathAttribute::MpReach(_)) {
                             attrs.retain(|a| a.attr_type() != attr.attr_type());
@@ -998,7 +1081,7 @@ impl crate::peer::OutRib for LocRibOut {
                 if !forwardable(&exported) {
                     continue;
                 }
-                let mut attrs = exported.attrs;
+                let mut attrs = (*exported.attrs).clone();
                 // §5.1.5's LOCAL_PREF shape for the session type.
                 shape_local_pref(&mut attrs, internal);
                 // B-10: the RS export attribute set — a client→client
@@ -1122,14 +1205,14 @@ mod tests {
     fn ladder_local_pref_first() {
         let p = peer("192.0.2.1", 65001, 1);
         let mut a = route("203.0.113.0/24", &p, false, base_attrs(vec![65001], None));
-        a.attrs.push(PathAttribute::LocalPref(50));
+        Arc::make_mut(&mut a.attrs).push(PathAttribute::LocalPref(50));
         let mut b = route(
             "203.0.113.0/24",
             &p,
             false,
             base_attrs(vec![65001, 65002], None),
         );
-        b.attrs.push(PathAttribute::LocalPref(200));
+        Arc::make_mut(&mut b.attrs).push(PathAttribute::LocalPref(200));
         // Higher LOCAL_PREF wins even with a longer AS_PATH.
         assert_eq!(best_path(&[a, b]).unwrap().local_pref(), 200);
     }
@@ -1153,7 +1236,7 @@ mod tests {
 
         // Tie on length: lower ORIGIN wins (IGP=0 < EGP=1).
         let mut egp = long;
-        egp.attrs[0] = PathAttribute::Origin(Origin::Egp);
+        Arc::make_mut(&mut egp.attrs)[0] = PathAttribute::Origin(Origin::Egp);
         assert_eq!(best_path(&[egp, short]).unwrap().origin(), Origin::Igp);
     }
 
@@ -1417,6 +1500,105 @@ mod tests {
         rib.announce(&p, &u);
         rib.recompute();
         assert!(rib.recompute().is_empty(), "no change, no event");
+    }
+
+    // ---- PERF-M1 M2: attribute interning -----------------------------
+
+    /// Identical tuples intern to one shared allocation (the census's
+    /// 6.02× duplication collapses), and the elected best shares the
+    /// same instance — the best table's deep copy is gone.
+    #[test]
+    fn interned_attrs_share_one_allocation() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        let u1 = BgpUpdate {
+            attrs: base_attrs(vec![65001, 65002], Some(50)),
+            nlri: vec!["203.0.113.0/24".parse::<IpPrefix>().unwrap().into()],
+            ..Default::default()
+        };
+        let mut u2 = u1.clone();
+        u2.nlri = vec!["198.51.100.0/24".parse::<IpPrefix>().unwrap().into()];
+        rib.announce(&p, &u1);
+        rib.announce(&p, &u2);
+        rib.recompute();
+        let r1 = rib.adj_in[&p.address]
+            .get(&path_nlri("203.0.113.0/24", 0))
+            .unwrap();
+        let r2 = rib.adj_in[&p.address]
+            .get(&path_nlri("198.51.100.0/24", 0))
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&r1.attrs, &r2.attrs),
+            "equal tuples across UPDATEs share the interned instance"
+        );
+        let best = rib.best_routes().next().unwrap();
+        assert!(
+            r1.attrs.iter().any(|a| a.attr_type() == attr_type::AS_PATH)
+                && r2
+                    .attrs
+                    .iter()
+                    .any(|a| a.attr_type() == attr_type::LOCAL_PREF),
+            "B-3's LOCAL_PREF 100 reset is part of the interned tuple"
+        );
+        assert_eq!(best.med(), 50, "shared attrs still read per-route");
+        assert_eq!(rib.attrs.len(), 1, "one distinct tuple in the table");
+    }
+
+    /// The sweep drops tuples no stored route references (bulk peer
+    /// clear) and keeps the ones still live.
+    #[test]
+    fn interner_sweep_drops_dead_tuples() {
+        let mut rib = LocRib::new(65000);
+        let p1 = peer("192.0.2.1", 65001, 1);
+        let p2 = peer("192.0.2.2", 65002, 2);
+        rib.announce(
+            &p1,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65001], Some(10)),
+                nlri: vec!["203.0.113.0/24".parse::<IpPrefix>().unwrap().into()],
+                ..Default::default()
+            },
+        );
+        rib.announce(
+            &p2,
+            &BgpUpdate {
+                attrs: base_attrs(vec![65002], Some(20)),
+                nlri: vec!["198.51.100.0/24".parse::<IpPrefix>().unwrap().into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(rib.attrs.len(), 2);
+        rib.clear_peer(&p1);
+        assert_eq!(rib.attrs.len(), 1, "p1's tuple swept with its routes");
+        assert_eq!(rib.route_count(), 1);
+    }
+
+    /// Copy-on-write: mutating a stored route's attributes (the policy
+    /// engine's set-actions) forks the tuple instead of corrupting
+    /// every sharer.
+    #[test]
+    fn attr_mutation_forks_the_shared_tuple() {
+        let mut rib = LocRib::new(65000);
+        let p = peer("192.0.2.1", 65001, 1);
+        let shared = Arc::new(base_attrs(vec![65001], None));
+        let mk = |prefix: &str| BgpUpdate {
+            attrs: (*shared).clone(),
+            nlri: vec![prefix.parse::<IpPrefix>().unwrap().into()],
+            ..Default::default()
+        };
+        rib.announce(&p, &mk("203.0.113.0/24"));
+        rib.announce(&p, &mk("198.51.100.0/24"));
+        let r1 = rib.adj_in[&p.address]
+            .get(&path_nlri("203.0.113.0/24", 0))
+            .unwrap();
+        let r2 = rib.adj_in[&p.address]
+            .get(&path_nlri("198.51.100.0/24", 0))
+            .unwrap();
+        assert!(Arc::ptr_eq(&r1.attrs, &r2.attrs));
+        let mut forked = r1.clone();
+        Arc::make_mut(&mut forked.attrs).push(PathAttribute::Med(42));
+        assert_ne!(forked.med(), r2.med(), "the fork does not leak to r2");
+        assert!(Arc::ptr_eq(&r1.attrs, &r2.attrs), "originals still shared");
     }
 
     // ---- RFC 7911 ADD-PATH receive semantics (N5B) ------------------
@@ -2306,14 +2488,14 @@ mod tests {
             false,
             base_attrs(vec![65001, 65002], None),
         );
-        rigging.attrs.push(PathAttribute::LocalPref(999));
+        Arc::make_mut(&mut rigging.attrs).push(PathAttribute::LocalPref(999));
         let honest = route("203.0.113.0/24", &p2, false, base_attrs(vec![65001], None));
         // Route::new bypasses announce (no reset) — apply the import
         // rule the way announce does, then compare.
-        let mut attrs = rigging.attrs.clone();
+        let mut attrs = (*rigging.attrs).clone();
         reset_external_local_pref(&mut attrs, false);
         let rigging = Route {
-            attrs,
+            attrs: Arc::new(attrs),
             ..rigging.clone()
         };
         assert_eq!(best_path(&[rigging, honest]).unwrap().as_path_len(), 1);

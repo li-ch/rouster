@@ -609,6 +609,46 @@ attrs (bar ≤1,200 B/prefix), M3 the map inline (≤1,000), M4 the
 census-named remainder (≤800). Each lands with a clean-mode 100k
 slice receipt (RSS series + B/prefix) and the wall/CPU gate.
 
+### M2 — attribute interning landed (2026-10-16)
+
+The census's first lever, landed as the FRR `bgp_attr` translation:
+`Route.attrs` is `Arc<Vec<PathAttribute>>` and `LocRib` owns an
+`AttrInterner` (`HashSet<Arc<Vec<PathAttribute>>>`; the refcount IS
+the pin count — `sweep()` drops tuples nothing references, run after
+the bulk removals and every 65,536 interns). `announce` interns once
+per UPDATE after the B-3 LOCAL_PREF reset (a session fact — identical
+for every prefix the UPDATE carries); the election's `best` insert,
+the export clones, and the recompute candidates all share the
+canonical instance; the import policy's set-actions fork
+copy-on-write via `Arc::make_mut` (an owned import candidate mutates
+in place — no policy-configured table never copies). Three tests pin
+it: shared-allocation identity (`Arc::ptr_eq` across UPDATEs and into
+the best table), the sweep's dead-tuple drop, and the fork's
+no-leak-to-sharers.
+
+Receipt (clean 100k slice, same protocol as the M1 baseline):
+**bgpd 476 B/prefix empty→final (RSS 2,044→48,548 KiB; HWM
+705 B/prefix)** — from 1,882, a 4.0× cut; the churn share collapsed
+with the deep clones (CPU 0.88→0.61 s, EOR wall 0.42→0.35 s — both
+improved, no regression); 99,998 prefixes, zero malformed/rejected.
+The post-M2 census: unique attr storage 9.07 MB (90.7 B/prefix,
+19% of RSS; was 589+388), the best table holds zero private tuples,
+16,623 interned tuples, ~0.66 allocations per route (was ~4). The
+new top consumer is the keyed-map inline (~212 B/prefix, 45%) —
+M3's named lever.
+
+The full-table leg (same protocol, `--limit 0`, single run):
+**bgpd 457 B/prefix empty→final at 1,126,481 prefixes (RSS
+2,040→504,424 KiB; HWM 625 B/prefix empty→HWM)** — the §R E5 series
+baseline was 1,679 (FRR's ledgered 897; a 1.96× delta, sub-2× under
+§F's darwin-vm rule — numbers only, no verdict). CPU: bgpd 7.07 s
+(§R 10.37, −31.8%), rousterd 11.15 s (§R 10.90, +2.3% — within the
+±5% gate), EOR wall 4.56 s (§R 6.07), first-route→main-complete
+10.0 s single-run (§R 17.1 s median). Zero malformed, zero rejected;
+1,126,481 in the main table. The §R entry itself is filed by the
+orchestrator from these artifacts (target/mem-logs/
+clean-20261016T080351Z/).
+
 ## §Deferred anchors
 
 Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime

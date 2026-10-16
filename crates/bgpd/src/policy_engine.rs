@@ -179,42 +179,44 @@ fn drop_attr(attrs: &mut Vec<PathAttribute>, ty: u8) {
 /// attrs are the base so passthrough attributes survive.
 pub fn write_back(data: &RouteData, route: &mut Route) {
     let original_med = route.med();
+    let has_as_path = route.attr(attr_type::AS_PATH).is_some();
+    // PERF-M1 M2: copy-on-write off the interned tuple — an owned
+    // import candidate mutates in place (refcount 1); a stored route
+    // forks its own tuple only when a set-action actually fires.
+    let attrs = Arc::make_mut(&mut route.attrs);
     if data.metric != original_med {
-        upsert_attr(&mut route.attrs, PathAttribute::Med(data.metric));
+        upsert_attr(attrs, PathAttribute::Med(data.metric));
     }
     let Some(bgp) = &data.bgp else {
         return;
     };
     if let Some(v) = bgp.local_pref {
-        upsert_attr(&mut route.attrs, PathAttribute::LocalPref(v));
+        upsert_attr(attrs, PathAttribute::LocalPref(v));
     }
     if let Some(v) = bgp.med {
-        upsert_attr(&mut route.attrs, PathAttribute::Med(v));
+        upsert_attr(attrs, PathAttribute::Med(v));
     }
     if let Some(o) = bgp.origin {
-        upsert_attr(
-            &mut route.attrs,
-            PathAttribute::Origin(from_policy_origin(o)),
-        );
+        upsert_attr(attrs, PathAttribute::Origin(from_policy_origin(o)));
     }
     // Communities: replace wholesale (an engine `set community none`
     // removes the attribute entirely).
     if bgp.communities.is_empty() {
-        drop_attr(&mut route.attrs, attr_type::COMMUNITIES);
+        drop_attr(attrs, attr_type::COMMUNITIES);
     } else {
         let wire: Vec<u32> = bgp
             .communities
             .iter()
             .map(|c| community_to_wire(*c))
             .collect();
-        upsert_attr(&mut route.attrs, PathAttribute::Communities(wire));
+        upsert_attr(attrs, PathAttribute::Communities(wire));
     }
     if let Some(v) = bgp.otc {
-        upsert_attr(&mut route.attrs, PathAttribute::Otc(v));
+        upsert_attr(attrs, PathAttribute::Otc(v));
     }
     // AS_PATH: rewrite from the model when the route carries one (a
     // prepend is the only structural edit the engine makes).
-    if route.attr(attr_type::AS_PATH).is_some() {
+    if has_as_path {
         let mut segments = Vec::new();
         for seg in bgp.as_path.segments() {
             match seg {
@@ -224,7 +226,7 @@ pub fn write_back(data: &RouteData, route: &mut Route) {
                 }
             }
         }
-        upsert_attr(&mut route.attrs, PathAttribute::AsPath(AsPath { segments }));
+        upsert_attr(attrs, PathAttribute::AsPath(AsPath { segments }));
     }
 }
 
@@ -453,9 +455,9 @@ mod tests {
     #[test]
     fn policy_view_exposes_the_wire_attributes() {
         let mut r = route("203.0.113.0/24", vec![65001, 65002]);
-        r.attrs.push(PathAttribute::LocalPref(200));
-        r.attrs.push(PathAttribute::Med(50));
-        r.attrs.push(PathAttribute::Communities(vec![
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::LocalPref(200));
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::Med(50));
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::Communities(vec![
             (65000u32 << 16) | 1,
             0xffff_0002,
         ]));
@@ -480,8 +482,8 @@ mod tests {
     #[test]
     fn policy_view_v6_nexthop_from_mp_reach() {
         let mut r = route("2001:db8:1::/48", vec![65001]);
-        r.attrs.retain(|a| !matches!(a, PathAttribute::NextHop(_)));
-        r.attrs.push(PathAttribute::MpReach(crate::attr::MpReach {
+        Arc::make_mut(&mut r.attrs).retain(|a| !matches!(a, PathAttribute::NextHop(_)));
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::MpReach(crate::attr::MpReach {
             afi: 2,
             safi: 1,
             next_hop: crate::attr::MpNextHop::V6 {
@@ -553,11 +555,11 @@ mod tests {
         // Unknown-transitive passthrough and AGGREGATOR survive an
         // engine pass untouched (§4.3/§5).
         let mut r = route("203.0.113.0/24", vec![65001]);
-        r.attrs.push(PathAttribute::Aggregator {
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::Aggregator {
             asn: 65001,
             addr: "10.0.0.1".parse().unwrap(),
         });
-        r.attrs.push(PathAttribute::Unknown {
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::Unknown {
             attr_type: 99,
             flags: 0xc0,
             value: vec![1, 2, 3],
@@ -571,8 +573,7 @@ mod tests {
     #[test]
     fn write_back_community_none_removes_the_attribute() {
         let mut r = route("203.0.113.0/24", vec![65001]);
-        r.attrs
-            .push(PathAttribute::Communities(vec![65000 << 16 | 1]));
+        Arc::make_mut(&mut r.attrs).push(PathAttribute::Communities(vec![65000 << 16 | 1]));
         let filter = prefix_set_filter(
             "203.0.113.0/24",
             vec![
@@ -668,9 +669,7 @@ bgp community-list standard TAGGED permit 65000:99
         assert!(run_filter(&import, route("198.51.100.0/24", vec![65001])).is_none());
         // OUT: only community 65000:99 passes (implicit deny-all tail).
         let mut tagged = route("203.0.113.0/24", vec![65001]);
-        tagged
-            .attrs
-            .push(PathAttribute::Communities(vec![65000 << 16 | 99]));
+        Arc::make_mut(&mut tagged.attrs).push(PathAttribute::Communities(vec![65000 << 16 | 99]));
         assert!(run_filter(&export, tagged).is_some());
         assert!(run_filter(&export, route("203.0.113.0/24", vec![65001])).is_none());
     }

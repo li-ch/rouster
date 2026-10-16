@@ -58,7 +58,7 @@ const OPTIONAL_NON_TRANSITIVE: u8 = attr_flag::OPTIONAL;
 const OPTIONAL_TRANSITIVE: u8 = attr_flag::OPTIONAL | attr_flag::TRANSITIVE;
 
 /// ORIGIN values (RFC 4271 §4.3 / §5.1.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
     Igp,
     Egp,
@@ -86,7 +86,7 @@ impl Origin {
 
 /// One AS_PATH segment: `AS_SET` (type 1) or `AS_SEQUENCE` (type 2)
 /// (RFC 4271 §4.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AsSegment {
     Set(Vec<u32>),
     Sequence(Vec<u32>),
@@ -111,7 +111,7 @@ impl AsSegment {
 
 /// An AS_PATH (or AS4_PATH — same encoding, wider ASes when
 /// negotiated).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct AsPath {
     pub segments: Vec<AsSegment>,
 }
@@ -250,7 +250,7 @@ fn asn_widen(asn: u32) -> u16 {
 /// trust): bgpd speaks only the unicast families, whose next-hop
 /// lengths are exactly 4 (v4), 16, or 32 (v6 global [+ link-local]) —
 /// anything else is malformed input, not a shape to guess at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MpNextHop {
     V4(Ipv4Addr),
     V6 {
@@ -286,7 +286,7 @@ impl MpNextHop {
 }
 
 /// MP_REACH_NLRI (attribute 14, RFC 4760 §3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MpReach {
     pub afi: u16,
     pub safi: u8,
@@ -295,7 +295,7 @@ pub struct MpReach {
 }
 
 /// MP_UNREACH_NLRI (attribute 15, RFC 4760 §4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MpUnreach {
     pub afi: u16,
     pub safi: u8,
@@ -303,7 +303,7 @@ pub struct MpUnreach {
 }
 
 /// One path attribute, typed for the ones v1 understands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PathAttribute {
     Origin(Origin),
     AsPath(AsPath),

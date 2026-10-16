@@ -229,7 +229,11 @@ impl ValidationGate {
                 None
             }
             (Role::Provider, None) | (Role::Peer, None) => {
-                upsert_attr(&mut route.attrs, PathAttribute::Otc(remote_as));
+                // PERF-M1 M2: copy-on-write off the interned tuple.
+                upsert_attr(
+                    Arc::make_mut(&mut route.attrs),
+                    PathAttribute::Otc(remote_as),
+                );
                 Some(route)
             }
             _ => Some(route),
@@ -256,7 +260,8 @@ impl ValidationGate {
             (Role::Peer, Some(_)) | (Role::Provider, Some(_)) => None, // rule 2
             (Role::Customer, None) | (Role::Peer, None) => {
                 let mut out = route.clone();
-                upsert_attr(&mut out.attrs, PathAttribute::Otc(local_as)); // rule 1
+                // PERF-M1 M2: copy-on-write off the interned tuple.
+                upsert_attr(Arc::make_mut(&mut out.attrs), PathAttribute::Otc(local_as)); // rule 1
                 Some(out)
             }
             _ => Some(route.clone()),
@@ -451,7 +456,7 @@ mod tests {
             &[("192.0.2.9", 65001, Role::Peer)],
         );
         let mut route = route_from("192.0.2.0/24", "192.0.2.9", 65001, vec![]);
-        route.attrs[1] = PathAttribute::AsPath(AsPath {
+        Arc::make_mut(&mut route.attrs)[1] = PathAttribute::AsPath(AsPath {
             segments: vec![
                 crate::attr::AsSegment::Sequence(vec![65001]),
                 crate::attr::AsSegment::Set(vec![64512]),
@@ -535,7 +540,7 @@ mod tests {
         // §5 ingress rule 1 verbatim.
         let gate = gate_with(tables(&[], &[]), &[("192.0.2.9", 65010, Role::Customer)]);
         let mut route = route_from("203.0.113.0/24", "192.0.2.9", 65010, vec![65010]);
-        route.attrs.push(PathAttribute::Otc(65099));
+        Arc::make_mut(&mut route.attrs).push(PathAttribute::Otc(65099));
         assert!(gate.apply(route).is_none());
     }
 
@@ -544,11 +549,11 @@ mod tests {
         let gate = gate_with(tables(&[], &[]), &[("192.0.2.9", 65010, Role::Peer)]);
         // OTC == peer AS: legitimate (ingress rule 2's allowed case).
         let mut ok = route_from("203.0.113.0/24", "192.0.2.9", 65010, vec![65010]);
-        ok.attrs.push(PathAttribute::Otc(65010));
+        Arc::make_mut(&mut ok.attrs).push(PathAttribute::Otc(65010));
         assert!(gate.apply(ok).is_some());
         // OTC != peer AS: a route leak, ineligible.
         let mut bad = route_from("203.0.113.0/24", "192.0.2.9", 65010, vec![65010]);
-        bad.attrs.push(PathAttribute::Otc(65099));
+        Arc::make_mut(&mut bad.attrs).push(PathAttribute::Otc(65099));
         assert!(gate.apply(bad).is_none());
     }
 
@@ -575,7 +580,7 @@ mod tests {
         // unchanged."
         let gate = gate_with(tables(&[], &[]), &[("192.0.2.9", 65010, Role::Provider)]);
         let mut route = route_from("203.0.113.0/24", "192.0.2.9", 65010, vec![65010]);
-        route.attrs.push(PathAttribute::Otc(65042));
+        Arc::make_mut(&mut route.attrs).push(PathAttribute::Otc(65042));
         let out = gate.apply(route).unwrap();
         assert_eq!(out.otc(), Some(65042));
     }
@@ -591,7 +596,7 @@ mod tests {
         };
         let plain = route_from("203.0.113.0/24", "198.51.100.9", 65020, vec![65020]);
         let mut marked = plain.clone();
-        marked.attrs.push(PathAttribute::Otc(65010));
+        Arc::make_mut(&mut marked.attrs).push(PathAttribute::Otc(65010));
         let to: IpAddr = "192.0.2.9".parse().unwrap();
 
         // Egress rule 1: to a Customer without OTC -> add local AS.
@@ -626,7 +631,7 @@ mod tests {
         // synthesized.
         let gate = gate_with(tables(&[], &[]), &[]);
         let mut route = route_from("203.0.113.0/24", "192.0.2.9", 65010, vec![65010]);
-        route.attrs.push(PathAttribute::Otc(65099));
+        Arc::make_mut(&mut route.attrs).push(PathAttribute::Otc(65099));
         let out = gate.apply(route).unwrap();
         assert_eq!(out.otc(), Some(65099), "unconfigured role: untouched");
         assert_eq!(out.rov, Some(Validity::NotFound), "ROV still computed");
@@ -848,7 +853,7 @@ mod tests {
         // RFC 9774 treat-as-withdraw prerequisite; enforce drops it).
         let gate = aspa_gate(&[(64501, &[64502])], Role::Customer, AspaMode::Enforce);
         let mut route = route_from("203.0.113.0/24", "192.0.2.9", 64502, vec![]);
-        route.attrs[1] = PathAttribute::AsPath(AsPath {
+        Arc::make_mut(&mut route.attrs)[1] = PathAttribute::AsPath(AsPath {
             segments: vec![
                 crate::attr::AsSegment::Sequence(vec![64502]),
                 crate::attr::AsSegment::Set(vec![64501]),
