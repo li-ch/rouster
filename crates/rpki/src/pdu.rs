@@ -625,7 +625,19 @@ impl Pdu {
                         want: 16,
                     });
                 }
+                // The encap/text lens bound-check BEFORE any slice:
+                // the fuzzers' first catch (errreport-encap-len-oob)
+                // — a u32 encap_len far past the body panicked the
+                // text_len read. Both fields must fit the declared
+                // body before the accounting check runs.
                 let encap_len = be_u32(&body[0..4])? as usize;
+                if 8 + encap_len > body.len() {
+                    return Err(DecodeError::UnaccountedLength {
+                        ptype,
+                        declared,
+                        accounted: (16 + encap_len.min(body.len())) as u32,
+                    });
+                }
                 let text_len = be_u32(&body[4 + encap_len..8 + encap_len])? as usize;
                 if 16 + encap_len + text_len != declared as usize {
                     return Err(DecodeError::UnaccountedLength {
@@ -1477,6 +1489,26 @@ mod tests {
                 pdu: 2,
                 requested: 1
             })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod fuzz_catch_tests {
+    use super::*;
+
+    /// The fuzzers' first catch (2026-10-16): a u32 encap_len far
+    /// past the body panicked the text_len read in ERROR_REPORT
+    /// decode. Repro: crates/rpki/fuzz/crashes/errreport-encap-len-oob.bin.
+    #[test]
+    fn errreport_encap_len_oob_is_rejected_not_panicked() {
+        let bytes = [
+            0x02u8, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10, 0x63, 0x61, 0x63, 0x68, 0x65, 0x20,
+            0x72, 0x65,
+        ];
+        assert!(matches!(
+            Pdu::decode(&bytes[..]),
+            Err(DecodeError::UnaccountedLength { .. })
         ));
     }
 }
