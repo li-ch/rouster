@@ -1,0 +1,76 @@
+name: fuzz
+
+# The nightly codec-fuzz net (AGENTS.md invariant 7: "fuzz every wire
+# codec (cargo-fuzz) before calling it done"). Each wire codec crate
+# carries a fuzz/ sub-project (cargo-fuzz's independent-workspace
+# layout — no workspace membership); this leg runs a bounded seeded
+# burst per target. It never gates pushes: schedule + manual dispatch
+# only, mirroring smokes.yml's division of labor (ci.yml stays the
+# push gate). A crash here is a finding, not flakiness: the artifact
+# upload carries the crash file + the run log; reproduce locally with
+# 'cargo +nightly fuzz run --fuzz-dir fuzz <target> <crash-file>'
+# (CONTRIBUTING.md "Fuzzing" has the full walkthrough).
+
+on:
+  schedule:
+    - cron: '30 4 * * *' # nightly, 04:30 UTC — staggered off smokes' 03:00 leg
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  burst:
+    name: burst (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: zapi
+            target: zapi_decode
+          - crate: bgpd
+            target: bgp_decode
+          - crate: ospfd
+            target: ospf_packet_decode
+          - crate: isisd
+            target: isis_pdu_decode
+          - crate: bfdd
+            target: bfd_packet_decode
+          - crate: rpki
+            target: rtr_pdu_decode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/${{ matrix.crate }}/fuzz
+      - name: Seeded burst (90 s per target)
+        working-directory: crates/${{ matrix.crate }}
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          if compgen -G 'fuzz/seeds/*.bin' > /dev/null; then
+            cp fuzz/seeds/*.bin fuzz/corpus/${{ matrix.target }}/
+          fi
+          cargo fuzz run --fuzz-dir fuzz ${{ matrix.target }} \
+            -- -max_total_time=90 -print_final_stats=1 2>&1 | tee fuzz-run.log
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: |
+            crates/${{ matrix.crate }}/fuzz/artifacts/
+            crates/${{ matrix.crate }}/fuzz-run.log
+          if-no-files-found: ignore
+          retention-days: 30
