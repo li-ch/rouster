@@ -311,32 +311,27 @@ LSP IDs display as dynamic hostnames (RFC 5301).
 
 `scripts/test-isis-broadcast-interop.sh` — the p2p smoke's LAN leg:
 FRR 10.2.2 in default broadcast mode against our `network broadcast`
-daemon at priority 100. Machine checks: ATTACH, ADJACENCY-OURS (our
-"LAN adjacency UP" via the CODE 6 dance; FRR's neighbor table holds
-the record), **DIS-US** (FRR's database holds OUR pseudonode LSP
+daemon at priority 100. Machine checks: ATTACH, ADJACENCY-BOTH (our
+"LAN adjacency UP" via the CODE 6 dance AND FRR's neighbor table
+holding us in state Up — its §8.4.1.5 own-lANAddress test now
+matches), **SNPA-REAL** (FRR's circuit SNPA reads a real MAC, not
+0000.0000.0000), DIS-US (FRR's database holds OUR pseudonode LSP
 `rouster-r2.01-00` and no r1 one), FRR-DB (our router LSP flooded
-across the LAN), 30 s SOAK. **Disclosed blocker — one root cause,
-three verified symptoms**: rousterd's zapi INTERFACE_ADD leaves
-`hw_addr` empty, so FRR's LAN circuit SNPA reads 0000.0000.0000 —
-(1) its §8.4.1.5 own-lANAddress test never matches (the adjacency
-stays Initializing; the p2p smoke is unaffected, RFC 5303 uses no
-SNPA); (2) FRR's `send_lsp()` refuses transmission with
-`upadjcount == 0`, so FRR never floods and our side cannot install
-FRR-derived routes (no REDIST legs in the smoke); (3) FRR's own LSP
-carries no LAN adjacency entry, so it could not route ours even with
-(2) fixed. The exact ask (four crates: IFLA_ADDRESS →
-`rib::InterfaceState` → `InterfaceMirror` → the server's `hw_addr`)
-sits first in §Deferred.
+across the LAN), REDIST-OUT (our static reaches FRR's kernel `proto
+isis`) and REDIST-IN (FRR's static reaches ours via its TLV 135), 30 s
+SOAK with both adjacencies and the learned route held. **The S14-a
+hw_addr release (2026-10-16)**: the four-crate chain
+(IFLA_ADDRESS → `rib::InterfaceState` → `InterfaceMirror` → the
+INTERFACE_ADD `hw_addr` field) landed; before it, the empty field made
+FRR's circuit SNPA zeros, kept its adjacency Initializing forever
+((1) its §8.4.1.5 test never matched), stopped its flooding
+((2) `send_lsp()` refuses with `upadjcount == 0` — no REDIST legs),
+and left its LSP without a LAN adjacency entry ((3) no routing of
+ours even with (2) fixed). All three symptoms verified gone, live,
+×2 runs.
 
 ## §Deferred (the remaining list)
 
-- **rousterd's zapi `hw_addr`** (the broadcast-smoke blocker): the
-  zapi server's INTERFACE_ADD never fills `ZapiInterface::hw_addr`,
-  so FRR's LAN circuit SNPA is zeros and its §8.4.1.5 adjacency-Up
-  test can never match. The fix wants `IFLA_ADDRESS` parsed in
-  netlink-dp's link dump → `rib::InterfaceState` → `InterfaceMirror`
-  → the server's wire set (four crates — an owner-sized change, not
-  a stream one-liner).
 - **IPv6** (NLPID 0x8E, TLV 236, multi-topology): the AF-generic
   invariant's IS-IS seam is `tlv.rs`'s v4-specific entries.
 - **BFD for IS-IS adjacencies**; **MT routing** (RFC 5120) and its

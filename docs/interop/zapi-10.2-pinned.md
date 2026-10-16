@@ -394,6 +394,13 @@ fetched by Z2 — and are implemented + synthetic-round-trip-tested in
   layout diagram inside `zclient.c`'s comment block is STALE — the code
   above is what 10.2.2 parses. Oracle run shows a fresh client gets VRF_ADD
   x1, Connected x4, Intf Addr x2, then INTERFACE_LINK_PARAMS (41) last.
+  **S14-a (2026-10-16)**: our emission now FILLS `hw_addr` (len 6 + the
+  interface's IFLA_ADDRESS MAC; len 0 when the kernel reports no
+  Ethernet-sized address). Wire evidence: the M4 capture's vrf-test device
+  already showed real zebra emitting a 6-byte hw_addr, and the released
+  broadcast interop smoke cross-checks it live — FRR's isisd reads its
+  circuit SNPA from our dump (`show isis interface` prints the real MAC,
+  adjacency Up) where it previously read 0000.0000.0000.
 - **ZEBRA_INTERFACE_ADDRESS_ADD/DELETE (2/3)**: ifindex u32 | flags u8 |
   family u8 | address bytes (4/16) | prefixlen u8 (AFTER the address) |
   destination bytes (all-zero = none). The flags u8 carries

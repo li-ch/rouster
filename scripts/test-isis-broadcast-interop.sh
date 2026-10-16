@@ -10,42 +10,34 @@
 #                         default priority 64)
 #   isis-bc-r2 (us):     rousterd + mgmtd + staticd + rouster isisd
 #                        (`network broadcast`, `priority 100` -> WE win
-#                         the DIS election and originate the pseudonode
-#                         LSP rouster-r2.01-00)
+#                        the DIS election and originate the pseudonode
+#                        LSP rouster-r2.01-00)
 #
 # Machine checks (script exit 0):
 #   - ATTACH: r2's rousterd logged a protocol=9 (ISIS) session.
-#   - ADJACENCY-OURS: our isisd logged "LAN adjacency UP" (the CODE 6
-#     dance); FRR's neighbor table carries rouster-r2. FRR's own Up
-#     transition is BLOCKED BY A ROUSTERD GAP, disclosed: rousterd's
-#     zapi INTERFACE_ADD never fills hw_addr, so FRR's circuit SNPA
-#     reads 0000.0000.0000 and ISO 8.4.1.5's "R reports this
-#     circuit's lANAddress" test can never match on FRR's side (the
-#     p2p smoke is unaffected - the three-way handshake uses no
-#     SNPA). Everything else here proves the LAN data path in both
-#     directions anyway.
+#   - ADJACENCY-BOTH: our isisd logged "LAN adjacency UP" (the CODE 6
+#     dance) AND FRR's neighbor table holds rouster-r2 in state Up —
+#     the S14-a hw_addr release (IFLA_ADDRESS -> InterfaceState ->
+#     InterfaceMirror -> the INTERFACE_ADD hw_addr field): FRR's
+#     8.4.1.5 own-lANAddress test now matches. Before it, rousterd's
+#     INTERFACE_ADD left hw_addr empty, FRR's circuit SNPA read
+#     0000.0000.0000, and its adjacency stayed Initializing forever.
+#   - SNPA-REAL: FRR's circuit SNPA (`show isis interface eth0`) is a
+#     real MAC, not the zeros — the released root cause, asserted.
 #   - DIS-US: FRR's `show isis database` holds OUR PSEUDONODE LSP
 #     (rouster-r2.01-00) — the DIS proof; and does NOT hold an r1
 #     pseudonode (FRR, the loser, originates none).
 #   - FRR-DB: FRR's database holds our ROUTER LSP (rouster-r2.00-00)
 #     flooded across the LAN.
-#   - SOAK: 30 s — our adjacency holds, FRR's record and our LSPs
-#     stay, every daemon alive.
-#
-# DISCLOSED BLOCKER (one root cause, three symptoms): rousterd's zapi
-# INTERFACE_ADD never fills hw_addr, so FRR's LAN circuit SNPA reads
-# 0000.0000.0000 ("show isis interface"). Verified live consequences:
-#   1. FRR's ISO 8.4.1.5 own-lANAddress test can never match -> its
-#      adjacency stays Initializing (the p2p smoke is unaffected —
-#      RFC 5303's handshake uses no SNPA).
-#   2. FRR's send_lsp() refuses to transmit with upadjcount == 0 ->
-#      FRR never floods its LSP -> our side cannot install
-#      FRR-derived routes (no REDIST legs here until that lands).
-#   3. FRR's own LSP carries no LAN adjacency entry (no Up
-#      adjacency) -> even with (2) fixed, FRR could not route ours.
-# The exact fix (IFLA_ADDRESS -> rib::InterfaceState ->
-# InterfaceMirror -> the server's hw_addr, four crates) sits in
-# isis.md's Deferred list as the broadcast blocker.
+#   - REDIST-OUT: staticd on r2 injects 198.51.100.0/24 -> we
+#     originate the TLV 135 entry -> FRR floods/installs it (r1
+#     kernel `proto isis` via us) — unblocked by the same fix (FRR's
+#     send_lsp() refuses to transmit with upadjcount == 0).
+#   - REDIST-IN: FRR's static (203.0.113.0/24) -> FRR's TLV 135 ->
+#     our SPF -> ROUTE_ADD through rousterd -> r2 kernel proto isis
+#     via FRR — the third symptom the SNPA gap used to block.
+#   - SOAK: 30 s — both adjacencies hold, FRR's record and our LSPs
+#     stay, the learned route stays, every daemon alive.
 #
 # Never pulls images (frr-testbed:10.2.2 cached); self-cleaning;
 # quarantine under away/2026-10-14/quarantine/isis-broadcast/.
@@ -158,9 +150,12 @@ read -r R2_IP R2_LEN <<< "$(bridge_ip "$R2")"
 echo "==> bridge: frr-r1=$R1_IP/$R1_LEN rouster-r2=$R2_IP/$R2_LEN"
 
 echo "==> resident rousterd (zebra) in both containers"
+# ROUSTERD_LOG=debug: the REDIST-IN leg greps rousterd's per-route
+# 'zapi: route add' export line (demoted to debug in PERF-P3 M2b —
+# the p2p smoke's convention).
 for name in "$R1" "$R2"; do
     docker exec "$name" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-    docker exec -d "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+    docker exec -d -e ROUSTERD_LOG=debug "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 done
 wait_in "$R1" "r1 rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 wait_in "$R2" "r2 rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
@@ -227,10 +222,18 @@ wait_in "$R2" "our isisd opened the raw socket" 15 \
 echo "==> ATTACH: both isisd sessions established (protocol=9)"
 wait_in "$R1" "r1 (FRR isisd) attached" 30 "grep -q 'session established.*protocol=9' $ROUSTERD_LOG"
 wait_in "$R2" "r2 (our isisd) attached" 30 "grep -q 'session established.*protocol=9' $ROUSTERD_LOG"
+R1_SESSIONS=$(docker exec "$R1" sh -c "grep -c 'session established' $ROUSTERD_LOG || true")
+R2_SESSIONS=$(docker exec "$R2" sh -c "grep -c 'session established' $ROUSTERD_LOG || true")
 
-echo "==> ADJACENCY-OURS: the CODE 6 dance lands Up on our side; FRR holds the record"
+echo "==> ADJACENCY-BOTH: our CODE 6 dance lands Up AND FRR's 8.4.1.5 test matches (the hw_addr release)"
 wait_in "$R2" "our isisd logged LAN adjacency UP" 90 "grep -q 'LAN adjacency UP' $OUR_ISISD_LOG"
-wait_in "$R1" "FRR's neighbor table carries us" 90 "vtysh -c 'show isis neighbor' | grep -q 'rouster-r2'"
+wait_in "$R1" "FRR's neighbor table holds us, state Up" 90 \
+    "vtysh -c 'show isis neighbor' | grep 'rouster-r2' | grep -q ' Up '"
+
+echo "==> SNPA-REAL: FRR's circuit SNPA is a real MAC (the released root cause)"
+wait_in "$R1" "FRR's circuit SNPA is not the zeros" 30 \
+    "vtysh -c 'show isis interface eth0' | grep 'SNPA:' | grep -qv '0000.0000.0000'"
+docker exec "$R1" sh -c "vtysh -c 'show isis interface eth0' | grep 'SNPA:'"
 
 echo "==> DIS-US: our pseudonode LSP in FRR's database; no r1 pseudonode"
 wait_in "$R1" "FRR's database holds our PSEUDONODE LSP" 45 \
@@ -242,27 +245,50 @@ fi
 echo "==> FRR-DB: our router LSP, flooded across the LAN"
 wait_in "$R1" "FRR's database holds our router LSP" 45 \
     "vtysh -c 'show isis database' | grep -q 'rouster-r2.00'"
-# FRR-derived routes on our side need FRR to flood, which the
-# disclosed SNPA gap blocks (see the header) — no REDIST legs here
-# until that lands.
+
+echo "==> REDIST-OUT: staticd injects $OUR_STATIC -> our TLV 135 -> FRR's kernel"
+docker exec "$R2" vtysh -c "configure terminal" -c "ip route $OUR_STATIC $R1_IP"
+wait_in "$R1" "FRR holds our prefix in its database" 60 \
+    "vtysh -c 'show isis database detail' | grep -q '${OUR_STATIC%/*}'"
+wait_in "$R1" "$OUR_STATIC in r1 kernel via ISIS" 60 \
+    "ip route show proto isis | grep -q '$OUR_STATIC'"
+docker exec "$R1" sh -c "ip route show proto isis | grep '$OUR_STATIC'" | grep -q "via $R2_IP" \
+    || fail "FRR's ISIS route for $OUR_STATIC does not point at us ($R2_IP)"
+
+echo "==> REDIST-IN: FRR's static -> FRR TLV 135 -> our SPF -> r2 kernel"
+docker exec "$R1" vtysh -c "configure terminal" -c "ip route $FRR_STATIC blackhole"
+wait_in "$R1" "FRR originated its prefix" 60 \
+    "vtysh -c 'show isis database detail' | grep -q '${FRR_STATIC%/*}'"
+wait_in "$R2" "our isisd installed FRR's prefix" 60 \
+    "grep 'IS-IS route installed' $OUR_ISISD_LOG | grep -q '${FRR_STATIC%/*}'"
+wait_in "$R2" "r2 rousterd exported it to the kernel" 60 \
+    "grep 'zapi: route add' $ROUSTERD_LOG | grep -q '$FRR_STATIC'"
+wait_in "$R2" "$FRR_STATIC in r2 kernel proto isis via FRR" 60 \
+    "ip route show proto isis | grep '$FRR_STATIC' | grep -q 'via $R1_IP'"
 
 echo "==> SOAK: 30 s stability (the DIS CSNP duty)"
 sleep 30
-docker exec "$R1" sh -c "vtysh -c 'show isis neighbor' | grep -q 'rouster-r2'" \
-    || fail "FRR's adjacency record dropped during soak"
+docker exec "$R1" sh -c "vtysh -c 'show isis neighbor' | grep 'rouster-r2' | grep -q ' Up '" \
+    || fail "FRR's adjacency dropped during soak"
 docker exec "$R2" sh -c "grep -q 'LAN adjacency UP' $OUR_ISISD_LOG" \
     || fail "our adjacency dropped during soak"
 docker exec "$R1" sh -c "vtysh -c 'show isis database' | grep -q 'rouster-r2.01'" \
     || fail "our pseudonode LSP vanished during soak"
 docker exec "$R1" sh -c "vtysh -c 'show isis database' | grep -q 'rouster-r2.00'" \
     || fail "our router LSP vanished during soak"
+docker exec "$R2" sh -c "ip route show proto isis | grep -q '$FRR_STATIC'" \
+    || fail "learned route lost during soak"
+[ "$(docker exec "$R1" sh -c "grep -c 'session established' $ROUSTERD_LOG || true")" = "$R1_SESSIONS" ] \
+    || fail "r1 saw a zapi reconnect during the soak"
+[ "$(docker exec "$R2" sh -c "grep -c 'session established' $ROUSTERD_LOG || true")" = "$R2_SESSIONS" ] \
+    || fail "r2 saw a zapi reconnect during the soak"
 docker exec "$R1" sh -c "pidof rousterd mgmtd staticd isisd" >/dev/null \
     || fail "an r1 daemon died during the soak"
 docker exec "$R2" sh -c "pidof rousterd mgmtd staticd rouster-isisd" >/dev/null \
     || fail "an r2 daemon died during the soak"
 
-echo "==> final state (the SNPA zeros are the disclosed blocker)"
-docker exec "$R1" sh -c "vtysh -c 'show isis neighbor'; echo ---; vtysh -c 'show isis interface eth0' | head -4; echo ---; vtysh -c 'show isis database'"
-docker exec "$R2" sh -c "grep -c 'LAN adjacency UP' /var/log/rouster-isisd.log"
+echo "==> final state (both directions routed, SNPA real)"
+docker exec "$R1" sh -c "vtysh -c 'show isis neighbor'; echo ---; vtysh -c 'show isis interface eth0' | head -4; echo ---; vtysh -c 'show isis database'; echo ---; ip route show proto isis"
+docker exec "$R2" sh -c "ip route show proto isis; echo ---; grep -c 'LAN adjacency UP' /var/log/rouster-isisd.log"
 
 echo "isis-broadcast interop: PASS"
