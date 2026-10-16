@@ -507,3 +507,19 @@ The phase text above is unchanged; this block is status only.
   runs — poll the status socket instead. Comparative claims stay
   closed on darwin-vm (17.1 vs 30.36 = 1.78×, under the 2× rule);
   the descriptive claim is licensed.
+
+- 2026-10-16 — S13 round GREEN, the v1.0 tail CLOSED: IS-IS
+  depth (RFC 5302 inter-area + the §3.10.2 ladder, broadcast/DIS/
+  pseudonode circuits with a new interop smoke, TLV 10 + RFC 5304
+  auth with key chains, fragment families + pacing + RFC 7987
+  lifetimes, the admin knobs; a live bug fixed — L1L2 never ran
+  its L1 database); F3 first-AS enforcement (RFC 4271 §6.3,
+  byte-pinned 3/11, iBGP-exempt; +the F5 log regression the smoke
+  re-run caught); RESTCONF v2 (unix socket default with 0660 bits
+  as access control, constant-time bearer token, TLS as a
+  documented owner block); the fuzz upgrade (six cargo-fuzz
+  targets + nightly CI; the first dispatch caught a real u32 OOB
+  panic in the RTR ERROR_REPORT decoder — fixed with a bounds
+  check + regression test). Gate 1845/0 ×3, smokes 39/39. One
+  new owner item: zapi INTERFACE_ADD hw_addr (blocks FRR's IS-IS
+  broadcast SNPA; the ask documented in isisd §Deferred).
