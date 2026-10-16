@@ -1,0 +1,18 @@
+# Dockerfile.mrt-replay — the E3 session-fleet injector image
+# (docs/benchmarks.md §E3; S14-b PERF-X stream).
+#
+# One image with the in-repo mrt-replay binary baked in, so the E3
+# harness can start N pinned injector containers (one per BGP
+# session, one source IP each) without a per-container docker cp.
+# The build context is a staging dir holding ONLY the binary:
+#
+#   mkdir -p target/bench-ctx
+#   cp target/<musl-target>/release/mrt-replay target/bench-ctx/
+#   docker build -f docker/bench/Dockerfile.mrt-replay \
+#       target/bench-ctx -t rouster-bench-mrt:local
+#
+# Same injector binary as every §R E1 entry (D1(c)); pinning the
+# image tag + binary sha256 in the ledger entry reproduces the fleet.
+FROM alpine:3.20
+COPY mrt-replay /usr/local/bin/mrt-replay
+ENTRYPOINT ["sleep", "infinity"]

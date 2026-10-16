@@ -81,6 +81,24 @@ full-table soak tests). This plan is how that changes, honestly.
   during; UPDATE/NOTIFICATION error counts; queue depth if
   observable.
 - **Effort**: 1 day on top of E1 tooling.
+- **Protocol addendum (2026-10-16, declared before the first §R
+  run)**: the concrete S14-b shape — the table is the pinned 100k
+  slice (announce file `announce-100k.announce`, the
+  bench-mrt2announce derivative of the §R dump; sha256 recorded in
+  the entry) loaded over ONE eBGP session by `scripts/bench-flap.py`
+  (a stdlib-Python BGP speaker; the mrt-replay announce content with
+  the one addition mrt-replay lacks — protocol-level
+  withdraw/reannounce on the announcing session; identical tool and
+  schedule on both SUTs per §F, so no vtysh-side clear which only
+  one side could receive identically). Storm: a fixed subset of
+  every 10th prefix (10% = ~10k) withdrawn and re-announced per
+  round, N=10 rounds with steady-state waits between rounds;
+  per-round reconvergence = reannounce-burst-done → SUT count
+  restored (both the SUT's own main-table count and the kernel FIB
+  count, the latter observed from a third container sharing the
+  SUT's netns but pinned off the SUT cpuset). The 100–1000 cycles/s
+  rate sweep stays deferred (this entry measures the round shape);
+  full-table E2 is a later cell on the same harness.
 
 ### E3 — Session-establishment scaling (tests the multi-core claim)
 
@@ -94,6 +112,21 @@ full-table soak tests). This plan is how that changes, honestly.
 - **Metrics**: wall time to all-N Established; sessions/s; CPU
   utilization per core count; failure count.
 - **Effort**: 1 day.
+- **Protocol addendum (2026-10-16, declared before the first §R
+  run)**: the concrete S14-b shape — N ∈ {10, 50, 100} mrt-replay
+  injector containers (one container per session: mrt-replay does
+  not bind `--local-addr`, so distinct peer IPs need distinct
+  containers; the binary is baked into the `docker/bench/
+  Dockerfile.mrt-replay` fleet image), all released at a common
+  T0 (busy-poll on the shared VM clock; the actual start-spread is
+  recorded per run) against ONE SUT with N configured passive
+  neighbors, SUT pinned to 1/2/4 cores (cpusets 4 / 4-5 / 4-7,
+  injector fleet 0-3). Simultaneous start only — the staggered
+  1-per-100ms variant stays deferred. Per-session table = the
+  first 100 prefixes of the §R feed (--limit 100: session
+  machinery, not table scale). Wall = min injector REPLAY-START →
+  max REPLAY-ESTABLISHED, cross-checked by the SUT's own
+  Established count.
 
 ### E4 — FIB programming rate (RIB → kernel)
 
@@ -106,6 +139,22 @@ full-table soak tests). This plan is how that changes, honestly.
 - **Metrics**: routes/s into the kernel; time to N% installed;
   RSS of the daemon pair.
 - **Effort**: half a day.
+- **Protocol addendum (2026-10-16, declared with the first §R
+  run)**: the concrete S14-b shape — batch sizes B ∈ {1k, 10k,
+  100k} of the pinned feed (mrt-replay --limit B, the E1 shape
+  unpaced hold 90), 6 runs per size (1 warmup + 5 measured). The
+  measured programming pass is the FIB install stream that follows
+  the RIB load (rousterd's pipelined route_replace_batch reconcile,
+  the F8 machinery); observation from a third container sharing the
+  SUT's network namespace but pinned off the SUT cpuset
+  (`ip route show proto 186 | wc -l`, 0.15 s / 0.4 s cadence at
+  1-10k / 100k — the RTNL cost of the dump itself is disclosed).
+  Metrics per size: wall first-kernel-route → B installed (the
+  programming window) and launch → installed, routes/s, rousterd +
+  bgpd CPU over the window, RSS of the pair, rcvbuf overruns,
+  malformed/rejected. The FRR side is DERIVED from its ledgered
+  full-table entry (zebra 9.67 CPU-s / 1,126,490 routes), not
+  re-run — disclosed per the stream prompt.
 
 ### E5 — Memory per prefix
 
