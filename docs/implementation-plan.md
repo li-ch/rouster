@@ -523,3 +523,13 @@ The phase text above is unchanged; this block is status only.
   check + regression test). Gate 1845/0 ×3, smokes 39/39. One
   new owner item: zapi INTERFACE_ADD hw_addr (blocks FRR's IS-IS
   broadcast SNPA; the ask documented in isisd §Deferred).
+
+- 2026-10-16 (perf wave 1+2 close) — the performance campaign's
+  first two waves: **bgpd 449 B/prefix (was 1,679; FRR 897 — 2.1×
+  better, the first ≥2× resolvable claim)** with CPU 10.37→6.88 s;
+  **rousterd 8.97 s CPU (was 10.80; FRR zebra 9.67)** with the
+  pair at 15.74 vs FRR's 20.7 s; the harness poll-loss root-caused
+  as SUT finding F9 (netlink rcvbuf overrun → dropped ACKs →
+  futures await forever); the census-first method (measure before
+  optimizing) overturned three prior theories by measurement. Gate
+  1854/0, smokes green.
