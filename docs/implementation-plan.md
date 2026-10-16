@@ -533,3 +533,18 @@ The phase text above is unchanged; this block is status only.
   futures await forever); the census-first method (measure before
   optimizing) overturned three prior theories by measurement. Gate
   1854/0, smokes green.
+
+- 2026-10-16 (perf wave 3 close — the optimization campaign's
+  final wave) — **wall-clock 3.79× FRR (8.02 s median vs 30.36 s,
+  ≥2× RESOLVED)**; **zebra-side memory 229 B/prefix vs FRR's 519
+  (2.27× better)**; rousterd CPU 6.95 s vs 9.67; the pair 13.63 vs
+  20.7 s (1.52×, honestly sub-2×). The levers: the 1 s status
+  cadence with O(1) incremental counters (the wall's hidden 7.6 s
+  was the 10 s refresh grid), the per-route log demotion + 64 KiB
+  chunked reader (the two fenced zapi levers, landed), and the rib
+  census's **100,000× nexthop-group duplication → Arc-shared
+  interning** + the slim programmed belief + the inline
+  single-candidate slot. Gate 1858/0, CI green. The campaign's
+  scoreboard: 3 of 4 headline metrics ≥2× ahead of FRR
+  (speaker memory 2.1×, wall 3.79×, zebra memory 2.27×); CPU ahead
+  on both processes but the pair honestly sub-2×.
