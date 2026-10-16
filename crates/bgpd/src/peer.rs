@@ -659,9 +659,12 @@ where
             // already-consumed header or body half exactly when a
             // timer branch won the select, desyncing the stream
             // ("marker is not all ones", §6.1).
-            while let FrameTake::Frame(read) =
-                take_frame(&mut self.read_pending, asn4, handling, add_path)
-            {
+            while let FrameTake::Frame(read) = {
+                let t_frame = crate::estprof::now();
+                let taken = take_frame(&mut self.read_pending, asn4, handling, add_path);
+                crate::estprof::note_decode(self.peer.address, t_frame);
+                taken
+            } {
                 match read {
                     Ok(decoded) => {
                         if let Some(end) = self.on_message(decoded, sink).await {
@@ -807,6 +810,7 @@ where
                 hold = n.map(|x| x.hold_time).unwrap_or(0),
                 "bgpd: session Established"
             );
+            crate::estprof::note_established(self.peer.address);
             // The SAVNET adjacency-up report (experimental-savnet):
             // in-process, monitor-only consumer; the session knows
             // addresses, not kernel interfaces, so no ifindex rides
@@ -840,7 +844,10 @@ where
                 }
                 None => {}
             }
-            if let Err(e) = self.on_established().await {
+            let t_dump = crate::estprof::now();
+            let dumped = self.on_established().await;
+            crate::estprof::note_dump(self.peer.address, t_dump);
+            if let Err(e) = dumped {
                 self.end = Some(SessionEnd::Transport(e.to_string()));
                 return self.end.clone();
             }
@@ -884,7 +891,12 @@ where
                     shared.note_open(open.bgp_id);
                     shared.note_gr(open.graceful_restart());
                 }
-                self.step(Event::BgpOpen(open), sink).await
+                // F10 profiling: the OPEN-processing wall (validation
+                // + our OPEN/KEEPALIVE out).
+                let t_open = crate::estprof::now();
+                let stepped = self.step(Event::BgpOpen(open), sink).await;
+                crate::estprof::note_open(self.peer.address, t_open);
+                stepped
             }
             BgpMessage::Keepalive => self.step(Event::KeepAliveMsg, sink).await,
             BgpMessage::Update(update) => {
@@ -897,7 +909,9 @@ where
                     let (afi, safi) = family.unwrap_or((1, 1));
                     info!(peer = %self.peer.address, afi, safi,
                         "bgpd: End-of-RIB received (RFC 4724)");
+                    let t_eor = crate::estprof::now();
                     sink.eor_received(&self.peer, afi, safi);
+                    crate::estprof::note_eor(self.peer.address, t_eor);
                     // RFC 4724 §4.1 (restarting speaker): the peer's
                     // EOR ends the selection deferral — re-selection
                     // happened above (that family's stale flushed),
@@ -1063,8 +1077,12 @@ where
                         });
                     }
                 }
+                // F10 profiling: the sink wall (RIB lock wait + work,
+                // one unit — the import-path candidate).
+                let t_sink = crate::estprof::now();
                 sink.announce(&self.peer, &update);
                 sink.withdraw(&self.peer, &withdrawn);
+                crate::estprof::note_update(self.peer.address, t_sink);
                 self.step(Event::UpdateMsg, sink).await
             }
             BgpMessage::Notification(n) => {

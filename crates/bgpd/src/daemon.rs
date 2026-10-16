@@ -238,6 +238,10 @@ impl Daemon {
         let refresh_accept = refresh.clone();
         let listener = self.listener;
         loop {
+            // F10 profiling: the accept arm's wait per iteration (queue
+            // wait + syscall) and the neighbor lookup both note into
+            // the estprof collector (no-ops unless BGPD_EST_PROFILE).
+            let t_accept = crate::estprof::now();
             tokio::select! {
                 _ = stop_accept.changed() => {
                     if *stop_accept.borrow() {
@@ -247,11 +251,14 @@ impl Daemon {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, peer)) => {
+                            crate::estprof::note_accept(peer.ip(), t_accept);
+                            let t_lookup = crate::estprof::now();
                             let Some(neighbor) = config.neighbors.get(&peer.ip()).cloned()
                             else {
                                 warn!(%peer, "bgpd: connection from unconfigured address, rejected");
                                 continue;
                             };
+                            crate::estprof::note_lookup(peer.ip(), t_lookup);
                             let local_addr = stream
                                 .local_addr()
                                 .map(|a| a.ip())
@@ -273,8 +280,9 @@ impl Daemon {
                                 stop: stop_accept.clone(),
                                 refresh: refresh_accept.clone(),
                             };
+                            let accepted_at = crate::estprof::now();
                             tokio::spawn(async move {
-                                accept_connection(stream, conn).await;
+                                accept_connection(stream, conn, accepted_at).await;
                             });
                         }
                         Err(e) => {
@@ -297,10 +305,17 @@ impl Daemon {
 
 /// One accepted connection: a free registry slot runs the session
 /// (Events 4/5 shape); an occupied one resolves the §6.8 collision.
-async fn accept_connection<S: RouteSink + 'static>(stream: TcpStream, conn: Connection<S>) {
+async fn accept_connection<S: RouteSink + 'static>(
+    stream: TcpStream,
+    conn: Connection<S>,
+    accepted_at: Option<std::time::Instant>,
+) {
     let live = Arc::clone(&conn.ctx.live);
     live.fetch_add(1, Ordering::SeqCst);
+    crate::estprof::task_started(conn.peer_addr, accepted_at);
+    let t_register = crate::estprof::now();
     let registered = register(&conn.ctx.registry, conn.peer_addr, false, &conn.ctx.next_id);
+    crate::estprof::note_register(conn.peer_addr, t_register);
     match registered {
         Some(registered) => {
             run_session(stream, conn, registered).await;
@@ -508,6 +523,9 @@ where
     let Registered { shared, evict, id } = registered;
     let shared_for_gr = Arc::clone(&shared);
     let flush_sink_for = ctx.sink.clone();
+    // F10 profiling: the construction wall (channels, session config
+    // resolve, PeerSession::new — the per-session setup candidate).
+    let t_construct = crate::estprof::now();
 
     // Per-session stop: the daemon's global stop OR this session's
     // eviction.
@@ -570,10 +588,12 @@ where
         }
     }
     let mut sink = ctx.sink;
+    crate::estprof::note_construct(peer_addr, t_construct);
     let end = session
         .run_with_signals(&mut sink, session_stop, refresh)
         .await;
     info!(peer = %peer_addr, ?end, "bgpd: session ended");
+    crate::estprof::note_end(peer_addr, &format!("{end:?}"));
     release(&ctx.registry, peer_addr, id);
     // RFC 4724 §4.1: an abnormal loss of a GR-negotiated session sets
     // the restart mark — the NEXT session announces the R bit (a

@@ -36,6 +36,12 @@ CORESES=${BENCH_E3_CORES:-"1 2 4"}
 TABLE=${BENCH_E3_TABLE:-100}
 FLEET_TAG=${BENCH_E3_FLEET_TAG:-rouster-bench-mrt:local}
 DEADLINE=${BENCH_E3_DEADLINE:-120}
+# F10 diagnosis mode (S15-a): run the SUT with BGPD_EST_PROFILE=1 so
+# bgpd emits per-session EST-PROF-EST / EST-PROF-END phase lines into
+# sut-bgpd.log (fold with scripts/bench-e3-diagnose.py). The fleet,
+# pins, release and receipts are unchanged — this only adds the env
+# var to the SUT container (the receipt runs keep it off).
+DIAGNOSE=${BENCH_E3_DIAGNOSE:-0}
 
 SUT_AS=65000
 INJ_AS=65412
@@ -61,7 +67,9 @@ TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR="target/bench-logs/e3-$TS"
 mkdir -p "$OUT_DIR"
 echo "bench-e3-sessions: mode=$MODE feed=$FEED_MRT ns=[$NS] cores=[$CORESES]"
-echo "  table/session=$TABLE runs=$RUNS out=$OUT_DIR"
+echo "  table/session=$TABLE runs=$RUNS out=$OUT_DIR diagnose=$DIAGNOSE"
+[ "$DIAGNOSE" = 1 ] && [ "$MODE" = rouster ] \
+    && echo "diagnose=BGPD_EST_PROFILE=1 (SUT)" >> "$OUT_DIR/PROTOCOL.txt"
 
 perl -e 'alarm 15; exec @ARGV' docker run --rm --entrypoint true "$IMAGE" \
     || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
@@ -164,8 +172,10 @@ for N in $NS; do
                 [ "$applied" = 1 ] || { echo "FAIL: FRR $N-neighbor config never applied" >&2; exit 1; }
                 wait_up "$SUT" "frr bgpd bound :179" 30 "grep -qi '00B3' /proc/net/tcp"
             else
+                SUT_DIAG_ENV=""
+                [ "$DIAGNOSE" = 1 ] && SUT_DIAG_ENV="-e BGPD_EST_PROFILE=1"
                 docker run -d --name "$SUT" --network "$NET_NAME" --ip "$SUT_IP" \
-                    --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
+                    --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS $SUT_DIAG_ENV \
                     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
                     --entrypoint sleep "$IMAGE" infinity >/dev/null
                 for b in rousterd rousterctl; do

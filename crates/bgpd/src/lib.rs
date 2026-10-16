@@ -23,6 +23,8 @@ pub mod census;
 pub mod config;
 pub mod daemon;
 pub mod error;
+/// F10 establishment profiling (runtime-gated; see the module doc).
+pub mod estprof;
 pub mod fsm;
 pub mod message;
 pub mod peer;
