@@ -184,26 +184,26 @@ for N in $NS; do
             fi
 
             # --- the fleet: N pinned injector containers, staged idle ----
-            # Each waits until common T0 (VM clock shared with the host),
-            # then connects: one mrt-replay per session, logs to the
-            # shared /fleet volume (host-visible, no docker cp loop).
-            T0_S=$(date +%s)
-            T0=$((T0_S + 6))
-            echo "$T0" > "$RUN_DIR/t0.txt"
+            # Each container's MAIN command is the waiter: it polls the
+            # shared /fleet/GO file (the harness writes the release epoch
+            # once staging is COMPLETE), coarse-sleeps to release-1s and
+            # spins on the second flip — so the release spread is the
+            # clock, not a docker-exec launch loop (the first grid's
+            # N>=50 walls measured that loop, 2.5-11.6 s of injector
+            # skew; diagnosed from start_spread==wall and fixed here).
+            rm -f "$RUN_DIR/fleet/GO"
             for i in $(seq 1 "$N"); do
                 IP=172.31.255.$((100 + i))
                 docker run -d --name "e3x-inj-$i" --network "$NET_NAME" --ip "$IP" \
                     --cpuset-cpus "$INJ_CPUS" \
                     -v "$FEED_MRT":/feed.mrt:ro \
                     -v "$RUN_DIR_ABS/fleet":/fleet \
-                    -e T0=$T0 -e SUT_IP=$SUT_IP -e OWN_IP=$IP -e INJ_AS=$INJ_AS \
+                    -e SUT_IP=$SUT_IP -e OWN_IP=$IP -e INJ_AS=$INJ_AS \
                     -e SUT_AS=$SUT_AS -e TABLE=$TABLE -e HOLD=$HOLD -e IDX=$i \
-                    --entrypoint sleep "$FLEET_TAG" infinity >/dev/null
-                docker exec -d "e3x-inj-$i" sh -c '
-                    # busybox date has no %N: coarse-sleep to T0-1s, then
-                    # spin on the second flip (the fleet shares the VM
-                    # clock; the actual spread is recorded per run).
-                    while [ "$(date +%s)" -lt $((T0 - 1)) ]; do sleep 0.2; done
+                    --entrypoint sh "$FLEET_TAG" -c '
+                    while [ ! -s /fleet/GO ]; do sleep 0.1; done
+                    T0=$(cat /fleet/GO)
+                    while [ "$(date +%s)" -lt $((T0 - 1)) ]; do sleep 0.1; done
                     while [ "$(date +%s)" -lt "$T0" ]; do :; done
                     exec mrt-replay --peer $SUT_IP:179 --local-addr $OWN_IP \
                         --local-as $INJ_AS --peer-as $SUT_AS --router-id $OWN_IP \
@@ -211,6 +211,10 @@ for N in $NS; do
                         --limit $TABLE --rate 0 --hold $HOLD --linger 60 \
                         > /fleet/inj-$IDX.txt 2>&1'
             done
+            # fleet staged and all waiters armed: release in 3 s
+            T0=$(( $(date +%s) + 3 ))
+            echo "$T0" > "$RUN_DIR/fleet/GO"
+            echo "$T0" > "$RUN_DIR/t0.txt"
 
             # --- poller: fleet Established count + SUT cross-count -------
             python3 - "$RUN_DIR" "$N" "$DEADLINE" "$MODE" "$SUT" > "$RUN_DIR/poller.log" 2>&1 <<'EOF'

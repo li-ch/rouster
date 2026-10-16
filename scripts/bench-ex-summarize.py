@@ -408,6 +408,14 @@ def summarize_e3(args):
             m["sessions_per_s"] = round(len(ests) / (t_last - t_first), 1)
             m["start_spread_s"] = round(max(starts) - min(starts), 3)
             m["est_spread_s"] = round(max(ests) - min(ests), 3)
+        # release-basis wall: the common T0 the fleet was released at
+        t0f = run_dir / "t0.txt"
+        if t0f.exists() and ests:
+            try:
+                t0 = float(t0f.read_text().strip()) + off
+                m["wall_release_to_all_s"] = round(max(ests) - t0, 3)
+            except ValueError:
+                pass
         m["failures"] = len(fleet) - len(ests)
         # poller.log holds CSV rows (one per poll) plus markers
         prows = []
