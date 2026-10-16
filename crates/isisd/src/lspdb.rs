@@ -215,8 +215,10 @@ impl Lspdb {
     /// reaches zero are purged in place (§7.3.16.4: SRM flags set —
     /// the returned PDUs are the synchronized-purge flood) and
     /// tombstones older than `ZERO_AGE_LIFETIME` are dropped
-    /// (§7.3.16.4.c).
-    pub fn tick(&mut self, now: u64) -> Vec<Pdu> {
+    /// (§7.3.16.4.c). `level2` stamps the purge PDU's type — the
+    /// database is per-level and its purges must carry the level's
+    /// PDU type (S13-a fix: they were hardcoded L1).
+    pub fn tick(&mut self, now: u64, level2: bool) -> Vec<Pdu> {
         let mut purges = Vec::new();
         let mut expired = Vec::new();
         for (id, stored) in self.entries.iter_mut() {
@@ -227,7 +229,7 @@ impl Lspdb {
                         stored.lsp.remaining_lifetime = 0;
                         stored.lsp.tlvs.clear();
                         purges.push(crate::pdu::lsp(
-                            false,
+                            level2,
                             *id,
                             stored.lsp.sequence_number,
                             0,
@@ -520,9 +522,9 @@ mod tests {
         assert_eq!(db.get(&id).unwrap().remaining_lifetime(50), 50);
         assert_eq!(db.get(&id).unwrap().remaining_lifetime(150), 0);
         // Not yet expired at 99 (100 seconds of holding remain 1).
-        assert!(db.tick(99).is_empty());
+        assert!(db.tick(99, false).is_empty());
         // Expired at 100: one synchronized purge PDU.
-        let purges = db.tick(100);
+        let purges = db.tick(100, false);
         assert_eq!(purges.len(), 1);
         let PduBody::Lsp(p) = &purges[0].body else {
             unreachable!()
@@ -532,9 +534,9 @@ mod tests {
         assert!(p.tlvs.is_empty());
         // The tombstone lingers ZeroAgeLifetime, then drops.
         assert!(db.get(&id).is_some());
-        let _ = db.tick(100 + crate::ZERO_AGE_LIFETIME as u64 - 1);
+        let _ = db.tick(100 + crate::ZERO_AGE_LIFETIME as u64 - 1, false);
         assert!(db.get(&id).is_some());
-        let _ = db.tick(100 + crate::ZERO_AGE_LIFETIME as u64);
+        let _ = db.tick(100 + crate::ZERO_AGE_LIFETIME as u64, false);
         assert!(db.get(&id).is_none());
     }
 

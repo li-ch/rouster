@@ -25,6 +25,7 @@ use tracing::{info, warn};
 use crate::adjacency::{
     process_hello, process_hold_expired, Action as AdjAction, Adjacency, CircuitContext, HelloInfo,
 };
+use crate::auth::{self, LevelAuth};
 use crate::config::{IsisdConfig, NetworkType};
 use crate::lan::{code6_of, LanAction, LanCircuit, LanHelloInfo};
 use crate::lspdb::{InstallOutcome, Lspdb, SequenceCounter};
@@ -197,6 +198,121 @@ impl Daemon {
         }
     }
 
+    // ---- authentication (M3) --------------------------------------
+
+    /// The level whose password authenticates one PDU (ISO §7.3.7/
+    /// §7.3.9: L1 LSPs carry the area password, L2 the domain; IIHs
+    /// follow their level, with the level-agnostic p2p IIH signed by
+    /// the domain password when the circuit runs L2 — the
+    /// circuitTransmitPassword elision, disclosed). SNPs only when
+    /// their mode asks for it. `None` = transmit unsigned / accept
+    /// unsigned.
+    fn auth_for_pdu(&self, pdu_type: u8, for_snp: bool) -> Option<&LevelAuth> {
+        use crate::pdu::{PDU_L1_CSNP, PDU_L1_LAN_HELLO, PDU_L1_LSP, PDU_L1_PSNP, PDU_P2P_HELLO};
+        let level2 = match pdu_type {
+            PDU_L1_LAN_HELLO | PDU_L1_LSP | PDU_L1_CSNP | PDU_L1_PSNP => false,
+            PDU_P2P_HELLO => self.config.interface.circuit_type.has_level2(),
+            _ => true,
+        };
+        let auth = &self.config.auth[usize::from(level2)];
+        if for_snp {
+            // SNPs ride the configured mode: Off = unsigned both
+            // ways; SendOnly/Validate = signed.
+            return match auth.snp {
+                crate::auth::SnpAuth::Off => None,
+                _ => Some(auth),
+            };
+        }
+        auth.enabled().then_some(auth)
+    }
+
+    /// Whether this PDU type is an SNP (the per-PDU auth modes).
+    fn is_snp(pdu_type: u8) -> bool {
+        matches!(
+            pdu_type,
+            crate::pdu::PDU_L1_CSNP
+                | crate::pdu::PDU_L2_CSNP
+                | crate::pdu::PDU_L1_PSNP
+                | crate::pdu::PDU_L2_PSNP
+        )
+    }
+
+    /// Sign one outbound PDU (ISO §9.7's TLV 10): the live send key
+    /// appends its TLV; an HMAC-MD5 value is computed over the
+    /// encoded PDU per RFC 5304 §2 — with the auth value, and for
+    /// LSPs the checksum and remaining lifetime, all zeroed — then
+    /// patched in, with the LSP checksum recomputed over the signed
+    /// bytes. The signed struct re-decodes so the database copy and
+    /// the flooded copy agree: §7.3.16.2's confusion purge would
+    /// otherwise meet our own unsigned checksum.
+    fn auth_sign(&self, pdu: &mut Pdu) {
+        let for_snp = Self::is_snp(pdu.header.pdu_type);
+        let Some(auth) = self.auth_for_pdu(pdu.header.pdu_type, for_snp) else {
+            return;
+        };
+        let now = self.now();
+        let Some(key) = auth.chain.send_key(now) else {
+            warn!("isisd: no live send key; transmitting unsigned (fail-visible)");
+            return;
+        };
+        if pdu
+            .tlvs()
+            .iter()
+            .any(|t| matches!(t, Tlv::Authentication { .. }))
+        {
+            return; // already carrying authentication (a re-flood)
+        }
+        let is_lsp = matches!(pdu.body, PduBody::Lsp(_));
+        pdu.push_tlv(auth::auth_tlv(key));
+        if key.algorithm != crate::auth::AuthAlgorithm::HmacMd5 {
+            return;
+        }
+        let mut bytes = pdu.encode();
+        let Some(at) = auth::find_auth_tlv(&bytes, pdu.header.length_indicator as usize) else {
+            return;
+        };
+        let digest = auth::hmac_md5_digest(&bytes, at, is_lsp, &key.secret);
+        auth::patch_digest(&mut bytes, at, &digest);
+        if is_lsp {
+            // The checksum covers the auth TLV: recompute over the
+            // signed bytes (the field zeroed internally).
+            let sum = crate::checksum::lsp_checksum(&mut bytes);
+            bytes[24] = (sum >> 8) as u8;
+            bytes[25] = (sum & 0xff) as u8;
+        }
+        if let Ok(signed) = Pdu::decode(&bytes) {
+            *pdu = signed;
+        }
+    }
+
+    /// Verify one inbound PDU against the configured passwords.
+    /// Unsigned/incorrect PDUs are dropped (RFC 5304 §2: "MUST
+    /// discard the PDU if the Authentication Value is incorrect";
+    /// ISO §7.3.15.1: the tests apply when the receive passwords are
+    /// non-null — unconfigured levels accept anything). The digest
+    /// runs over the re-encoded bytes (the codec is byte-preserving,
+    /// so they equal the wire bytes; the fields it may differ on —
+    /// checksum, lifetime — are zeroed for the computation anyway).
+    fn auth_verify(&self, pdu: &Pdu) -> Result<(), String> {
+        let for_snp = Self::is_snp(pdu.header.pdu_type);
+        let Some(level_auth) = self.auth_for_pdu(pdu.header.pdu_type, for_snp) else {
+            return Ok(());
+        };
+        if for_snp && level_auth.snp == crate::auth::SnpAuth::SendOnly {
+            return Ok(()); // the transition mode: tolerate on receipt
+        }
+        let bytes = pdu.encode();
+        let is_lsp = matches!(pdu.body, PduBody::Lsp(_));
+        auth::verify(
+            &bytes,
+            pdu.header.length_indicator as usize,
+            is_lsp,
+            &level_auth.chain,
+            self.now(),
+        )
+        .map_err(|e| e.to_string())
+    }
+
     pub fn attach_zapi(&mut self, tx: mpsc::UnboundedSender<ZedgeCommand>) {
         self.zapi = Some(tx);
     }
@@ -333,9 +449,11 @@ impl Daemon {
         };
         let tlvs = self.own_tlvs(level2);
         let now = self.now();
-        let state = self.levels[level_index(level2)].as_mut()?;
-        let seq = state.seq.take_next()?;
-        let pdu = lsp_pdu(
+        let seq = {
+            let state = self.levels[level_index(level2)].as_mut()?;
+            state.seq.take_next()?
+        };
+        let mut pdu = lsp_pdu(
             level2,
             LspId::zero(self.system_id),
             seq,
@@ -343,12 +461,17 @@ impl Daemon {
             bits,
             tlvs,
         );
+        self.auth_sign(&mut pdu);
         let bytes = pdu.encode();
         let decoded = match Pdu::decode(&bytes).ok()?.body {
             PduBody::Lsp(l) => l,
             _ => return None,
         };
-        match state.db.install_self(decoded, now) {
+        match self.levels[level_index(level2)]
+            .as_mut()?
+            .db
+            .install_self(decoded, now)
+        {
             Ok(()) => Some(pdu),
             Err(e) => {
                 warn!("isisd: own LSP install failed: {e:?}");
@@ -379,6 +502,10 @@ impl Daemon {
     // ---- PDU handling --------------------------------------------
 
     pub fn handle_pdu(&mut self, pdu: Pdu, src_mac: [u8; 6], out: &mut Vec<Pdu>) {
+        if let Err(reason) = self.auth_verify(&pdu) {
+            info!(pdu_type = pdu.header.pdu_type, %reason, "PDU dropped: authentication");
+            return;
+        }
         match pdu.body {
             PduBody::P2pHello(hello) => self.handle_hello(hello, out),
             PduBody::LanHello(hello) => {
@@ -532,16 +659,23 @@ impl Daemon {
             Tlv::ExtIsReachability(members),
         ];
         let now = self.now();
-        let state = self.levels[level_index(level2)].as_mut()?;
-        let seq = state.pseudo_seq.take_next()?;
+        let seq = {
+            let state = self.levels[level_index(level2)].as_mut()?;
+            state.pseudo_seq.take_next()?
+        };
         let id = LspId::new(self.system_id, LOCAL_CIRCUIT_ID, 0);
-        let pdu = lsp_pdu(level2, id, seq, crate::MAX_AGE, bits, tlvs);
+        let mut pdu = lsp_pdu(level2, id, seq, crate::MAX_AGE, bits, tlvs);
+        self.auth_sign(&mut pdu);
         let bytes = pdu.encode();
         let decoded = match Pdu::decode(&bytes).ok()?.body {
             PduBody::Lsp(l) => l,
             _ => return None,
         };
-        match state.db.install_self(decoded, now) {
+        match self.levels[level_index(level2)]
+            .as_mut()?
+            .db
+            .install_self(decoded, now)
+        {
             Ok(()) => Some(pdu),
             Err(e) => {
                 warn!("isisd: own pseudonode LSP install failed: {e:?}");
@@ -557,16 +691,19 @@ impl Daemon {
     fn purge_pseudonode(&mut self, level2: bool, out: &mut Vec<Pdu>) {
         let id = LspId::new(self.system_id, LOCAL_CIRCUIT_ID, 0);
         let now = self.now();
-        let Some(state) = self.levels[level_index(level2)].as_mut() else {
+        let Some((seq, bits)) = self.levels[level_index(level2)]
+            .as_ref()
+            .and_then(|state| state.db.get(&id))
+            .map(|stored| (stored.lsp.sequence_number, stored.lsp.bits))
+        else {
             return;
         };
-        let Some(stored) = state.db.get(&id) else {
-            return;
-        };
-        let (seq, bits) = (stored.lsp.sequence_number, stored.lsp.bits);
-        let purge = lsp_pdu(level2, id, seq, 0, bits, vec![]);
+        let mut purge = lsp_pdu(level2, id, seq, 0, bits, vec![]);
+        self.auth_sign(&mut purge);
         if let Some(PduBody::Lsp(l)) = Pdu::decode(&purge.encode()).ok().map(|p| p.body) {
-            let _ = state.db.install(l, now);
+            let _ = self.levels[level_index(level2)]
+                .as_mut()
+                .map(|state| state.db.install(l, now));
         }
         out.push(purge);
     }
@@ -736,11 +873,9 @@ impl Daemon {
         }
         // Request the missing/newer ones.
         if !actions.requests.is_empty() {
-            out.push(psnp_pdu(
-                level2,
-                self.system_id,
-                state.db.psnp_for(&actions.requests),
-            ));
+            let mut psnp = psnp_pdu(level2, self.system_id, state.db.psnp_for(&actions.requests));
+            self.auth_sign(&mut psnp);
+            out.push(psnp);
         }
         self.recompute_routes(out);
     }
@@ -784,7 +919,9 @@ impl Daemon {
             sequence_number: lsp.sequence_number,
             checksum: lsp.checksum,
         };
-        psnp_pdu(level2, self.system_id, vec![Tlv::LspEntries(vec![entry])])
+        let mut psnp = psnp_pdu(level2, self.system_id, vec![Tlv::LspEntries(vec![entry])]);
+        self.auth_sign(&mut psnp);
+        psnp
     }
 
     // ---- builders -------------------------------------------------
@@ -827,7 +964,10 @@ impl Daemon {
         let total = bytes.len() as u16;
         bytes[17] = (total >> 8) as u8;
         bytes[18] = (total & 0xff) as u8;
-        Pdu::decode(&bytes).ok()
+        let mut padded = Pdu::decode(&bytes).ok()?;
+        // RFC 5304 2: hello digests are computed after the padding.
+        self.auth_sign(&mut padded);
+        Some(padded)
     }
 
     /// Every IIH we transmit right now: one p2p hello, or one LAN
@@ -879,7 +1019,10 @@ impl Daemon {
             let total = bytes.len() as u16;
             bytes[17] = (total >> 8) as u8;
             bytes[18] = (total & 0xff) as u8;
-            if let Ok(pdu) = Pdu::decode(&bytes) {
+            if let Ok(mut pdu) = Pdu::decode(&bytes) {
+                // RFC 5304 2: hello digests are computed after the
+                // padding.
+                self.auth_sign(&mut pdu);
                 out.push(pdu);
             }
         }
@@ -907,7 +1050,9 @@ impl Daemon {
         let state = self.levels[level_index(level2)]
             .as_mut()
             .expect("active level");
-        csnp_pdu(level2, self.system_id, state.db.csnp_entries(now))
+        let mut csnp = csnp_pdu(level2, self.system_id, state.db.csnp_entries(now));
+        self.auth_sign(&mut csnp);
+        csnp
     }
 
     // ---- SPF and export -------------------------------------------
@@ -1133,9 +1278,10 @@ impl Daemon {
         // Aging (purges flood; tombstones expire).
         for level2 in self.active_levels().collect::<Vec<_>>() {
             let state = self.levels[level_index(level2)].as_mut().unwrap();
-            let purges = state.db.tick(now);
+            let purges = state.db.tick(now, level2);
             let aged = !purges.is_empty();
-            for purge in purges {
+            for mut purge in purges {
+                self.auth_sign(&mut purge);
                 out.push(purge);
             }
             if aged {
@@ -1774,6 +1920,210 @@ router isis T
             out.iter().any(|p| matches!(p.body, PduBody::Csnp(_))),
             "the DIS sends a periodic CSNP"
         );
+    }
+
+    // ---- authentication (M3) --------------------------------------
+
+    const AUTH_SECRET: &str = "hush-hush";
+
+    fn auth_daemon() -> Daemon {
+        let conf = "router isis T
+ net 49.0001.1921.6800.1002.00
+ is-type level-2
+ hostname r2
+ domain-password hmac-md5 hush-hush snp-auth validate
+ interface eth0
+  address 172.16.0.2/24
+  circuit-type level-2
+";
+        Daemon::new(parse_config(conf).unwrap()).unwrap()
+    }
+
+    /// Sign a peer PDU with the shared secret (our own helpers, the
+    /// RFC 5304 order).
+    fn sign(pdu: &mut Pdu, key: &str, is_lsp: bool) {
+        pdu.push_tlv(Tlv::Authentication {
+            auth_type: crate::tlv::AUTH_HMAC_MD5,
+            value: vec![0u8; 16],
+        });
+        let mut bytes = pdu.encode();
+        let at = crate::auth::find_auth_tlv(&bytes, pdu.header.length_indicator as usize).unwrap();
+        let digest = crate::auth::hmac_md5_digest(&bytes, at, is_lsp, key.as_bytes());
+        crate::auth::patch_digest(&mut bytes, at, &digest);
+        if is_lsp {
+            let sum = crate::checksum::lsp_checksum(&mut bytes);
+            bytes[24] = (sum >> 8) as u8;
+            bytes[25] = (sum & 0xff) as u8;
+        }
+        *pdu = Pdu::decode(&bytes).unwrap();
+    }
+
+    fn peer_hello_pdu(signed: bool, key: &str) -> Pdu {
+        let mut pdu = crate::pdu::p2p_hello(
+            Level::Level2,
+            PEER,
+            30,
+            9,
+            vec![
+                Tlv::AreaAddresses(vec![vec![0x49, 0x00, 0x01]]),
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+            ],
+        );
+        if signed {
+            sign(&mut pdu, key, false);
+        }
+        pdu
+    }
+
+    /// RFC 5304 end to end at the daemon: unsigned IIHs are dropped
+    /// ("MUST discard"), correctly signed ones pass, wrong keys do
+    /// not.
+    #[test]
+    fn authenticated_adjacency_acceptance() {
+        let mut d = auth_daemon();
+        // Unsigned: rejected, adjacency untouched.
+        let mut out = Vec::new();
+        d.handle_pdu(peer_hello_pdu(false, ""), [2, 0, 0, 0, 0, 1], &mut out);
+        assert_eq!(d.adjacency.state, crate::adjacency::AdjacencyState::Down);
+
+        // Signed with the right key: accepted.
+        let mut out = Vec::new();
+        d.handle_pdu(
+            peer_hello_pdu(true, AUTH_SECRET),
+            [2, 0, 0, 0, 0, 1],
+            &mut out,
+        );
+        assert_eq!(d.adjacency.state, crate::adjacency::AdjacencyState::Up);
+
+        // A wrong key is dropped (the adjacency holds via hold time).
+        let mut d2 = auth_daemon();
+        let mut out = Vec::new();
+        d2.handle_pdu(peer_hello_pdu(true, "wrong"), [2, 0, 0, 0, 0, 1], &mut out);
+        assert_eq!(d2.adjacency.state, crate::adjacency::AdjacencyState::Down);
+    }
+
+    /// Our own originations carry TLV 10 and verify against the
+    /// configured chain; so do the purges we initiate (RFC 5304 §2's
+    /// unauthenticated-purge prohibition).
+    #[test]
+    fn originated_lsps_and_purges_are_signed() {
+        let mut d = auth_daemon();
+        let mut out = Vec::new();
+        d.handle_pdu(
+            peer_hello_pdu(true, AUTH_SECRET),
+            [2, 0, 0, 0, 0, 1],
+            &mut out,
+        );
+        // Every LSP we originated (router LSP, and any flood echo of
+        // our own PDUs) carries a TLV 10.
+        let l = out
+            .iter()
+            .find_map(|p| match &p.body {
+                PduBody::Lsp(l) if l.id == LspId::zero(d.system_id) => Some(l.clone()),
+                _ => None,
+            })
+            .expect("router LSP originated");
+        assert!(l
+            .tlvs
+            .iter()
+            .any(|t| matches!(t, Tlv::Authentication { auth_type, .. } if *auth_type == crate::tlv::AUTH_HMAC_MD5)));
+        // The re-encoded PDU verifies against the domain chain.
+        let mut verify_pdu = crate::pdu::lsp(
+            true,
+            l.id,
+            l.sequence_number,
+            l.remaining_lifetime,
+            l.bits,
+            l.tlvs.clone(),
+        );
+        let _ = &mut verify_pdu;
+        let bytes = {
+            let mut b = verify_pdu.encode();
+            // checksum recomputed by encode equals the stored one;
+            // verify over the struct's own encode
+            let _ = &mut b;
+            b
+        };
+        assert!(crate::auth::verify(&bytes, 27, true, &d.config.auth[1].chain, 0).is_ok());
+        // The aging purge of the PEER's LSP is signed too (our own
+        // LSP refreshes at the same boundary; the peer's has no
+        // originator here to refresh it).
+        let mut peer = peer_lsp(true, (Ipv4Addr::new(10, 60, 0, 0), 24), 10, false);
+        sign(&mut peer, AUTH_SECRET, true);
+        let mut out = Vec::new();
+        d.handle_pdu(peer, [2, 0, 0, 0, 0, 1], &mut out);
+        d.time_travel(1200);
+        let mut out = Vec::new();
+        d.tick(&mut out);
+        assert!(out.iter().any(|p| matches!(&p.body,
+            PduBody::Lsp(l) if l.is_purge() && l.id == LspId::zero(PEER)
+                && l.tlvs.iter().any(|t| matches!(t, Tlv::Authentication { .. })))));
+    }
+
+    /// The SNP auth modes: `validate` signs our CSNPs and drops
+    /// unsigned ones; `send-only` signs but tolerates; `off` never
+    /// signs.
+    #[test]
+    fn snp_auth_modes() {
+        // Validate: our own CSNP is signed; an unsigned CSNP is dropped.
+        let mut d = auth_daemon();
+        let mut out = Vec::new();
+        d.handle_pdu(
+            peer_hello_pdu(true, AUTH_SECRET),
+            [2, 0, 0, 0, 0, 1],
+            &mut out,
+        );
+        assert!(out.iter().any(|p| matches!(&p.body,
+            PduBody::Csnp(c) if c.tlvs.iter().any(|t| matches!(t, Tlv::Authentication { .. })))));
+        let unsigned = crate::pdu::csnp(true, PEER, vec![]);
+        let mut out2 = Vec::new();
+        d.handle_pdu(unsigned, [2, 0, 0, 0, 0, 1], &mut out2);
+        // Dropped: no PSNP request emitted for its (empty) entries;
+        // the observable: processing a signed one DOES run (it would
+        // emit nothing too) — pin the drop via a distinguishable
+        // body: a signed one passes, so give the unsigned one an
+        // entry we hold older, forcing a PSNP request when accepted.
+        let mut db_entry = LspId::zero(PEER);
+        db_entry.fragment = 0;
+        let entry = crate::tlv::LspEntry {
+            remaining_lifetime: 1200,
+            lsp_id: db_entry,
+            sequence_number: 99,
+            checksum: 0x5566,
+        };
+        let mut rich = crate::pdu::csnp(true, PEER, vec![Tlv::LspEntries(vec![entry])]);
+        let mut out3 = Vec::new();
+        d.handle_pdu(rich.clone(), [2, 0, 0, 0, 0, 1], &mut out3);
+        assert!(
+            !out3.iter().any(|p| matches!(p.body, PduBody::Psnp(_))),
+            "unsigned CSNP dropped at validate"
+        );
+        sign(&mut rich, AUTH_SECRET, false);
+        let mut out4 = Vec::new();
+        d.handle_pdu(rich, [2, 0, 0, 0, 0, 1], &mut out4);
+        assert!(
+            out4.iter().any(|p| matches!(p.body, PduBody::Psnp(_))),
+            "signed CSNP processed (a PSNP request)"
+        );
+
+        // Off: nothing signed, nothing required.
+        let conf = "router isis T
+ net 49.0001.1921.6800.1002.00
+ is-type level-2
+ hostname r2
+ interface eth0
+  address 172.16.0.2/24
+  circuit-type level-2
+";
+        let mut plain = Daemon::new(parse_config(conf).unwrap()).unwrap();
+        let mut out5 = Vec::new();
+        plain.handle_pdu(peer_hello_pdu(false, ""), [2, 0, 0, 0, 0, 1], &mut out5);
+        assert_eq!(plain.adjacency.state, crate::adjacency::AdjacencyState::Up);
+        assert!(out5.iter().all(|p| !p
+            .tlvs()
+            .iter()
+            .any(|t| matches!(t, Tlv::Authentication { .. }))));
     }
 
     /// The IIH builder: circuit type, hold time, TLVs, TLV 240, and

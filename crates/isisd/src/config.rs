@@ -36,6 +36,7 @@
 
 use std::net::Ipv4Addr;
 
+use crate::auth::{AuthAlgorithm, AuthKey, KeyChain, LevelAuth, Lifetime, SnpAuth};
 use crate::system::{Level, SystemId};
 
 /// The parsed daemon configuration.
@@ -54,6 +55,9 @@ pub struct IsisdConfig {
     /// RFC 5302 route leaking: advertise L2-derived prefixes into L1
     /// with the up/down bit set (`redistribute level-2 into level-1`).
     pub redistribute_level2_into_l1: bool,
+    /// Per-level authentication (index 0 = the area password, 1 = the
+    /// domain password — ISO §7.3.7/§7.3.9).
+    pub auth: [LevelAuth; 2],
     pub interface: InterfaceConfig,
 }
 
@@ -180,6 +184,7 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
         hostname: String::new(),
         redistribute_static: false,
         redistribute_level2_into_l1: false,
+        auth: Default::default(),
         interface: InterfaceConfig::default(),
     };
     let mut in_router = false;
@@ -366,6 +371,51 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
                     other => {
                         return Err(parse_error(line_no, &format!("bad metric-style {other:?}")))
                     }
+                };
+            }
+            "area-password" | "domain-password" => {
+                let level2 = directive == "domain-password";
+                let (algorithm, secret) = match words.get(1).copied() {
+                    Some("cleartext") => (AuthAlgorithm::Cleartext, 2),
+                    Some("hmac-md5") => (AuthAlgorithm::HmacMd5, 2),
+                    _ => {
+                        return Err(parse_error(
+                            line_no,
+                            &format!("`{directive} cleartext|hmac-md5 <secret> [snp-auth off|send-only|validate]`"),
+                        ))
+                    }
+                };
+                let Some(secret) = words.get(secret) else {
+                    return Err(parse_error(line_no, "the password string is required"));
+                };
+                let mut snp = SnpAuth::Off;
+                match (words.get(3).copied(), words.get(4)) {
+                    (None, None) => {}
+                    (Some("snp-auth"), Some(mode)) => {
+                        snp = SnpAuth::parse(mode).ok_or_else(|| {
+                            parse_error(
+                                line_no,
+                                &format!("bad snp-auth mode {mode:?} (off|send-only|validate)"),
+                            )
+                        })?;
+                    }
+                    _ => {
+                        return Err(parse_error(
+                            line_no,
+                            "expected `[snp-auth off|send-only|validate]` after the secret",
+                        ))
+                    }
+                }
+                config.auth[usize::from(level2)] = LevelAuth {
+                    chain: KeyChain {
+                        keys: vec![AuthKey {
+                            algorithm,
+                            secret: secret.as_bytes().to_vec(),
+                            send_lifetime: Lifetime::ALWAYS,
+                            accept_lifetime: Lifetime::ALWAYS,
+                        }],
+                    },
+                    snp,
                 };
             }
             "hostname" => {
@@ -562,5 +612,93 @@ router isis ROUSTER
                 "{err} for {bad:?}"
             );
         }
+    }
+
+    /// The circuit's network type: p2p (default) or broadcast (the
+    /// DIS/pseudonode mode).
+    #[test]
+    fn network_type_directive() {
+        let config = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n  network broadcast\n",
+        )
+        .unwrap();
+        assert_eq!(config.interface.network, NetworkType::Broadcast);
+        // The default.
+        let config =
+            parse("router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n").unwrap();
+        assert_eq!(config.interface.network, NetworkType::PointToPoint);
+        // Bad value.
+        let err = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n  network carrier-pigeon\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("network"), "{err}");
+    }
+
+    /// The LAN priority directive (0..=127, default 64).
+    #[test]
+    fn priority_directive() {
+        let config = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n  priority 127\n",
+        )
+        .unwrap();
+        assert_eq!(config.interface.priority, 127);
+        assert_eq!(
+            parse("router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n")
+                .unwrap()
+                .interface
+                .priority,
+            64
+        );
+        assert!(parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n  priority 128\n"
+        )
+        .is_err());
+    }
+
+    /// The per-level passwords: both modes, both levels, the snp-auth
+    /// suffix, and the rejection shapes.
+    #[test]
+    fn password_directives() {
+        let config = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n area-password cleartext plain-one\n domain-password hmac-md5 hush-hush snp-auth validate\n interface eth1\n",
+        )
+        .unwrap();
+        let l1 = &config.auth[0];
+        assert_eq!(l1.chain.keys.len(), 1);
+        assert_eq!(
+            l1.chain.keys[0].algorithm,
+            crate::auth::AuthAlgorithm::Cleartext
+        );
+        assert_eq!(l1.chain.keys[0].secret, b"plain-one".to_vec());
+        assert_eq!(l1.snp, crate::auth::SnpAuth::Off);
+        let l2 = &config.auth[1];
+        assert_eq!(
+            l2.chain.keys[0].algorithm,
+            crate::auth::AuthAlgorithm::HmacMd5
+        );
+        assert_eq!(l2.snp, crate::auth::SnpAuth::Validate);
+        // send-only parses.
+        let config = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n domain-password cleartext pw snp-auth send-only\n interface eth1\n",
+        )
+        .unwrap();
+        assert_eq!(config.auth[1].snp, crate::auth::SnpAuth::SendOnly);
+        // Rejections: bad mode, unknown algorithm, missing secret,
+        // snp-auth without a mode.
+        for bad in [
+            "domain-password cleartext pw snp-auth sometimes",
+            "domain-password sha256 pw",
+            "domain-password hmac-md5",
+            "domain-password cleartext pw snp-auth",
+        ] {
+            let text =
+                format!("router isis T\n net 49.0001.1921.6800.1001.00\n {bad}\n interface eth1\n");
+            assert!(parse(&text).is_err(), "{bad:?} must not parse");
+        }
+        // Unconfigured by default.
+        let plain =
+            parse("router isis T\n net 49.0001.1921.6800.1001.00\n interface eth1\n").unwrap();
+        assert!(!plain.auth[0].enabled() && !plain.auth[1].enabled());
     }
 }

@@ -811,7 +811,7 @@ mod tests {
             LspBits::default(),
         );
         // Age R2's LSP into a purge.
-        let purges = db.tick(1200);
+        let purges = db.tick(1200, false);
         assert_eq!(purges.len(), 2); // both LSPs age out
         let result = run(R1, Level::Level1, &db, 1200);
         assert!(!result.distances.contains_key(&v(R2)));

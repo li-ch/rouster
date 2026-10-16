@@ -30,6 +30,7 @@
 //!   the run loop.
 
 pub mod adjacency;
+pub mod auth;
 pub mod checksum;
 pub mod config;
 pub mod daemon;

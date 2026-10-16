@@ -241,6 +241,17 @@ impl Pdu {
             PduBody::Psnp(p) => &p.tlvs,
         }
     }
+
+    /// Append one TLV to the block (the authentication seam).
+    pub fn push_tlv(&mut self, tlv: Tlv) {
+        match &mut self.body {
+            PduBody::LanHello(p) => p.tlvs.push(tlv),
+            PduBody::P2pHello(p) => p.tlvs.push(tlv),
+            PduBody::Lsp(p) => p.tlvs.push(tlv),
+            PduBody::Csnp(p) => p.tlvs.push(tlv),
+            PduBody::Psnp(p) => p.tlvs.push(tlv),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
