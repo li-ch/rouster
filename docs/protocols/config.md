@@ -442,6 +442,10 @@ at a time (no lockfile; disclosed).
    two surfaces do not yet exclude each other: a vtyd `write` and
    a RESTCONF PUT can interleave. One operator at a time remains
    the honest v1 rule).
-10. **TLS/auth for restconfd** — the standing owner dependency
-   decision (rustls vs a unix-socket alternative);
-   [../yang.md §restconf](../yang.md) carries the disclosure.
+10. **TLS for restconfd's TCP plane** — PARTIALLY RESOLVED
+   (S13-c): the unix-socket alternative IS the default listener
+   now (filesystem permissions = access control) and the optional
+   bearer token landed (constant-time, 401s); TLS itself remains
+   the documented owner decision, evaluated with a decision block
+   in [../yang.md §restconf](../yang.md) (option D stands; rustls
+   is the pre-agreed flip when a networked listener is wanted).

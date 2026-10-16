@@ -144,8 +144,10 @@ here per the cite-what-the-RFC-says rule.)
    §gNMI-transport decided C (2026-10-15); §restconf below is what
    LANDED and carries its own omissions table (each entry cited).
    gNMI stays the documented next step: the §restconf mapping table
-   preserves exactly what option A needs. TLS/auth for the HTTP edge
-   is the standing owner dependency decision.
+   preserves exactly what option A needs. TLS for the HTTP edge's
+   TCP plane remains the owner dependency decision (S13-c
+   evaluated it with a decision block — §restconf below; the
+   socket default + bearer token are the landed v1.0 posture).
 
 ## §gNMI-transport — the evaluation (NO implementation; an owner decision)
 
@@ -374,6 +376,112 @@ port is a management surface and the binary warns on any
 non-loopback bind. The optional bearer token (below, S13-c M2) is
 the one authentication check available on either plane.
 
+#### The optional bearer token (S13-c M2)
+
+`restconf { token <hex>; }` — an optional static bearer token,
+hex (case-insensitive, even length; the bind gate floors it at 32
+hex chars = 128 bits, refusing weaker tokens with the stanza's
+line). When configured, every request on either plane must carry
+`Authorization: Bearer <hex>` or it is refused with **401** — the
+RFC 8040 §7.1 error form, RFC 6241's `access-denied` tag, and the
+`WWW-Authenticate: Bearer` challenge (RFC 9110 §11.6.1: a 401 MUST
+carry it; RFC 6750 §3.1's bearer form). The comparison is the
+standard XOR fold — every byte pair XORs into one accumulator,
+the single branch happens on the folded result, so the comparison
+timing never depends on where the first difference sits (the
+`subtle` crate's `ConstantTimeEq` discipline, hand-rolled because
+a dependency for eight lines is outside the no-new-deps fence).
+The gate sits before any routing: unauthenticated clients learn
+nothing about the resources, and a wrong-token mutation never
+reaches the single-flight lock. Posture details with teeth:
+
+- a `token` line that fails the model's pattern is a **hard bind
+  refusal**, not a pass-through warning — an operator who typo'd
+  an auth line must not get an open API (auth lines do not
+  degrade; transport knobs may default, credentials may not);
+- the token is **write-only through the API**: `GET
+  /restconf/data/restconf/token` answers 403 `access-denied` and
+  the dump member never carries it — a credential echo would hand
+  it to every reader of the surface (RFC 8040 has no credential
+  echo either);
+- internally it rides a `Secret` newtype with redacted `Debug`, so
+  the bytes never leak into tracing or test failure output;
+- there is deliberately **no `--token` flag** — a token on a
+  command line sits in every `ps` output on the box;
+- **not a substitute for TLS over a network**: on the socket plane
+  it is defense-in-depth (the filesystem already gates access); on
+  the TCP plane without TLS it authenticates the request but the
+  token and every config byte still cross the wire in the clear —
+  it is a holding measure for the opt-in plane, not a network
+  posture.
+
+### The TLS decision — an OWNER DECISION BLOCK (documented, not implemented; zero new deps)
+
+RFC 8040 §2 expects HTTPS with client authentication. The v1.0
+posture above (unix socket default + optional token) makes no
+cryptographic claims; when a NETWORKED listener is actually
+wanted, TLS is a dependency decision the owner must take
+explicitly — it is deliberately NOT taken by S13-c (the
+no-new-deps fence), and the local-socket default makes it
+non-blocking for 1.0.
+
+**The evaluation** (S13-c, 2026-10-16):
+
+- **rustls** — the de-facto standard Rust TLS library (TLS 1.2/1.3
+  only, the modern profile), actively maintained with frequent
+  releases through 2026, regular third-party audits, and the
+  backing of the wider ecosystem (hyper/reqwest/axum sit on it).
+  *Dependency weight*: not one crate — rustls + an async
+  integration (`tokio-rustls`) + a certificate-roots story
+  (own-file parsing suffices for a daemon: server cert + key, no
+  webpki-roots needed) + a crypto provider. The default provider
+  since Feb 2024 is `aws-lc-rs` (FIPS + post-quantum; an AWS-LC —
+  BoringSSL-fork — wrapper needing a C/C++ toolchain and CMake at
+  build time); `default-features = false` + the `ring` feature
+  trims the build (ring is C/asm but famously self-contained). So
+  the *pure-Rust claim is real for the protocol state machine and
+  nominal for the crypto backend* — aws-lc-rs and ring are both C
+  underneath; a pure-Rust RustCrypto provider exists
+  (`rustls-rustcrypto`) but is a further, less-battle-tested
+  dependency. *Value to this project's positioning*: Rouster's
+  story is a memory-safety-first routing suite; rustls keeps that
+  story honest (no OpenSSL process-wide initialization, no
+  platform variability), and the wire exposure (a management
+  edge, not the dataplane) matches rustls's audit surface.
+- **native-tls** — **not acceptable**: it binds OpenSSL on Linux,
+  SChannel on Windows, Security.framework on macOS — non-Rust
+  (against the suite's positioning), platform-variable (a
+  routing daemon's management plane must behave identically
+  everywhere it runs), and drags openssl-sys's build machinery.
+  Rejected on positioning grounds, not merely on weight.
+- **hand-rolled TLS** — **NO**, categorically: a TLS stack is the
+  canonical never-roll-your-own; the suite's own bar (fuzz every
+  wire codec, no unsafe in protocol code) exists precisely
+  because this class of code is where memory-safety stories die.
+
+**OWNER DECISION BLOCK** (choose one; the recommendation is the
+first):
+
+- **A. rustls when a network listener is actually wanted** — add
+  rustls + tokio-rustls (provider choice at that moment: aws-lc-rs
+  for the FIPS/PQ default, or ring for the lighter build) behind
+  a `restconf { tls { cert …; key …; } }`-shaped stanza on the
+  TCP plane; the socket default stays the local-access posture.
+  **(RECOMMENDED — the local-socket default makes it
+  non-blocking for 1.0; nothing built today forces this choice,
+  and no early adopter exists to break.)**
+- **B. native-tls** — rejected above; listed for completeness.
+- **C. hand-rolled** — rejected above; listed for completeness.
+- **D. stay socket-only** — the status quo: no TLS, the unix
+  socket's permissions as the access control, the token as
+  optional defense-in-depth; revisit when an operator asks for a
+  networked API (the same trigger that would arm option A).
+
+**DECIDED: D stands today (owner not yet asked; S13-c's own
+terms). A is the pre-agreed shape of the flip when a networked
+listener is wanted — this block is the evaluation, not the
+authorization to add the dependency.**
+
 ### The omissions table (each cut cited; all §Deferred here)
 
 | Omission | Citation | Note |
@@ -389,6 +497,8 @@ the one authentication check available on either plane.
 | `ETag`/`Last-Modified`, optimistic concurrency | RFC 8040 §3.4.1 | single-flight mutation lock instead (one mutation at a time) |
 | Multiple error objects per response | RFC 8040 §3.9 | one error entry; `must` violation lists every violation in one message |
 | The savd drop-friction `must` is unsatisfiable through tree edits | `rouster-savd.yang` | the model's `must` compares `'yes'` against the boolean's canonical `'true'` (the linebind converts `yes`→`true` at bind): drop-with-acknowledgement always violates; savd's own gate stays the real friction (a model/must-engine fix, outside S12-a's lane) |
+| TLS / HTTPS | RFC 8040 §2 | the documented owner decision above (option D stands; A is the pre-agreed flip) — not a silent cut |
+| The `token` leaf is never echoed | — (a deliberate extension of §3.4's datastore view) | write-only credential discipline: GET of the leaf is 403, the dump omits it; nothing in RFC 8040 mandates echoing credentials |
 
 ### The gNMI mapping table (decision C's promise to option A)
 
