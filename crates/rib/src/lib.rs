@@ -908,7 +908,7 @@ impl Rib {
         for (bkey, _) in believed {
             stale_keys.push(*bkey);
         }
-        drop(_census);
+        let _ = &_census; // borrow held through the diff; released naturally
         self.reconcile_delta(dp, to_install, stale_keys, unchanged)
             .await;
     }
@@ -961,7 +961,7 @@ impl Rib {
             .filter(|key| !desired_keys.contains(*key) && self.programmed.contains_key(key))
             .copied()
             .collect();
-        drop(_census);
+        let _ = &_census; // borrow held through the diff; released naturally
         self.reconcile_delta(dp, to_install, stale_keys, unchanged)
             .await;
     }
