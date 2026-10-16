@@ -214,6 +214,10 @@
             <p class="num">0</p>
             <p class="lbl">malformed or rejected messages, across every measured run</p>
           </div>
+          <div class="stat">
+            <p class="num">2,000<small>&nbsp;sessions/s</small></p>
+            <p class="lbl">concurrent BGP session establishment at N=100 (50 ms wall, CPU within 2× FRR)</p>
+          </div>
         </div>
 
         <div class="perf-grid">
@@ -255,12 +259,14 @@
                 <tr><td>bgpd-side memory</td><td class="win">449 B/prefix</td><td>897 B/prefix</td></tr>
                 <tr><td>core-side memory</td><td class="win">229 B/prefix</td><td>519 B/prefix</td></tr>
                 <tr><td>protocol errors</td><td class="win">0</td><td class="win">9 rejected</td></tr>
+                <tr><td>FIB programming rate (100k batch)</td><td class="win">144.6k routes/s</td><td>116.5k routes/s</td></tr>
+                <tr><td>session establishment, N=100 wall</td><td>50 ms</td><td class="win">41 ms</td></tr>
+                <tr><td>churn reconvergence per round</td><td>0.330 s</td><td class="win">0.235 s</td></tr>
               </tbody>
             </table>
-            <p class="footnote">Every metric shown clears the project's own ≥2× fairness bar for
-            same-rig claims (wall 3.79×, speaker memory 2.1×, core memory 2.27×);
-            total CPU is ahead 1.52× and honestly sub-2× — the ledger records
-            everything, including the losses along the way.</p>
+            <p class="footnote">Bulk-path metrics (wall, memory) clear the ≥2× bar; reactive
+            metrics (sessions, churn) are at or near parity with losses published
+            alongside wins — the ledger records everything, both directions.</p>
           </div>
         </div>
       </div>
