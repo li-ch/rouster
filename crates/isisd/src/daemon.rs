@@ -54,6 +54,72 @@ const COMPLETE_SNP_INTERVAL: u16 = 10;
 /// id octet when we are the DIS; one circuit per daemon, v1).
 const LOCAL_CIRCUIT_ID: u8 = 1;
 
+/// ISO §11's minimumBroadcastLSPTransmissionInterval-Default (33 ms),
+/// so §7.3.15.6's "no more than 1000/33 LSPs in any one second
+/// period" caps a circuit at 30.
+const MAX_LSPS_PER_SECOND: usize = 30;
+
+/// ISO §7.3.5 + §10.1's refresh jitter: fragment 0 refreshes at the
+/// plain window; higher fragments (§7.3.5's "L > 0" clause) stagger
+/// theirs by up to 25% so a large fragment set does not refresh in
+/// one burst — deterministic per LSP id (an FNV-1a of the id), in
+/// [REFRESH_BELOW × 3/4, REFRESH_BELOW).
+fn refresh_threshold(id: LspId) -> u16 {
+    if id.fragment == 0 {
+        return REFRESH_BELOW;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in id.system.0 {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash ^= id.pseudonode as u64;
+    hash = hash.wrapping_mul(0x100_0000_01b3);
+    hash ^= id.fragment as u64;
+    hash = hash.wrapping_mul(0x100_0000_01b3);
+    let jitter = (hash % (REFRESH_BELOW / 4) as u64) as u16;
+    REFRESH_BELOW - jitter
+}
+
+/// ISO §7.3.15's circuit pacing, pure and clock-injected:
+/// §7.3.15.5's p2p rule ("the interval between two consecutive
+/// transmissions of the same LSP shall be at least
+/// minimumLSPTransmissionInterval" — 5 s) and §7.3.15.6's broadcast
+/// rate ("no more than 1000/33 LSPs in any one second period").
+/// Admitted transmissions stamp both axes; the daemon queues what is
+/// not admitted and retries on its 1 s tick (which also satisfies
+/// §7.3.15.6's floor that the scan continues whenever there is
+/// something to send).
+#[derive(Debug, Clone, Default)]
+pub struct LspRateLimiter {
+    per_lsp_last: HashMap<LspId, u64>,
+    sent_at: std::collections::VecDeque<u64>,
+}
+
+impl LspRateLimiter {
+    /// Whether `id`'s LSP may be transmitted on the circuit at `now`.
+    pub fn admit(&mut self, id: LspId, now: u64) -> bool {
+        if let Some(&last) = self.per_lsp_last.get(&id) {
+            if now.saturating_sub(last) < crate::MINIMUM_LSP_TRANSMISSION_INTERVAL as u64 {
+                return false;
+            }
+        }
+        while self
+            .sent_at
+            .front()
+            .is_some_and(|&t| now.saturating_sub(t) >= 1)
+        {
+            self.sent_at.pop_front();
+        }
+        if self.sent_at.len() >= MAX_LSPS_PER_SECOND {
+            return false;
+        }
+        self.sent_at.push_back(now);
+        self.per_lsp_last.insert(id, now);
+        true
+    }
+}
+
 /// One inter-level advertised prefix: the prefix, its carried metric
 /// and the up/down bit it rides with (RFC 5302).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,11 +132,13 @@ pub struct LeakedPrefix {
 /// Per-level state.
 struct LevelState {
     db: Lspdb,
-    /// The router LSP's sequence counter.
+    /// The router LSP fragment 0's sequence counter.
     seq: SequenceCounter,
-    /// The pseudonode LSP's counter (§7.3.16.1: "The sequence numbers
+    /// Higher fragments' counters (§7.3.16.1: "The sequence numbers
     /// the Intermediate system generates for its Link State PDUs with
     /// different values of LSP number are independent").
+    frag_seqs: HashMap<u8, SequenceCounter>,
+    /// The pseudonode LSP's counter (same independence).
     pseudo_seq: SequenceCounter,
 }
 
@@ -108,6 +176,11 @@ pub struct Daemon {
     installed: HashMap<(Ipv4Addr, u8), RouteEntry>,
     /// The broadcast circuit engines, per level (None on p2p).
     lan: [Option<LanCircuit>; 2],
+    /// The circuit's LSP pacing state (§7.3.15.5/§7.3.15.6).
+    rate: LspRateLimiter,
+    /// LSPs waiting for their pacing slot (drained every tick —
+    /// §7.3.15.6's floor: the scan continues while there is traffic).
+    tx_queue: std::collections::VecDeque<Pdu>,
     /// The clock of the last periodic CSNP (the DIS duty).
     last_csnp_at: Option<u64>,
     start: Instant,
@@ -135,6 +208,7 @@ impl Daemon {
             levels[0] = Some(LevelState {
                 db: Lspdb::new(),
                 seq: SequenceCounter::new(),
+                frag_seqs: HashMap::new(),
                 pseudo_seq: SequenceCounter::new(),
             });
         }
@@ -142,6 +216,7 @@ impl Daemon {
             levels[1] = Some(LevelState {
                 db: Lspdb::new(),
                 seq: SequenceCounter::new(),
+                frag_seqs: HashMap::new(),
                 pseudo_seq: SequenceCounter::new(),
             });
         }
@@ -183,6 +258,8 @@ impl Daemon {
             zapi: None,
             installed: HashMap::new(),
             lan,
+            rate: LspRateLimiter::default(),
+            tx_queue: std::collections::VecDeque::new(),
             last_csnp_at: None,
             config,
             start: Instant::now(),
@@ -436,31 +513,61 @@ impl Daemon {
         tlvs
     }
 
-    /// (Re)originate our LSP for `level`: bump the sequence counter,
-    /// install into our own DB, return the PDU to flood.
-    fn originate(&mut self, level2: bool) -> Option<Pdu> {
-        // Compute the immutable inputs first so the level-state borrow
-        // below is exclusive.
+    /// The LSP buffer budget (ISO §11's OriginatingLSPBufferSize:
+    /// "less than or equal to the smallest MTU of any circuit", at
+    /// least 512) minus the LSP fixed part.
+    fn lsp_budget(&self) -> usize {
+        self.config.interface.mtu.clamp(512, 1492) as usize - 27
+    }
+
+    /// Our own TLV set split into fragment bodies (§7.3.4) — pure,
+    /// the test target.
+    fn own_fragments(&self, level2: bool) -> Vec<Vec<Tlv>> {
+        crate::fragment::fragment_tlvs(&self.own_tlvs(level2), self.lsp_budget())
+    }
+
+    /// (Re)originate our LSP set for `level`: fragment the TLVs
+    /// (§7.3.4), originate each fragment with its independent
+    /// sequence counter (§7.3.16.1), install into our own DB, and
+    /// purge any higher fragment the new set no longer fills.
+    fn originate(&mut self, level2: bool) -> Vec<Pdu> {
+        let fragments = self.own_fragments(level2);
+        let count = fragments.len();
+        let mut out = Vec::new();
+        for (frag_no, tlvs) in fragments.into_iter().enumerate() {
+            if let Some(pdu) = self.originate_fragment(level2, frag_no as u8, tlvs) {
+                out.push(pdu);
+            }
+        }
+        self.purge_retired_fragments(level2, count, &mut out);
+        out
+    }
+
+    /// Originate one fragment (§7.3.4h: on change, "the Intermediate
+    /// system shall reissue only those Link State PDUs which are
+    /// affected" — the refresh path calls this per stale fragment).
+    fn originate_fragment(&mut self, level2: bool, fragment: u8, tlvs: Vec<Tlv>) -> Option<Pdu> {
         let bits = LspBits {
             partition: false,
             attached: [false; 4],
             overload: false,
             is_type: self.config.is_type,
         };
-        let tlvs = self.own_tlvs(level2);
         let now = self.now();
         let seq = {
             let state = self.levels[level_index(level2)].as_mut()?;
-            state.seq.take_next()?
+            if fragment == 0 {
+                state.seq.take_next()?
+            } else {
+                state
+                    .frag_seqs
+                    .entry(fragment)
+                    .or_insert_with(SequenceCounter::new)
+                    .take_next()?
+            }
         };
-        let mut pdu = lsp_pdu(
-            level2,
-            LspId::zero(self.system_id),
-            seq,
-            crate::MAX_AGE,
-            bits,
-            tlvs,
-        );
+        let id = LspId::new(self.system_id, 0, fragment);
+        let mut pdu = lsp_pdu(level2, id, seq, crate::MAX_AGE, bits, tlvs);
         self.auth_sign(&mut pdu);
         let bytes = pdu.encode();
         let decoded = match Pdu::decode(&bytes).ok()?.body {
@@ -474,27 +581,88 @@ impl Daemon {
         {
             Ok(()) => Some(pdu),
             Err(e) => {
-                warn!("isisd: own LSP install failed: {e:?}");
+                warn!("isisd: own LSP fragment {fragment} install failed: {e:?}");
                 None
             }
         }
     }
 
-    /// The own-LSP refresh check (ISO §7.3.14): reoriginate when the
-    /// stored copy's remaining lifetime drops below the window.
-    fn refresh_check(&mut self, out: &mut Vec<Pdu>) {
-        for level2 in self.active_levels().collect::<Vec<_>>() {
-            let needs = {
-                let state = self.levels[level_index(level2)].as_ref().unwrap();
-                match state.db.get(&LspId::zero(self.system_id)) {
-                    Some(stored) => stored.remaining_lifetime(self.now()) < REFRESH_BELOW,
-                    None => true,
-                }
+    /// §7.3.4: a non-zero LSP number with no information left is
+    /// purged — anything we hold beyond the new fragment count goes
+    /// out as a zero-lifetime tombstone at its stored sequence.
+    fn purge_retired_fragments(&mut self, level2: bool, count: usize, out: &mut Vec<Pdu>) {
+        let now = self.now();
+        let retired: Vec<(LspId, u32, LspBits)> = {
+            let Some(state) = self.levels[level_index(level2)].as_ref() else {
+                return;
             };
-            if needs {
-                if let Some(pdu) = self.originate(level2) {
-                    out.push(pdu);
+            state
+                .db
+                .stored_lsps()
+                .map(|s| s.lsp.id)
+                .filter(|id| {
+                    id.system == self.system_id
+                        && id.pseudonode == 0
+                        && (id.fragment as usize) >= count
+                })
+                .filter_map(|id| {
+                    state
+                        .db
+                        .get(&id)
+                        .map(|s| (id, s.lsp.sequence_number, s.lsp.bits))
+                })
+                .collect()
+        };
+        for (id, seq, bits) in retired {
+            let mut purge = lsp_pdu(level2, id, seq, 0, bits, vec![]);
+            if let Some(PduBody::Lsp(l)) = Pdu::decode(&purge.encode()).ok().map(|p| p.body) {
+                let _ = self.levels[level_index(level2)]
+                    .as_mut()
+                    .map(|state| state.db.install(l, now));
+            }
+            self.auth_sign(&mut purge);
+            out.push(purge);
+        }
+    }
+
+    /// The own-LSP refresh check (ISO §7.3.14 with §7.3.5/§10.1's
+    /// per-fragment jitter): reoriginate each fragment whose stored
+    /// copy's remaining lifetime dropped below its jittered window —
+    /// only the stale fragment (§7.3.4h).
+    fn refresh_check(&mut self, out: &mut Vec<Pdu>) {
+        let now = self.now();
+        for level2 in self.active_levels().collect::<Vec<_>>() {
+            let stale: Vec<u8> = {
+                let state = self.levels[level_index(level2)].as_ref().unwrap();
+                state
+                    .db
+                    .ids()
+                    .filter(|id| id.system == self.system_id && id.pseudonode == 0)
+                    .filter(|id| match state.db.get(id) {
+                        Some(stored) => stored.remaining_lifetime(now) < refresh_threshold(*id),
+                        None => id.fragment == 0, // absent fragment 0: originate
+                    })
+                    .map(|id| id.fragment)
+                    .collect()
+            };
+            if stale.is_empty() {
+                continue;
+            }
+            let fragments = self.own_fragments(level2);
+            for fragment in stale {
+                if let Some(tlvs) = fragments
+                    .get(usize::from(fragment))
+                    .filter(|_| (fragment as usize) < fragments.len())
+                    .cloned()
+                {
+                    if let Some(pdu) = self.originate_fragment(level2, fragment, tlvs) {
+                        out.push(pdu);
+                    }
                 }
+                // A stale fragment beyond the new count retires via
+                // the originate path's purge when content changed;
+                // when only it aged (content identical), the empty
+                // window cannot happen (fragments.len() covers it).
             }
         }
     }
@@ -581,9 +749,7 @@ impl Daemon {
         match action {
             LanAction::NeighborUp(system) => {
                 info!(neighbor = %system, level = if level2 { "L2" } else { "L1" }, "LAN adjacency UP");
-                if let Some(pdu) = self.originate(level2) {
-                    out.push(pdu);
-                }
+                out.extend(self.originate(level2));
                 if let Some(pdu) = self.originate_pseudonode(level2) {
                     out.push(pdu);
                 }
@@ -592,9 +758,7 @@ impl Daemon {
             }
             LanAction::NeighborDown(system) => {
                 info!(neighbor = %system, "LAN adjacency DOWN");
-                if let Some(pdu) = self.originate(level2) {
-                    out.push(pdu);
-                }
+                out.extend(self.originate(level2));
                 if let Some(pdu) = self.originate_pseudonode(level2) {
                     out.push(pdu);
                 }
@@ -602,9 +766,7 @@ impl Daemon {
             }
             LanAction::DisChanged { us: true, .. } => {
                 info!("DIS takeover: originating the pseudonode LSP");
-                if let Some(pdu) = self.originate(level2) {
-                    out.push(pdu);
-                }
+                out.extend(self.originate(level2));
                 if let Some(pdu) = self.originate_pseudonode(level2) {
                     out.push(pdu);
                 }
@@ -613,9 +775,7 @@ impl Daemon {
             LanAction::DisChanged { us: false, .. } => {
                 info!("DIS resignation: purging our pseudonode LSP");
                 self.purge_pseudonode(level2, out);
-                if let Some(pdu) = self.originate(level2) {
-                    out.push(pdu);
-                }
+                out.extend(self.originate(level2));
                 self.recompute_routes(out);
             }
             LanAction::None => {}
@@ -750,9 +910,7 @@ impl Daemon {
                     // validate the databases (ISO §7.3.18: a CSNP on
                     // adjacency establishment).
                     for level2 in self.active_levels().collect::<Vec<_>>() {
-                        if let Some(pdu) = self.originate(level2) {
-                            out.push(pdu);
-                        }
+                        out.extend(self.originate(level2));
                         out.push(self.build_csnp(level2));
                     }
                     self.recompute_routes(out);
@@ -760,9 +918,7 @@ impl Daemon {
                 AdjAction::AdjacencyDown(reason) => {
                     info!(neighbor = %self.adjacency.neighbor, reason, "adjacency DOWN");
                     for level2 in self.active_levels().collect::<Vec<_>>() {
-                        if let Some(pdu) = self.originate(level2) {
-                            out.push(pdu);
-                        }
+                        out.extend(self.originate(level2));
                     }
                     self.recompute_routes(out);
                 }
@@ -1167,9 +1323,7 @@ impl Daemon {
         if new_leak != self.leaked_down {
             info!(count = new_leak.len(), "L2->L1 leak set changed");
             self.leaked_down = new_leak;
-            if let Some(pdu) = self.originate(false) {
-                out.push(pdu);
-            }
+            out.extend(self.originate(false));
         }
 
         // L1→L2 (RFC 1195's area-prefix re-advertisement by the
@@ -1197,9 +1351,7 @@ impl Daemon {
         if new_up != self.moved_up {
             info!(count = new_up.len(), "L1->L2 advertisement set changed");
             self.moved_up = new_up;
-            if let Some(pdu) = self.originate(true) {
-                out.push(pdu);
-            }
+            out.extend(self.originate(true));
         }
 
         // Flush the diff.
@@ -1268,9 +1420,7 @@ impl Daemon {
             if matches!(action, AdjAction::AdjacencyDown(_)) {
                 info!("adjacency DOWN (hold time expired)");
                 for level2 in self.active_levels().collect::<Vec<_>>() {
-                    if let Some(pdu) = self.originate(level2) {
-                        out.push(pdu);
-                    }
+                    out.extend(self.originate(level2));
                 }
                 self.recompute_routes(out);
             }
@@ -1292,6 +1442,40 @@ impl Daemon {
         self.refresh_check(out);
     }
 
+    /// Dispatch produced PDUs: non-LSPs go straight out; LSPs pass
+    /// the circuit's rate limiter (§7.3.15.5's per-LSP spacing,
+    /// §7.3.15.6's per-second cap), with the blocked ones queued and
+    /// retried — the queue is scanned head to tail, so a paced LSP
+    /// does not block fresher ones (the §7.3.15.6 scan shape).
+    pub fn pump(&mut self, out: Vec<Pdu>, send: &mut impl FnMut(Pdu)) {
+        for pdu in out {
+            if matches!(pdu.body, PduBody::Lsp(_)) {
+                self.tx_queue.push_back(pdu);
+            } else {
+                send(pdu);
+            }
+        }
+        let now = self.now();
+        let mut admitted_any = true;
+        while admitted_any {
+            admitted_any = false;
+            let mut blocked = std::collections::VecDeque::new();
+            while let Some(pdu) = self.tx_queue.pop_front() {
+                let ok = match &pdu.body {
+                    PduBody::Lsp(l) => self.rate.admit(l.id, now),
+                    _ => true,
+                };
+                if ok {
+                    send(pdu);
+                    admitted_any = true;
+                } else {
+                    blocked.push_back(pdu);
+                }
+            }
+            self.tx_queue = blocked;
+        }
+    }
+
     pub fn redistribute(&mut self, prefix: (Ipv4Addr, u8), add: bool, out: &mut Vec<Pdu>) {
         if add {
             if !self.redistributed.contains(&prefix) {
@@ -1301,9 +1485,7 @@ impl Daemon {
             self.redistributed.retain(|p| *p != prefix);
         }
         for level2 in self.active_levels().collect::<Vec<_>>() {
-            if let Some(pdu) = self.originate(level2) {
-                out.push(pdu);
-            }
+            out.extend(self.originate(level2));
         }
         self.recompute_routes(out);
     }
@@ -1334,16 +1516,12 @@ pub async fn run(
                     Some(Event::Pdu(pdu, src_mac)) => {
                         let mut out = Vec::new();
                         daemon.handle_pdu(pdu, src_mac, &mut out);
-                        for pdu in out {
-                            send(pdu);
-                        }
+                        daemon.pump(out, &mut send);
                     }
                     Some(Event::Redistributed { prefix, add }) => {
                         let mut out = Vec::new();
                         daemon.redistribute(prefix, add, &mut out);
-                        for pdu in out {
-                            send(pdu);
-                        }
+                        daemon.pump(out, &mut send);
                     }
                     None => break,
                 }
@@ -1357,9 +1535,7 @@ pub async fn run(
             _ = second_ticker.tick() => {
                 let mut out = Vec::new();
                 daemon.tick(&mut out);
-                for pdu in out {
-                    send(pdu);
-                }
+                daemon.pump(out, &mut send);
             }
         }
     }
@@ -2126,6 +2302,191 @@ router isis T
             .any(|t| matches!(t, Tlv::Authentication { .. }))));
     }
 
+    // ---- M4: fragments, jitter, rate limiting ----------------------
+
+    /// A small-MTU daemon carrying many redistributed prefixes — the
+    /// fragmentation fixture.
+    fn frag_daemon(prefixes: usize) -> Daemon {
+        let conf = "router isis T
+ net 49.0001.1921.6800.2002.00
+ is-type level-2
+ hostname frag-a
+ interface eth0
+  address 172.16.0.9/24
+  circuit-type level-2
+  mtu 512
+";
+        let mut d = Daemon::new(parse_config(conf).unwrap()).unwrap();
+        for i in 0..prefixes {
+            d.redistributed
+                .push((Ipv4Addr::new(10, 200, i as u8, 0), 24));
+        }
+        d
+    }
+
+    /// §7.3.4/§7.3.16.1: a TLV set beyond one fragment originates as
+    /// a fragment FAMILY — independent sequence numbers, correct LSP
+    /// ids, and §7.3.4's retirement purge when the set shrinks.
+    #[test]
+    fn fragmented_origination_and_retirement() {
+        let mut d = frag_daemon(60);
+        let pdus = d.originate(true);
+        assert!(pdus.len() >= 2, "60 prefixes at a 485-byte budget split");
+        let ids: Vec<u8> = pdus
+            .iter()
+            .filter_map(|p| match &p.body {
+                PduBody::Lsp(l) => Some(l.id.fragment),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, (0..ids.len() as u8).collect::<Vec<u8>>(), "0..n");
+        // All fragments sit in our own DB.
+        let state = d.levels[1].as_ref().unwrap();
+        for frag in ids {
+            assert!(state.db.get(&LspId::new(d.system_id, 0, frag)).is_some());
+        }
+        // Withdraw most prefixes: the family shrinks and the retired
+        // fragment numbers go out as zero-lifetime purges.
+        d.redistributed.truncate(2);
+        let pdus = d.originate(true);
+        let purges: Vec<u8> = pdus
+            .iter()
+            .filter_map(|p| match &p.body {
+                PduBody::Lsp(l) if l.is_purge() => Some(l.id.fragment),
+                _ => None,
+            })
+            .collect();
+        assert!(!purges.is_empty(), "retired fragments purged");
+        assert!(purges.iter().all(|f| *f > 0), "fragment 0 never retires");
+    }
+
+    /// §7.2.5 end to end: a peer merges our fragment family — a
+    /// prefix riding the HIGHEST fragment routes only when fragment 0
+    /// is present too, and is ignored without it.
+    #[test]
+    fn spf_merges_fragments() {
+        let mut a = frag_daemon(60);
+        let pdus = a.originate(true);
+        let highest_prefix = a.redistributed.last().copied().unwrap();
+
+        // A fresh daemon B: adjacency up toward A, then the fragments.
+        let mut b = daemon();
+        let hello = crate::pdu::p2p_hello(
+            Level::Level2,
+            a.system_id,
+            30,
+            9,
+            vec![
+                Tlv::AreaAddresses(vec![vec![0x49, 0x00, 0x01]]),
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+            ],
+        );
+        let mut out = Vec::new();
+        b.handle_pdu(hello.clone(), [2, 0, 0, 0, 0, 1], &mut out);
+        let mut out = Vec::new();
+        for pdu in pdus.clone() {
+            b.handle_pdu(pdu, [2, 0, 0, 0, 0, 1], &mut out);
+        }
+        assert!(
+            b.installed.contains_key(&highest_prefix),
+            "the highest fragment's prefix routes (merged)"
+        );
+
+        // Without fragment 0 the family is ignored (7.2.5): B' gets
+        // only the higher fragments.
+        let mut b2 = daemon();
+        let mut out = Vec::new();
+        b2.handle_pdu(hello.clone(), [2, 0, 0, 0, 0, 1], &mut out);
+        let mut out = Vec::new();
+        for pdu in pdus.into_iter().filter(|p| match &p.body {
+            PduBody::Lsp(l) => l.id.fragment > 0,
+            _ => false,
+        }) {
+            b2.handle_pdu(pdu, [2, 0, 0, 0, 0, 1], &mut out);
+        }
+        assert!(
+            !b2.installed.contains_key(&highest_prefix),
+            "no live fragment 0: the fragments are ignored"
+        );
+    }
+
+    /// §7.3.5 + §10.1's jitter: fragment 0 refreshes at the plain
+    /// window; higher fragments stagger deterministically inside
+    /// [3/4·window, window).
+    #[test]
+    fn refresh_jitter_bounds() {
+        let sys = SystemId::from_bytes([9, 9, 9, 9, 9, 9]);
+        assert_eq!(refresh_threshold(LspId::zero(sys)), REFRESH_BELOW);
+        let mut values = std::collections::BTreeSet::new();
+        for frag in 1u8..64 {
+            let t = refresh_threshold(LspId::new(sys, 0, frag));
+            assert!(
+                (REFRESH_BELOW - REFRESH_BELOW / 4..=REFRESH_BELOW).contains(&t),
+                "fragment {frag}: {t}"
+            );
+            values.insert(t);
+        }
+        assert!(values.len() > 10, "the jitter spreads across fragments");
+    }
+
+    /// §7.3.15.5/§7.3.15.6 pacing: the same LSP waits out the 5 s
+    /// interval; the circuit caps at 30 LSPs per second; a paced head
+    /// does not block fresher LSPs; the next second admits the rest.
+    #[test]
+    fn lsp_rate_limiter() {
+        let mut limiter = LspRateLimiter::default();
+        let sys = SystemId::from_bytes([1, 1, 1, 1, 1, 1]);
+        let a = LspId::new(sys, 0, 0);
+        let b = LspId::new(sys, 0, 1);
+        assert!(limiter.admit(a, 0));
+        assert!(!limiter.admit(a, 3), "same LSP inside 5 s");
+        assert!(limiter.admit(a, 5), "the interval elapsed");
+        // 30 per second, distinct LSPs.
+        let mut limiter = LspRateLimiter::default();
+        for i in 0..30u16 {
+            let id = LspId::new(SystemId::from_bytes([0, 0, 0, 0, 1, 0]), 0, i as u8);
+            assert!(limiter.admit(id, 100), "LSP {i} of the 30");
+        }
+        assert!(!limiter.admit(b, 100), "the 31st in the same second");
+        assert!(limiter.admit(b, 101), "the next second");
+        // The head-of-line case: `a` is pacing but `b` still passes.
+        let mut limiter = LspRateLimiter::default();
+        assert!(limiter.admit(a, 200));
+        assert!(!limiter.admit(a, 202));
+        assert!(limiter.admit(b, 202), "a paced head blocks no one else");
+    }
+
+    /// The pump: blocked LSPs queue and leave on the next tick (the
+    /// §7.3.15.6 floor).
+    #[test]
+    fn pump_queues_and_drains() {
+        let mut d = daemon();
+        let peer = SystemId::from_bytes([3, 3, 3, 3, 3, 3]);
+        let lsp1 = lsp_pdu(true, LspId::zero(peer), 1, 1200, LspBits::default(), vec![]);
+        let lsp2 = lsp_pdu(
+            true,
+            LspId::new(peer, 0, 1),
+            1,
+            1200,
+            LspBits::default(),
+            vec![],
+        );
+        let mut sent: Vec<Pdu> = Vec::new();
+        d.pump(vec![lsp1.clone()], &mut |p| sent.push(p));
+        assert_eq!(sent.len(), 1);
+        // The same LSP again immediately: queued, not sent.
+        d.pump(vec![lsp1], &mut |p| sent.push(p));
+        assert_eq!(sent.len(), 1, "paced: held in the queue");
+        // A different LSP passes while the first paces.
+        d.pump(vec![lsp2], &mut |p| sent.push(p));
+        assert_eq!(sent.len(), 2);
+        // Five seconds later the queue drains (the tick floor).
+        d.time_travel(5);
+        d.pump(Vec::new(), &mut |p| sent.push(p));
+        assert_eq!(sent.len(), 3, "the queued LSP left");
+    }
+
     /// The IIH builder: circuit type, hold time, TLVs, TLV 240, and
     /// §8.2.3 padding to MTU-1.
     #[test]
@@ -2161,8 +2522,9 @@ router isis T
     #[test]
     fn own_lsp_content() {
         let mut d = daemon();
-        let pdu = d.originate(true).unwrap();
-        let PduBody::Lsp(l) = pdu.body else {
+        let pdus = d.originate(true);
+        let pdu = &pdus[0];
+        let PduBody::Lsp(l) = &pdu.body else {
             unreachable!()
         };
         assert_eq!(l.id.to_string(), "1921.6800.1002.00-00");
@@ -2180,8 +2542,8 @@ router isis T
         );
         assert!(l.tlvs.iter().any(|t| matches!(t, Tlv::ExtIpReachability(ps) if ps[0].prefix == (Ipv4Addr::new(172, 16, 0, 2), 24))));
         // Sequence advances on reorigination.
-        let pdu = d.originate(true).unwrap();
-        let PduBody::Lsp(l2) = pdu.body else {
+        let pdus = d.originate(true);
+        let PduBody::Lsp(l2) = &pdus[0].body else {
             unreachable!()
         };
         assert_eq!(l2.sequence_number, 2);
@@ -2298,7 +2660,9 @@ router isis T
         );
         let mut out = Vec::new();
         d.handle_pdu(hello, [0x02, 0, 0, 0, 0, 1], &mut out);
-        // The peer's LSP at a 5 s lifetime, with the reverse edge.
+        // The peer's LSP with the reverse edge. Its advertised
+        // lifetime is 5 s, but RFC 7987 stores it at MaxAge — aging
+        // runs from 1200, not 5.
         let peer_lsp = lsp_pdu(
             true,
             LspId::zero(peer),
@@ -2326,9 +2690,9 @@ router isis T
         assert!(d
             .installed
             .contains_key(&(Ipv4Addr::new(203, 0, 113, 0), 24)));
-        // After its lifetime, the purge floods and the route
-        // withdraws.
-        d.time_travel(6);
+        // After the stored lifetime (RFC 7987's MaxAge, not the 5 s
+        // it advertised), the purge floods and the route withdraws.
+        d.time_travel(crate::MAX_AGE as u64);
         let mut out = Vec::new();
         d.tick(&mut out);
         assert!(

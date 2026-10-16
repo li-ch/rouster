@@ -35,6 +35,7 @@ pub mod checksum;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod fragment;
 pub mod lan;
 pub mod lspdb;
 pub mod pdu;

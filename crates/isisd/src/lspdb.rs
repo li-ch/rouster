@@ -166,17 +166,19 @@ impl Lspdb {
     /// §7.3.15.1 receive path restricted to the database actions.
     /// Purges (zero remaining lifetime) install as header-only
     /// tombstones: §7.3.16.4 "retain only the LSP header".
-    pub fn install(&mut self, received: Lsp, now: u64) -> InstallOutcome {
+    pub fn install(&mut self, mut received: Lsp, now: u64) -> InstallOutcome {
         match self
             .entries
             .get(&received.id)
             .map(|s| newer_than(&received, &s.lsp))
         {
             None => {
+                self.rejuvenate(&mut received);
                 self.put(received, now);
                 InstallOutcome::Installed
             }
             Some(Ordering::ReceivedNewer) => {
+                self.rejuvenate(&mut received);
                 self.put(received, now);
                 InstallOutcome::Installed
             }
@@ -192,6 +194,18 @@ impl Lspdb {
                 self.put(tombstone, now);
                 InstallOutcome::ConfusionPurged
             }
+        }
+    }
+
+    /// RFC 7987's added step to §7.3.15.1.e(1): "If the Remaining
+    /// Lifetime of the new LSP is less than MaxAge, it is set to
+    /// MaxAge" — a stored (non-purge) instance never ages out before
+    /// it has been in the database MaxAge seconds, so corruption of
+    /// the lifetime (which neither the checksum nor HMAC covers) can
+    /// only shorten an LSP's life up to the originator's own refresh.
+    fn rejuvenate(&self, lsp: &mut Lsp) {
+        if !lsp.is_purge() && lsp.remaining_lifetime < crate::MAX_AGE {
+            lsp.remaining_lifetime = crate::MAX_AGE;
         }
     }
 
@@ -491,6 +505,25 @@ mod tests {
         assert!(stored.lsp.tlvs.is_empty(), "tombstone is header-only");
     }
 
+    /// RFC 7987: a newer LSP arriving with a short remaining
+    /// lifetime is stored at MaxAge (the minimum-remaining-lifetime
+    /// rule added to 7.3.15.1.e(1)); purges are untouched.
+    #[test]
+    fn rfc7987_minimum_remaining_lifetime() {
+        let mut db = Lspdb::new();
+        let id = LspId::zero(A);
+        db.install(make_lsp(id, 1, 200, 0x1111, vec![]), 0);
+        let stored = db.get(&id).unwrap();
+        assert_eq!(
+            stored.lsp.remaining_lifetime,
+            crate::MAX_AGE,
+            "stored at MaxAge, not the advertised 200"
+        );
+        // A purge stays zero.
+        db.install(make_lsp(id, 2, 0, 0x2222, vec![]), 1);
+        assert_eq!(db.get(&id).unwrap().lsp.remaining_lifetime, 0);
+    }
+
     /// §7.3.16.2: same sequence, different checksums, someone else's
     /// LSP → purge one copy and flood.
     #[test]
@@ -508,9 +541,10 @@ mod tests {
         assert!(stored.lsp.tlvs.is_empty());
     }
 
-    /// §7.3.16.3: aging decrements with the injected clock and the
-    /// expiry purge floods a header-only tombstone (§7.3.16.4.a/b),
-    /// which the tombstone expiry later drops (§7.3.16.4.c).
+    /// §7.3.16.3 + RFC 7987: aging decrements with the injected
+    /// clock from the stored (MaxAge-bumped) lifetime, the expiry
+    /// purge floods a header-only tombstone (§7.3.16.4.a/b), and the
+    /// tombstone expiry later drops it (§7.3.16.4.c).
     #[test]
     fn aging_purges_and_tombstones_expire() {
         let mut db = Lspdb::new();
@@ -519,12 +553,21 @@ mod tests {
             make_lsp(id, 1, 100, 0x1234, vec![Tlv::Hostname("a".into())]),
             0,
         );
-        assert_eq!(db.get(&id).unwrap().remaining_lifetime(50), 50);
-        assert_eq!(db.get(&id).unwrap().remaining_lifetime(150), 0);
-        // Not yet expired at 99 (100 seconds of holding remain 1).
-        assert!(db.tick(99, false).is_empty());
-        // Expired at 100: one synchronized purge PDU.
-        let purges = db.tick(100, false);
+        // RFC 7987: stored at MaxAge however short the advertisement
+        // was — aging runs from MaxAge, not from 100.
+        assert_eq!(
+            db.get(&id).unwrap().remaining_lifetime(50),
+            crate::MAX_AGE - 50
+        );
+        assert_eq!(
+            db.get(&id)
+                .unwrap()
+                .remaining_lifetime(crate::MAX_AGE as u64),
+            0
+        );
+        assert!(db.tick(crate::MAX_AGE as u64 - 1, false).is_empty());
+        // Expired at MaxAge: one synchronized purge PDU.
+        let purges = db.tick(crate::MAX_AGE as u64, false);
         assert_eq!(purges.len(), 1);
         let PduBody::Lsp(p) = &purges[0].body else {
             unreachable!()
@@ -533,10 +576,11 @@ mod tests {
         assert_eq!(p.remaining_lifetime, 0);
         assert!(p.tlvs.is_empty());
         // The tombstone lingers ZeroAgeLifetime, then drops.
+        let zeroed = crate::MAX_AGE as u64;
         assert!(db.get(&id).is_some());
-        let _ = db.tick(100 + crate::ZERO_AGE_LIFETIME as u64 - 1, false);
+        let _ = db.tick(zeroed + crate::ZERO_AGE_LIFETIME as u64 - 1, false);
         assert!(db.get(&id).is_some());
-        let _ = db.tick(100 + crate::ZERO_AGE_LIFETIME as u64, false);
+        let _ = db.tick(zeroed + crate::ZERO_AGE_LIFETIME as u64, false);
         assert!(db.get(&id).is_none());
     }
 

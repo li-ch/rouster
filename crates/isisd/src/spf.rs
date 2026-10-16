@@ -191,7 +191,21 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
     let mut adjacency: HashMap<NeighborId, Vec<Edge>> = HashMap::new();
     let mut bits_by_system: HashMap<NeighborId, LspBits> = HashMap::new();
     let mut addresses: HashMap<NeighborId, Vec<Ipv4Addr>> = HashMap::new();
-    let mut stored: HashMap<NeighborId, &Lsp> = HashMap::new();
+    // §7.2.5: "If an LSP with LSP number 0 is not present, or has a
+    // zero Remaining Lifetime, fragments n>0 shall be ignored" — the
+    // systems whose fragment 0 is live drive everything else.
+    let live_frag0: std::collections::HashSet<NeighborId> = db
+        .stored_lsps()
+        .filter(|r| {
+            !r.lsp.is_purge()
+                && r.remaining_lifetime(now) > 0
+                && r.lsp.id.pseudonode == 0
+                && r.lsp.id.fragment == 0
+        })
+        .map(|r| NeighborId::new(r.lsp.id.system, 0))
+        .collect();
+    // The merged TLV set per router (all fragments of §7.3.4's set).
+    let mut merged_tlvs: HashMap<NeighborId, Vec<&Tlv>> = HashMap::new();
 
     for record in db.stored_lsps() {
         let lsp = &record.lsp;
@@ -199,24 +213,32 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
             continue;
         }
         let vertex = NeighborId::new(lsp.id.system, lsp.id.pseudonode);
+        if lsp.id.pseudonode == 0 && !live_frag0.contains(&vertex) {
+            continue; // §7.2.5: fragments without a live fragment 0
+        }
         adjacency.entry(vertex).or_default().extend(edges_of(lsp));
         if lsp.id.pseudonode == 0 {
-            // Router-only TLVs: the type block (§7.2.5 reads it from
-            // fragment 0 — v1's flat fragment space) and TLV 132.
-            bits_by_system.insert(vertex, lsp.bits);
-            let addrs: Vec<Ipv4Addr> = lsp
-                .tlvs
-                .iter()
-                .filter_map(|t| match t {
-                    Tlv::IpInterfaceAddress(a) => Some(a.clone()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            if !addrs.is_empty() {
-                addresses.insert(vertex, addrs);
+            merged_tlvs
+                .entry(vertex)
+                .or_default()
+                .extend(lsp.tlvs.iter());
+            if lsp.id.fragment == 0 {
+                // Router-only TLVs: the type block (§7.2.5 reads it
+                // from fragment 0) and TLV 132.
+                bits_by_system.insert(vertex, lsp.bits);
+                let addrs: Vec<Ipv4Addr> = lsp
+                    .tlvs
+                    .iter()
+                    .filter_map(|t| match t {
+                        Tlv::IpInterfaceAddress(a) => Some(a.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                if !addrs.is_empty() {
+                    addresses.insert(vertex, addrs);
+                }
             }
-            stored.insert(vertex, lsp);
         }
     }
 
@@ -299,15 +321,14 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
         if vertex == root || vertex.is_pseudonode() {
             continue;
         }
-        let Some(lsp) = stored.get(&vertex) else {
+        let Some(tlvs) = merged_tlvs.get(&vertex) else {
             continue;
         };
         let hops = result.next_hops.get(&vertex).cloned().unwrap_or_default();
         if hops.is_empty() {
             continue; // reachable only via a LAN we cannot resolve
         }
-        let wide: Vec<&Vec<WideIpReach>> = lsp
-            .tlvs
+        let wide: Vec<&Vec<WideIpReach>> = tlvs
             .iter()
             .filter_map(|t| match t {
                 Tlv::ExtIpReachability(p) => Some(p),
@@ -330,7 +351,7 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
                 }
             }
         } else {
-            for t in &lsp.tlvs {
+            for t in tlvs {
                 let (list, external): (&Vec<NarrowIpReach>, bool) = match t {
                     Tlv::IpInternalReachability(list) => (list, false),
                     Tlv::IpExternalReachability(list) => (list, true),
