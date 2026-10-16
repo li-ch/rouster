@@ -31,7 +31,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bfdd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "socket2",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "bgpd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "policy",
@@ -162,14 +162,14 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "configd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "thiserror 2.0.21",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "isisd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "proptest",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "netlink-dp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "futures",
@@ -600,7 +600,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "ospfd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "libc",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "policy"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "proptest",
@@ -816,7 +816,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rib"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "proptest",
@@ -826,14 +826,14 @@ dependencies = [
 
 [[package]]
 name = "rousterctl"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
 ]
 
 [[package]]
 name = "rousterd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "netlink-dp",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "rpki"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "proptest",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "sav"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "netlink-dp",
@@ -1212,7 +1212,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vty"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "common",
  "thiserror 2.0.21",
@@ -1343,7 +1343,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "yang"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.21",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "zapi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "common",

@@ -46,7 +46,8 @@ impl Phase {
     /// Counts one occurrence (for the count-only rows).
     #[cfg(feature = "cpu-census")]
     pub fn bump(&self) {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(not(feature = "cpu-census"))]
@@ -154,7 +155,12 @@ mod tests {
         if cfg!(feature = "cpu-census") {
             assert_eq!(
                 names,
-                vec!["nl_build", "nl_request", "nl_events_rx", "nl_events_dropped"]
+                vec![
+                    "nl_build",
+                    "nl_request",
+                    "nl_events_rx",
+                    "nl_events_dropped"
+                ]
             );
         } else {
             assert!(rows.is_empty());

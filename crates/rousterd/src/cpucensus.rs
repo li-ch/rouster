@@ -47,7 +47,8 @@ impl Phase {
     /// Counts one occurrence (for the count-only rows).
     #[cfg(feature = "cpu-census")]
     pub fn bump(&self) {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(not(feature = "cpu-census"))]

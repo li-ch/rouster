@@ -1640,8 +1640,12 @@ mod tests {
         u2.nlri = vec!["198.51.100.0/24".parse::<IpPrefix>().unwrap().into()];
         rib.announce(&p, &u1);
         rib.announce(&p, &u2);
-        let r1 = rib.adj_in[&p.address].get(&path_nlri("203.0.113.0/24", 0)).unwrap();
-        let r2 = rib.adj_in[&p.address].get(&path_nlri("198.51.100.0/24", 0)).unwrap();
+        let r1 = rib.adj_in[&p.address]
+            .get(&path_nlri("203.0.113.0/24", 0))
+            .unwrap();
+        let r2 = rib.adj_in[&p.address]
+            .get(&path_nlri("198.51.100.0/24", 0))
+            .unwrap();
         assert!(
             Arc::ptr_eq(&r1.source, &r2.source),
             "routes of one peer share the PeerInfo instance"
@@ -1649,9 +1653,14 @@ mod tests {
         assert_eq!(r1.source.address, p.address, "readers deref unchanged");
         // A re-announcement with changed session facts (new BGP
         // Identifier) re-pins the shared instance for new routes.
-        let renewed = PeerInfo { bgp_id: Some(Ipv4Addr::new(10, 9, 9, 9)), ..p };
+        let renewed = PeerInfo {
+            bgp_id: Some(Ipv4Addr::new(10, 9, 9, 9)),
+            ..p
+        };
         rib.announce(&renewed, &u1);
-        let r1b = rib.adj_in[&p.address].get(&path_nlri("203.0.113.0/24", 0)).unwrap();
+        let r1b = rib.adj_in[&p.address]
+            .get(&path_nlri("203.0.113.0/24", 0))
+            .unwrap();
         assert_eq!(r1b.source.bgp_id, Some(Ipv4Addr::new(10, 9, 9, 9)));
     }
 

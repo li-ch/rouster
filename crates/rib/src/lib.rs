@@ -612,21 +612,25 @@ impl Rib {
         if want.len() != have.len() {
             return false;
         }
-        want.iter().zip(have.iter()).all(|(&(hop, w1), &(have_hop, w2))| {
-            w1 == w2
-                && match hop {
-                    Nexthop::Ipv4(g) => {
-                        self.resolve_nexthop_recursive(IpAddr::V4(g)).as_ref() == Some(&have_hop)
+        want.iter()
+            .zip(have.iter())
+            .all(|(&(hop, w1), &(have_hop, w2))| {
+                w1 == w2
+                    && match hop {
+                        Nexthop::Ipv4(g) => {
+                            self.resolve_nexthop_recursive(IpAddr::V4(g)).as_ref()
+                                == Some(&have_hop)
+                        }
+                        Nexthop::Ipv6(g) => {
+                            self.resolve_nexthop_recursive(IpAddr::V6(g)).as_ref()
+                                == Some(&have_hop)
+                        }
+                        Nexthop::Blackhole
+                        | Nexthop::IfIndex(_)
+                        | Nexthop::Ipv4If(..)
+                        | Nexthop::Ipv6If(..) => hop == have_hop,
                     }
-                    Nexthop::Ipv6(g) => {
-                        self.resolve_nexthop_recursive(IpAddr::V6(g)).as_ref() == Some(&have_hop)
-                    }
-                    Nexthop::Blackhole
-                    | Nexthop::IfIndex(_)
-                    | Nexthop::Ipv4If(..)
-                    | Nexthop::Ipv6If(..) => hop == have_hop,
-                }
-        })
+            })
     }
 
     /// Apply one dataplane event to the mirrored state.
@@ -846,9 +850,7 @@ impl Rib {
                 // replaced, or stale-because-desired-nothing), and the
                 // cursor must never re-see it.
                 let believed_entry = match believed.peek() {
-                    Some((&bkey, _)) if bkey == key => {
-                        believed.next().map(|(_, entry)| entry)
-                    }
+                    Some((&bkey, _)) if bkey == key => believed.next().map(|(_, entry)| entry),
                     _ => None,
                 };
                 // A connected candidate MASKS the prefix (distance 0,
@@ -985,10 +987,8 @@ impl Rib {
             // batch call, and the belief insert moves (never clones)
             // what the batch just verified. (The former shape cloned
             // every entry into a parallel `entries` Vec first.)
-            let keys: Vec<(TableId, IpPrefix)> =
-                to_install.iter().map(|(key, _)| *key).collect();
-            let entries: Vec<RouteEntry> =
-                to_install.into_iter().map(|(_, entry)| entry).collect();
+            let keys: Vec<(TableId, IpPrefix)> = to_install.iter().map(|(key, _)| *key).collect();
+            let entries: Vec<RouteEntry> = to_install.into_iter().map(|(_, entry)| entry).collect();
             let results = dp.route_replace_batch(&entries).await;
             for ((key, entry), result) in keys.into_iter().zip(entries).zip(results) {
                 match result {
@@ -1236,8 +1236,15 @@ mod tests {
         // the programmed belief is stale, the route withdraws.
         rib.apply_event(&address(2, "198.51.100.5/24", true));
         block_on(rib.reconcile(&dp));
-        assert_eq!(dp.removed_prefixes(), vec!["198.51.100.0/24".parse().unwrap()]);
-        assert_eq!(dp.installed_prefixes().len(), 1, "no re-install while masked");
+        assert_eq!(
+            dp.removed_prefixes(),
+            vec!["198.51.100.0/24".parse().unwrap()]
+        );
+        assert_eq!(
+            dp.installed_prefixes().len(),
+            1,
+            "no re-install while masked"
+        );
 
         // Unmask: the still-desired static route returns.
         rib.apply_event(&address(2, "198.51.100.5/24", false));

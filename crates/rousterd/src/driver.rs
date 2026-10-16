@@ -312,8 +312,7 @@ impl RibDriver {
             } => {
                 // The add twin's fast path (see above).
                 if self.redistributes.is_empty() {
-                    let removed =
-                        self.rib.table_mut(table).remove(&prefix, protocol);
+                    let removed = self.rib.table_mut(table).remove(&prefix, protocol);
                     if removed {
                         debug!(prefix = %prefix, ?protocol, "zapi: route delete");
                         self.dirty.insert((table, prefix));

@@ -116,7 +116,10 @@ mod tests {
     fn ansi_output_is_colored() {
         let log = captured_log(true);
         assert!(log.contains("zapi: listening"));
-        assert!(log.contains('\u{1b}'), "TTY output keeps its ANSI coloring: {log:?}");
+        assert!(
+            log.contains('\u{1b}'),
+            "TTY output keeps its ANSI coloring: {log:?}"
+        );
     }
 
     /// The knob (PERF-P2): the env table parses to the matching filter,
