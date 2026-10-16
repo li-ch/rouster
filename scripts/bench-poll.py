@@ -149,6 +149,14 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--status-file", default="/run/rouster/rousterd.status")
     ap.add_argument("--bgpd-log", default="/var/log/rouster-bgpd.log")
+    # P0-b stall guard (rouster mode): after EOR is seen, a run whose
+    # main-table count AND both SUT daemons' CPU jiffies are all frozen
+    # for this many seconds is declared wedged (POLL-STALL) instead of
+    # burning the full timeout — the 2026-10-15/16 post-F8 signature.
+    # A healthy full-table run advances every status refresh (~10 s);
+    # 180 s of total freeze after EOR is unambiguous at this scale.
+    # 0 disables. FRR mode ignores it.
+    ap.add_argument("--stall-after", type=int, default=180)
     args = ap.parse_args()
 
     proc_sut = PROC_ROUSTER if args.mode == "rouster" else PROC_FRR
@@ -156,6 +164,8 @@ def main():
     eor_at = None
     eor_seen_sticky = False
     complete_streak = 0
+    stall_sig = None      # (prefixes, bgpd jiffies, zebra jiffies)
+    stall_since = None
     t_start = time.time()
 
     with open(args.csv, "w", newline="") as fh:
@@ -230,6 +240,34 @@ def main():
                 (time.monotonic() - mono) * 1000.0, 3)
             w.writerow(row)
             fh.flush()
+
+            # P0-b stall guard (rouster mode, post-EOR only): frozen
+            # count + frozen CPU on both daemons for --stall-after
+            # seconds = the wedged-SUT signature; fail fast instead
+            # of burning the timeout. Missing values reset the timer.
+            if args.mode == "rouster" and args.stall_after and eor_at is not None:
+                jiffies = []
+                for tag in ("sut_bgpd", "sut_zebra"):
+                    u, s = row.get(f"{tag}_utime", ""), row.get(f"{tag}_stime", "")
+                    if u and s:
+                        jiffies.append(int(u) + int(s))
+                if prefixes.isdigit() and len(jiffies) == 2:
+                    sig = (prefixes, jiffies[0], jiffies[1])
+                    if sig == stall_sig:
+                        if stall_since is not None and \
+                                mono - stall_since >= args.stall_after:
+                            print(
+                                f"POLL-STALL frozen {args.stall_after}s "
+                                f"after EOR at prefixes={prefixes}",
+                                file=sys.stderr)
+                            break
+                    else:
+                        stall_sig = sig
+                        stall_since = mono
+                else:
+                    stall_sig = None
+                    stall_since = None
+
             if done:
                 complete_streak += 1
                 if complete_at is None:

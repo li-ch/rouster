@@ -60,6 +60,27 @@ REPLAY_RATE=${BENCH_REPLAY_RATE:-0}
 # 120 msg/s (kept here as history; do not re-enable without cause).
 HOLD=${BENCH_HOLD:-90}
 TIMEOUT=${BENCH_TIMEOUT:-3600}
+# P0-b harness fix (2026-10-16): the SUT containers get a large
+# netlink receive buffer. Diagnosis of the 2026-10-15/16 post-F8
+# poll loss: rousterd's netlink socket is subscribed to the route
+# multicast groups, so every install of the 1.1M-route storm echoes
+# a notification back to the same socket; when the daemon's single
+# netlink connection task is starved >~25 ms under the storm, the
+# default rcvbuf (net.core.rmem_default = 212992) overruns (ENOBUFS)
+# and the kernel DROPS datagrams — including ACKs for in-flight
+# installs. netlink-proto 0.12.2 request futures have no timeout:
+# each dropped ACK hangs its route_replace future, the zapi drain
+# arm of rousterd's main loop never returns, the reconcile tick
+# stops, and the status file freezes (the "lost poll side"). The
+# rig-side fix gives the socket ~2 s of starvation slack instead of
+# ~25 ms; applied symmetrically to BOTH SUT starters (§F). The
+# SUT-side hardening (ACK timeout / overrun resync) is escalated as
+# a finding for the owner. BENCH_SUT_RMEM=0 disables for A/B runs.
+SUT_RMEM=${BENCH_SUT_RMEM:-33554432}
+SUT_SYSCTLS=""
+if [ "$SUT_RMEM" != 0 ]; then
+    SUT_SYSCTLS="--sysctl net.core.rmem_default=$SUT_RMEM --sysctl net.core.rmem_max=$((SUT_RMEM * 2))"
+fi
 
 case "$(uname -m)" in
     arm64|aarch64) MUSL_TARGET=aarch64-unknown-linux-musl ;;
@@ -103,7 +124,7 @@ wait_up() { # container desc attempts cmd
 
 start_sut_rouster() { # name
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     for b in rousterd rousterctl; do
@@ -130,7 +151,7 @@ start_sut_rouster() { # name
 
 start_sut_frr() { # name — zebra + mgmtd + real bgpd, vtysh -b push
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"

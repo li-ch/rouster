@@ -63,6 +63,16 @@ def parse_bgpd_log(path):
     }
 
 
+def parse_rousterd_log(path):
+    """P0-b harness evidence: the netlink rcvbuf-overrun warnings
+    (netlink-proto framed ENOBUFS) that precede the wedged-SUT
+    signature. Counted per run so a fixed rig shows 0."""
+    if not path.exists():
+        return {}
+    text = path.read_text(errors="replace")
+    return {"netlink_rcvbuf_overruns": text.count("netlink socket buffer full")}
+
+
 def parse_injector_log(path):
     out = {}
     if not path.exists():
@@ -158,6 +168,7 @@ def parse_poll_complete(path):
 def run_metrics(run_dir, clk_tck):
     m = {"run": run_dir.name}
     m.update(parse_bgpd_log(run_dir / "sut-bgpd.log"))
+    m.update(parse_rousterd_log(run_dir / "rousterd.log"))
     m.update(parse_injector_log(run_dir / "injector.log"))
     m.update(parse_poll(run_dir / "poll.csv"))
     m["poll_complete_s"] = parse_poll_complete(run_dir / "poller.log")
