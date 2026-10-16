@@ -48,7 +48,13 @@ pub struct InterfaceState {
 #[derive(Debug, Default)]
 pub struct Table {
     /// All candidate routes per prefix, from every protocol.
-    entries: BTreeMap<IpPrefix, Vec<RouteEntry>>,
+    /// PERF-P3 (M3 L3): the single-candidate case — the overwhelmingly
+    /// common shape (a full-table import holds one BGP candidate per
+    /// prefix; measured 99,998 of 99,998 at the census slice) — stores
+    /// the entry INLINE instead of a heap `Vec` with one element
+    /// (which cost one allocation plus its header/rounding per
+    /// prefix). The multi-protocol shape keeps the `Vec`.
+    entries: BTreeMap<IpPrefix, Slot>,
     /// PERF-P3: total candidate count, maintained incrementally by
     /// [`Table::add`]/[`Table::remove`]. The status surface's per-table
     /// route count was an O(table) candidates walk per publish —
@@ -58,33 +64,106 @@ pub struct Table {
     candidate_count: usize,
 }
 
+/// The candidates of one prefix: inline when one, heap-allocated when
+/// several (PERF-P3 M3 L3).
+#[derive(Debug)]
+enum Slot {
+    One(RouteEntry),
+    Many(Vec<RouteEntry>),
+}
+
+impl Slot {
+    fn as_slice(&self) -> &[RouteEntry] {
+        match self {
+            Slot::One(entry) => std::slice::from_ref(entry),
+            Slot::Many(entries) => entries,
+        }
+    }
+}
+
 impl Table {
     /// Offer a route to the table. Replaces any existing route from the same
     /// protocol with the same prefix.
     pub fn add(&mut self, entry: RouteEntry) {
-        let candidates = self.entries.entry(entry.prefix).or_default();
-        let before = candidates.len();
-        candidates.retain(|e| e.protocol != entry.protocol);
-        candidates.push(entry);
-        // Same-protocol replacement keeps the count (retain removes at
-        // most the one same-protocol candidate; push adds one).
-        self.candidate_count += candidates.len() - before;
+        use std::collections::btree_map::Entry;
+        match self.entries.entry(entry.prefix) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(Slot::One(entry));
+                self.candidate_count += 1;
+            }
+            Entry::Occupied(mut occupied) => match occupied.get_mut() {
+                Slot::Many(candidates) => {
+                    let before = candidates.len();
+                    candidates.retain(|e| e.protocol != entry.protocol);
+                    candidates.push(entry);
+                    // Same-protocol replacement keeps the count (retain
+                    // removes at most the one same-protocol candidate).
+                    self.candidate_count += candidates.len() - before;
+                }
+                slot @ Slot::One(_) => {
+                    // Inline slot: same protocol replaces in place; a
+                    // second protocol promotes to the heap Vec.
+                    let same_protocol =
+                        slot.as_slice()[0].protocol == entry.protocol;
+                    if same_protocol {
+                        if let Slot::One(existing) = slot {
+                            *existing = entry;
+                        }
+                    } else {
+                        let old = match std::mem::replace(
+                            slot,
+                            Slot::Many(Vec::with_capacity(2)),
+                        ) {
+                            Slot::One(old) => old,
+                            Slot::Many(_) => unreachable!("matched One above"),
+                        };
+                        self.candidate_count += 1;
+                        if let Slot::Many(candidates) = slot {
+                            candidates.push(old);
+                            candidates.push(entry);
+                        }
+                    }
+                }
+            },
+        }
     }
 
     /// Withdraw all routes of `protocol` for `prefix`. Returns true if any
     /// route was withdrawn.
     pub fn remove(&mut self, prefix: &IpPrefix, protocol: common::RouteProtocol) -> bool {
-        let Some(candidates) = self.entries.get_mut(prefix) else {
+        let Some(slot) = self.entries.get_mut(prefix) else {
             return false;
         };
-        let before = candidates.len();
-        candidates.retain(|e| e.protocol != protocol);
-        self.candidate_count -= before - candidates.len();
-        let removed = candidates.len() != before;
-        if candidates.is_empty() {
-            self.entries.remove(prefix);
+        match slot {
+            Slot::One(entry) => {
+                if entry.protocol != protocol {
+                    return false;
+                }
+                // The last candidate goes; the prefix row goes with it.
+                self.entries.remove(prefix);
+                self.candidate_count -= 1;
+                true
+            }
+            Slot::Many(candidates) => {
+                let before = candidates.len();
+                candidates.retain(|e| e.protocol != protocol);
+                self.candidate_count -= before - candidates.len();
+                let removed = candidates.len() != before;
+                match candidates.len() {
+                    0 => {
+                        self.entries.remove(prefix);
+                    }
+                    // Demote: the common single-candidate shape stays
+                    // inline after churn (the M3 L3 invariant).
+                    1 => {
+                        let last = candidates.pop().unwrap();
+                        *slot = Slot::One(last);
+                    }
+                    _ => {}
+                }
+                removed
+            }
         }
-        removed
     }
 
     /// `(candidate count, prefix count)` — O(1) (PERF-P3: the
@@ -98,12 +177,13 @@ impl Table {
     pub fn best(&self, prefix: &IpPrefix) -> Option<&RouteEntry> {
         self.entries
             .get(prefix)?
+            .as_slice()
             .iter()
             .min_by_key(|e| (e.protocol.admin_distance(), e.metric))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&IpPrefix, &Vec<RouteEntry>)> {
-        self.entries.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&IpPrefix, &[RouteEntry])> {
+        self.entries.iter().map(|(prefix, slot)| (prefix, slot.as_slice()))
     }
 }
 
@@ -1491,6 +1571,44 @@ mod tests {
         // Removing an absent route changes nothing.
         assert!(!table.remove(&"10.0.0.0/8".parse().unwrap(), RouteProtocol::Bgp));
         assert_eq!(table.counts(), (1, 1));
+    }
+
+    /// PERF-P3 (M3 L3): the single-candidate inline slot's storage
+    /// transitions — a second protocol promotes to the multi-candidate
+    /// Vec, withdrawing back to one demotes (the common shape stays
+    /// inline through churn), with counts exact throughout. Selection
+    /// behavior is the suite above; this pins the shape itself.
+    #[test]
+    fn slot_promotes_and_demotes_across_protocol_churn() {
+        let prefix: IpPrefix = "10.0.0.0/8".parse().unwrap();
+        let mut rib = Rib::new();
+        let table = rib.table_mut(254);
+        table.add(entry("10.0.0.0/8", RouteProtocol::Bgp, 0));
+        assert!(
+            matches!(table.entries.get(&prefix), Some(Slot::One(_))),
+            "single candidate stored inline"
+        );
+        table.add(entry("10.0.0.0/8", RouteProtocol::Ospf, 10));
+        assert!(
+            matches!(table.entries.get(&prefix), Some(Slot::Many(v)) if v.len() == 2),
+            "a second protocol promotes to the heap Vec"
+        );
+        assert_eq!(table.counts(), (2, 1));
+        assert!(table.remove(&prefix, RouteProtocol::Ospf));
+        assert!(
+            matches!(table.entries.get(&prefix), Some(Slot::One(_))),
+            "withdrawal back to one demotes to inline"
+        );
+        assert_eq!(table.counts(), (1, 1));
+        // The same-protocol replacement on the inline slot keeps it inline.
+        table.add(entry("10.0.0.0/8", RouteProtocol::Bgp, 5));
+        assert!(matches!(table.entries.get(&prefix), Some(Slot::One(_))));
+        assert_eq!(table.counts(), (1, 1));
+        assert_eq!(
+            table.best(&prefix).unwrap().metric,
+            5,
+            "the in-place replacement is visible through best()"
+        );
     }
 
     /// PERF-P3 (M3 L1): equal nexthop groups entering the RIB share
