@@ -75,6 +75,10 @@ phases! {
     /// Of those, the non-kernel-origin echoes the feedback filter
     /// drops (count only) — the install storm's own notifications.
     NL_EVENTS_DROPPED => "nl_events_dropped",
+    /// Receive-buffer overruns observed (count only, F9): the framed
+    /// layer's ENOBUFS markers — each one dropped datagrams and
+    /// triggered a link/address mirror resync.
+    NL_OVERRUNS => "nl_overruns",
 }
 
 /// Whether the census is armed (`ROUSTERD_CPU_CENSUS=1`).
@@ -159,7 +163,8 @@ mod tests {
                     "nl_build",
                     "nl_request",
                     "nl_events_rx",
-                    "nl_events_dropped"
+                    "nl_events_dropped",
+                    "nl_overruns"
                 ]
             );
         } else {

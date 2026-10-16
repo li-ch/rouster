@@ -65,6 +65,10 @@ pub struct NetlinkDataplane {
         NetlinkMessage<RouteNetlinkMessage>,
         SocketAddr,
     )>,
+    /// Mirror refresh queued by the last receive-overrun resync (F9),
+    /// drained one event per `next_event` call ahead of new socket
+    /// traffic. Empty unless an overrun was observed.
+    resync_backlog: std::collections::VecDeque<DataplaneEvent>,
     /// ifindex → (interface name at write time, pre-SAV rp_filter,
     /// applied value). Interior-mutable so the `&self` trait methods
     /// can update it; never held across an await.
@@ -90,11 +94,26 @@ impl NetlinkDataplane {
     /// Opens the netlink connection, subscribed to link/address/route/
     /// neighbour multicast groups so kernel changes arrive as events.
     ///
-    /// The returned future is the connection driver; spawn it on the runtime
-    /// (e.g. `tokio::spawn(conn)`).
+    /// F9's optional half: the receive buffer is enlarged to
+    /// [`NL_RCVBUF_ASK`] before binding. The daemon's own ~65k
+    /// notifications/s install storm (every programmed route echoes back
+    /// on this socket) overruns the kernel-default rcvbuf in ~25 ms of
+    /// reader starvation; the harness workaround raised the sysctls, this
+    /// is the daemon asking for the same slack itself. Best-effort and
+    /// disclosed: plain `SO_RCVBUF` is capped by `net.core.rmem_max`
+    /// (raising it further would take `SO_RCVBUFFORCE`, which netlink-sys
+    /// does not expose); the ACK timeout below is the recovery path that
+    /// makes a lost datagram survivable regardless.
     #[allow(clippy::type_complexity)]
     pub fn new() -> std::io::Result<(Self, impl std::future::Future<Output = ()> + Send)> {
         let mut socket = TokioSocket::new(NETLINK_ROUTE)?;
+        if let Err(e) = socket.socket_mut().set_rx_buf_sz(NL_RCVBUF_ASK) {
+            warn!(
+                ask = NL_RCVBUF_ASK,
+                error = %e,
+                "cannot enlarge the netlink receive buffer (F9); keeping the kernel default"
+            );
+        }
         let groups = libc::RTMGRP_LINK
             | libc::RTMGRP_IPV4_IFADDR
             | libc::RTMGRP_IPV6_IFADDR
@@ -110,6 +129,7 @@ impl NetlinkDataplane {
             Self {
                 handle,
                 messages,
+                resync_backlog: std::collections::VecDeque::new(),
                 sav_applied: Mutex::new(BTreeMap::new()),
                 sav_nft_counters: Mutex::new(None),
                 sav_backend: SavBackend::default(),
@@ -183,35 +203,144 @@ impl NetlinkDataplane {
 
     /// Next kernel event, mapped to a [`DataplaneEvent`]. Returns `None` when
     /// the connection is closed. Unmapped message kinds are skipped.
+    ///
+    /// F9: a receive overrun (the framed layer's ENOBUFS marker — the
+    /// kernel dropped datagrams) does not kill the socket, it only leaves
+    /// the mirror behind: the marker triggers a bounded link/address
+    /// re-dump whose events are drained ahead of new traffic, and every
+    /// in-flight request still awaiting its ACK is re-issued by
+    /// [`ack_bounded`] on its deadline.
     pub async fn next_event(&mut self) -> Option<DataplaneEvent> {
-        use futures::StreamExt;
-        loop {
-            let (msg, _addr) = self.messages.next().await?;
-            crate::cpucensus::NL_EVENTS_RX.bump();
-            let NetlinkPayload::InnerMessage(inner) = msg.payload else {
-                continue;
-            };
-            let ev = match inner {
-                RouteNetlinkMessage::NewLink(m) => link_event(&m, true),
-                RouteNetlinkMessage::DelLink(m) => Some(DataplaneEvent::LinkDel {
-                    ifindex: m.header.index,
-                }),
-                RouteNetlinkMessage::NewAddress(m) => address_event(&m, true),
-                RouteNetlinkMessage::DelAddress(m) => address_event(&m, false),
-                RouteNetlinkMessage::NewRoute(m) => route_new_event(&m),
-                RouteNetlinkMessage::DelRoute(m) => route_del_event(&m),
-                RouteNetlinkMessage::NewNeighbour(m) => neighbour_event(&m, true),
-                RouteNetlinkMessage::DelNeighbour(m) => neighbour_event(&m, false),
-                // Kernel neighbour-resolution requests (RTM_GETNEIGH) and
-                // everything unmapped are skipped.
-                _ => None,
-            };
-            if let Some(ev) = ev {
-                return Some(ev);
+        let NetlinkDataplane {
+            messages,
+            resync_backlog,
+            handle,
+            ..
+        } = self;
+        next_event_with(messages, resync_backlog, || {
+            resync_link_address_mirror(handle)
+        })
+        .await
+    }
+}
+
+/// How one received netlink message steps the event loop.
+#[derive(Debug)]
+enum RxStep {
+    /// A mirror event for the RIB.
+    Event(DataplaneEvent),
+    /// Received but not mirrored: the feedback filter's non-kernel-origin
+    /// route echoes, or a kind this mirror does not track.
+    Skip,
+    /// The framed layer's ENOBUFS marker (NLMSG_OVERRUN): the kernel
+    /// dropped datagrams while the receive buffer was full.
+    Overrun,
+}
+
+/// Classifies one message off the wire (the mapping half of
+/// [`next_event_with`]; kept pure for the overrun-path tests).
+fn classify_rx(msg: NetlinkMessage<RouteNetlinkMessage>) -> RxStep {
+    let NetlinkPayload::InnerMessage(inner) = msg.payload else {
+        return match msg.payload {
+            NetlinkPayload::Overrun(_) => RxStep::Overrun,
+            _ => RxStep::Skip,
+        };
+    };
+    let ev = match inner {
+        RouteNetlinkMessage::NewLink(m) => link_event(&m, true),
+        RouteNetlinkMessage::DelLink(m) => Some(DataplaneEvent::LinkDel {
+            ifindex: m.header.index,
+        }),
+        RouteNetlinkMessage::NewAddress(m) => address_event(&m, true),
+        RouteNetlinkMessage::DelAddress(m) => address_event(&m, false),
+        RouteNetlinkMessage::NewRoute(m) => route_new_event(&m),
+        RouteNetlinkMessage::DelRoute(m) => route_del_event(&m),
+        RouteNetlinkMessage::NewNeighbour(m) => neighbour_event(&m, true),
+        RouteNetlinkMessage::DelNeighbour(m) => neighbour_event(&m, false),
+        // Kernel neighbour-resolution requests (RTM_GETNEIGH) and
+        // everything unmapped are skipped.
+        _ => None,
+    };
+    match ev {
+        Some(ev) => RxStep::Event(ev),
+        None => RxStep::Skip,
+    }
+}
+
+/// The drain-and-resync event loop (F9), over any message stream:
+/// queued resync events first, then the next stream message mapped by
+/// [`classify_rx`]. An [`RxStep::Overrun`] warns, runs `resync`, and
+/// queues its events — the stream is not dead, just behind, so reading
+/// continues right where it is.
+async fn next_event_with<S, F, Fut>(
+    messages: &mut S,
+    resync_backlog: &mut std::collections::VecDeque<DataplaneEvent>,
+    mut resync: F,
+) -> Option<DataplaneEvent>
+where
+    S: futures::Stream<Item = (NetlinkMessage<RouteNetlinkMessage>, SocketAddr)> + Unpin,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Vec<DataplaneEvent>>,
+{
+    loop {
+        if let Some(ev) = resync_backlog.pop_front() {
+            return Some(ev);
+        }
+        let (msg, _addr) = futures::StreamExt::next(messages).await?;
+        crate::cpucensus::NL_EVENTS_RX.bump();
+        match classify_rx(msg) {
+            RxStep::Event(ev) => return Some(ev),
+            RxStep::Skip => {
+                crate::cpucensus::NL_EVENTS_DROPPED.bump();
             }
-            crate::cpucensus::NL_EVENTS_DROPPED.bump();
+            RxStep::Overrun => {
+                crate::cpucensus::NL_OVERRUNS.bump();
+                warn!(
+                    "netlink socket overrun (ENOBUFS): the kernel dropped datagrams; \
+                     re-syncing the link/address mirror (in-flight requests re-issue \
+                     on their ACK deadline)"
+                );
+                *resync_backlog = resync().await.into();
+            }
         }
     }
+}
+
+/// The overrun mirror resync: re-dump LINKS and ADDRESSES only (F9).
+///
+/// Scope, disclosed: interfaces are a small bounded table, so this dump
+/// is cheap and cannot meaningfully feed the next overrun; a full ROUTE
+/// re-dump can (on the very install storm that overran the buffer it
+/// would pull every echo back through the same rcvbuf), so route mirror
+/// truth keeps its existing repair paths — in-flight installs verify via
+/// [`ack_bounded`], and the periodic reconcile re-establishes desired
+/// state. Bounded by [`NL_ACK_TIMEOUT`]: a silent dump yields the events
+/// collected so far rather than a hang.
+async fn resync_link_address_mirror(handle: &rtnetlink::Handle) -> Vec<DataplaneEvent> {
+    let mut events = Vec::new();
+    let dump = async {
+        let mut links = handle.link().get().execute();
+        while let Some(msg) = links.try_next().await.map_err(|e| e.to_string())? {
+            if let Some(ev) = link_event(&msg, true) {
+                events.push(ev);
+            }
+        }
+        let mut addrs = handle.address().get().execute();
+        while let Some(msg) = addrs.try_next().await.map_err(|e| e.to_string())? {
+            if let Some(ev) = address_event(&msg, true) {
+                events.push(ev);
+            }
+        }
+        Ok::<(), String>(())
+    };
+    if let Err(reason) = tokio::time::timeout(NL_ACK_TIMEOUT, dump).await {
+        warn!(
+            collected = events.len(),
+            reason = %reason,
+            "overrun resync dump went silent; applying the partial mirror refresh"
+        );
+    }
+    events
 }
 
 /// `RT_TABLE_COMPAT` — header marker for routing tables addressed by
@@ -765,19 +894,104 @@ impl NetlinkDataplane {
 /// `wmem_default`.
 const NL_ROUTE_PIPELINE: usize = 512;
 
+/// F9 (the PERF-P0 escalation): how long one netlink request may stay
+/// silent before it is re-issued. Sized from measurement, not guess:
+/// the F8 receipt's healthy install ACK latency is single-digit
+/// milliseconds (1,126,481 routes in 17.0 s ≈ 66k ACKs/s through the
+/// 512-deep pipeline ⇒ ~8 ms queue-depth latency per request), so 10 s
+/// is ~1000x the healthy bound — a wedged install recovers in seconds
+/// instead of parking the daemon's whole select! loop forever (the
+/// 2026-10-15/16 bench wedges: one rcvbuf overrun dropped install ACKs;
+/// netlink-proto 0.12.2 request futures have no timeout of their own).
+const NL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Attempts per request under [`ack_bounded`]: the original send plus
+/// two re-issues. Route programming is idempotent (NLM_F_REPLACE, and
+/// deletes tolerate ESRCH), so a re-issue cannot double-install; after
+/// the budget the request is reported lost and the reconcile tick
+/// retries the route as a whole.
+const NL_ACK_ATTEMPTS: usize = 3;
+/// F9's optional half: the receive-buffer size the daemon asks for at
+/// socket creation (see [`NetlinkDataplane::new`] for the sizing story
+/// and the `rmem_max` cap disclosure).
+const NL_RCVBUF_ASK: libc::c_int = 8 * 1024 * 1024;
+
+/// The bounded-ACK outcome of one netlink request (F9).
+enum AckWait<T> {
+    /// The kernel answered inside the deadline — with success or with a
+    /// netlink error (an answer is an answer; errors never re-issue).
+    Answered(Result<T, rtnetlink::Error>),
+    /// Every attempt stayed silent past [`NL_ACK_TIMEOUT`]: the ACK is
+    /// presumed lost to a receive-buffer overrun.
+    Silent,
+}
+
+/// Runs one netlink request attempt under [`NL_ACK_TIMEOUT`], logging
+/// and re-issuing while the kernel stays silent (F9's resync).
+///
+/// A timed-out attempt is dropped, not leaked on the wire: the kernel
+/// may still be processing it, and the request machinery's pending
+/// entry ages out of netlink-proto's table when (or if) the late reply
+/// arrives. Programming is idempotent, so overlap between a slow
+/// original and its re-issue converges to the same kernel state.
+async fn ack_bounded<T, F, Fut>(what: &'static str, attempt: F) -> AckWait<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, rtnetlink::Error>>,
+{
+    ack_bounded_within(NL_ACK_TIMEOUT, what, attempt).await
+}
+
+/// [`ack_bounded`] with an explicit deadline — the test seam (the
+/// production bound is minutes too long to wait in real time, and the
+/// workspace's tokio carries no `test-util` feature to pause it).
+async fn ack_bounded_within<T, F, Fut>(
+    deadline: std::time::Duration,
+    what: &'static str,
+    mut attempt: F,
+) -> AckWait<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, rtnetlink::Error>>,
+{
+    for no in 1..=NL_ACK_ATTEMPTS {
+        match tokio::time::timeout(deadline, attempt()).await {
+            Ok(answer) => return AckWait::Answered(answer),
+            Err(_elapsed) => {
+                warn!(
+                    request = what,
+                    attempt = no,
+                    ?deadline,
+                    "netlink request silent (ACK lost to an rcvbuf overrun?); re-issuing"
+                );
+            }
+        }
+    }
+    AckWait::Silent
+}
+
 impl Dataplane for NetlinkDataplane {
     /// Installs or atomically replaces a route (RTM_NEWROUTE, NLM_F_REPLACE).
+    ///
+    /// F9: the ACK wait is bounded — a lost ACK (rcvbuf overrun) re-issues
+    /// the idempotent replace instead of hanging the caller.
     #[instrument(level = "debug", skip(self), fields(prefix = %entry.prefix))]
     async fn route_replace(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
         let _census = crate::cpucensus::scope(&crate::cpucensus::NL_REQUEST);
-        self.handle
-            .route()
-            .add(msg)
-            .replace()
-            .execute()
-            .await
-            .map_err(nl_err)?;
+        match ack_bounded("route add/replace", || {
+            self.handle.route().add(msg.clone()).replace().execute()
+        })
+        .await
+        {
+            AckWait::Answered(result) => result.map_err(nl_err)?,
+            AckWait::Silent => {
+                return Err(DataplaneError::Other(format!(
+                    "netlink route add/replace for {} silent past {} attempts at {:?} \
+                     (F9: ACK presumed lost to an rcvbuf overrun)",
+                    entry.prefix, NL_ACK_ATTEMPTS, NL_ACK_TIMEOUT
+                )));
+            }
+        }
         debug!("route installed");
         Ok(())
     }
@@ -786,21 +1000,37 @@ impl Dataplane for NetlinkDataplane {
     async fn route_delete(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
         let _census = crate::cpucensus::scope(&crate::cpucensus::NL_REQUEST);
-        if let Err(e) = self.handle.route().del(msg).execute().await {
-            // ESRCH: the kernel no longer holds this route. That is the
-            // goal state of a delete, so it is success — notably when a
-            // link-down flushed the route without a DELROUTE notification
-            // (the RIB must be able to drop its belief, or a later
-            // re-resolve would wrongly look already-programmed).
-            let already_absent = matches!(
-                &e,
-                rtnetlink::Error::NetlinkError(m)
-                    if m.code == std::num::NonZeroI32::new(-libc::ESRCH)
-            );
-            if !already_absent {
-                return Err(nl_err(e));
+        match ack_bounded("route delete", || {
+            self.handle.route().del(msg.clone()).execute()
+        })
+        .await
+        {
+            AckWait::Answered(result) => {
+                if let Err(e) = result {
+                    // ESRCH: the kernel no longer holds this route. That is
+                    // the goal state of a delete, so it is success — notably
+                    // when a link-down flushed the route without a DELROUTE
+                    // notification (the RIB must be able to drop its belief,
+                    // or a later re-resolve would wrongly look
+                    // already-programmed).
+                    let already_absent = matches!(
+                        &e,
+                        rtnetlink::Error::NetlinkError(m)
+                            if m.code == std::num::NonZeroI32::new(-libc::ESRCH)
+                    );
+                    if !already_absent {
+                        return Err(nl_err(e));
+                    }
+                    debug!("route already absent (ESRCH); delete is idempotent");
+                }
             }
-            debug!("route already absent (ESRCH); delete is idempotent");
+            AckWait::Silent => {
+                return Err(DataplaneError::Other(format!(
+                    "netlink route delete for {} silent past {} attempts at {:?} \
+                     (F9: ACK presumed lost to an rcvbuf overrun)",
+                    entry.prefix, NL_ACK_ATTEMPTS, NL_ACK_TIMEOUT
+                )));
+            }
         }
         debug!("route deleted");
         Ok(())
@@ -1204,6 +1434,7 @@ fn remove_run_file(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtnetlink::packet_core::NetlinkHeader;
 
     /// The sysctl path is the canonical procfs location keyed by
     /// interface name (what the container smoke greps for).
@@ -1213,5 +1444,159 @@ mod tests {
             rp_filter_path("vethspoof"),
             "/proc/sys/net/ipv4/conf/vethspoof/rp_filter"
         );
+    }
+
+    // ---- F9: the bounded ACK + resync --------------------------------
+
+    /// The wedge shape from the bench evidence: the first attempt's ACK
+    /// never arrives (the kernel dropped it), the second lands — the
+    /// request re-issues instead of hanging. The seam deadline keeps the
+    /// wait at milliseconds (production runs [`NL_ACK_TIMEOUT`]).
+    #[tokio::test]
+    async fn ack_bounded_reissues_a_silent_request_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let outcome: AckWait<()> =
+            ack_bounded_within(std::time::Duration::from_millis(10), "test", || {
+                let silent = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if silent {
+                        futures::future::pending::<()>().await;
+                        unreachable!("the wedged attempt must be dropped at its deadline");
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        assert!(matches!(outcome, AckWait::Answered(Ok(()))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A permanently silent request consumes exactly the attempt budget
+    /// and reports `Silent` — the caller surfaces an error instead of
+    /// parking forever (the F9 wedge the escalation pinned).
+    #[tokio::test]
+    async fn ack_bounded_gives_up_after_the_attempt_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let outcome: AckWait<()> =
+            ack_bounded_within(std::time::Duration::from_millis(10), "test", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                futures::future::pending::<Result<(), rtnetlink::Error>>()
+            })
+            .await;
+        assert!(matches!(outcome, AckWait::Silent));
+        assert_eq!(attempts.load(Ordering::SeqCst), NL_ACK_ATTEMPTS);
+    }
+
+    /// A kernel ANSWER — success or error — is final on the first
+    /// attempt: re-issuing an answered error would only duplicate
+    /// kernel work (ESRCH tolerance is the caller's business).
+    #[tokio::test]
+    async fn ack_bounded_forwards_kernel_errors_without_reissue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let outcome: AckWait<()> = ack_bounded("test", || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(rtnetlink::Error::RequestFailed) }
+        })
+        .await;
+        assert!(matches!(
+            outcome,
+            AckWait::Answered(Err(rtnetlink::Error::RequestFailed))
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// The framed layer's ENOBUFS synthesis (framed.rs: default header,
+    /// NLMSG_OVERRUN, empty body) classifies as the resync trigger;
+    /// inner messages keep their event/skip mapping.
+    #[test]
+    fn overrun_marker_classifies_for_resync() {
+        let overrun = NetlinkMessage::new(
+            NetlinkHeader::default(),
+            NetlinkPayload::Overrun(Vec::new()),
+        );
+        assert!(matches!(classify_rx(overrun), RxStep::Overrun));
+
+        let mut link = LinkMessage::default();
+        link.header.index = 2;
+        link.attributes.push(LinkAttribute::IfName("eth0".into()));
+        let new_link = NetlinkMessage::new(
+            NetlinkHeader::default(),
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)),
+        );
+        match classify_rx(new_link) {
+            RxStep::Event(DataplaneEvent::LinkNew { ifindex, .. }) => assert_eq!(ifindex, 2),
+            other => panic!("expected a LinkNew event, got {other:?}"),
+        }
+    }
+
+    /// The drain-and-resync ordering: events already queued ahead of an
+    /// overrun marker surface first, the resync's mirror refresh drains
+    /// next, and the stream behind the marker continues — recovery, not
+    /// restart (the "socket is not dead, just behind" contract).
+    #[tokio::test]
+    async fn overrun_pump_drains_resyncs_then_recovers() {
+        fn link_msg(ifindex: u32, name: &str) -> NetlinkMessage<RouteNetlinkMessage> {
+            let mut link = LinkMessage::default();
+            link.header.index = ifindex;
+            link.attributes.push(LinkAttribute::IfName(name.into()));
+            NetlinkMessage::new(
+                NetlinkHeader::default(),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)),
+            )
+        }
+        let addr = SocketAddr::new(0, 0);
+        let mut stream = futures::stream::iter(vec![
+            (link_msg(2, "eth0"), addr),
+            (
+                NetlinkMessage::new(
+                    NetlinkHeader::default(),
+                    NetlinkPayload::Overrun(Vec::new()),
+                ),
+                addr,
+            ),
+            (link_msg(3, "eth1"), addr),
+        ]);
+        let mut backlog = std::collections::VecDeque::new();
+
+        // Before the marker: the plain event.
+        let first = next_event_with(&mut stream, &mut backlog, || async { Vec::new() }).await;
+        assert!(matches!(
+            first,
+            Some(DataplaneEvent::LinkNew { ifindex: 2, .. })
+        ));
+
+        // The marker: the resync queue fills, and its events drain ahead
+        // of the stream (marker events stand in for the re-dump here —
+        // `resync_link_address_mirror` needs a live kernel) — starting
+        // with the very call that observed the marker.
+        let resync_first = next_event_with(&mut stream, &mut backlog, || async {
+            vec![
+                DataplaneEvent::LinkDel { ifindex: 98 },
+                DataplaneEvent::LinkDel { ifindex: 99 },
+            ]
+        })
+        .await;
+        assert!(matches!(
+            resync_first,
+            Some(DataplaneEvent::LinkDel { ifindex: 98 })
+        ));
+        let resync_second =
+            next_event_with(&mut stream, &mut backlog, || async { Vec::new() }).await;
+        assert!(matches!(
+            resync_second,
+            Some(DataplaneEvent::LinkDel { ifindex: 99 })
+        ));
+
+        // Behind the marker: reading continues where it left off.
+        let after = next_event_with(&mut stream, &mut backlog, || async { Vec::new() }).await;
+        assert!(matches!(
+            after,
+            Some(DataplaneEvent::LinkNew { ifindex: 3, .. })
+        ));
+        let end = next_event_with(&mut stream, &mut backlog, || async { Vec::new() }).await;
+        assert!(end.is_none());
     }
 }
