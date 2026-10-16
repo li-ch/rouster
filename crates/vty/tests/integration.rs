@@ -319,10 +319,8 @@ fn vtyd(args: &[&str]) -> Output {
     // reachable before issuing the command, so a bounded retry is
     // honest — expected failure codes (2 usage / 3 not-found / 4
     // not-running) are NOT retried.
-    for _ in 0..3 {
-        if output.status.code() != Some(1) {
-            break;
-        }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while output.status.code() == Some(1) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
         output = Command::new(env!("CARGO_BIN_EXE_vtyd"))
             .args(args)
@@ -703,32 +701,51 @@ fn binary_write_file_end_to_end_through_a_stub_configd() {
     std::fs::write(&canonical, seeded).unwrap();
     let stub = stub_configd(&dir);
 
-    let port = free_port();
-    let config = dir.join("vtyd-write.conf");
-    std::fs::write(
-        &config,
-        format!(
-            "port {port}\nbind 127.0.0.1\nrun-dir {}\ncanonical {}\nhostname bin-w1\n",
-            dir.display(),
-            canonical.display()
-        ),
-    )
-    .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vtyd"))
-        .arg("--config")
-        .arg(&config)
-        .env("ROUSTER_CONFIGD_BIN", &stub)
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn vtyd server");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+    // The free-port probe races sibling test binaries under the
+    // workspace fork storm (the bfdd/vty helper precedent): an
+    // AddrInUse early exit means a fresh port, not a failure.
+    let mut child = None;
+    let mut port = 0u16;
+    for _ in 0..8 {
+        port = free_port();
+        let config = dir.join("vtyd-write.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "port {port}\nbind 127.0.0.1\nrun-dir {}\ncanonical {}\nhostname bin-w1\n",
+                dir.display(),
+                canonical.display()
+            ),
+        )
+        .unwrap();
+        let mut spawned = Command::new(env!("CARGO_BIN_EXE_vtyd"))
+            .arg("--config")
+            .arg(&config)
+            .env("ROUSTER_CONFIGD_BIN", &stub)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vtyd server");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                child = Some(spawned);
+                break;
+            }
+            if spawned.try_wait().expect("child state").is_some() {
+                break; // early exit: fresh port
+            }
+            if Instant::now() >= deadline {
+                let _ = spawned.kill();
+                let _ = spawned.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if child.is_some() {
             break;
         }
-        assert!(child.try_wait().expect("child state").is_none());
-        std::thread::sleep(Duration::from_millis(25));
     }
+    let mut child = child.expect("vtyd server never listened after 8 attempts");
 
     // A one-shot write over the real binary pair: a fresh session
     // seeds from the canonical, so this write is the idempotence leg
