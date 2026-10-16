@@ -173,7 +173,7 @@ for N in $NS; do
                 wait_up "$SUT" "frr bgpd bound :179" 30 "grep -qi '00B3' /proc/net/tcp"
             else
                 SUT_DIAG_ENV=""
-                [ "$DIAGNOSE" = 1 ] && SUT_DIAG_ENV="-e BGPD_EST_PROFILE=1"
+                [ "$DIAGNOSE" = 1 ] && SUT_DIAG_ENV="-e BGPD_EST_PROFILE=/var/log/bgpd-estprof.log"
                 docker run -d --name "$SUT" --network "$NET_NAME" --ip "$SUT_IP" \
                     --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS $SUT_DIAG_ENV \
                     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
@@ -280,6 +280,7 @@ EOF
                 docker cp "$SUT:/tmp/$f.log" "$RUN_DIR/$f.log" 2>/dev/null || true
             done
             docker cp "$SUT:/var/log/rouster-bgpd.log" "$RUN_DIR/sut-bgpd.log" 2>/dev/null || true
+            docker cp "$SUT:/var/log/bgpd-estprof.log" "$RUN_DIR/estprof.log" 2>/dev/null || true
             docker cp "$SUT:/var/log/rousterd.log" "$RUN_DIR/rousterd.log" 2>/dev/null || true
             if [ "$MODE" = frr ]; then
                 docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary'" \

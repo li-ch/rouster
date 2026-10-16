@@ -29,16 +29,23 @@
 //!   message counts, EOR handling, and frame decode.
 //!
 //! Emission: one `EST-PROF-EST` line at the Established transition and
-//! one `EST-PROF-END` line at session end, both to stderr (the bench
-//! harness captures bgpd's stderr) in `key=value` form — deliberately
-//! NOT through tracing, so the profiler's own cost stays out of the
-//! subscriber's formatting path and the lines stay trivially greppable.
+//! one `EST-PROF-END` line at session end, plus a periodic
+//! `EST-PROF-SNAP` aggregate line (the harness kills the daemon with
+//! sessions still live, so the snapshot series — not the END lines —
+//! carries the import-path totals in bench shape). `BGPD_EST_PROFILE=1`
+//! emits to stderr; `BGPD_EST_PROFILE=<path>` appends to a dedicated
+//! file (the bench shape: tracing's stdout and the profiler's stderr
+//! are separate buffers into one redirect, which can interleave
+//! mid-line — the dedicated file avoids that entirely). `key=value`
+//! form, deliberately NOT through tracing, so the profiler's own cost
+//! stays out of the subscriber's formatting path.
 //!
 //! Scoping: keyed by peer address (one live session per neighbor by
 //! the registry's construction; a re-connect overwrites — a bench-shape
 //! disclosure, not a production observability surface).
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -70,7 +77,36 @@ struct Phases {
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("BGPD_EST_PROFILE").is_some_and(|v| v != "0"))
+    *ENABLED.get_or_init(|| output_path().is_some())
+}
+
+/// `Some(None)` = stderr; `Some(Some(path))` = dedicated append file.
+fn output_path() -> Option<Option<std::path::PathBuf>> {
+    static PATH: OnceLock<Option<Option<std::path::PathBuf>>> = OnceLock::new();
+    PATH.get_or_init(|| match std::env::var_os("BGPD_EST_PROFILE") {
+        None => None,
+        Some(v) if v == "0" => None,
+        Some(v) if v == "1" => Some(None),
+        Some(v) => Some(Some(std::path::PathBuf::from(v))),
+    })
+    .clone()
+}
+
+/// One line to the profiler's sink (dedicated file, else stderr).
+fn emit(line: &str) {
+    match output_path() {
+        Some(Some(path)) => {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+        }
+        _ => eprintln!("{line}"),
+    }
 }
 
 fn collector() -> &'static Mutex<BTreeMap<IpAddr, Phases>> {
@@ -158,8 +194,84 @@ pub fn note_established(peer: IpAddr) {
         ));
     });
     if let Some(line) = line {
-        eprintln!("{line}");
+        emit(&line);
     }
+}
+
+/// One aggregate demand line across all sessions (ms, cumulative).
+/// Accept waits > 1 s are the idle pre-burst wait (the listener armed
+/// long before the fleet's first connect) and are excluded from the
+/// accept sum — a profiler heuristic, disclosed here.
+pub fn snapshot(t_ms: u128) {
+    if !enabled() {
+        return;
+    }
+    let mut peers = 0usize;
+    let mut established = 0usize;
+    let (mut accept, mut lookup, mut spawn_gap) = (0u64, 0u64, 0u64);
+    let (mut register, mut construct) = (0u64, 0u64);
+    let (mut open, mut openproc, mut est_wall, mut dump) = (0u64, 0u64, 0u64, 0u64);
+    let (mut update, mut update_n) = (0u64, 0u64);
+    let (mut eor, mut decode, mut frames_n) = (0u64, 0u64, 0u64);
+    {
+        let map = collector().lock().unwrap();
+        for p in map.values() {
+            peers += 1;
+            established += usize::from(p.est_seq > 0);
+            if p.accept_us <= 1_000_000 {
+                accept += p.accept_us;
+            }
+            lookup += p.lookup_us;
+            spawn_gap += p.spawn_gap_us;
+            register += p.register_us;
+            construct += p.construct_us;
+            open += p.open_us;
+            openproc += p.openproc_us;
+            est_wall += p.est_us;
+            dump += p.dump_us;
+            update += p.update_us;
+            update_n += p.update_n as u64;
+            eor += p.eor_us;
+            decode += p.decode_us;
+            frames_n += p.frames_n as u64;
+        }
+    }
+    emit(&format!(
+        "EST-PROF-SNAP t_ms={t_ms} peers={peers} established={established} \
+         accept_ms={} lookup_ms={} spawn_gap_ms={} register_ms={} \
+         construct_ms={} open_ms={} openproc_ms={} est_wall_ms={} \
+         dump_ms={} update_ms={} update_n={} eor_ms={} decode_ms={} frames_n={}",
+        accept / 1000,
+        lookup / 1000,
+        spawn_gap / 1000,
+        register / 1000,
+        construct / 1000,
+        open / 1000,
+        openproc / 1000,
+        est_wall / 1000,
+        dump / 1000,
+        update / 1000,
+        update_n,
+        eor / 1000,
+        decode / 1000,
+        frames_n
+    ));
+}
+
+/// The periodic reporter (the bench window kills the daemon with
+/// sessions still live, so the snapshot series carries the totals).
+/// Called once from `Daemon::run` when profiling is on.
+pub fn spawn_reporter() {
+    if !enabled() {
+        return;
+    }
+    let start = Instant::now();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            snapshot(start.elapsed().as_millis());
+        }
+    });
 }
 
 pub fn note_dump(peer: IpAddr, t: Option<Instant>) {
@@ -203,6 +315,6 @@ pub fn note_end(peer: IpAddr, end: &str) {
         ));
     });
     if let Some(line) = line {
-        eprintln!("{line}");
+        emit(&line);
     }
 }

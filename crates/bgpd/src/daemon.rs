@@ -200,6 +200,9 @@ impl Daemon {
         let next_id = Arc::new(AtomicU64::new(1));
         let live = Arc::new(AtomicUsize::new(0));
         let restarts: Arc<Mutex<BTreeSet<IpAddr>>> = Arc::new(Mutex::new(BTreeSet::new()));
+        // F10 profiling: the periodic aggregate reporter (no-op unless
+        // BGPD_EST_PROFILE names this run).
+        crate::estprof::spawn_reporter();
 
         // Connectors for every non-passive neighbor (Events 1/3: the
         // active side; ConnectRetry per §10).
