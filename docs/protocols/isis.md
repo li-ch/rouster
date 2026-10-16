@@ -133,9 +133,14 @@ against its source and on the wire).
 
 ### Daemon (M5)
 
-- One p2p circuit; `is-type level-1-2` runs both levels' databases on
-  it (LSP exchange and SPF per level; L1 routes preferred over L2 —
-  RFC 1195 §3.10.1).
+- One circuit per daemon (p2p or broadcast — `network
+  point-to-point|broadcast`); `is-type level-1-2` runs both levels'
+  databases on it (LSP exchange and SPF per level; the RFC 1195
+  §3.10.2 preference ladder orders the results — see the S13-a
+  section). S13-a fixed `active_levels()`: it had yielded the slot's
+  `is_some()` where callers read a level flag, so an L1L2 daemon ran
+  its L2 database twice and never its L1 one (invisible while every
+  config and smoke was L2-only).
 - Own-LSP origination/refresh (§7.3.14's regeneration window), the
   adjacency in TLV 22, the interface prefix and redistributed
   statics in TLV 135.
@@ -165,32 +170,168 @@ our area runs L2 (`isis circuit-type level-2` pinned both sides);
 FRR's redistribute syntax is `redistribute ipv4 static level-2`;
 LSP IDs display as dynamic hostnames (RFC 5301).
 
-## §Deferred (the Day-2 pickup list)
+## S13-a — the Day-2 closeout
 
-- **L1/L2 ladders beyond one area**: inter-area prefix movement
-  (RFC 5302 up/down semantics on re-advertisement), L2→L1 leaking,
-  the full RFC 1195 §3.10.2 route-preference ladder (the daemon
-  prefers L1 over L2; the finer external-metric ordering is
-  unimplemented).
-- **Broadcast/LAN circuits**: DIS election, pseudonode LSPs, the LAN
-  SPF fan-out (the codec and FSM layers already carry the shapes;
-  the spf graph skips pseudonodes and the daemon ignores LAN IIHs).
-- **LSP fragmenting** beyond fragment 0 (`ISIS_MIN_LSP_BUF`-driven
-  splitting of TLV sets).
-- **Authentication**: TLV 10 shapes are modeled; cleartext/HMAC-MD5
-  enforcement (RFC 5304), key chains (the ospfd keychain crate
-  pattern), and SNP authentication modes are not wired.
-- **Prefix suppression**, **BFD for IS-IS adjacencies**, **MT
-  routing** (RFC 5120), **overload on-startup / max-metric**
-  administrative knobs, **SPF throttling** (the daemon runs SPF on
-  change), **LSP refresh jitter**, **ISO 10589 §7.3.15.6 rate
-  limiting** beyond the constant.
-- **RFC 7987** (minimum remaining lifetime for purges) — purges are
-  handled per plain §7.3.16.4.
-- **metric-style narrow/transition origination** (the grammar parses
-  them; only wide is originated).
+### Inter-area prefix movement and the §3.10.2 ladder (M1)
+
+- **The ladder** (RFC 1195 §3.10.2, quoted): for one prefix, "routes
+  learned via level 1 routing" beat level 2 routes; among
+  same-level candidates, "Routes using internal metrics only are
+  always preferred to routes using external metrics"; then the
+  shortest path (equal-cost load-splitting permitted — v1 installs
+  the deterministic first next hop). Implemented as a
+  `(level, external, metric)` preference key over both levels' SPF
+  results.
+- **L2→L1 leaking** behind `redistribute level-2 into level-1`
+  (opt-in): the L2 view's prefixes re-advertised into our L1 LSP with
+  the up/down bit set — RFC 5302 §2: "L1L2 routers MUST set this bit
+  to one for prefixes that are derived from L2 routing and are
+  advertised into L1 LSPs". Excluded: prefixes the L1 area already
+  reaches (leaking would only shadow local routing), L2 copies that
+  already carry the bit (leaked down from a higher domain), and our
+  own origins.
+- **L1→L2 movement** (the border's area-prefix re-advertisement):
+  L1-learned prefixes ride our L2 LSP with the bit clear, honouring
+  RFC 5302's loop prevention MUST NOT: "Prefixes with the up/down bit
+  set that are learned via L1 routing MUST NOT be advertised by L1L2
+  routers back into L2". `Route` carries the bit from both
+  advertisement families (TLV 135's control octet; the
+  default-metric octet's bit 7 on TLV 128/130, which RFC 5302
+  redefined).
+- Both inter-area sets re-originate only on change; leaked metrics
+  are the source level's total (distance + prefix metric).
+
+### Broadcast/LAN circuits (M2)
+
+- **DIS election** (ISO §8.4.4, verbatim): "A LAN Designated
+  Intermediate System is the highest priority Intermediate system in
+  a particular set on the LAN, with numerically highest MAC source
+  lANAddress breaking ties" — the set being ourselves plus the
+  systems with Up adjacencies, with §8.4.4's standing condition that
+  an IS "shall not declare itself" DIS "until it has at least one Up
+  Intermediate system adjacency on the circuit". Preemptive
+  (§7.2.3's resignation on takeover), per level, our LAN ID =
+  systemID + nonzero Local Circuit ID.
+- **The LAN IIH dance**: acceptance per §8.4.1.2/§8.4.1.3 (disjoint
+  areas reject at L1 only; L2 always accepts), the Up condition of
+  §8.4.1.5 ("R reports this circuit's lANAddress in its Level n LAN
+  IIH PDUs" — the CODE 6 SNPA list), hold expiry per §8.4.1.5.
+  CODE 6 lists Up AND Initializing neighbours — FRR 10.2.2's
+  `isis_adj_build_neigh_list` parity; listing only Up would deadlock
+  the first-heard dance.
+- **Pseudonode LSPs** (§7.2.3): the DIS originates one reporting "a
+  link to each of the Intermediate systems ... with a zero metric"
+  (itself included, §7.3.8's "own systemID with an appended zero
+  octet"); resignation purges it at the stored sequence.
+- **The LAN SPF fan-out**: graph vertices are full (system,
+  pseudonode) ids — a router LSP's pseudonode adjacency entry is an
+  edge to the LAN vertex at the circuit metric, and the pseudonode
+  LSP fans out at metric zero. Next hops resolve THROUGH the LAN to
+  the member itself (frames cross the segment straight to its MAC);
+  the per-endpoint LAN costing is ISO's (each side pays only its own
+  attachment). The Bellman-Ford oracle and both property tests run
+  over random LAN topologies.
+- The DIS duty: periodic CSNPs every CompleteSNPInterval (§7.3.15.3,
+  10 s), hellos at a third of the interval (§9.5's
+  dRISISHelloTimer); broadcast LSP receipts are not PSNP-acked (the
+  DIS CSNP carries the ack). Interface knobs: `network broadcast`,
+  `priority <0-127>`.
+
+### Authentication (M3)
+
+- **TLV 10 cleartext** (ISO §9.7) and **HMAC-MD5** (RFC 5304): type
+  54, a 17-octet TLV value with **no Key ID** (§3.4 rejected one);
+  the digest over the PDU with the auth value zeroed and, for LSPs,
+  the Checksum and Remaining Lifetime zeroed too (§2) — so
+  re-flooding decrements never break it. Engines: MD5 (RFC 1321)
+  and HMAC-MD5 (RFC 2104) in pure safe Rust, the ospfd `auth.rs`
+  pattern, self-verified against the RFCs' vectors (RFC 1321 A.5,
+  RFC 2202).
+- **Key chains** (RFC 8177, the ospfd `keychain.rs` shape): send =
+  the live key with the most recent start; accept = any key inside
+  its accept window — i.e. RFC 5304 §2's multiple-password
+  permission, since nothing on the wire names the key.
+- **Grammar**: `area-password|domain-password cleartext|hmac-md5
+  <secret> [snp-auth off|send-only|validate]` — the per-level
+  passwords (§7.3.7/§7.3.9) and the SNP modes (`send-only` is RFC
+  5304's transition mode; ISO's default with a password set is
+  validate).
+- Every origination signs BEFORE its database install (the stored
+  and flooded copies must agree, or §7.3.16.2's confusion purge
+  would meet our own unsigned checksum); hellos sign after the MTU
+  padding (RFC 5304 §2); receive drops unsigned/incorrect PDUs when
+  the level's password is configured ("MUST discard"); the purges we
+  initiate carry the TLV (the unauthenticated-purge prohibition).
+  Elided, disclosed: the per-circuit hello password — p2p IIHs sign
+  with the level password of their circuit type.
+
+### Fragments, pacing, lifetimes (M4)
+
+- **Fragmenting** (§7.3.4): the TLV set splits across the LSP number
+  space — area addresses only in fragment 0, IS-neighbour entries in
+  the lowest fragments ahead of every prefix family, entry-granular
+  splitting under the 255-octet TLV value cap, the 256-fragment
+  ceiling, emptied higher fragments purged. Per-fragment sequence
+  counters (§7.3.16.1: "different values of LSP number are
+  independent"); refresh reissues only the stale fragment (§7.3.4h).
+  The SPF merges families per §7.2.5 ("If an LSP with LSP number 0
+  is not present, or has a zero Remaining Lifetime, fragments n>0
+  shall be ignored"); the type block reads from fragment 0.
+- **Refresh jitter** (§7.3.5 + §10.1): fragment 0 refreshes at the
+  plain window; higher fragments stagger by up to 25%
+  (deterministic per LSP id) so a large family does not refresh in
+  one burst.
+- **Circuit pacing** (§7.3.15.5/§7.3.15.6): the 5 s same-LSP
+  transmission interval and the 30-LSPs-per-second circuit cap
+  (1000/33); blocked LSPs queue, the pump rescans every tick (the
+  §7.3.15.6 floor), and a paced head blocks no fresher LSP.
+- **RFC 7987**: a newer received LSP with remaining lifetime below
+  MaxAge is stored at MaxAge (the step added to §7.3.15.1.e(1)) —
+  the lifetime is covered by neither the checksum nor the HMAC, so
+  corruption can only shorten an LSP's life up to the originator's
+  own refresh.
+
+### The administrative knobs (M5)
+
+- `set-overload-bit [on-startup <secs>] [suppress-prefixes]` — the
+  LSPDBOL (§9.8) rides our LSPs; suppress-prefixes originates no
+  prefixes while overloaded (TLV 132 stays).
+- `prefix-suppression` (interface) — the connected prefix leaves
+  TLV 135; redistributed prefixes stay.
+- `spf-throttle <initial-ms> <increment-ms> <max-ms>` — the ospfd
+  `SpfScheduler` back-off pattern; `(0, 0, 0)` (default) computes on
+  change.
+- `metric-style narrow|transition` now originates: narrow emits
+  TLV 2 + TLV 128 (the deployed 11/12-octet forms, S-octets 0x80,
+  up/down on the default-metric octet, metrics clamped to the
+  six-bit space); transition carries both families (RFC 1195's
+  transition mode).
+
+### The broadcast interop smoke
+
+`scripts/test-isis-broadcast-interop.sh` — the p2p smoke's LAN leg:
+FRR 10.2.2 in default broadcast mode against our `network broadcast`
+daemon at priority 100. Machine checks: ATTACH, ADJACENCY-BOTH (the
+CODE 6 dance), **DIS-US** (FRR's database holds OUR pseudonode LSP
+`rouster-r2.01-00` and no r1 one), LSDB-BOTH, REDIST both
+directions through the LAN, 30 s SOAK.
+
+## §Deferred (the remaining list)
+
 - **IPv6** (NLPID 0x8E, TLV 236, multi-topology): the AF-generic
   invariant's IS-IS seam is `tlv.rs`'s v4-specific entries.
-- The netlink-dp `IsIs→RTPROT_ISIS` one-liner was this stream's one
-  cross-fence edit (disclosed in the report); adjudication may want
+- **BFD for IS-IS adjacencies**; **MT routing** (RFC 5120) and its
+  TLV 22/135 sub-TLV consumers; **RFC 5310** (SHA-family
+  authentication).
+- **Key-chain rollover on wall-clock time** (RFC 8177's §2.4 —
+  cross-router rollover wants NTP-anchored lifetimes; the model and
+  selection rules are in, the config exposes one always-live key).
+- **Leaking policy** (route-map-style filtering of what moves
+  between levels; v1 leaks all qualifying prefixes).
+- **The ES neighbours options** (TLV 3/4?) and OSI-only forwarding —
+  the v4-only v1 daemon rejects OSI-only peers.
+- Timed rollover + per-circuit transmit passwords beyond the
+  level-password elision (ISO §7.3.7's circuitTransmitPassword).
+- The netlink-dp `IsIs→RTPROT_ISIS` one-liner was S10-a's one
+  cross-fence edit (disclosed in its report); adjudication may want
   to fold it into netlink-dp's own change discipline.

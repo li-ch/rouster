@@ -11,10 +11,13 @@
 //!  hostname rouster-r2
 //!  redistribute static
 //!  redistribute level-2 into level-1
+//!  domain-password hmac-md5 hush-hush snp-auth send-only
+//!  spf-throttle 0 50 5000
 //!  interface eth0
 //!   address 172.16.0.2/24
 //!   circuit-type level-1-2
 //!   network broadcast
+//!   priority 64
 //!   hello-interval 10
 //!   hello-multiplier 3
 //!   mtu 1500
