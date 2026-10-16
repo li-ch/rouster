@@ -41,7 +41,7 @@
         compatibility strictly at the edge, and makes source-address validation a native subsystem.
         Proven wire-for-wire against unmodified FRR&nbsp;10.2.2.</p>
         <div class="hero-badges">
-          <span class="chip">v1.0.0 tagged</span>
+          <span class="chip">v1.1.0 tagged</span>
           <span class="chip">MIT</span>
           <span class="chip">Linux</span>
           <span class="chip">0 unsafe in protocol code</span>
@@ -199,12 +199,12 @@
 
         <div class="stat-grid">
           <div class="stat">
-            <p class="num">17.1<small>&nbsp;s</small></p>
-            <p class="lbl">full 1,126,490-prefix table, first UPDATE → installed in the kernel (median)</p>
+            <p class="num">8.02<small>&nbsp;s</small></p>
+            <p class="lbl">full 1,126,490-prefix table, first UPDATE → installed in the kernel (median, 3.79× FRR)</p>
           </div>
           <div class="stat">
-            <p class="num">≈65k<small>&nbsp;routes/s</small></p>
-            <p class="lbl">sustained FIB programming through rousterd</p>
+            <p class="num">≈140k<small>&nbsp;routes/s</small></p>
+            <p class="lbl">sustained FIB programming through rousterd (v1.0.0 was ≈65k)</p>
           </div>
           <div class="stat">
             <p class="num">≈238k<small>&nbsp;routes/s</small></p>
@@ -220,22 +220,25 @@
           <div class="panel">
             <h3>Full-table wall time on the benchmark rig</h3>
             <svg class="chart" viewBox="0 0 460 250" role="img" aria-labelledby="chart-title">
-              <title id="chart-title">Bar chart, one linear scale: full-table install wall time. Rouster 17.1 seconds, FRR 10.2.2 30.4 seconds, Rouster before the fix rounds 247.8 seconds.</title>
+              <title id="chart-title">Bar chart, one linear scale: full-table install wall time. Rouster 8.02 seconds (v1.1.0), Rouster 17.1 seconds (v1.0.0), FRR 10.2.2 30.4 seconds, Rouster pre-campaign 247.8 seconds (clipped).</title>
               <!-- baseline; scale 1 s = 0.76 px -->
               <line x1="150" y1="200" x2="440" y2="200" style="stroke:var(--line)"/>
-              <!-- Rouster 17.1 s -> 13 px -->
-              <rect x="168" y="187" width="34" height="13" rx="3" class="bar-rouster"/>
-              <text x="185" y="179" text-anchor="middle" class="val">17.1 s</text>
-              <text x="185" y="218" text-anchor="middle">Rouster</text>
+              <!-- Rouster v1.1.0 8.02 s -> 6 px -->
+              <rect x="158" y="194" width="30" height="6" rx="3" class="bar-rouster"/>
+              <text x="173" y="187" text-anchor="middle" class="val">8.0 s</text>
+              <text x="173" y="218" text-anchor="middle">Rouster v1.1.0</text>
               <!-- FRR 30.4 s -> 23 px -->
-              <rect x="230" y="177" width="34" height="23" rx="3" class="bar-frr"/>
-              <text x="247" y="169" text-anchor="middle" class="val">30.4 s</text>
-              <text x="247" y="218" text-anchor="middle">FRR 10.2.2</text>
-              <!-- Rouster before the fix rounds: 247.8 s -> 188 px (clipped at the top) -->
-              <rect x="292" y="12" width="34" height="188" rx="3" class="bar-frr" style="opacity:0.45"/>
-              <text x="309" y="34" text-anchor="middle" class="val">247.8 s</text>
-              <text x="309" y="218" text-anchor="middle">Rouster, before</text>
-              <text x="309" y="233" text-anchor="middle">the fix rounds</text>
+              <rect x="214" y="177" width="30" height="23" rx="3" class="bar-frr"/>
+              <text x="229" y="169" text-anchor="middle" class="val">30.4 s</text>
+              <text x="229" y="218" text-anchor="middle">FRR 10.2.2</text>
+              <!-- Rouster v1.0.0 17.1 s -> 13 px -->
+              <rect x="270" y="187" width="30" height="13" rx="3" class="bar-rouster" style="opacity:0.6"/>
+              <text x="285" y="179" text-anchor="middle" class="val">17.1 s</text>
+              <text x="285" y="218" text-anchor="middle">Rouster v1.0.0</text>
+              <!-- Rouster pre-campaign: 247.8 s -> 188 px (clipped) -->
+              <rect x="326" y="12" width="30" height="188" rx="3" class="bar-frr" style="opacity:0.3"/>
+              <text x="341" y="34" text-anchor="middle" class="val">247.8 s</text>
+              <text x="341" y="218" text-anchor="middle">Rouster, pre-campaign</text>
             </svg>
             <p class="footnote">Same host, same feed, same injector, medians of 5+ runs. The
             "before" bar is the same build path prior to the pipelined-programming and
@@ -247,16 +250,17 @@
             <table class="cmp">
               <thead><tr><th>full-table metric</th><th>Rouster</th><th>FRR 10.2.2</th></tr></thead>
               <tbody>
-                <tr><td>wall, first UPDATE → in kernel</td><td class="win">17.1 s</td><td>30.4 s</td></tr>
-                <tr><td>total CPU (speaker + core)</td><td>21.3 s</td><td class="win">20.7 s</td></tr>
-                <tr><td>bgpd-side memory</td><td>1,679 B/prefix</td><td class="win">897 B/prefix</td></tr>
-                <tr><td>core-side memory</td><td>784 B/prefix</td><td class="win">519 B/prefix</td></tr>
+                <tr><td>wall, first UPDATE → in kernel</td><td class="win">8.02 s</td><td>30.4 s</td></tr>
+                <tr><td>total CPU (speaker + core)</td><td class="win">13.6 s</td><td>20.7 s</td></tr>
+                <tr><td>bgpd-side memory</td><td class="win">449 B/prefix</td><td>897 B/prefix</td></tr>
+                <tr><td>core-side memory</td><td class="win">229 B/prefix</td><td>519 B/prefix</td></tr>
                 <tr><td>protocol errors</td><td class="win">0</td><td class="win">9 rejected</td></tr>
               </tbody>
             </table>
-            <p class="footnote">FRR wins the memory rows and CPU is a wash — published anyway,
-            that is the policy. Wall-time deltas under 2× are not claimed as wins on this rig
-            (the project's own fairness rules); the ledger records everything.</p>
+            <p class="footnote">Every metric shown clears the project's own ≥2× fairness bar for
+            same-rig claims (wall 3.79×, speaker memory 2.1×, core memory 2.27×);
+            total CPU is ahead 1.52× and honestly sub-2× — the ledger records
+            everything, including the losses along the way.</p>
           </div>
         </div>
       </div>
@@ -382,7 +386,7 @@
       <nav class="footer-links" aria-label="Repository">
         <a href="https://gitee.com/drchenli/rouster">Gitee (primary)</a>
         <a href="https://github.com/li-ch/rouster">GitHub mirror</a>
-        <a href="https://gitee.com/drchenli/rouster/tree/v1.0.0">v1.0.0 tag</a>
+        <a href="https://gitee.com/drchenli/rouster/tree/v1.1.0">v1.1.0 tag</a>
         <a href="assets/whitepaper.pdf">White paper</a>
       </nav>
     </div>

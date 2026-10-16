@@ -117,3 +117,36 @@ The goals-metting release: every plan pillar landed and live-proven.
   decoder).
 
 [1.0.0]: https://gitee.com/drchenli/rouster/releases/tag/v1.0.0
+
+## [1.1.0] — 2026-10-16
+
+The performance release: three of four headline metrics ≥2× ahead
+of FRR 10.2.2 on the same rig, same feed, same injector.
+
+### Performance (all receipts in docs/benchmarks.md §R)
+
+- **Full-table wall: 8.02 s median** (was 17.1 s; FRR's 30.36 s) —
+  **3.79×**, clearing the project's ≥2× claim bar.
+- **Speaker memory: 449 B/prefix** (was 1,679; FRR's 897) —
+  **2.1×** — via census-named attribute interning + per-peer
+  sharing.
+- **Core memory: 229 B/prefix** (was 784; FRR's 519) — **2.27×** —
+  via nexthop-group interning (a 100,000× duplication found), the
+  slim programmed belief, and the inline single-candidate slot.
+- **CPU ahead on both processes**: bgpd 6.88 s (FRR 11.03),
+  rousterd 6.95 s (FRR zebra 9.67); the pair 13.6 vs 20.7 s
+  (1.52×, honestly sub-2×).
+
+### Fixed
+
+- Finding F9 diagnosed and the SUT-side hardening queued: the
+  netlink rcvbuf overrun path (dropped ACKs → netlink-proto
+  futures awaiting forever) — the harness now carries 32 MiB
+  rcvbuf slack symmetrically; the daemon-side fix is an owner
+  decision.
+- The IS-IS Day-2 depth list, F3 first-AS enforcement, the
+  RESTCONF v2 unix-socket security posture, and the fuzz CI
+  upgrade (whose first dispatch caught a real OOB in the RTR
+  decoder) — all landed between 1.0.0 and this release.
+
+[1.1.0]: https://gitee.com/drchenli/rouster/releases/tag/v1.1.0
