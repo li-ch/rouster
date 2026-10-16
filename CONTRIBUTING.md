@@ -86,7 +86,49 @@ Anything that changes how a real FRR daemon behaves when attached belongs
 in `docs/interop/frr-10.2-interop.md` too — future readers will want to
 know what was observed, not just what was intended.
 
-## CI: the two pipelines
+## Fuzzing the wire codecs
+
+AGENTS.md invariant 7: every wire codec is fuzzed with cargo-fuzz. Each
+codec crate carries a `fuzz/` subproject in cargo-fuzz's
+independent-workspace layout — its own `Cargo.toml` (a path dependency
+on the crate, `libfuzzer-sys`, and a `[workspace]` table of its own), so
+the fuzz crates build outside the Rust workspace and the root manifest
+never mentions them. Targets: `zapi_decode`, `bgp_decode`,
+`ospf_packet_decode`, `isis_pdu_decode`, `bfd_packet_decode`,
+`rtr_pdu_decode`. The oracle is the decode `Result` — `Ok` and `Err` are
+both fine; a panic (unwrap, index, slice) inside the codec is the bug.
+
+Nightly is required to *drive* the fuzzers (libFuzzer's sanitizers ride
+`-Z` flags) — that's the nightly toolchain, not nightly *features*: the
+workspace tree and the fuzz targets themselves stay stable-language.
+`rustup toolchain install nightly` once, then from a codec crate:
+
+```sh
+cargo install cargo-fuzz                      # once per machine
+cd crates/bgpd
+cargo +nightly fuzz build --fuzz-dir fuzz bgp_decode
+mkdir -p fuzz/corpus/bgp_decode
+cp fuzz/seeds/*.bin fuzz/corpus/bgp_decode/   # the checked-in seeds
+cargo +nightly fuzz run --fuzz-dir fuzz bgp_decode -- -max_total_time=90
+```
+
+`fuzz/corpus/` and `fuzz/artifacts/` are gitignored (cargo-fuzz's
+template); `fuzz/seeds/` is checked in — real FRR 10.2.2 wire frames for
+zapi, encode-API output for the other five. Extend it whenever a new
+message shape lands that the decoders should survive.
+
+A crash writes `fuzz/artifacts/<target>/crash-*` plus the panic and stack
+to the run log. Reproduce and minimize:
+
+```sh
+cargo +nightly fuzz run  --fuzz-dir fuzz <target> <crash-file>
+cargo +nightly fuzz tmin --fuzz-dir fuzz <target> <crash-file>
+```
+
+Fix the codec, then keep the crashing input (as `fuzz/crashes/` holds
+the RTR ErrorReport catch) so the fix carries its regression file.
+
+## CI: the three pipelines
 
 - **`ci.yml` (push/PR)** — the fast gate: `cargo fmt --check`,
   `clippy -D warnings` (plus the musl leg that actually compiles the
@@ -99,6 +141,11 @@ know what was observed, not just what was intended.
   provenance and pins in `docker/README.md`), pre-seeds every other
   image tag the scripts pin, pre-builds the musl binaries, and runs
   the runner unmodified. Smoke logs upload as an artifact on failure.
+- **`fuzz.yml` (nightly ~04:30 UTC + manual dispatch)** — the codec
+  fuzz net: a seeded 90-second libFuzzer burst per target on the
+  nightly toolchain (see "Fuzzing the wire codecs" above). It never
+  gates pushes; a red leg means a real finding — the crash file and
+  run log upload as artifacts for local reproduction.
 
 ### Running the suite locally
 
