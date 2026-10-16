@@ -44,6 +44,13 @@ pub struct InterfaceState {
 pub struct Table {
     /// All candidate routes per prefix, from every protocol.
     entries: BTreeMap<IpPrefix, Vec<RouteEntry>>,
+    /// PERF-P3: total candidate count, maintained incrementally by
+    /// [`Table::add`]/[`Table::remove`]. The status surface's per-table
+    /// route count was an O(table) candidates walk per publish —
+    /// fine at a 10 s cadence, not at the status file's 1 s refresh
+    /// (see rousterd's `STATUS_REFRESH_INTERVAL`); prefix count stays
+    /// O(1) via the map's own length.
+    candidate_count: usize,
 }
 
 impl Table {
@@ -51,8 +58,12 @@ impl Table {
     /// protocol with the same prefix.
     pub fn add(&mut self, entry: RouteEntry) {
         let candidates = self.entries.entry(entry.prefix).or_default();
+        let before = candidates.len();
         candidates.retain(|e| e.protocol != entry.protocol);
         candidates.push(entry);
+        // Same-protocol replacement keeps the count (retain removes at
+        // most the one same-protocol candidate; push adds one).
+        self.candidate_count += candidates.len() - before;
     }
 
     /// Withdraw all routes of `protocol` for `prefix`. Returns true if any
@@ -63,11 +74,18 @@ impl Table {
         };
         let before = candidates.len();
         candidates.retain(|e| e.protocol != protocol);
+        self.candidate_count -= before - candidates.len();
         let removed = candidates.len() != before;
         if candidates.is_empty() {
             self.entries.remove(prefix);
         }
         removed
+    }
+
+    /// `(candidate count, prefix count)` — O(1) (PERF-P3: the
+    /// incremental counterpart of the former status-side walk).
+    pub fn counts(&self) -> (usize, usize) {
+        (self.candidate_count, self.entries.len())
     }
 
     /// The selected best route for a prefix: lowest administrative distance,
@@ -1347,6 +1365,33 @@ mod tests {
             table.best(&"10.0.0.0/8".parse().unwrap()).unwrap().protocol,
             RouteProtocol::Ospf
         );
+    }
+
+    /// PERF-P3: the status surface's per-table counts are maintained
+    /// incrementally — adds, same-protocol replacements, multi-protocol
+    /// candidates, and withdrawals all keep `(routes, prefixes)` exact.
+    #[test]
+    fn table_counts_stay_exact_across_mutations() {
+        let mut rib = Rib::new();
+        let table = rib.table_mut(254);
+        assert_eq!(table.counts(), (0, 0));
+        table.add(entry("10.0.0.0/8", RouteProtocol::Bgp, 0));
+        table.add(entry("10.0.0.0/8", RouteProtocol::Ospf, 10));
+        assert_eq!(table.counts(), (2, 1));
+        // Same-protocol add replaces, not appends.
+        table.add(entry("10.0.0.0/8", RouteProtocol::Bgp, 5));
+        assert_eq!(table.counts(), (2, 1));
+        // A second prefix; then withdraw one protocol of the first.
+        table.add(entry("192.0.2.0/24", RouteProtocol::Bgp, 0));
+        assert_eq!(table.counts(), (3, 2));
+        assert!(table.remove(&"10.0.0.0/8".parse().unwrap(), RouteProtocol::Ospf));
+        assert_eq!(table.counts(), (2, 2));
+        // Withdrawing the last candidate drops the prefix row too.
+        assert!(table.remove(&"10.0.0.0/8".parse().unwrap(), RouteProtocol::Bgp));
+        assert_eq!(table.counts(), (1, 1));
+        // Removing an absent route changes nothing.
+        assert!(!table.remove(&"10.0.0.0/8".parse().unwrap(), RouteProtocol::Bgp));
+        assert_eq!(table.counts(), (1, 1));
     }
 
     #[test]
