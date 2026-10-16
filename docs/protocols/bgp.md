@@ -13,7 +13,8 @@ landed the honest `Nlri { prefix, path_id }` message model (the B-22
 refactor) with ADD-PATH receive. S7-b (2026-10-14, `875da2a`..)
 added ADD-PATH transmit (B-19/B-21), the RFC 4724 §4.1
 restarting-speaker duties, and the §9.2/RFC 4456 iBGP dissemination
-rules.
+rules. S13-b (2026-10-16, `a366fd8`..) added the RFC 4271 §6.3
+first-AS enforcement (F3) and iBGP propagation of ROV validity.
 
 ## Layout
 
@@ -23,7 +24,7 @@ rules.
 | `capability` | RFC 5492 capability triples; extended OPEN optional parameters per RFC 9072 |
 | `attr` | Path-attribute model: §4.3 flags, AS_PATH (RFC 6793 4-octet, AS_TRANS=23456 bridging), communities (RFC 1997), MP_REACH/MP_UNREACH (RFC 4760), OTC (RFC 9234 type 35), unknown-transitive passthrough with the partial bit forced |
 | `fsm` | The §8 six-state machine, table-driven, pure and clock-injected |
-| `peer` | Session runtime: framed IO, hold/keepalive timers, §6.2 OPEN checks, §9.5 AS-loop rejection, RFC 2918 refresh answers (inbound requests + outbound soft-reset hook), MRAI gate, Adj-RIB-In sink / Adj-RIB-Out source traits, `SessionShared` (the §6.8 observability) |
+| `peer` | Session runtime: framed IO, hold/keepalive timers, §6.2 OPEN checks, §9.5 AS-loop rejection, §6.3 first-AS enforcement (F3), RFC 2918 refresh answers (inbound requests + outbound soft-reset hook), MRAI gate, Adj-RIB-In sink / Adj-RIB-Out source traits, `SessionShared` (the §6.8 observability) |
 | `rib` | Adj-RIBs-In + Loc-RIB, `best_path` = the §9.1.2.2 ladder, Import/Export policy seams (§9.2.1 Phase 1/3) |
 | `policy_engine` | The typed-engine bridge: `PolicyView` (bgpd's `RouteView`), wire↔policy attribute conversion with replace-or-insert write-back, `ImportPipeline`/`ExportPipeline`, config→filter compilation |
 | `rov` | RPKI-derived validation: RFC 6811 §2 ROV, RFC 9234 §5 OTC ingress/egress by role, ASPA verification (draft-ietf-sidrops-aspa-verification-28 §5.5/§5.6), `vrp-file` fixture grammar, RTR table source |
@@ -407,8 +408,11 @@ The send side of N5B's receive leg (B-19/B-21 per the sheet):
   the remote AS. Egress (eBGP): OTC := local AS is synthesized toward
   customers and peers when absent; OTC-bearing routes are never
   propagated to peers or providers; once set, preserved unchanged.
-  Validation only runs on eBGP-learned routes (validity is an edge
-  property).
+  OTC/role rules run on eBGP-learned routes (roles are edge
+  concepts); ROV validity (S13-b) records on internal paths too —
+  RFC 6811 §2's verdict is a pure prefix/origin function, computed
+  at import either way, record-only for iBGP (reject-invalid stays
+  the eBGP posture).
 - **ASPA** (draft-ietf-sidrops-aspa-verification-28): verification at
   import when the neighbor has a role (role → PeerRelation, §6.3);
   `aspa advisory` (default v1) records the verdict on the path only;
@@ -515,16 +519,55 @@ paced.
   20.7), EOR 6.07 s with installs overlapping the ingest. Harness
   follow-up noted: the main-table poll's netlink dump starves under
   the install storm on short runs — poll the status socket instead.
-- Also recorded by the round (not fixed): first-AS enforcement is
-  absent (FRR rejects AS_PATHs that do not open with the peer AS,
-  RFC 4271 §6.3; the bench feed prepends symmetrically to stay
-  well-formed for both).
+- **F3 — FIXED (S13-b, 2026-10-16, commit `a366fd8`): first-AS
+  enforcement.** RFC 4271 §6.3: "If the UPDATE message is received
+  from an external peer, the local system MAY check whether the
+  leftmost (with respect to the position of octets in the protocol
+  message) AS in the AS_PATH attribute is equal to the autonomous
+  system number of the peer that sent the message. If the check
+  determines this is not the case, the Error Subcode MUST be set to
+  Malformed AS_PATH" — with the §6.3 preamble's Error Code (UPDATE
+  Message Error): the violation answers NOTIFICATION 3/11 and resets
+  the session (FRR's default-on `bgp enforce-first-as`,
+  `aspath_firstas_check`). `AsPath::leftmost_as` is the first AS of
+  the first segment when it is an AS_SEQUENCE — an empty path or a
+  leading AS_SET has none and fails the equality (FRR parity). The
+  check lives at import in `peer.rs` `on_message`'s UPDATE arm,
+  before the RFC 7606 disposition arms (FRR enforces at
+  attribute-parse time); iBGP is exempt by the rule's own scope
+  ("received from an external peer" — §9.2 dissemination leaves an
+  internal path untouched). Ten tests pin it, four with byte-level
+  NOTIFICATION pins (bad first AS, empty path, leading AS_SET,
+  withdrawal-carrying UPDATE), plus the ordering pin (a bad first AS
+  resets even when a second, attribute-discard-class defect rides
+  the same UPDATE) and the iBGP exemptions (any-shape path, empty
+  path). The interop leg (`test-bgp-frr-interop.sh` F3-FIRST-AS, the
+  z-smoke pattern): a crafted third AS streams a byte-exact bad-path
+  UPDATE and the exact 21-octet 3/11 NOTIFICATION is asserted as the
+  session's final frame. The bench feed stays valid: mrt-replay's
+  symmetric prepend (`--prepend-as $INJ_AS`, the AS both SUTs'
+  neighbor lines name) puts the injector's AS at the front of every
+  replayed path — exactly what the check requires — pinned by test
+  for the three dump shapes (leading sequence, leading AS_SET,
+  multi-segment). The disable knob (FRR's `no bgp enforce-first-as`
+  — needed by an RS-client of a foreign RS, whose reflected paths
+  open with the origin client's AS) is §Deferred with no v1 user.
+  A drive-by the smoke re-run exposed: the F5 counts-only log line
+  had broken the four smokes' prefix/path-id greps (red since
+  2026-10-15); the line now carries counts plus a bounded four-entry
+  NLRI preview (path ids included) — O(1), never the full list.
 
 ## §Deferred anchors
 
 Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime
 policy/config reload (the soft-reset mechanism exists; reload is
-rousterd/YANG territory) · iBGP propagation of ROV/ASPA validity ·
+rousterd/YANG territory) · iBGP propagation of ASPA/OTC validity
+(the ROV half LANDED S13-b: RFC 6811 §2's prefix/origin verdict
+records on internal paths for show output — record-only, enforcement
+stays the eBGP edge posture; ASPA/OTC stay eBGP-only, their
+procedures key on the edge role) · first-AS disable knob (FRR's `no
+bgp enforce-first-as` — an RS-client of a foreign RS needs it; no v1
+user) ·
 ROV-informed path selection (ANP) · RFC 9234 RS/RS-client roles and
 the role-mismatch NOTIFICATION (subcode 11) · RFC 7606: AFI/SAFI
 disable (the fourth §2 approach) — receive-side treats unparseable MP
