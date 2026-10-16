@@ -42,6 +42,20 @@ use zapi::RibCommand;
 /// extra pass with no drift programs nothing.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The status file's own refresh cadence (PERF-P3 M2a), decoupled from
+/// the reconcile tick above. The E1 receipt's wall decomposition named
+/// the 10 s publish grid as the dominant share of the externally
+/// observed table-completion time: every install was ACK-verified at
+/// +9.3 s while the observer learned of it at the next grid point
+/// (~+17.5 s) — and an operator polling `rousterctl` mid-convergence
+/// saw the same 10 s-stale file (P0-b's escalated "faster refresh"
+/// option, landed). FRR's native surface (vtysh) answers live, so the
+/// comparison's observation lag now matches: ours ≤1 s refresh + the
+/// poller's own 1 s, FRR's ≤1 s poll. The publish itself is
+/// O(interfaces + neighbours + tables) — the per-table route counts
+/// went incremental with it (`rib::Table::counts`).
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Capacity of the ZAPI-session → RIB command queue. Bounded so a daemon
 /// burst applies backpressure to its session task instead of unbounded
 /// queue growth.
@@ -293,6 +307,11 @@ async fn main() -> std::io::Result<()> {
     // batch. Delay collapses missed ticks into one, a full interval
     // apart.
     reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // PERF-P3 M2a: the status file refreshes on its own 1 s cadence
+    // (same Delay hygiene — a publish skipped behind a long install
+    // batch collapses into the next tick, never bursts).
+    let mut status_tick = tokio::time::interval(STATUS_REFRESH_INTERVAL);
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -356,6 +375,8 @@ async fn main() -> std::io::Result<()> {
             }
             _ = reconcile_tick.tick() => {
                 driver.rib.reconcile(&dp).await;
+            }
+            _ = status_tick.tick() => {
                 rousterd::status::publish(&driver.rib);
             }
             Some(command) = zapi_rx.recv() => {

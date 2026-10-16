@@ -2,13 +2,15 @@
 //! mirror state as one line-based run-dir file.
 //!
 //! The savd/bfdd shape applied to the main daemon: `/run/rouster/
-//! rousterd.status`, refreshed on the main loop's convergence cadence
-//! (the reconcile tick — the same funnel that re-programs drift), one
-//! keyword-first line per fact, additive fields only, written
-//! warn-never-fail (a failed write never fails the daemon). The file
-//! is the source for `rousterctl show interface|neighbour|vrf|rib
-//! summary` and the vty's `show interface` family
-//! (docs/operator-surfaces.md §2.3).
+//! rousterd.status`, refreshed on the main loop's status cadence
+//! (PERF-P3: a dedicated 1 s timer, decoupled from the 10 s reconcile
+//! safety-net tick — the file is the operator's live convergence view
+//! and the bench rig's completion surface, and a 10 s refresh left
+//! both 10 s-stale), one keyword-first line per fact, additive fields
+//! only, written warn-never-fail (a failed write never fails the
+//! daemon). The file is the source for `rousterctl show
+//! interface|neighbour|vrf|rib summary` and the vty's `show
+//! interface` family (docs/operator-surfaces.md §2.3).
 //!
 //! Format (v1):
 //!
@@ -57,8 +59,8 @@ use common::IpPrefix;
 use common::TableId;
 use rib::{InterfaceState, Rib, MAIN_TABLE};
 
-/// Default status file (A21): refreshed by the main loop's reconcile
-/// tick.
+/// Default status file (A21): refreshed by the main loop's status
+/// cadence (1 s; PERF-P3).
 pub const DEFAULT_STATUS_FILE: &str = "/run/rouster/rousterd.status";
 
 /// Renders the snapshot text (pure — the unit tests pin it; `publish`
@@ -223,11 +225,11 @@ fn table_ids(rib: &Rib) -> BTreeSet<TableId> {
     ids
 }
 
-/// `(candidate count, prefix count)` of one table's entries.
+/// `(candidate count, prefix count)` of one table's entries — O(1)
+/// (PERF-P3: the rib maintains the candidate count incrementally; the
+/// former walk was fine at a 10 s publish cadence, not at 1 s).
 fn count_table(table: &rib::Table) -> (usize, usize) {
-    let prefixes = table.iter().count();
-    let routes = table.iter().map(|(_, candidates)| candidates.len()).sum();
-    (routes, prefixes)
+    table.counts()
 }
 
 /// Link-layer address as colon-separated hex (`02:00:00:00:00:11`),
