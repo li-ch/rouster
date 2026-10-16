@@ -510,3 +510,66 @@ async fn run(
     sleep(Duration::from_secs(linger)).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::prepend_as_path;
+    use bgpd::attr::{
+        decode_attributes, encode_attributes, AddPathCtx, AsPath, AsSegment, PathAttribute,
+    };
+
+    /// The E1 bench feed's AS layout vs the §6.3 first-AS check (the
+    /// F3 follow-up verification): the injector speaks `--local-as`
+    /// and prepends that same AS (`--prepend-as $INJ_AS` in
+    /// bench-e1-ingest.sh) to the FRONT of every replayed path — into
+    /// the first AS_SEQUENCE, or a fresh one-AS segment when the dump
+    /// path opens with an AS_SET. The SUT's neighbor line names the
+    /// injector AS, so every UPDATE arrives with leftmost AS == the
+    /// peer's AS: the symmetric prepend that keeps the feed
+    /// well-formed for FRR (enforce-first-as, default on) keeps it
+    /// well-formed for rouster's check too.
+    #[test]
+    fn prepend_yields_the_injector_as_as_leftmost() {
+        let injector_as = 65412;
+        for path in [
+            // The common dump shape: an AS_SEQUENCE opens the path.
+            AsPath::sequence([65000, 64512]),
+            // Aggregated entries: the path opens with an AS_SET —
+            // prepend places a fresh sequence segment in front.
+            AsPath {
+                segments: vec![
+                    AsSegment::Set(vec![65001, 65002]),
+                    AsSegment::Sequence(vec![65000]),
+                ],
+            },
+            // Multi-segment sequences prepend into the first one.
+            AsPath {
+                segments: vec![
+                    AsSegment::Sequence(vec![65000]),
+                    AsSegment::Sequence(vec![64500]),
+                ],
+            },
+        ] {
+            let mut attrs = Vec::new();
+            encode_attributes(
+                &[PathAttribute::AsPath(path)],
+                &mut attrs,
+                true,
+                AddPathCtx::default(),
+            )
+            .unwrap();
+            prepend_as_path(&mut attrs, injector_as);
+            let decoded = decode_attributes(&attrs, true).unwrap();
+            match &decoded[0] {
+                PathAttribute::AsPath(p) => {
+                    assert_eq!(
+                        p.leftmost_as(),
+                        Some(injector_as),
+                        "the SUT sees its peer's AS first (RFC 4271 §6.3)"
+                    );
+                }
+                other => panic!("expected the AS_PATH attribute first, got {other:?}"),
+            }
+        }
+    }
+}
