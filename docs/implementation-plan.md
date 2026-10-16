@@ -548,3 +548,16 @@ The phase text above is unchanged; this block is status only.
   scoreboard: 3 of 4 headline metrics ≥2× ahead of FRR
   (speaker memory 2.1×, wall 3.79×, zebra memory 2.27×); CPU ahead
   on both processes but the pair honestly sub-2×.
+
+- 2026-10-16 (S14 close — the tail items) — F9 CLOSED (bounded ACK
+  wait + idempotent re-issue + ENOBUFS re-dump + 8 MiB daemon
+  rcvbuf; kernel-proven); hw_addr CLOSED (the four-crate chain;
+  IS-IS broadcast FRR-side legs green ×2 — real SNPA, both REDIST
+  directions); the P4 experiments measured and ledgered: E4 FIB
+  rate 144.6k routes/s at 100k (FRR derived 1.34×, unresolved),
+  E2 churn FRR-ahead 1.40× per-round / Rouster-ahead 1.43× on
+  storm CPU (both sub-2×), E3 sessions **FRR resolved-ahead at
+  N=100 (2.3–4.3×, finding F10 escalated)**, allocator share 42%
+  speaker / 18-43% core → the evaluation branch recommended
+  (mimalloc A/B, receipt-gated). TLS deferred (no user). Gate
+  1859/0.
