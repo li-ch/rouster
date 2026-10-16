@@ -152,10 +152,10 @@ fn dump(rib: &Rib, milestone: usize) {
             }
         }
     }
-    let mut distinct_in_programmed: HashSet<u64> = HashSet::new();
-    for entry in rib.programmed.values() {
-        distinct_in_programmed.insert(group_hash(entry.nexthops.hops()));
-    }
+        let mut distinct_in_programmed: HashSet<u64> = HashSet::new();
+        for belief in rib.programmed.values() {
+            distinct_in_programmed.insert(group_hash(belief.hops.hops()));
+        }
     let kernel_mirror_prefixes: usize = rib
         .kernel_mirror
         .values()

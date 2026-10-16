@@ -122,7 +122,11 @@ pub struct Rib {
     /// (table, prefix). Reconcile diffs desired state against this. Values
     /// are the *resolved programming forms* (gateway hops rewritten to
     /// ifindex-carrying form), so a resolution change re-replaces the route.
-    programmed: BTreeMap<(TableId, IpPrefix), RouteEntry>,
+    /// PERF-P3 (M3 L2): the value is the slim [`Belief`] — the former
+    /// full-`RouteEntry` value duplicated the key's (table, prefix) in
+    /// every entry; the belief keeps exactly what the diff compares and
+    /// what a withdrawal rebuilds.
+    programmed: BTreeMap<(TableId, IpPrefix), Belief>,
     /// Interface state mirrored from dataplane events, keyed by ifindex.
     interfaces: BTreeMap<u32, InterfaceState>,
     /// The CONNECT protocol table set: connected routes derived from the
@@ -167,6 +171,28 @@ pub struct Rib {
 /// Linux main table (RT_TABLE_MAIN) — the table the routed NHT lookup
 /// answers from (A23).
 pub const MAIN_TABLE: TableId = 254;
+
+/// PERF-P3 (M3 L2): the programmed-belief value — the fields the
+/// reconcile diff compares (protocol, metric, hops) plus nothing the
+/// map's `(table, prefix)` key already carries. The withdraw path
+/// rebuilds a full [`RouteEntry`] from key + belief when it needs a
+/// delete message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Belief {
+    protocol: common::RouteProtocol,
+    metric: u32,
+    hops: NexthopGroup,
+}
+
+impl Belief {
+    fn of(entry: &RouteEntry) -> Self {
+        Self {
+            protocol: entry.protocol,
+            metric: entry.metric,
+            hops: entry.nexthops.clone(),
+        }
+    }
+}
 
 impl Rib {
     pub fn new() -> Self {
@@ -630,21 +656,20 @@ impl Rib {
     /// Their overwhelmingly common case (the idle tick, a retried
     /// batch) is "unchanged", and the former shape paid a RouteEntry
     /// clone per route per pass to say so. Sound by construction: a
-    /// `true` answer implies the built form equals `believed` (scalar
+    /// `true` answer implies the built form equals the belief (scalar
     /// fields first, then hop-by-hop — a bare gateway compares as its
     /// CURRENT resolution, an unresolved gateway or a length mismatch
     /// answers false and the caller falls through to the exact
-    /// build-and-compare).
-    fn form_matches(&self, entry: &RouteEntry, believed: &RouteEntry) -> bool {
-        if entry.prefix != believed.prefix
-            || entry.protocol != believed.protocol
-            || entry.metric != believed.metric
-            || entry.table != believed.table
-        {
+    /// build-and-compare). PERF-P3 (M3 L2): the belief no longer
+    /// carries prefix/table (the map key owns both — equal by
+    /// construction on this lookup), so the comparison covers
+    /// protocol, metric, and hops.
+    fn form_matches(&self, entry: &RouteEntry, believed: &Belief) -> bool {
+        if entry.protocol != believed.protocol || entry.metric != believed.metric {
             return false;
         }
         let want = entry.nexthops.hops();
-        let have = believed.nexthops.hops();
+        let have = believed.hops.hops();
         if want.len() != have.len() {
             return false;
         }
@@ -818,7 +843,7 @@ impl Rib {
         let shared = group.as_shared().clone();
         self.nhg_cache.insert(shared.clone());
         self.nhg_interns += 1;
-        if self.nhg_interns % 65_536 == 0 {
+        if self.nhg_interns.is_multiple_of(65_536) {
             self.sweep_nhgs();
         }
         NexthopGroup::from_shared(shared)
@@ -955,7 +980,7 @@ impl Rib {
                 }
                 match self.resolved_programming_form(best) {
                     Some(form) => {
-                        if believed_entry.is_some_and(|b| *b == form) {
+                        if believed_entry.is_some_and(|b| *b == Belief::of(&form)) {
                             unchanged += 1;
                         } else {
                             to_install.push((key, form));
@@ -1020,7 +1045,7 @@ impl Rib {
                 }
                 if let Some(form) = self.resolved_programming_form(best) {
                     desired_keys.insert((table_id, prefix));
-                    if believed != Some(&form) {
+                    if !believed.is_some_and(|b| *b == Belief::of(&form)) {
                         to_install.push(((table_id, prefix), form));
                     }
                 }
@@ -1070,7 +1095,14 @@ impl Rib {
                         // it mirrors — equal by construction on this
                         // path, so this usually bumps a refcount).
                         entry.nexthops = self.intern_nhg(&entry.nexthops);
-                        self.programmed.insert(key, entry);
+                        // PERF-P3 (M3 L2): the slim belief — the key
+                        // carries (table, prefix) from here on.
+                        let belief = Belief {
+                            protocol: entry.protocol,
+                            metric: entry.metric,
+                            hops: entry.nexthops,
+                        };
+                        self.programmed.insert(key, belief);
                         installed += 1;
                     }
                     Err(e) => {
@@ -1091,9 +1123,18 @@ impl Rib {
         let mut keys: Vec<(TableId, IpPrefix)> = Vec::new();
         let mut entries: Vec<RouteEntry> = Vec::new();
         for key in stale_keys {
-            if let Some(entry) = self.programmed.remove(&key) {
+            if let Some(belief) = self.programmed.remove(&key) {
                 keys.push(key);
-                entries.push(entry);
+                // PERF-P3 (M3 L2): the delete message is rebuilt from
+                // key + belief (the belief no longer duplicates the
+                // key's prefix/table fields).
+                entries.push(RouteEntry {
+                    prefix: key.1,
+                    table: key.0,
+                    protocol: belief.protocol,
+                    metric: belief.metric,
+                    nexthops: belief.hops,
+                });
             }
         }
         if !entries.is_empty() {
@@ -1108,7 +1149,7 @@ impl Rib {
                         // The kernel most likely still holds the route; keep the
                         // belief so the next pass tries the withdrawal again.
                         warn!(prefix = %entry.prefix, table_id = entry.table, %e, "route withdrawal failed; will retry");
-                        self.programmed.insert(key, entry);
+                        self.programmed.insert(key, Belief::of(&entry));
                     }
                 }
             }
@@ -1501,7 +1542,7 @@ mod tests {
             .values()
             .next()
             .unwrap()
-            .nexthops
+            .hops
             .as_shared()
             .clone();
         assert!(
