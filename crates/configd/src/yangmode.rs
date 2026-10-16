@@ -106,8 +106,62 @@ pub struct RestconfSettings {
     /// The local unix socket path (S13-c — the DEFAULT listener;
     /// absolute, model-defaulted).
     pub socket: String,
+    /// The optional bearer token (S13-c M2), hex-decoded — None
+    /// when the stanza carries no `token`. The [`Secret`] wrapper
+    /// keeps the bytes out of derived Debug output.
+    pub token: Option<Secret>,
     /// The stanza opener's line (errors point at the operator's file).
     pub header_line: usize,
+}
+
+/// A bearer token's bytes with a REDACTED [`Debug`] — the settings
+/// tree rides `Bound`'s derive(Debug) everywhere (tracing, test
+/// failures); a derived Debug would print the credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub Vec<u8>);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Secret(<{} bytes, redacted>)", self.0.len())
+    }
+}
+
+/// Decodes a hex token (case-insensitive, even length — the model's
+/// pattern enforces the shape; this is the belt to that braces) and
+/// floors it at 16 decoded bytes: a bearer token is a high-entropy
+/// random value, and `token caffee` would be guessable in seconds.
+/// The refusal names the stanza's line (the house error shape).
+fn decode_token(hex: &str, line: usize) -> Result<Vec<u8>, YangError> {
+    let bytes = decode_hex(hex).ok_or_else(|| YangError::Bind {
+        line,
+        reason: format!("the restconf token must be even-length hex (saw `{hex}`)"),
+    })?;
+    if bytes.len() < 16 {
+        return Err(YangError::Bind {
+            line,
+            reason: format!(
+                "the restconf token must be at least 32 hex characters (128 bits); \
+                 saw {} — generate one with e.g. `openssl rand -hex 32`",
+                hex.chars().count()
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+/// Even-length case-insensitive hex → bytes.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || s.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let chars: Vec<char> = s.chars().collect();
+    for pair in chars.chunks(2) {
+        let hi = pair[0].to_digit(16)?;
+        let lo = pair[1].to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 impl Bound {
@@ -224,7 +278,7 @@ fn bind_restconf(stanza: &RestconfStanza) -> Result<RestconfSettings, YangError>
             }),
     );
     let dialect = LineDialect::default();
-    let (mut tree, _) =
+    let (mut tree, report) =
         yang::line::parse(&schema, &sources, &dialect).map_err(|e| YangError::Bind {
             line: match &e {
                 yang::line::LineError::Line { line, .. } => *line,
@@ -235,6 +289,28 @@ fn bind_restconf(stanza: &RestconfStanza) -> Result<RestconfSettings, YangError>
                 yang::line::LineError::Data(d) => d.to_string(),
             },
         })?;
+    // A `token` line that failed to bind (the soft pass-through seam
+    // a bad pattern rides) is a HARD refusal, not a warning: an
+    // operator who typed an auth line and typo'd it must not get an
+    // OPEN API out of the deal (the port/bind default-fallback is
+    // fine for transport knobs; auth lines do not degrade).
+    for line in &report.unmodeled {
+        let text = stanza
+            .body
+            .iter()
+            .find(|BodyLine { line: l, .. }| l == line)
+            .map(|BodyLine { text, .. }| text.clone())
+            .unwrap_or_default();
+        if text.split_whitespace().next() == Some("token") {
+            return Err(YangError::Bind {
+                line: *line,
+                reason: format!(
+                    "the token line did not bind against the model (even-length hex \
+                     required) — refusing rather than serving with no auth: `{text}`"
+                ),
+            });
+        }
+    }
     let violations = tree.validate();
     if !violations.is_empty() {
         return Err(violations_error(&violations));
@@ -259,10 +335,20 @@ fn bind_restconf(stanza: &RestconfStanza) -> Result<RestconfSettings, YangError>
             ),
         });
     }
+    // The token (S13-c M2): present → hex-decoded + floored at 128
+    // bits; absent → None (no auth check runs). A token line that
+    // fails the model's pattern never reaches here — the unmodeled
+    // check above refused it (auth lines do not degrade to open).
+    let token = tree
+        .get_value(&Path::parse("/restconf/token").expect("literal path"))
+        .map(|hex| decode_token(&hex, stanza.header_line))
+        .transpose()?
+        .map(Secret);
     Ok(RestconfSettings {
         port,
         bind,
         socket,
+        token,
         header_line: stanza.header_line,
     })
 }
@@ -327,7 +413,9 @@ pub fn dump_json(bound: &Bound) -> String {
     }
     if let Some(settings) = &bound.restconf {
         // The member order is fixed (port, bind, socket): the smoke
-        // greps the prefix, the docs quote the whole shape.
+        // greps the prefix, the docs quote the whole shape. The
+        // `token` leaf is NEVER a member — write-only (a credential
+        // echo would hand it to every reader of the dump).
         parts.push(format!(
             "\"restconf\":{{\"port\":{},\"bind\":\"{}\",\"socket\":\"{}\"}}",
             settings.port, settings.bind, settings.socket
@@ -392,6 +480,7 @@ mod tests {
                 port: RESTCONF_DEFAULT_PORT,
                 bind: RESTCONF_DEFAULT_BIND.to_string(),
                 socket: RESTCONF_DEFAULT_SOCKET.to_string(),
+                token: None,
                 header_line: 1,
             })
         );
@@ -404,6 +493,7 @@ mod tests {
                 port: 8443,
                 bind: "10.0.0.9".to_string(),
                 socket: "/tmp/rc.sock".to_string(),
+                token: None,
                 header_line: 1,
             })
         );
@@ -416,6 +506,71 @@ mod tests {
         let err = bind_text("restconf {\nsocket run/rouster/x.sock\n}\n").unwrap_err();
         assert!(err.to_string().contains("absolute"), "{err}");
         assert!(err.to_string().contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn a_restconf_token_binds_decoded_and_floored() {
+        // 32 hex chars = 128 bits: the floor.
+        let hex = "0123456789abcdef0123456789abcdef";
+        let expected = Secret(vec![
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ]);
+        let bound = bind_text(&format!("restconf {{\ntoken {hex}\n}}\n")).unwrap();
+        assert_eq!(
+            bound.restconf.as_ref().unwrap().token,
+            Some(expected.clone())
+        );
+        // Hex is case-insensitive: the same bytes.
+        let bound = bind_text("restconf {\ntoken 0123456789ABCDEF0123456789ABCDEF\n}\n").unwrap();
+        assert_eq!(bound.restconf.as_ref().unwrap().token, Some(expected));
+        // No token line, no token.
+        let bound = bind_text("restconf {\n}\n").unwrap();
+        assert_eq!(bound.restconf.as_ref().unwrap().token, None);
+    }
+
+    #[test]
+    fn a_short_restconf_token_is_refused() {
+        // Even-length hex, but only 64 bits — under the floor.
+        let err = bind_text("restconf {\ntoken 0123456789abcdef\n}\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("128 bits"), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn a_malformed_restconf_token_refuses_rather_than_degrading_to_open() {
+        // Fails the model's even-hex pattern → rides the pass-through
+        // seam → the bind REFUSES: a typo'd auth line must not open
+        // the API (the port/bind default-fallback is for transport
+        // knobs, not auth).
+        let err = bind_text("restconf {\ntoken zzzz\n}\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("serving with no auth"), "{msg}");
+        assert!(msg.contains("line 2"), "{msg}");
+        let err = bind_text("restconf {\ntoken abc\n}\n").unwrap_err();
+        assert!(err.to_string().contains("serving with no auth"), "{err}");
+    }
+
+    #[test]
+    fn the_restconf_token_rides_secret_debug_never_the_bytes() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        let bound = bind_text(&format!("restconf {{\ntoken {hex}\n}}\n")).unwrap();
+        let debugged = format!("{:?}", bound);
+        assert!(!debugged.contains(hex), "{debugged}");
+        assert!(debugged.contains("redacted"), "{debugged}");
+    }
+
+    #[test]
+    fn dump_json_never_carries_the_token() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        let bound = bind_text(&format!(
+            "restconf {{\ntoken {hex}\n}}\ndaemon savd {{\nmode strict\n}}\n"
+        ))
+        .unwrap();
+        let json = dump_json(&bound);
+        assert!(!json.contains(hex), "{json}");
+        assert!(!json.contains("token"), "{json}");
     }
 
     #[test]

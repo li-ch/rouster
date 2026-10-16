@@ -48,22 +48,119 @@ use super::http::{self, HttpError, Request};
 use super::resources::{self, Datastore, Reply, Store, Verb};
 
 /// The serving state: where the datastore lives, whether mutations
-/// are armed, and the single-flight lock.
+/// are armed, the optional bearer token, and the single-flight lock.
 pub struct Server {
     pub store: Datastore,
     pub dry_run: bool,
+    /// The configured bearer token's bytes (S13-c M2): when Some,
+    /// every request must carry `Authorization: Bearer <hex>` or it
+    /// is refused with 401 (+`WWW-Authenticate: Bearer`, RFC 9110
+    /// §11.6.1). None = no auth check (the socket's filesystem
+    /// permissions are then the whole access control).
+    pub token: Option<Vec<u8>>,
     /// One mutation at a time (RFC 8040 §3.4.1).
     flight: std::sync::Mutex<()>,
 }
 
 impl Server {
-    pub fn new(store: Datastore, dry_run: bool) -> Server {
+    pub fn new(store: Datastore, dry_run: bool, token: Option<Vec<u8>>) -> Server {
         Server {
             store,
             dry_run,
+            token,
             flight: std::sync::Mutex::new(()),
         }
     }
+}
+
+/// Constant-time equality — the standard XOR fold: every byte pair
+/// XORs into ONE accumulator and the single branch happens on the
+/// folded result, so the comparison's control flow (and through it
+/// the timing) never depends on where the first difference sits.
+/// This is the `subtle` crate's `ConstantTimeEq` discipline,
+/// hand-rolled because a dependency for eight lines is outside the
+/// no-new-deps fence. Length mismatch returns early: the length is
+/// public-shaped information (the configured token's length shapes
+/// the check's runtime regardless of the attacker's input), the
+/// CONTENT is what must not leak.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The bearer check (S13-c M2). `None` = authorized (no token
+/// configured, or the presented token matches); `Some(message)` =
+/// the 401's story.
+///
+/// - A configured token and NO `Authorization` header → 401.
+/// - A non-Bearer scheme, or a token that is not even-length hex →
+///   401 (presented credentials that decode to nothing comparable
+///   are just another wrong token).
+/// - A well-formed token → hex-decoded and compared against the
+///   configured bytes with [`constant_time_eq`].
+///
+/// Hex decoding of the PRESENTED token makes the comparison
+/// case-insensitive on both sides (the configured side decodes at
+/// bind time).
+fn bearer_challenge(configured: &[u8], request: &Request) -> Option<String> {
+    let header = match request.header("authorization") {
+        Some(header) => header,
+        None => {
+            return Some(
+                "authentication required: send `Authorization: Bearer <token>` \
+                 (RFC 6750 §2.1's form)"
+                    .to_string(),
+            )
+        }
+    };
+    let mut parts = header.splitn(2, ' ');
+    let scheme = parts.next().unwrap_or_default();
+    let credentials = parts.next().unwrap_or_default().trim();
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Some(format!(
+            "unsupported authorization scheme `{scheme}` (Bearer is the one this edge takes)"
+        ));
+    }
+    let presented = match decode_hex(credentials) {
+        Some(presented) => presented,
+        None => return Some("invalid bearer token".to_string()),
+    };
+    if constant_time_eq(configured, &presented) {
+        return None;
+    }
+    Some("invalid bearer token".to_string())
+}
+
+/// Even-length case-insensitive hex → bytes (None on any bad shape).
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || s.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let chars: Vec<char> = s.chars().collect();
+    for pair in chars.chunks(2) {
+        let hi = pair[0].to_digit(16)?;
+        let lo = pair[1].to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// The 401 response: the RFC 8040 §7.1 error form (error-tag from
+/// RFC 6241's access-denied) with the `WWW-Authenticate: Bearer`
+/// challenge (RFC 9110 §11.6.1 — a 401 MUST carry it; RFC 6750
+/// §3.1 is the bearer challenge's shape).
+fn unauthorized(message: &str) -> Vec<u8> {
+    let e = resources::ApiError::new(401, "access-denied", message);
+    http::render_response_with_headers(
+        401,
+        resources::JSON_MEDIA_TYPE,
+        e.body().as_bytes(),
+        None,
+        &[("WWW-Authenticate", "Bearer")],
+    )
 }
 
 /// Binds the unix socket the v1.0 way (S13-c): removes a stale
@@ -236,6 +333,14 @@ async fn respond(server: Arc<Server>, request: Request) -> Vec<u8> {
         e.status = 400;
         return http::render_response(400, resources::JSON_MEDIA_TYPE, e.body().as_bytes(), None);
     }
+    // The token gate (S13-c M2): after the transport-level sanity,
+    // before ANY routing — every request, every verb, both planes.
+    // Unauthenticated clients learn nothing about the resources.
+    if let Some(configured) = &server.token {
+        if let Some(message) = bearer_challenge(configured, &request) {
+            return unauthorized(&message);
+        }
+    }
     let tail_store = match resources::split_target(&request.target) {
         Ok(pair) => pair,
         Err(err) => {
@@ -393,6 +498,18 @@ mod tests {
     }
 
     async fn spawn_server(tag: &str, dry_run: bool, canonical: &str) -> (std::path::PathBuf, u16) {
+        let (dir, port) = spawn_server_full(tag, dry_run, canonical, None).await;
+        (dir, port)
+    }
+
+    /// The full spawn: TCP listener + optional bearer token (S13-c
+    /// M2's test arm).
+    async fn spawn_server_full(
+        tag: &str,
+        dry_run: bool,
+        canonical: &str,
+        token: Option<Vec<u8>>,
+    ) -> (std::path::PathBuf, u16) {
         let dir = scratch(tag);
         let canonical_path = dir.join("rouster.conf");
         std::fs::write(&canonical_path, canonical).unwrap();
@@ -403,6 +520,7 @@ mod tests {
                 etc_dir: dir.join("etc"),
             },
             dry_run,
+            token,
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -562,6 +680,15 @@ mod tests {
         dry_run: bool,
         canonical: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
+        spawn_unix_server_full(tag, dry_run, canonical, None)
+    }
+
+    fn spawn_unix_server_full(
+        tag: &str,
+        dry_run: bool,
+        canonical: &str,
+        token: Option<Vec<u8>>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = scratch(tag);
         let canonical_path = dir.join("rouster.conf");
         std::fs::write(&canonical_path, canonical).unwrap();
@@ -572,6 +699,7 @@ mod tests {
                 etc_dir: dir.join("etc"),
             },
             dry_run,
+            token,
         ));
         // The socket needs a SHORT path (sun_path is ~104 bytes; the
         // temp-dir scratch prefix alone can eat that).
@@ -668,5 +796,198 @@ mod tests {
             std::fs::read_to_string(dir.join("rouster.conf")).unwrap(),
             CANONICAL
         );
+    }
+
+    // ---- the bearer token (S13-c M2) ----
+
+    /// 32 hex chars = the bind gate's floor; the bytes 0x00..0x0f
+    /// (the hex form is spelled inline in the wires below).
+    const TOKEN_BYTES: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    #[tokio::test]
+    async fn a_configured_token_gates_every_request() {
+        // TCP plane: missing header, wrong token, non-hex, wrong
+        // scheme — all 401 with the challenge; the right token 200s.
+        let (_dir, port) =
+            spawn_server_full("tok-tcp", false, CANONICAL, Some(TOKEN_BYTES.to_vec())).await;
+        let (status, body) = roundtrip(
+            port,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 401, "{body}");
+        assert!(body.contains("access-denied"), "{body}");
+        assert!(body.contains("authentication required"), "{body}");
+        let (status, body) = roundtrip(
+            port,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer ffffffffffffffffffffffffffffffff\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 401, "{body}");
+        assert!(body.contains("invalid bearer token"), "{body}");
+        // Not hex at all: the same 401, no distinguishable story.
+        let (status, _) = roundtrip(
+            port,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer zzzz\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 401);
+        // Wrong scheme.
+        let (status, _) = roundtrip(
+            port,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nAuthorization: Basic eHg6eHg=\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 401);
+        // The right token (scheme case-insensitive, hex
+        // case-insensitive).
+        let (status, body) = roundtrip(
+            port,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nAuthorization: bearer 000102030405060708090A0B0C0D0E0F\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "{\"poll\":2}");
+    }
+
+    #[tokio::test]
+    async fn the_401_carries_the_www_authenticate_header() {
+        let (_dir, port) =
+            spawn_server_full("tok-hdr", false, CANONICAL, Some(TOKEN_BYTES.to_vec())).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"GET /restconf/data HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let _ = stream.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized"), "{text}");
+        // RFC 9110 §11.6.1: a 401 MUST carry the challenge.
+        assert!(text.contains("WWW-Authenticate: Bearer\r\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_token_gates_the_socket_plane_too() {
+        let (_dir, socket) =
+            spawn_unix_server_full("tok-sock", false, CANONICAL, Some(TOKEN_BYTES.to_vec()));
+        let (status, _) = unix_roundtrip(
+            &socket,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 401);
+        let (status, body) = unix_roundtrip(
+            &socket,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer 000102030405060708090a0b0c0d0e0f\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[tokio::test]
+    async fn mutations_are_gated_before_the_single_flight() {
+        // A PUT with a wrong token never reaches the mutation path:
+        // 401 and the canonical untouched.
+        let (dir, port) =
+            spawn_server_full("tok-put", false, CANONICAL, Some(TOKEN_BYTES.to_vec())).await;
+        let (status, _) = roundtrip(
+            port,
+            "PUT /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer ffffffffffffffffffffffffffffffff\r\nContent-Length: 1\r\n\r\n3",
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rouster.conf")).unwrap(),
+            CANONICAL
+        );
+    }
+
+    #[tokio::test]
+    async fn no_token_configured_is_the_unchanged_open_plane() {
+        // None = the socket's filesystem permissions are the whole
+        // access control; no 401s.
+        let (_dir, port) = spawn_server("tok-off", false, CANONICAL).await;
+        let (status, body) = roundtrip(
+            port,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn the_xor_fold_compares_every_byte_pair() {
+        // Equal.
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(&TOKEN_BYTES, &TOKEN_BYTES));
+        // Every single-byte difference position is caught (the fold
+        // has no early exit to get wrong).
+        for i in 0..TOKEN_BYTES.len() {
+            let mut presented = TOKEN_BYTES;
+            presented[i] ^= 0x01;
+            assert!(!constant_time_eq(&TOKEN_BYTES, &presented), "byte {i}");
+        }
+        // Length mismatch.
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    #[test]
+    fn the_bearer_parser_takes_the_header_shapes() {
+        let req = |value: &str| {
+            parse_request(&format!(
+                "GET /restconf/data HTTP/1.1\r\nHost: t\r\nAuthorization: {value}\r\n\r\n"
+            ))
+        };
+        // Missing header → the required-auth story.
+        let bare = parse_request("GET /restconf/data HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(bearer_challenge(&TOKEN_BYTES, &bare)
+            .expect("missing header is a challenge")
+            .contains("authentication required"));
+        // Right token, both cases.
+        assert_eq!(
+            bearer_challenge(
+                &TOKEN_BYTES,
+                &req("Bearer 000102030405060708090a0b0c0d0e0f")
+            ),
+            None
+        );
+        assert_eq!(
+            bearer_challenge(
+                &TOKEN_BYTES,
+                &req("BEARER 000102030405060708090A0B0C0D0E0F")
+            ),
+            None
+        );
+        // Wrong / malformed / wrong scheme.
+        assert!(bearer_challenge(&TOKEN_BYTES, &req("Bearer deadbeef")).is_some());
+        assert!(bearer_challenge(&TOKEN_BYTES, &req("Bearer xyz")).is_some());
+        assert!(
+            bearer_challenge(&TOKEN_BYTES, &req("Token 000102030405060708090a0b0c0d0e0f"))
+                .is_some()
+        );
+        // A prefix of the right token is NOT the right token (the
+        // fold compares lengths).
+        assert!(bearer_challenge(&TOKEN_BYTES, &req("Bearer 000102")).is_some());
+        // Header-name case-insensitivity (the parser's own rule).
+        assert_eq!(
+            bearer_challenge(
+                &TOKEN_BYTES,
+                &parse_request(
+                    "GET /restconf/data HTTP/1.1\r\nHost: t\r\nauthorization: Bearer 000102030405060708090a0b0c0d0e0f\r\n\r\n"
+                )
+            ),
+            None
+        );
+    }
+
+    /// parse_head over a full wire head (the test-only shorthand).
+    fn parse_request(wire: &str) -> Request {
+        let head = wire.split("\r\n\r\n").next().unwrap_or(wire);
+        http::parse_head(head).expect("well-formed head")
     }
 }

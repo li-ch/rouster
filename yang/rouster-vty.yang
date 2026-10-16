@@ -60,6 +60,18 @@ module rouster-vty {
       type string;
       default /run/rouster/restconf.sock;
     }
+    leaf token {
+      type string {
+        pattern '([0-9a-fA-F][0-9a-fA-F])+';
+      }
+      description
+        "Optional static bearer token (hex, case-insensitive, even
+         length — the pattern; the bind gate additionally floors it
+         at 32 hex chars = 128 bits). Checked on every request when
+         configured, constant-time. WRITE-ONLY through the API: it
+         is never echoed (a credential echo would hand it to every
+         reader of the surface).";
+    }
   }
 
   // ---- the modeled config surface (session + canonical merge) ----

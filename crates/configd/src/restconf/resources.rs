@@ -622,8 +622,18 @@ pub fn get(store: &Datastore, running: bool, tail: &str) -> Result<Reply, ApiErr
                     200,
                     format!("{{\"socket\":\"{}\"}}", settings.socket),
                 )),
+                // WRITE-ONLY (S13-c M2): the token is never echoed —
+                // a credential echo would hand it to every reader of
+                // the API. RFC 8040/RFC 6241's access-denied tag.
+                1 if tail[0].name == "token" => Err(ApiError::new(
+                    403,
+                    "access-denied",
+                    "the `token` leaf is write-only — it is never echoed (the one-way \
+                     credential discipline; PUT/POST it, never GET it)",
+                )),
                 _ => Err(ApiError::not_found(
-                    "the restconf stanza's members are `port`, `bind`, and `socket`",
+                    "the restconf stanza's members are `port`, `bind`, and `socket` \
+                     (`token` is write-only)",
                 )),
             }
         }
@@ -1311,13 +1321,17 @@ fn scalar_of(value: &Json) -> Result<String, ApiError> {
 
 /// The stanza's bound tree (rouster-vty schema, the `restconf`
 /// subtree filled from the file — yangmode's walk, reconstructed
-/// here for subtree addressing).
+/// here for subtree addressing). The `token` leaf IS filled (as
+/// hex): this tree is the MUTATION base — a merge that does not
+/// mention the token must render it back, not destroy it. The READ
+/// paths never encode this tree (they answer from the settings with
+/// the token omitted — write-only).
 fn stanza_tree(bound: &Bound) -> DataTree {
     let schema = yang::models::schema("rouster-vty");
     let mut tree = DataTree::empty(schema);
     // The settings carry everything the model defines (port, bind,
-    // socket — defaults filled at bind time); rebuild the subtree
-    // from them.
+    // socket, token — defaults filled at bind time); rebuild the
+    // subtree from them.
     if let Some(settings) = &bound.restconf {
         let base = Path::parse("/restconf").expect("literal path");
         let _ = tree.set_container(&base);
@@ -1327,6 +1341,11 @@ fn stanza_tree(bound: &Bound) -> DataTree {
         let _ = tree.set(&port, &settings.port.to_string(), None);
         let _ = tree.set(&bind, &settings.bind, None);
         let _ = tree.set(&socket, &settings.socket, None);
+        if let Some(secret) = &settings.token {
+            let hex: String = secret.0.iter().map(|b| format!("{b:02x}")).collect();
+            let token = Path::parse("/restconf/token").expect("literal path");
+            let _ = tree.set(&token, &hex, None);
+        }
     }
     tree
 }

@@ -248,6 +248,8 @@ pub fn reason(status: u16) -> &'static str {
         201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -270,12 +272,28 @@ pub fn render_response(
     body: &[u8],
     allow: Option<&str>,
 ) -> Vec<u8> {
+    render_response_with_headers(status, content_type, body, allow, &[])
+}
+
+/// [`render_response`] plus extra header lines — the 401s carry
+/// `WWW-Authenticate` (RFC 9110 §11.6.1: a 401 MUST name its
+/// challenge), the one extra header this edge ever needs.
+pub fn render_response_with_headers(
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    allow: Option<&str>,
+    extra: &[(&str, &str)],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 128);
     out.extend_from_slice(format!("HTTP/1.1 {status} {}\r\n", reason(status)).as_bytes());
     out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
     out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     if let Some(allow) = allow {
         out.extend_from_slice(format!("Allow: {allow}\r\n").as_bytes());
+    }
+    for (name, value) in extra {
+        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
     out.extend_from_slice(body);
@@ -353,10 +371,31 @@ mod tests {
     #[test]
     fn reason_phrases_cover_the_emitted_statuses() {
         for status in [
-            200, 201, 204, 400, 404, 405, 409, 413, 431, 500, 501, 503, 505,
+            200, 201, 204, 400, 401, 403, 404, 405, 409, 413, 431, 500, 501, 503, 505,
         ] {
             assert_ne!(reason(status), "Status", "{status} needs a phrase");
         }
+    }
+
+    #[test]
+    fn a_401_carries_the_www_authenticate_challenge() {
+        let bytes = render_response_with_headers(
+            401,
+            "application/json",
+            b"{}",
+            None,
+            &[("WWW-Authenticate", "Bearer")],
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{text}");
+        assert!(text.contains("WWW-Authenticate: Bearer\r\n"), "{text}");
+        // Order: the fixed heads, the extra, the close.
+        let fixed = text.find("Content-Length: 2\r\n").expect("length head");
+        let extra = text
+            .find("WWW-Authenticate: Bearer\r\n")
+            .expect("challenge");
+        let close = text.find("Connection: close\r\n").expect("close");
+        assert!(fixed < extra && extra < close, "{text}");
     }
 
     #[test]

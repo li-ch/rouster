@@ -90,6 +90,9 @@ struct Settings {
     run_dir: PathBuf,
     etc_dir: PathBuf,
     dry_run: bool,
+    /// Mirrors the stanza's token presence for the status file (the
+    /// bytes themselves live only in the Server).
+    has_token: bool,
 }
 
 impl Default for Settings {
@@ -103,6 +106,7 @@ impl Default for Settings {
             run_dir: PathBuf::from(DEFAULT_RUN_DIR),
             etc_dir: PathBuf::from(DEFAULT_ETC_DIR),
             dry_run: false,
+            has_token: false,
         }
     }
 }
@@ -224,6 +228,10 @@ struct StanzaKnobs {
     port: Option<u16>,
     bind: Option<String>,
     socket: Option<String>,
+    /// The bearer token's BYTES (hex-decoded at bind; no flag exists
+    /// for it — a token on a command line would sit in every `ps`
+    /// output on the box).
+    token: Option<Vec<u8>>,
 }
 
 /// The stanza's settings from the canonical file, when present and
@@ -252,6 +260,7 @@ fn stanza_settings(canonical: &std::path::Path) -> Result<StanzaKnobs, String> {
             port: Some(settings.port),
             bind: Some(settings.bind),
             socket: Some(settings.socket),
+            token: settings.token.map(|t| t.0),
         }),
         None => Ok(StanzaKnobs::default()),
     }
@@ -268,14 +277,24 @@ enum Plane {
 fn write_status(settings: &Settings, plane: &Plane) -> std::io::Result<()> {
     let listener = match plane {
         Plane::Socket(path) => format!(
-            "listener socket\nsocket {}\nsecurity v1.0 socket 0{:o} (filesystem permissions = \
-             access control, the unix convention; docs/yang.md §restconf)",
+            "listener socket\nsocket {}\nsecurity v1.0 socket 0{:o} {} (filesystem permissions \
+             = access control, the unix convention; docs/yang.md §restconf)",
             path.display(),
-            server::SOCKET_MODE
+            server::SOCKET_MODE,
+            if settings.has_token {
+                "+ bearer token (constant-time check)"
+            } else {
+                "+ no token"
+            }
         ),
         Plane::Tcp { bind, port } => format!(
-            "listener tcp\nbind {bind}\nport {port}\nsecurity v1.0 tcp plain-HTTP no-TLS \
-             (RFC 8040 §2 expects HTTPS — the documented owner decision; docs/yang.md §restconf)"
+            "listener tcp\nbind {bind}\nport {port}\nsecurity v1.0 tcp plain-HTTP no-TLS {} \
+             (RFC 8040 §2 expects HTTPS — the documented owner decision; docs/yang.md §restconf)",
+            if settings.has_token {
+                "+ bearer token (constant-time check)"
+            } else {
+                "+ no token"
+            }
         ),
     };
     let text = format!(
@@ -292,7 +311,7 @@ fn write_status(settings: &Settings, plane: &Plane) -> std::io::Result<()> {
 }
 
 fn main() {
-    let settings = match parse_args() {
+    let mut settings = match parse_args() {
         Ok(settings) => settings,
         Err(complaint) => {
             eprintln!("restconfd: {complaint}");
@@ -307,6 +326,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    settings.has_token = knobs.token.is_some();
     let plane = if settings.tcp {
         let port = settings
             .port
@@ -344,13 +364,13 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let code = runtime.block_on(run(settings, plane));
+    let code = runtime.block_on(run(settings, plane, knobs.token));
     std::process::exit(code as i32);
 }
 
 /// Bind the plane, publish the status file, serve until
 /// SIGTERM/SIGINT.
-async fn run(settings: Settings, plane: Plane) -> u8 {
+async fn run(settings: Settings, plane: Plane, token: Option<Vec<u8>>) -> u8 {
     let server = Arc::new(Server::new(
         Datastore {
             canonical: settings.canonical.clone(),
@@ -358,6 +378,7 @@ async fn run(settings: Settings, plane: Plane) -> u8 {
             etc_dir: settings.etc_dir.clone(),
         },
         settings.dry_run,
+        token,
     ));
     // The clean-exit clear list (the savd discipline): a stale status
     // or socket file only survives SIGKILL.
