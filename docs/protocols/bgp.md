@@ -683,9 +683,46 @@ condition, commit `9131271`); the receipt runner now carries the
 same SUT rcvbuf sysctls as P0's harness, and this run is clean.
 Artifacts: `target/mem-logs/clean-20261016T083843Z/`.
 
+### M4 — the next mile: the census-justified plateau (2026-10-16)
+
+The bar (≤800 B/prefix at 100k) fell at M2 (476) and M3 tightened it
+(449); the full table sits at 420. What the post-M3 census still
+names at 100k, and why each stays unlanded:
+
+- **Unique attr tuples, 90.7 B/prefix** (16,623 tuples, exact-fit
+  Vecs). The remaining density lever is replacing the wire-shaped
+  `Vec<PathAttribute>` (64 B per enum slot × ~7 attrs) with a dense
+  storage struct — that rewrites the attr/message model every
+  consumer shares. Fence: no architectural rewrites; §Deferred.
+- **Map inline, ~165 B/prefix** — (Nlri 24 + Route 56) ×2 maps plus
+  node headers, within ~4 B/entry of a std keyed store's floor. The
+  next cut (dropping `Route.prefix`) crosses the policy trait seams.
+  §Deferred with the M3 note.
+- **~185 B/prefix of allocator bins + decode/drain transients +
+  runtime baseline.** An allocator swap is an owner decision under
+  the campaign fence (escalate, don't adopt) — the finding is filed
+  for the owner: a `GlobalAlloc` counterpart on darwin-vm/Linux-musl
+  with size-class-friendly small allocations could cut this share.
+- The prompt's other candidates are cleared by measurement: the
+  ADD-PATH transmit map is empty on classic sessions; the decision
+  scratch is per-UPDATE transient; the session read buffer is
+  bounded.
+
+The campaign's speaker-side ledger (single-run receipts, E1 protocol
+scaled, darwin-vm): 100k slice 1,882 → 476 → 449 B/prefix; full
+table 1,679 (§R) → 457 → 420 B/prefix; bgpd CPU on the full table
+10.37 s (§R) → 7.07 → 6.88 s; every leg zero-malformed, the four
+interop smokes and the full workspace gate green at each commit. The
+§R entries are the orchestrator's to file from these artifacts.
+
 ## §Deferred anchors
 
-Per-prefix MRAI queues · MRAI defaults beyond the knob · runtime
+Dense storage-form attributes (the 64 B `PathAttribute` enum slots →
+a compact RIB-side struct; PERF-M1 M4's named-but-fenced lever) ·
+`Route.prefix` drop (trait-seam change; PERF-M1 M3 note) · owner
+decision: allocator counterpart for the ~185 B/prefix bin/transient
+share (PERF-M1 M4) · Per-prefix MRAI queues · MRAI defaults beyond
+the knob · runtime
 policy/config reload (the soft-reset mechanism exists; reload is
 rousterd/YANG territory) · iBGP propagation of ASPA/OTC validity
 (the ROV half LANDED S13-b: RFC 6811 §2's prefix/origin verdict
