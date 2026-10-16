@@ -40,7 +40,7 @@ use std::net::Ipv4Addr;
 
 use crate::lspdb::Lspdb;
 use crate::pdu::{Lsp, LspBits};
-use crate::system::{Level, SystemId};
+use crate::system::{Level, NeighborId, SystemId};
 use crate::tlv::{NarrowIpReach, OldIsNeighbor, Tlv, WideIpReach};
 
 /// One forwarding next hop for a destination.
@@ -77,11 +77,14 @@ pub struct Route {
 /// The SPF result for one level.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpfResult {
-    /// SPF distance to every reachable IS (system id → cost).
-    pub distances: BTreeMap<SystemId, u64>,
+    /// SPF distance to every reachable IS vertex — routers
+    /// (`pseudonode == 0`) and LAN pseudonodes alike (ISO §7.2.3's
+    /// broadcast graph).
+    pub distances: BTreeMap<NeighborId, u64>,
     /// Next hops per destination IS (first hops on the shortest
-    /// paths — the ECMP set deduplicated by neighbour).
-    pub next_hops: BTreeMap<SystemId, Vec<NextHop>>,
+    /// paths — the ECMP set deduplicated by neighbour). Router
+    /// vertices only: a LAN forwards nothing by itself.
+    pub next_hops: BTreeMap<NeighborId, Vec<NextHop>>,
     /// The IP routes derived from reachable LSPs' prefix TLVs.
     pub routes: Vec<Route>,
     /// L1 only: the reachable attached L2 ISs (RFC 1195 §3.10.1's
@@ -93,14 +96,14 @@ pub struct SpfResult {
 /// One graph edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Edge {
-    to: SystemId,
+    to: NeighborId,
     metric: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeapNode {
     cost: u64,
-    id: SystemId,
+    id: NeighborId,
 }
 
 impl Ord for HeapNode {
@@ -131,6 +134,10 @@ fn link_metric(metric: u32) -> Option<u64> {
 
 /// Collect the usable edges of one LSP (wide preferred, narrow
 /// fallback; overload kills transit; purged LSPs carry nothing).
+/// Adjacency entries that name a pseudonode become edges to the LAN
+/// vertex (ISO §7.2.3's broadcast model) — the pseudonode LSP's own
+/// entries then fan out to the member routers at their advertised
+/// (zero, §7.2.3) metric.
 fn edges_of(lsp: &Lsp) -> Vec<Edge> {
     if lsp.is_purge() {
         return vec![];
@@ -147,16 +154,9 @@ fn edges_of(lsp: &Lsp) -> Vec<Edge> {
     if !wide.is_empty() {
         for t in wide {
             for n in t {
-                // Pseudonode entries (LAN adjacencies): the broadcast
-                // fan-out through the DIS's pseudonode LSP is
-                // §Deferred with LAN circuits; p2p adjacencies never
-                // produce one.
-                if n.id.is_pseudonode() {
-                    continue;
-                }
                 if let Some(m) = link_metric(n.metric) {
                     edges.push(Edge {
-                        to: n.id.system,
+                        to: n.id,
                         metric: m,
                     });
                 }
@@ -170,11 +170,8 @@ fn edges_of(lsp: &Lsp) -> Vec<Edge> {
                 id, default_metric, ..
             } in list
             {
-                if id.is_pseudonode() {
-                    continue; // LAN narrow adjacencies: §Deferred with broadcast
-                }
                 edges.push(Edge {
-                    to: id.system,
+                    to: *id,
                     metric: default_metric.metric() as u64,
                 });
             }
@@ -186,59 +183,59 @@ fn edges_of(lsp: &Lsp) -> Vec<Edge> {
 /// Run the SPF for `level` over `db` rooted at `self_id` at clock
 /// `now`. `Level::Level1` collects the attached-bit candidates.
 pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
-    // The vertex set and adjacency: router LSPs (fragment space is
-    // v1-flat — one fragment per system, the 0 fragment), plus
-    // pseudonode LSPs as LAN vertices.
-    let mut adjacency: HashMap<SystemId, Vec<Edge>> = HashMap::new();
-    let mut bits_by_system: HashMap<SystemId, LspBits> = HashMap::new();
-    let mut addresses: HashMap<SystemId, Vec<Ipv4Addr>> = HashMap::new();
-    let mut stored: HashMap<SystemId, &Lsp> = HashMap::new();
+    // The vertex set and adjacency: every LSP is one vertex keyed by
+    // its (system, pseudonode) id — router LSPs at pseudonode 0, a
+    // DIS's pseudonode LSPs as LAN vertices (fragment space is
+    // v1-flat — fragment 0 of each).
+    let root = NeighborId::new(self_id, 0);
+    let mut adjacency: HashMap<NeighborId, Vec<Edge>> = HashMap::new();
+    let mut bits_by_system: HashMap<NeighborId, LspBits> = HashMap::new();
+    let mut addresses: HashMap<NeighborId, Vec<Ipv4Addr>> = HashMap::new();
+    let mut stored: HashMap<NeighborId, &Lsp> = HashMap::new();
 
     for record in db.stored_lsps() {
         let lsp = &record.lsp;
         if lsp.is_purge() || record.remaining_lifetime(now) == 0 {
             continue;
         }
-        if lsp.id.pseudonode != 0 {
-            // LAN pseudonode LSPs: §Deferred with broadcast.
-            continue;
-        }
-        let vertex = lsp.id.system;
+        let vertex = NeighborId::new(lsp.id.system, lsp.id.pseudonode);
         adjacency.entry(vertex).or_default().extend(edges_of(lsp));
-        bits_by_system.insert(vertex, lsp.bits);
-        let addrs: Vec<Ipv4Addr> = lsp
-            .tlvs
-            .iter()
-            .filter_map(|t| match t {
-                Tlv::IpInterfaceAddress(a) => Some(a.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        if !addrs.is_empty() {
-            addresses.insert(vertex, addrs);
+        if lsp.id.pseudonode == 0 {
+            // Router-only TLVs: the type block (§7.2.5 reads it from
+            // fragment 0 — v1's flat fragment space) and TLV 132.
+            bits_by_system.insert(vertex, lsp.bits);
+            let addrs: Vec<Ipv4Addr> = lsp
+                .tlvs
+                .iter()
+                .filter_map(|t| match t {
+                    Tlv::IpInterfaceAddress(a) => Some(a.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if !addrs.is_empty() {
+                addresses.insert(vertex, addrs);
+            }
+            stored.insert(vertex, lsp);
         }
-        stored.insert(vertex, lsp);
     }
 
-    // Dijkstra from self_id.
-    let mut dist: HashMap<SystemId, u64> = HashMap::new();
-    let mut parents: HashMap<SystemId, HashSet<SystemId>> = HashMap::new();
+    // Dijkstra from the root router vertex.
+    let mut dist: HashMap<NeighborId, u64> = HashMap::new();
+    let mut parents: HashMap<NeighborId, HashSet<NeighborId>> = HashMap::new();
     let mut heap = BinaryHeap::new();
-    dist.insert(self_id, 0);
-    heap.push(HeapNode {
-        cost: 0,
-        id: self_id,
-    });
+    dist.insert(root, 0);
+    heap.push(HeapNode { cost: 0, id: root });
     while let Some(HeapNode { cost, id }) = heap.pop() {
         if cost > dist.get(&id).copied().unwrap_or(u64::MAX) {
             continue;
         }
-        // Overloaded systems do not forward through themselves (ISO
+        // Overloaded ROUTERS do not forward through themselves (ISO
         // §9.8: no routes "to another IS through the originating
         // system") — their own LSP contributes no transit edges.
+        // LAN vertices carry no type block and always fan out.
         let overloaded = bits_by_system.get(&id).map(|b| b.overload).unwrap_or(false);
-        if overloaded && id != self_id {
+        if overloaded && id != root {
             continue;
         }
         let Some(edges) = adjacency.get(&id) else {
@@ -265,22 +262,25 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
     }
 
     // Next hops: walk the DAG back to the first hop; the parent of
-    // self_id's neighbours is self_id, so a neighbour's own entry is
-    // the first hop. Resolve LAN vertices through to their member
-    // routers (the LAN edge carries the metric; the member hop is
-    // what forwards).
-    let mut next_hops: BTreeMap<SystemId, Vec<NextHop>> = BTreeMap::new();
-    let mut resolved: HashMap<SystemId, Vec<SystemId>> = HashMap::new();
+    // root's direct neighbours is root, so such a neighbour's own
+    // entry is the first hop. A LAN vertex on the path resolves
+    // THROUGH to the member router it leads to (the frame goes
+    // straight to that member's MAC — the pseudonode forwards
+    // nothing).
+    let mut next_hops: BTreeMap<NeighborId, Vec<NextHop>> = BTreeMap::new();
+    let mut resolved: HashMap<NeighborId, Vec<SystemId>> = HashMap::new();
     for &dest in dist.keys() {
-        if dest == self_id {
+        if dest == root || dest.is_pseudonode() {
             continue;
         }
-        let hops = first_hops(dest, &parents, self_id, &mut resolved, &mut HashSet::new());
+        let hops = first_hops(dest, &parents, root, &mut resolved, &mut HashSet::new());
         let hops: Vec<NextHop> = hops
             .into_iter()
             .map(|system| NextHop {
                 neighbor: system,
-                address: addresses.get(&system).and_then(|a| a.first().copied()),
+                address: addresses
+                    .get(&NeighborId::new(system, 0))
+                    .and_then(|a| a.first().copied()),
             })
             .collect();
         next_hops.insert(dest, hops);
@@ -294,15 +294,15 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
     };
 
     // Prefixes: wide preferred (135), else narrow (128/130), from
-    // reachable systems.
-    for (&system, &cost) in result.distances.iter() {
-        if system == self_id {
+    // reachable router vertices.
+    for (&vertex, &cost) in result.distances.iter() {
+        if vertex == root || vertex.is_pseudonode() {
             continue;
         }
-        let Some(lsp) = stored.get(&system) else {
+        let Some(lsp) = stored.get(&vertex) else {
             continue;
         };
-        let hops = result.next_hops.get(&system).cloned().unwrap_or_default();
+        let hops = result.next_hops.get(&vertex).cloned().unwrap_or_default();
         if hops.is_empty() {
             continue; // reachable only via a LAN we cannot resolve
         }
@@ -353,22 +353,22 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
         }
     }
 
-    // The attached-bit candidates (L1 only): reachable systems whose
+    // The attached-bit candidates (L1 only): reachable routers whose
     // LSP carries an ATT bit and can forward (they are L2 ISs —
     // IS type 3 on the wire).
     if level == Level::Level1 {
         let mut attached: Vec<(SystemId, u64, Vec<NextHop>)> = result
             .distances
             .iter()
-            .filter(|(&system, _)| system != self_id)
-            .filter_map(|(&system, &cost)| {
-                let bits = bits_by_system.get(&system)?;
-                let hops = result.next_hops.get(&system)?.clone();
+            .filter(|(&vertex, _)| vertex != root && !vertex.is_pseudonode())
+            .filter_map(|(&vertex, &cost)| {
+                let bits = bits_by_system.get(&vertex)?;
+                let hops = result.next_hops.get(&vertex)?.clone();
                 if hops.is_empty() {
                     return None;
                 }
                 if bits.is_attached() && bits.is_type.has_level2() {
-                    Some((system, cost, hops))
+                    Some((vertex.system, cost, hops))
                 } else {
                     None
                 }
@@ -381,20 +381,22 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
     result
 }
 
-/// First hops for `dest` by walking the parent DAG down to self_id's
-/// direct neighbours; LAN vertices resolve through to member routers
-/// via their own parents (a LAN's parents are the attached routers).
+/// First hops for `dest` by walking the parent DAG down to root's
+/// direct neighbours. A LAN vertex whose parents include root means
+/// both stations sit on that LAN — the member the path continues to
+/// is itself the first hop (frames cross the LAN straight to its
+/// MAC; the pseudonode only models the broadcast segment).
 fn first_hops(
-    dest: SystemId,
-    parents: &HashMap<SystemId, HashSet<SystemId>>,
-    self_id: SystemId,
-    memo: &mut HashMap<SystemId, Vec<SystemId>>,
-    seen: &mut HashSet<SystemId>,
+    dest: NeighborId,
+    parents: &HashMap<NeighborId, HashSet<NeighborId>>,
+    root: NeighborId,
+    memo: &mut HashMap<NeighborId, Vec<SystemId>>,
+    seen: &mut HashSet<NeighborId>,
 ) -> Vec<SystemId> {
     if let Some(cached) = memo.get(&dest) {
         return cached.clone();
     }
-    if dest == self_id {
+    if dest == root {
         return vec![];
     }
     if !seen.insert(dest) {
@@ -406,15 +408,20 @@ fn first_hops(
     };
     let mut hops: Vec<SystemId> = Vec::new();
     for &p in ps {
-        if p == self_id {
-            // dest itself is a first hop.
-            hops.push(dest);
-        } else if parents.get(&p).is_some_and(|gp| gp.contains(&self_id)) {
-            // p is a direct neighbour — p is the first hop. Unless
-            // dest IS the LAN vertex: then the first hop is a member.
-            hops.push(p);
+        if p == root {
+            // A direct router-to-router edge: dest itself forwards.
+            hops.push(dest.system);
+        } else if parents.get(&p).is_some_and(|gp| gp.contains(&root)) {
+            // p is one hop from root. A LAN vertex there means dest
+            // is a member of a LAN we are on — dest forwards.
+            // Otherwise p is a direct neighbour and the first hop.
+            if p.is_pseudonode() {
+                hops.push(dest.system);
+            } else {
+                hops.push(p.system);
+            }
         } else {
-            hops.extend(first_hops(p, parents, self_id, memo, seen));
+            hops.extend(first_hops(p, parents, root, memo, seen));
         }
     }
     hops.sort();
@@ -435,6 +442,11 @@ mod tests {
     const R2: SystemId = SystemId::from_bytes([0, 0, 0, 0, 0, 2]);
     const R3: SystemId = SystemId::from_bytes([0, 0, 0, 0, 0, 3]);
     const R4: SystemId = SystemId::from_bytes([0, 0, 0, 0, 0, 4]);
+
+    /// The router vertex of a system id.
+    fn v(id: SystemId) -> NeighborId {
+        NeighborId::new(id, 0)
+    }
 
     fn neighbor(id: SystemId, metric: u32) -> ExtIsNeighbor {
         ExtIsNeighbor {
@@ -504,8 +516,8 @@ mod tests {
             LspBits::default(),
         );
         let result = run(R1, Level::Level1, &db, 0);
-        assert_eq!(result.distances.get(&R2), Some(&10));
-        let hops = result.next_hops.get(&R2).unwrap();
+        assert_eq!(result.distances.get(&v(R2)), Some(&10));
+        let hops = result.next_hops.get(&v(R2)).unwrap();
         assert_eq!(hops.len(), 1);
         assert_eq!(hops[0].neighbor, R2);
         assert_eq!(hops[0].address, Some(Ipv4Addr::new(10, 0, 0, 2)));
@@ -531,8 +543,8 @@ mod tests {
         add_router(&mut db, R2, vec![], vec![], None, LspBits::default());
         add_router(&mut db, R3, vec![], vec![], None, LspBits::default());
         let result = run(R1, Level::Level2, &db, 0);
-        assert_eq!(result.distances.get(&R2), None);
-        assert_eq!(result.distances.get(&R3), Some(&50));
+        assert_eq!(result.distances.get(&v(R2)), None);
+        assert_eq!(result.distances.get(&v(R3)), Some(&50));
     }
 
     /// ISO §9.8: an overloaded IS does not forward transit traffic,
@@ -561,9 +573,13 @@ mod tests {
         );
         add_router(&mut db, R3, vec![], vec![], None, LspBits::default());
         let result = run(R1, Level::Level1, &db, 0);
-        assert_eq!(result.distances.get(&R2), Some(&10), "R2 itself reachable");
         assert_eq!(
-            result.distances.get(&R3),
+            result.distances.get(&v(R2)),
+            Some(&10),
+            "R2 itself reachable"
+        );
+        assert_eq!(
+            result.distances.get(&v(R3)),
             None,
             "no transit through overload"
         );
@@ -669,8 +685,8 @@ mod tests {
             LspBits::default(),
         );
         let result = run(R1, Level::Level1, &db, 0);
-        assert_eq!(result.distances.get(&R4), Some(&20));
-        let hops = result.next_hops.get(&R4).unwrap();
+        assert_eq!(result.distances.get(&v(R4)), Some(&20));
+        let hops = result.next_hops.get(&v(R4)).unwrap();
         let mut neighbors: Vec<SystemId> = hops.iter().map(|h| h.neighbor).collect();
         neighbors.sort();
         assert_eq!(neighbors, vec![R2, R3]);
@@ -732,7 +748,7 @@ mod tests {
         );
         let result = run(R1, Level::Level2, &db, 0);
         assert_eq!(
-            result.distances.get(&R2),
+            result.distances.get(&v(R2)),
             Some(&40),
             "wide metric preferred over narrow 1"
         );
@@ -778,7 +794,7 @@ mod tests {
         // Rooted at R2 (its LSP carries the narrow adjacency; the
         // symmetric R1 side of a narrow link is the same shape).
         let result = run(R2, Level::Level2, &db2, 0);
-        assert_eq!(result.distances.get(&R1), Some(&7), "narrow fallback");
+        assert_eq!(result.distances.get(&v(R1)), Some(&7), "narrow fallback");
     }
 
     /// Purged LSPs contribute nothing (§7.3.16.4's tombstone).
@@ -798,7 +814,7 @@ mod tests {
         let purges = db.tick(1200);
         assert_eq!(purges.len(), 2); // both LSPs age out
         let result = run(R1, Level::Level1, &db, 1200);
-        assert!(!result.distances.contains_key(&R2));
+        assert!(!result.distances.contains_key(&v(R2)));
     }
 
     /// RFC 5302's up/down bit rides the computed `Route` from both
@@ -921,33 +937,122 @@ mod tests {
         assert!(route.up_down, "the narrow bit reaches the route");
     }
 
+    /// The broadcast model (ISO §7.2.3): three routers on one LAN —
+    /// each router LSP carries a pseudonode adjacency entry at its
+    /// circuit metric; the DIS's pseudonode LSP fans out to every
+    /// member (itself included, §7.3.8's "own systemID with an
+    /// appended zero octet") at metric zero. Distances cross the LAN
+    /// as m1 + 0 + m2; next hops resolve THROUGH the LAN vertex to
+    /// the member itself; the LAN vertex is reachable but forwards
+    /// nothing.
+    #[test]
+    fn lan_fanout_three_routers() {
+        let dis = R1; // R1 is the DIS: pseudonode 1
+        let lan = NeighborId::new(dis, 1);
+        let mut db = Lspdb::new();
+        // Router LSPs: each attaches to the LAN at metric 10.
+        for (sys, addr) in [
+            (R1, Ipv4Addr::new(10, 0, 0, 1)),
+            (R2, Ipv4Addr::new(10, 0, 0, 2)),
+            (R3, Ipv4Addr::new(10, 0, 0, 3)),
+        ] {
+            add_router(
+                &mut db,
+                sys,
+                vec![ExtIsNeighbor {
+                    id: lan,
+                    metric: 10,
+                    sub_tlvs: vec![],
+                }],
+                if sys == R3 {
+                    vec![wide(5, [192, 168, 30, 0], 24)]
+                } else {
+                    vec![]
+                },
+                Some(addr),
+                LspBits::default(),
+            );
+        }
+        // The pseudonode LSP: links to every member at metric 0.
+        let members = [R1, R2, R3].map(|m| ExtIsNeighbor {
+            id: NeighborId::new(m, 0),
+            metric: 0,
+            sub_tlvs: vec![],
+        });
+        let pdu = lsp_pdu(
+            false,
+            LspId::new(dis, 1, 0),
+            1,
+            1200,
+            LspBits::default(),
+            vec![
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::ExtIsReachability(members.to_vec()),
+            ],
+        );
+        let decoded = Pdu::decode(&pdu.encode()).unwrap();
+        let PduBody::Lsp(l) = decoded.body else {
+            unreachable!()
+        };
+        db.install(l, 0);
+
+        let result = run(R2, Level::Level2, &db, 0);
+        // The LAN vertex is reachable at our circuit metric; each
+        // member pays only ITS OWN attachment metric (the pseudonode
+        // edges are zero — the per-endpoint LAN costing).
+        assert_eq!(result.distances.get(&lan), Some(&10));
+        assert_eq!(result.distances.get(&v(R1)), Some(&10));
+        assert_eq!(result.distances.get(&v(R3)), Some(&10));
+        // Next hops resolve through the LAN to the member itself (the
+        // frame crosses the segment straight to its MAC).
+        let hops = result.next_hops.get(&v(R3)).unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].neighbor, R3);
+        assert_eq!(hops[0].address, Some(Ipv4Addr::new(10, 0, 0, 3)));
+        // The LAN vertex itself has no forwarding entry.
+        assert!(!result.next_hops.contains_key(&lan));
+        // R3's prefix rides the LAN: 10 (to the LAN) + 0 + 10 (to
+        // R3) + 5 (the prefix) = 25.
+        let route = result
+            .routes
+            .iter()
+            .find(|r| r.prefix == (Ipv4Addr::new(192, 168, 30, 0), 24))
+            .unwrap();
+        assert_eq!(route.metric, 15);
+        assert_eq!(route.next_hops[0].neighbor, R3);
+    }
+
     // ---- the brute-force oracle (the ospfd recipe) ----------------
 
     /// Bellman-Ford over the same edge extraction: |V|·|E| relaxations.
-    fn oracle_distances(db: &Lspdb, root: SystemId, now: u64) -> BTreeMap<SystemId, u64> {
-        let mut edges: Vec<(SystemId, SystemId, u64)> = Vec::new();
-        let mut live: HashSet<SystemId> = HashSet::new();
-        let mut overloaded: HashSet<SystemId> = HashSet::new();
+    /// Vertices are the full (system, pseudonode) ids — LAN vertices
+    /// included, exactly like the Dijkstra under test.
+    fn oracle_distances(db: &Lspdb, root: SystemId, now: u64) -> BTreeMap<NeighborId, u64> {
+        let mut edges: Vec<(NeighborId, NeighborId, u64)> = Vec::new();
+        let mut live: HashSet<NeighborId> = HashSet::new();
+        let mut overloaded: HashSet<NeighborId> = HashSet::new();
         for record in db.stored_lsps() {
             let lsp = &record.lsp;
-            if lsp.is_purge() || record.remaining_lifetime(now) == 0 || lsp.id.pseudonode != 0 {
+            if lsp.is_purge() || record.remaining_lifetime(now) == 0 {
                 continue;
             }
-            live.insert(lsp.id.system);
-            if lsp.bits.overload {
-                overloaded.insert(lsp.id.system);
+            let vertex = NeighborId::new(lsp.id.system, lsp.id.pseudonode);
+            live.insert(vertex);
+            if lsp.id.pseudonode == 0 && lsp.bits.overload {
+                overloaded.insert(vertex);
             }
             for e in edges_of(lsp) {
-                edges.push((lsp.id.system, e.to, e.metric));
+                edges.push((vertex, e.to, e.metric));
             }
         }
-        let mut dist: BTreeMap<SystemId, u64> = BTreeMap::new();
+        let root = NeighborId::new(root, 0);
+        let mut dist: BTreeMap<NeighborId, u64> = BTreeMap::new();
         dist.insert(root, 0);
         for _ in 0..=edges.len() + 1 {
             let mut changed = false;
             for &(from, to, m) in &edges {
                 // Overload blocks transit (edges OUT of the
-                // overloaded IS), not reachability of it.
+                // overloaded ROUTER), not reachability of it.
                 if overloaded.contains(&from) && from != root {
                     continue;
                 }
@@ -979,14 +1084,34 @@ mod tests {
         };
         let systems = [R1, R2, R3, R4];
         let mut db = Lspdb::new();
+        // One optional broadcast segment (ISO 10589 §7.2.3): a LAN
+        // vertex (the DIS's pseudonode) that a subset of routers
+        // attach to, with its pseudonode LSP fanning out at metric 0.
+        let lan_on = next() % 2 == 0;
+        let lan = NeighborId::new(R4, 1);
+        let mut lan_members: Vec<SystemId> = Vec::new();
+        if lan_on {
+            for &sys in &systems[..3] {
+                if next() % 2 == 0 {
+                    lan_members.push(sys);
+                }
+            }
+        }
         for &sys in &systems {
             let n = (next() % 3) as usize;
-            let neighbors = (0..n)
-                .map(|_| {
-                    let target = systems[(next() % systems.len() as u64) as usize];
-                    neighbor(target, (next() % 30) as u32)
-                })
-                .collect();
+            let mut neighbors = Vec::new();
+            for _ in 0..n {
+                let target = systems[(next() % systems.len() as u64) as usize];
+                neighbors.push(neighbor(target, (next() % 30) as u32));
+            }
+            let lan_active = !lan_members.is_empty();
+            if lan_active && (lan_members.contains(&sys) || sys == R4) {
+                neighbors.push(ExtIsNeighbor {
+                    id: lan,
+                    metric: (next() % 20) as u32,
+                    sub_tlvs: vec![],
+                });
+            }
             let p = (next() % 2) as usize;
             let prefixes = (0..p)
                 .map(|_| wide((next() % 20) as u32, [10, 0, (next() % 256) as u8, 0], 24))
@@ -1001,31 +1126,62 @@ mod tests {
             };
             add_router(&mut db, sys, neighbors, prefixes, None, bits);
         }
+        if !lan_members.is_empty() {
+            // The DIS's pseudonode LSP: a link to every member (the
+            // DIS itself included, §7.3.8's "own systemID with an
+            // appended zero octet") at metric zero (§7.2.3).
+            let members: Vec<ExtIsNeighbor> = lan_members
+                .iter()
+                .chain(std::iter::once(&R4))
+                .map(|&m| ExtIsNeighbor {
+                    id: NeighborId::new(m, 0),
+                    metric: 0,
+                    sub_tlvs: vec![],
+                })
+                .collect();
+            let pdu = lsp_pdu(
+                false,
+                LspId::new(R4, 1, 0),
+                1,
+                1200,
+                LspBits::default(),
+                vec![
+                    Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                    Tlv::ExtIsReachability(members),
+                ],
+            );
+            let decoded = Pdu::decode(&pdu.encode()).expect("encodes");
+            let PduBody::Lsp(l) = decoded.body else {
+                unreachable!()
+            };
+            db.install(l, 0);
+        }
         let root = systems[(next() % systems.len() as u64) as usize];
         (db, root)
     }
 
     /// Property: Dijkstra matches the Bellman-Ford oracle on random
-    /// 4-router topologies (the ospfd `property_distances_match_
-    /// bellman_ford_oracle` shape).
+    /// 4-router topologies, with and without a broadcast segment (the
+    /// ospfd `property_distances_match_bellman_ford_oracle` shape,
+    /// extended over LAN vertices).
     #[test]
     fn property_distances_match_bellman_ford_oracle() {
         for seed in 0..300u64 {
             let (db, root) = random_spf_case(seed);
             let ours = run(root, Level::Level1, &db, 0);
             let oracle = oracle_distances(&db, root, 0);
-            for (&node, &want) in oracle.iter() {
+            for (node, want) in oracle.iter() {
                 assert_eq!(
-                    ours.distances.get(&node),
-                    Some(&want),
+                    ours.distances.get(node),
+                    Some(want),
                     "seed {seed}: distance to {node}"
                 );
             }
-            for (&node, &got) in ours.distances.iter() {
-                if node != root {
+            for (node, got) in ours.distances.iter() {
+                if *node != NeighborId::new(root, 0) {
                     assert_eq!(
-                        oracle.get(&node),
-                        Some(&got),
+                        oracle.get(node),
+                        Some(got),
                         "seed {seed}: extra reachability {node}"
                     );
                 }
@@ -1033,19 +1189,40 @@ mod tests {
         }
     }
 
-    /// Property: next-hop sets only contain direct neighbours of the
-    /// root, and every routed prefix sits on a reachable node with
-    /// metric = distance + prefix metric (the route composition).
+    /// Property: next-hop sets only contain stations the root frames
+    /// can actually reach directly — direct p2p neighbours, or
+    /// members of a LAN the root sits on — and every routed prefix
+    /// sits on a reachable node with metric ≥ the SPF distance (the
+    /// route composition).
     #[test]
     fn property_next_hops_and_route_composition() {
         for seed in 0..300u64 {
             let (db, root) = random_spf_case(seed);
             let result = run(root, Level::Level2, &db, 0);
-            let direct: HashSet<SystemId> = db
-                .lsps()
-                .find(|l| l.id.system == root)
-                .map(|l| edges_of(l).into_iter().map(|e| e.to).collect())
-                .unwrap_or_default();
+            // The root's own LSP: p2p edge targets are direct
+            // neighbours; a LAN edge makes that LAN's members direct
+            // (the pseudonode LSP lists them).
+            let mut direct: HashSet<SystemId> = HashSet::new();
+            let mut root_lans: HashSet<NeighborId> = HashSet::new();
+            if let Some(l) = db.lsps().find(|l| l.id.system == root) {
+                for e in edges_of(l) {
+                    if e.to.is_pseudonode() {
+                        root_lans.insert(e.to);
+                    } else {
+                        direct.insert(e.to.system);
+                    }
+                }
+            }
+            for l in db.lsps() {
+                if root_lans.contains(&NeighborId::new(l.id.system, l.id.pseudonode)) {
+                    for e in edges_of(l) {
+                        if !e.to.is_pseudonode() {
+                            direct.insert(e.to.system);
+                        }
+                    }
+                }
+            }
+            direct.remove(&root);
             for (dest, hops) in result.next_hops.iter() {
                 for hop in hops {
                     assert!(
@@ -1057,9 +1234,15 @@ mod tests {
                 }
             }
             for route in &result.routes {
-                let origin = db
+                // When exactly one router advertises the prefix, the
+                // route metric must be at least the SPF distance to
+                // it (the composition cost). (With several
+                // advertisers the route may belong to any of them —
+                // attribution is ambiguous, so the property only
+                // pins the unique case.)
+                let origins: Vec<NeighborId> = db
                     .lsps()
-                    .find(|l| {
+                    .filter(|l| {
                         l.tlvs.iter().any(|t| match t {
                             Tlv::ExtIpReachability(ps) => {
                                 ps.iter().any(|p| p.prefix == route.prefix)
@@ -1067,9 +1250,10 @@ mod tests {
                             _ => false,
                         })
                     })
-                    .map(|l| l.id.system);
-                if let Some(origin) = origin {
-                    if let Some(&d) = result.distances.get(&origin) {
+                    .map(|l| NeighborId::new(l.id.system, l.id.pseudonode))
+                    .collect();
+                if let [origin] = origins.as_slice() {
+                    if let Some(&d) = result.distances.get(origin) {
                         assert!(
                             route.metric >= d,
                             "seed {seed}: route metric below the SPF distance"

@@ -627,6 +627,41 @@ pub fn p2p_hello(
     }
 }
 
+/// The L1/L2 LAN IIH constructor (the broadcast circuit's TX shape —
+/// ISO §9.5/§9.6: priority and the LAN ID ride the fixed part).
+pub fn lan_hello(
+    level2: bool,
+    circuit_type: Level,
+    source: SystemId,
+    holding_time: u16,
+    priority: u8,
+    lan_id: NeighborId,
+    tlvs: Vec<Tlv>,
+) -> Pdu {
+    Pdu {
+        header: CommonHeader {
+            length_indicator: 27,
+            id_length: 0,
+            pdu_type: if level2 {
+                PDU_L2_LAN_HELLO
+            } else {
+                PDU_L1_LAN_HELLO
+            },
+            reserved: 0,
+            max_area_addresses: 0,
+        },
+        body: PduBody::LanHello(LanHello {
+            circuit_type,
+            source_id: source,
+            holding_time,
+            pdu_length: 0,
+            priority: priority & 0x7f,
+            lan_id,
+            tlvs,
+        }),
+    }
+}
+
 /// The L1/L2 LSP constructor (the daemon's origination shape — the
 /// checksum is computed on encode).
 pub fn lsp(

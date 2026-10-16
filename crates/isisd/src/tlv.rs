@@ -46,6 +46,7 @@ use crate::wire::{put_u16, put_u24, put_u32, put_u8, Reader};
 /// TLV codepoints (ISO 10589 §9.8 unless noted).
 pub const TLV_AREA_ADDRESSES: u8 = 1;
 pub const TLV_IS_REACHABILITY: u8 = 2;
+pub const TLV_LAN_NEIGHBORS: u8 = 6; // §9.5: LAN IIH "IS Neighbours"
 pub const TLV_PADDING: u8 = 8;
 pub const TLV_LSP_ENTRIES: u8 = 9;
 pub const TLV_AUTHENTICATION: u8 = 10;
@@ -288,6 +289,11 @@ pub enum Tlv {
     /// CODE 2: the narrow IS-reachability set (ISO layout — see the
     /// module note for the FRR divergence).
     IsReachability(Vec<OldIsNeighbor>),
+    /// CODE 6 (§9.5): the LAN IIH's IS neighbours — the SNPA (MAC)
+    /// addresses of the systems whose IIHs this IS has recently
+    /// received, 6 octets each. The presence of our own MAC in a
+    /// peer's CODE 6 is ISO §8.4.1.5's Up condition.
+    LanNeighbors(Vec<[u8; 6]>),
     /// CODE 8: padding, opaque value.
     Padding(Vec<u8>),
     /// CODE 9: LSP entries (CSNP/PSNP bodies).
@@ -322,6 +328,7 @@ impl Tlv {
         match self {
             Self::AreaAddresses(_) => TLV_AREA_ADDRESSES,
             Self::IsReachability(_) => TLV_IS_REACHABILITY,
+            Self::LanNeighbors(_) => TLV_LAN_NEIGHBORS,
             Self::Padding(_) => TLV_PADDING,
             Self::LspEntries(_) => TLV_LSP_ENTRIES,
             Self::Authentication { .. } => TLV_AUTHENTICATION,
@@ -418,6 +425,19 @@ fn decode_one(kind: u8, value: &[u8]) -> Result<Tlv, IsisError> {
             Tlv::IsReachability(neighbors)
         }
         TLV_PADDING => Tlv::Padding(value.to_vec()),
+        TLV_LAN_NEIGHBORS => {
+            if !value.len().is_multiple_of(6) {
+                return Err(entry_err(6));
+            }
+            Tlv::LanNeighbors(
+                value
+                    .as_chunks::<6>()
+                    .0
+                    .iter()
+                    .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
+                    .collect(),
+            )
+        }
         TLV_LSP_ENTRIES => {
             if !value.len().is_multiple_of(16) {
                 return Err(entry_err(16));
@@ -689,6 +709,11 @@ pub fn encode_tlv(buf: &mut Vec<u8>, tlv: &Tlv) {
             }
         }
         Tlv::Padding(v) => value.extend_from_slice(v),
+        Tlv::LanNeighbors(macs) => {
+            for m in macs {
+                value.extend_from_slice(m);
+            }
+        }
         Tlv::LspEntries(entries) => {
             for e in entries {
                 put_u16(&mut value, e.remaining_lifetime);
@@ -1201,6 +1226,36 @@ mod tests {
             roundtrip(&[Tlv::Padding(vec![])]),
             vec![Tlv::Padding(vec![])]
         );
+    }
+
+    /// CODE 6 (§9.5): 6-octet SNPA entries; the modulo-6 rule; the
+    /// IIH's Up condition (§8.4.1.5) reads our own MAC out of one.
+    #[test]
+    fn lan_neighbors_six_byte_entries() {
+        let ours = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let theirs = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let tlv = Tlv::LanNeighbors(vec![ours, theirs]);
+        let mut buf = Vec::new();
+        encode_tlv(&mut buf, &tlv);
+        assert_eq!(buf.len(), 2 + 12);
+        assert_eq!(buf[1], 12);
+        let back = roundtrip(std::slice::from_ref(&tlv));
+        assert_eq!(back, vec![tlv.clone()]);
+        assert!(matches!(&back[0], Tlv::LanNeighbors(m) if m.contains(&ours)));
+        // 7 bytes is not an entry set.
+        let bad = {
+            let mut v = vec![TLV_LAN_NEIGHBORS, 7];
+            v.extend_from_slice(&[0u8; 7]);
+            v
+        };
+        assert!(matches!(
+            decode_tlvs(&bad),
+            Err(IsisError::BadTlvEntrySize {
+                kind: 6,
+                entry: 6,
+                ..
+            })
+        ));
     }
 
     #[test]

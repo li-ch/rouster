@@ -81,6 +81,9 @@ mod linux_main {
             }
         };
         info!(iface = %iface, mac = %socket.our_mac(), "isisd: raw 0x00FE socket open");
+        // The broadcast circuits need our SNPA (the DIS tie-break and
+        // CODE 6's own-MAC membership test).
+        core.set_lan_mac(socket.our_mac().0);
 
         // Events in (PDUs from the wire, redistribute pushes).
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -134,7 +137,7 @@ mod linux_main {
                         if let Some(frame) = isisd::transport::parse_frame(&buf[..n]) {
                             match Pdu::decode(frame.payload) {
                                 Ok(pdu) => {
-                                    let _ = rx_tx.send(Event::Pdu(pdu));
+                                    let _ = rx_tx.send(Event::Pdu(pdu, frame.src.0));
                                 }
                                 Err(e) => {
                                     tracing::warn!("isisd: undecodable PDU on the wire (dropped): {e}");

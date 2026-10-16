@@ -14,6 +14,7 @@
 //!  interface eth0
 //!   address 172.16.0.2/24
 //!   circuit-type level-1-2
+//!   network broadcast
 //!   hello-interval 10
 //!   hello-multiplier 3
 //!   mtu 1500
@@ -79,6 +80,16 @@ pub enum MetricStyle {
     Transition,
 }
 
+/// The circuit's network type (FRR's `isis network`): p2p IIHs with
+/// RFC 5303's three-way handshake, or LAN IIHs with ISO 10589's DIS
+/// election and pseudonode LSPs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkType {
+    #[default]
+    PointToPoint,
+    Broadcast,
+}
+
 /// Per-interface parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceConfig {
@@ -86,6 +97,10 @@ pub struct InterfaceConfig {
     /// The interface's IPv4 (the TLV 132 source and the LSP prefix).
     pub address: Option<(Ipv4Addr, u8)>,
     pub circuit_type: Level,
+    pub network: NetworkType,
+    /// The LAN priority (ISO §9.5's 7-bit DIS election input; 0..=127,
+    /// FRR's default 64).
+    pub priority: u8,
     pub hello_interval: u16,
     /// holding time = interval × multiplier (FRR's shape).
     pub hello_multiplier: u16,
@@ -98,6 +113,8 @@ impl Default for InterfaceConfig {
             name: String::new(),
             address: None,
             circuit_type: Level::Level1And2,
+            network: NetworkType::PointToPoint,
+            priority: 64,
             hello_interval: 10,
             hello_multiplier: 3,
             mtu: 1500,
@@ -250,6 +267,33 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
                     config.interface.circuit_type = parse_level(words[1]).ok_or_else(|| {
                         parse_error(line_no, &format!("bad circuit-type {:?}", words[1]))
                     })?;
+                }
+                "priority" => {
+                    if words.len() != 2 {
+                        return Err(parse_error(line_no, "`priority <0-127>`"));
+                    }
+                    let value: u8 = words[1]
+                        .parse()
+                        .map_err(|_| parse_error(line_no, "priority is numeric"))?;
+                    if value > 127 {
+                        return Err(parse_error(line_no, "priority is 0..=127"));
+                    }
+                    config.interface.priority = value;
+                }
+                "network" => {
+                    if words.len() != 2 {
+                        return Err(parse_error(line_no, "`network <point-to-point|broadcast>`"));
+                    }
+                    config.interface.network = match words[1] {
+                        "point-to-point" => NetworkType::PointToPoint,
+                        "broadcast" => NetworkType::Broadcast,
+                        other => {
+                            return Err(parse_error(
+                                line_no,
+                                &format!("bad network type {other:?}"),
+                            ))
+                        }
+                    };
                 }
                 "hello-interval" => {
                     if words.len() != 2 {
