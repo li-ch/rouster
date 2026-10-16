@@ -557,6 +557,85 @@ paced.
   2026-10-15); the line now carries counts plus a bounded four-entry
   NLRI preview (path ids included) — O(1), never the full list.
 
+## Bench round 2026-10-16 (S15-a): F10 fixed — the session-establishment gap, diagnosed then levered
+
+The E3 session-scaling grid (§R) escalated F10: at N=100 concurrent
+sessions rouster bgpd burned ~11× FRR's establishment CPU
+(0.57-0.60 s vs 0.05 s) and its throughput degraded with N
+(2,286/s → 636/s) where FRR stayed flat. The S15-a instrumented
+diagnosis (`crates/bgpd/src/estprof.rs`, runtime-gated by
+`BGPD_EST_PROFILE=<path>`; folded by `scripts/bench-e3-diagnose.py`)
+measured the per-phase walls inside bgpd at N=100 c4 and ruled the
+three pre-named candidates OUT by measurement — accept-loop wait
+~30 ms summed over 100 sessions (p95 1.2 ms/accept), neighbor
+lookup + config resolve < 1 ms summed, registry + session
+construction (channels, `PeerSession::new`) < 2 ms summed, OPEN
+processing < 1 ms summed. The A/B cell (per-session table 1 prefix
+vs 100) attributed the whole gap to the per-session TABLE EXCHANGE
+behind the Loc-RIB lock: at table=1 the N=100 establishment
+completes in 26 ms (3,782 sessions/s, 0.02 s CPU — faster than
+FRR's same cell); at table=100 the demand sat in the sink
+announce/withdraw path (1.36-1.52 s summed, ~320 µs per UPDATE),
+the EOR handler (3.5 ms per EOR), and the Established-time
+Adj-RIB-Out dump — with not-yet-established sessions' FSM
+handshakes starved behind it (per-session establishment wall grew
+×14.7 from the first to the last half of the burst, which is what
+the wall metric measures). Three levers, each with its own E3-cell
+receipt:
+
+- **F10-1 — EOR recomputes only the flushed prefixes.**
+  `RibSink::eor_received` ran the full-table `recompute()` per
+  End-of-RIB (O(peers × prefixes) at the worst moment — every
+  session's EOR lands inside the establishment window).
+  `LocRib::flush_stale_family` now returns the flushed prefixes and
+  the EOR path recomputes exactly those (a prefix whose every
+  candidate was flushed still yields its withdrawal change through
+  the per-prefix recompute) — the same F1 rule the hot path already
+  states: recompute what the message touched. Receipt: 157 → 96 ms
+  wall, 636 → 1,039 sessions/s, 0.60 → 0.31 s CPU (N=100 c4
+  medians).
+- **F10-2 — `best_path` precomputes each candidate's §9.1 scalars
+  once.** Every decision step re-derived its scalar by scanning the
+  candidate's attribute list, and the MED step compares candidates
+  pairwise — with same-feed peers every step runs to the
+  BGP-Identifier tiebreak, making one recompute
+  O(candidates² × attributes). The scalars (LOCAL_PREF, path
+  length, ORIGIN, MED, neighbor AS, session type, BGP Identifier,
+  peer address) are derived once per recompute; the steps compare
+  plain numbers. Step-for-step semantics unchanged (the pure
+  decision table tests pin them). Receipt: 96 → 61 ms,
+  1,039 → 1,643 sessions/s, 0.31 → 0.09 s CPU.
+- **F10-3 — `recompute_prefix` elects over borrowed candidates.**
+  The election cloned every candidate `Route` into a `Vec` to
+  satisfy `best_path(&[Route])`; it now collects `Vec<&Route>` and
+  clones only the winner (`best_path` takes `&[&Route]`; the
+  decision table tests converted mechanically). Receipt:
+  61 → 50 ms, 1,643 → 2,000 sessions/s, CPU 0.10 s median
+  (0.09-0.11 across runs) — within the pre-set bar (≥1,600
+  sessions/s; CPU within 3× of FRR's 0.05 s) on every measured
+  run, zero establishment failures, SUT cross-count = N every run.
+
+The close receipt re-ran the full E3 grid on the levered tree
+(`e3-20261016T225714Z`, 54 runs, zero failures, SUT cross-count = N
+every cell; FRR comparators from the ledgered grid
+`e3-20261016T161507Z`, same rig/harness): wall first-connect →
+all-N Established medians — N=10: 3/4/4 ms (c1/2/4; FRR 4/4/4);
+N=50: 23/24/21 ms (FRR 19/20/18); N=100: 70/48/64 ms (FRR
+41/39/41) — FRR ahead 1.2-1.7× at N=100, sub-2× everywhere.
+sessions/s at N=100: 1,433/2,098/1,569 (FRR 2,441/2,544/2,428) —
+the dedicated lever-3 receipt cell measured 2,000 (min 1,347);
+cell-to-cell variance disclosed. Speaker CPU at N=100: 0.09/0.09/
+0.11 s vs FRR's 0.05 — 1.8-2.2×, inside the pre-set 3× bar on
+every cell (was ~11×); the throughput degradation with N is gone
+(2,351-3,286/s at N=10, 2,056-2,410/s at N=50, 1,433-2,098/s at
+N=100 — flat within noise against the fleet's ~27 ms release
+spread, which both sides' walls include). estprof stays in the tree
+as the establishment profiler (inert without the env var; one
+relaxed atomic read per note site). §Deferred: the per-UPDATE
+`Vec<&Route>` collection still range-scans every peer's Adj-RIB-In
+per touched prefix (an O(candidates) walk, no index) — the next
+lever if a heavier fan-out cell names it.
+
 ## Memory campaign 2026-10-16 (PERF-M1): the census
 
 The §R E5 gap (bgpd 1,679 B/prefix at the full table vs FRR's 897)
