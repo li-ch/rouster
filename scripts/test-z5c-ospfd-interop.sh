@@ -155,7 +155,7 @@ echo "==> resident rousterd in both containers"
 for name in "$R1" "$R2"; do
     docker exec "$name" sh -c "echo '188 ospf' >> /etc/iproute2/rt_protos"
     docker exec "$name" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-    docker exec -d "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+    docker exec -d -e ROUSTERD_LOG=debug "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 done
 wait_in r1 "rousterd r1 listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 wait_in r2 "rousterd r2 listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"

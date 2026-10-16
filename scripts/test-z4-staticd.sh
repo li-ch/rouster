@@ -89,7 +89,7 @@ docker exec "$NAME" sh -c "printf '%s\n' \
   > $STATICD_CONF"
 
 echo "==> starting resident rousterd (no routes of its own)"
-docker exec -d "$NAME" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+docker exec -d -e ROUSTERD_LOG=debug "$NAME" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 wait_in_container "rousterd zapi server up" 30 "sed 's/\x1b\[[0-9;]*m//g' $ROUSTERD_LOG | grep -q 'zapi: listening'"
 
 echo "==> starting staticd against the zapi socket"
