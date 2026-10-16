@@ -263,7 +263,7 @@ impl ExportPolicy for AcceptAll {
 /// recompute over same-feed peers cost O(candidates² × attributes)
 /// attribute walks. Semantics are unchanged step for step (the pure
 /// decision table tests below pin them).
-pub fn best_path(candidates: &[Route]) -> Option<&Route> {
+pub fn best_path<'a>(candidates: &[&'a Route]) -> Option<&'a Route> {
     if candidates.is_empty() {
         return None;
     }
@@ -279,7 +279,7 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
     }
     let scores: Vec<Score> = candidates
         .iter()
-        .map(|r| Score {
+        .map(|&r| Score {
             pref: r.local_pref(),
             path_len: r.as_path_len(),
             origin: r.origin(),
@@ -296,21 +296,21 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
     let top_pref = alive.iter().map(|&i| scores[i].pref).max().unwrap();
     alive.retain(|&i| scores[i].pref == top_pref);
     if alive.len() == 1 {
-        return Some(&candidates[alive[0]]);
+        return Some(candidates[alive[0]]);
     }
 
     // a) smallest AS_PATH count (AS_SET = 1).
     let shortest = alive.iter().map(|&i| scores[i].path_len).min().unwrap();
     alive.retain(|&i| scores[i].path_len == shortest);
     if alive.len() == 1 {
-        return Some(&candidates[alive[0]]);
+        return Some(candidates[alive[0]]);
     }
 
     // b) lowest ORIGIN number.
     let best_origin = alive.iter().map(|&i| scores[i].origin).min().unwrap();
     alive.retain(|&i| scores[i].origin == best_origin);
     if alive.len() == 1 {
-        return Some(&candidates[alive[0]]);
+        return Some(candidates[alive[0]]);
     }
 
     // c) lowest MED among routes from the same neighboring AS
@@ -329,14 +329,14 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
     }
     alive = med_alive;
     if alive.len() == 1 {
-        return Some(&candidates[alive[0]]);
+        return Some(candidates[alive[0]]);
     }
 
     // d) eBGP over iBGP.
     if alive.iter().any(|&i| !scores[i].internal) {
         alive.retain(|&i| !scores[i].internal);
         if alive.len() == 1 {
-            return Some(&candidates[alive[0]]);
+            return Some(candidates[alive[0]]);
         }
     }
 
@@ -352,14 +352,14 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
             .unwrap();
         alive.retain(|&i| scores[i].bgp_id == Some(lowest));
         if alive.len() == 1 {
-            return Some(&candidates[alive[0]]);
+            return Some(candidates[alive[0]]);
         }
     }
 
     // g) lowest peer address.
     let lowest_addr = alive.iter().map(|&i| scores[i].addr).min().unwrap();
     alive.retain(|&i| scores[i].addr == lowest_addr);
-    Some(&candidates[alive[0]])
+    Some(candidates[alive[0]])
 }
 
 /// A Loc-RIB change produced by a recompute: the prefix, its new best
@@ -677,7 +677,9 @@ impl LocRib {
     /// orders by prefix first, so each peer's Adj-RIB-In is range-
     /// scanned, never flattened). The UPDATE hot path calls this for
     /// exactly the prefixes a message touched (bench F1: the old
-    /// full-table recompute per UPDATE made ingestion O(n²)).
+    /// full-table recompute per UPDATE made ingestion O(n²)); F10
+    /// lever 3: candidates stay borrowed (one clone of the winner
+    /// beats N clones for the election).
     pub fn recompute_prefix(&mut self, prefix: IpPrefix) -> Vec<BestChange> {
         let lo = Nlri {
             prefix,
@@ -687,13 +689,12 @@ impl LocRib {
             prefix,
             path_id: u32::MAX,
         };
-        let candidates: Vec<Route> = self
+        let candidates: Vec<&Route> = self
             .adj_in
             .values()
             .flat_map(|rib| rib.range(lo..=hi).map(|(_, r)| r))
-            .cloned()
             .collect();
-        let new_best = best_path(&candidates).cloned();
+        let new_best = best_path(&candidates).map(|r| (*r).clone());
         let old_best = self.best.get(&prefix).cloned();
         if new_best.as_ref() == old_best.as_ref() {
             return Vec::new();
@@ -1270,7 +1271,7 @@ mod tests {
         );
         Arc::make_mut(&mut b.attrs).push(PathAttribute::LocalPref(200));
         // Higher LOCAL_PREF wins even with a longer AS_PATH.
-        assert_eq!(best_path(&[a, b]).unwrap().local_pref(), 200);
+        assert_eq!(best_path(&[&a, &b]).unwrap().local_pref(), 200);
     }
 
     #[test]
@@ -1284,7 +1285,7 @@ mod tests {
             base_attrs(vec![65001, 65002], None),
         );
         assert_eq!(
-            best_path(&[long.clone(), short.clone()])
+            best_path(&[&long.clone(), &short.clone()])
                 .unwrap()
                 .as_path_len(),
             1
@@ -1293,7 +1294,7 @@ mod tests {
         // Tie on length: lower ORIGIN wins (IGP=0 < EGP=1).
         let mut egp = long;
         Arc::make_mut(&mut egp.attrs)[0] = PathAttribute::Origin(Origin::Egp);
-        assert_eq!(best_path(&[egp, short]).unwrap().origin(), Origin::Igp);
+        assert_eq!(best_path(&[&egp, &short]).unwrap().origin(), Origin::Igp);
     }
 
     #[test]
@@ -1316,7 +1317,7 @@ mod tests {
         );
         let longer = route("203.0.113.0/24", &p, false, base_attrs(vec![1, 2, 3], None));
         // set path = 1 + 1 = 2 beats sequence of 3.
-        assert_eq!(best_path(&[set, longer]).unwrap().as_path_len(), 2);
+        assert_eq!(best_path(&[&set, &longer]).unwrap().as_path_len(), 2);
     }
 
     #[test]
@@ -1336,7 +1337,7 @@ mod tests {
             false,
             base_attrs(vec![65001], Some(50)),
         );
-        assert_eq!(best_path(&[hi, lo]).unwrap().med(), 50);
+        assert_eq!(best_path(&[&hi, &lo]).unwrap().med(), 50);
 
         // Different neighbor ASes: MED incomparable — falls through to
         // eBGP-tie (both eBGP) → BGP Identifier (10.1.1.2 > 10.1.1.1).
@@ -1353,7 +1354,7 @@ mod tests {
             base_attrs(vec![65002], Some(1)),
         );
         assert_eq!(
-            best_path(&[a, b]).unwrap().source.bgp_id,
+            best_path(&[&a, &b]).unwrap().source.bgp_id,
             Some(Ipv4Addr::new(10, 1, 1, 1)),
             "MED not compared across neighbor ASes (§9.1.2.2 c)"
         );
@@ -1370,7 +1371,7 @@ mod tests {
         );
         let without = route("203.0.113.0/24", &p, false, base_attrs(vec![65001], None));
         assert_eq!(
-            best_path(&[with_med, without]).unwrap().med(),
+            best_path(&[&with_med, &without]).unwrap().med(),
             0,
             "absent MED is the lowest possible value"
         );
@@ -1393,7 +1394,7 @@ mod tests {
             true,
             base_attrs(vec![65001], None),
         );
-        assert!(!best_path(&[e, i]).unwrap().internal);
+        assert!(!best_path(&[&e, &i]).unwrap().internal);
     }
 
     #[test]
@@ -1405,7 +1406,7 @@ mod tests {
         // Different neighbor ASes (MED skipped) → both eBGP → lowest
         // BGP Identifier (10.1.1.2) wins regardless of peer address.
         assert_eq!(
-            best_path(&[a.clone(), b.clone()]).unwrap().source.bgp_id,
+            best_path(&[&a.clone(), &b.clone()]).unwrap().source.bgp_id,
             Some(Ipv4Addr::new(10, 1, 1, 2))
         );
 
@@ -1426,7 +1427,7 @@ mod tests {
             ..b
         };
         assert_eq!(
-            best_path(&[same_id_a, same_id_b]).unwrap().source.address,
+            best_path(&[&same_id_a, &same_id_b]).unwrap().source.address,
             "192.0.2.1".parse::<IpAddr>().unwrap()
         );
     }
@@ -2594,7 +2595,7 @@ mod tests {
             attrs: Arc::new(attrs),
             ..rigging.clone()
         };
-        assert_eq!(best_path(&[rigging, honest]).unwrap().as_path_len(), 1);
+        assert_eq!(best_path(&[&rigging, &honest]).unwrap().as_path_len(), 1);
     }
 
     /// The RS RIB stays out of the kernel (FRR's view semantics): an
