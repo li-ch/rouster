@@ -13,6 +13,7 @@
 //!   rousterd.status`), refreshed on the main loop's reconcile tick.
 
 pub mod config;
+pub mod cpucensus;
 pub mod driver;
 pub mod logging;
 pub mod staticd;

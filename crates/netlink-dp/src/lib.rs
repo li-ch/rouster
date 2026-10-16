@@ -34,6 +34,10 @@ pub mod sav_nft;
 /// host-side tests.
 pub mod sav_state;
 
+/// PERF-P2's CPU-census phase timers (feature `cpu-census`; a no-op
+/// without it, runtime-inert unless `ROUSTERD_CPU_CENSUS=1`).
+pub mod cpucensus;
+
 // TODO(phase-0): netns awareness; TODO(phase-1): nexthop-group objects.
 // (Link — including VRF device/table association —, address, route, and
 // neighbour dumps/events are implemented above.)

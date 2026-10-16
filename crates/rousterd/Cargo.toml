@@ -14,3 +14,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+# PERF-P2's CPU census: the daemon-side phase table plus the rib and
+# netlink-dp ones, runtime-inert unless ROUSTERD_CPU_CENSUS=1 (the
+# PERF-M1 mem-census precedent).
+cpu-census = ["rib/cpu-census", "netlink-dp/cpu-census"]

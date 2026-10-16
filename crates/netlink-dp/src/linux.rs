@@ -187,6 +187,7 @@ impl NetlinkDataplane {
         use futures::StreamExt;
         loop {
             let (msg, _addr) = self.messages.next().await?;
+            crate::cpucensus::NL_EVENTS_RX.bump();
             let NetlinkPayload::InnerMessage(inner) = msg.payload else {
                 continue;
             };
@@ -205,9 +206,10 @@ impl NetlinkDataplane {
                 // everything unmapped are skipped.
                 _ => None,
             };
-            if ev.is_some() {
-                return ev;
+            if let Some(ev) = ev {
+                return Some(ev);
             }
+            crate::cpucensus::NL_EVENTS_DROPPED.bump();
         }
     }
 }
@@ -496,6 +498,7 @@ fn nl_protocol(entry: &RouteEntry) -> NlRouteProtocol {
 /// `RTA_GATEWAY`/`RTA_OIF` attributes. Nexthop *objects* (`RTA_NH_ID`) are
 /// a documented follow-up.
 fn build_message(entry: &RouteEntry) -> Result<RouteMessage, DataplaneError> {
+    let _census = crate::cpucensus::scope(&crate::cpucensus::NL_BUILD);
     let mut msg = RouteMessage::default();
 
     match entry.prefix {
@@ -767,6 +770,7 @@ impl Dataplane for NetlinkDataplane {
     #[instrument(level = "debug", skip(self), fields(prefix = %entry.prefix))]
     async fn route_replace(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
+        let _census = crate::cpucensus::scope(&crate::cpucensus::NL_REQUEST);
         self.handle
             .route()
             .add(msg)
@@ -781,6 +785,7 @@ impl Dataplane for NetlinkDataplane {
     #[instrument(level = "debug", skip(self), fields(prefix = %entry.prefix))]
     async fn route_delete(&self, entry: &RouteEntry) -> Result<(), DataplaneError> {
         let msg = build_message(entry)?;
+        let _census = crate::cpucensus::scope(&crate::cpucensus::NL_REQUEST);
         if let Err(e) = self.handle.route().del(msg).execute().await {
             // ESRCH: the kernel no longer holds this route. That is the
             // goal state of a delete, so it is success — notably when a

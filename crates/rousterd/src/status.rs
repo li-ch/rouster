@@ -108,12 +108,38 @@ pub fn status_text(rib: &Rib, pid: u32) -> String {
             "table {id} routes {routes} prefixes {prefixes} connected {connected} kernel {kernel} vrf {vrf}\n"
         ));
     }
+    // PERF-P2's CPU census (feature-gated + env-armed): the union of
+    // the three crates' phase tables as additive lines — every
+    // consumer's tolerance contract drops unknown keywords, so the
+    // file stays valid with and without them.
+    #[cfg(feature = "cpu-census")]
+    if crate::cpucensus::enabled() {
+        out.push_str(&census_text());
+    }
+    out
+}
+
+/// The census block (see the PERF-P2 report): one
+/// `cpucensus <crate> <phase> ns <nanos> n <count>` line per phase.
+#[cfg(feature = "cpu-census")]
+fn census_text() -> String {
+    let mut out = String::new();
+    for (name, ns, n) in rib::cpucensus::snapshot() {
+        out.push_str(&format!("cpucensus rib {name} ns {ns} n {n}\n"));
+    }
+    for (name, ns, n) in netlink_dp::cpucensus::snapshot() {
+        out.push_str(&format!("cpucensus netlink {name} ns {ns} n {n}\n"));
+    }
+    for (name, ns, n) in crate::cpucensus::snapshot() {
+        out.push_str(&format!("cpucensus rousterd {name} ns {ns} n {n}\n"));
+    }
     out
 }
 
 /// Publishes the snapshot to the run dir; diagnostics only — a failed
 /// write warns and never fails the caller (the savd/bfdd rule).
 pub fn publish(rib: &Rib) {
+    let _census = crate::cpucensus::scope(&crate::cpucensus::RD_STATUS_PUBLISH);
     publish_to(Path::new(DEFAULT_STATUS_FILE), rib, std::process::id());
 }
 

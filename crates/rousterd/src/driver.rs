@@ -169,6 +169,7 @@ impl RibDriver {
     /// prefix's best route also fan REDISTRIBUTE_ROUTE_ADD pushes out to
     /// interested sessions.
     pub fn apply(&mut self, command: RibCommand) -> bool {
+        let _census = crate::cpucensus::scope(&crate::cpucensus::RD_APPLY);
         match command {
             RibCommand::AttachSession { owner, push } => {
                 self.sessions.insert(owner, push);
@@ -962,6 +963,7 @@ impl RibDriver {
     /// prunes every registration it left behind (the identity-keyed
     /// reconnect memory deliberately survives).
     fn push(&mut self, owner: u64, item: SessionPush) -> bool {
+        crate::cpucensus::RD_PUSH.bump();
         let Some(session) = self.sessions.get(&owner) else {
             debug!(owner, "zapi: push for unattached session dropped");
             return false;

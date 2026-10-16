@@ -14,6 +14,10 @@ use common::{
 };
 use tracing::{debug, info, instrument, warn};
 
+/// PERF-P2's CPU-census phase timers (feature `cpu-census`; a no-op
+/// without it, runtime-inert unless `ROUSTERD_CPU_CENSUS=1`).
+pub mod cpucensus;
+
 /// Observed state of one network interface, mirrored from the dataplane.
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceState {
@@ -704,6 +708,7 @@ impl Rib {
     ///
     /// Gateway nexthops of the new route enter nexthop tracking immediately.
     pub fn add_route(&mut self, entry: RouteEntry) {
+        let _census = cpucensus::scope(&cpucensus::RIB_ADD_ROUTE);
         let table_id = entry.table;
         for gw in gateway_ips(&entry.nexthops) {
             let resolved = self.resolve_nexthop_recursive(gw);
@@ -770,6 +775,7 @@ impl Rib {
     /// a failed route is retried on the next pass.
     #[instrument(skip(self, dp))]
     pub async fn reconcile<D: Dataplane + Sync>(&mut self, dp: &D) {
+        let _census = cpucensus::scope(&cpucensus::RIB_DIFF_FULL);
         let mut to_install: Vec<((TableId, IpPrefix), RouteEntry)> = Vec::new();
         let mut desired_keys: std::collections::HashSet<(TableId, IpPrefix)> =
             std::collections::HashSet::new();
@@ -815,6 +821,7 @@ impl Rib {
             .filter(|key| !desired_keys.contains(key))
             .copied()
             .collect();
+        drop(_census);
         self.reconcile_delta(dp, to_install, stale_keys, unchanged)
             .await;
     }
@@ -829,6 +836,7 @@ impl Rib {
         dp: &D,
         keys: &std::collections::BTreeSet<(TableId, IpPrefix)>,
     ) {
+        let _census = cpucensus::scope(&cpucensus::RIB_DIFF_KEYS);
         let mut to_install: Vec<((TableId, IpPrefix), RouteEntry)> = Vec::new();
         let mut desired_keys: std::collections::HashSet<(TableId, IpPrefix)> =
             std::collections::HashSet::new();
@@ -857,6 +865,7 @@ impl Rib {
             .filter(|key| !desired_keys.contains(*key) && self.programmed.contains_key(key))
             .copied()
             .collect();
+        drop(_census);
         self.reconcile_delta(dp, to_install, stale_keys, unchanged)
             .await;
     }
@@ -874,6 +883,7 @@ impl Rib {
         stale_keys: Vec<(TableId, IpPrefix)>,
         unchanged: usize,
     ) {
+        let _census = cpucensus::scope(&cpucensus::RIB_BATCH_AWAIT);
         let mut installed = 0usize;
         if !to_install.is_empty() {
             let entries: Vec<RouteEntry> =

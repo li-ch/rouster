@@ -14,3 +14,9 @@ tracing.workspace = true
 # M3 property tests (reconcile diff add/withdraw/keep partition) — dev-only,
 # pinned in the workspace table; same convention as sav's W5B suite.
 proptest.workspace = true
+
+[features]
+# PERF-P2's CPU census: phase timers over the hot paths, runtime-inert
+# unless ROUSTERD_CPU_CENSUS=1 is set in the daemon's environment (the
+# PERF-M1 mem-census precedent).
+cpu-census = []

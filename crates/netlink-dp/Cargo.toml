@@ -20,3 +20,9 @@ rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 futures.workspace = true
 libc.workspace = true
+
+[features]
+# PERF-P2's CPU census: phase timers over the netlink encode/send
+# path, runtime-inert unless ROUSTERD_CPU_CENSUS=1 (the PERF-M1
+# mem-census precedent).
+cpu-census = []
