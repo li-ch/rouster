@@ -267,6 +267,93 @@ in the chat record. The "Your decision" column stays the owner's.
   pass); wall_total medians 2.54 / 2.61 / 3.90 s for 1k / 10k / 100k.
   No verdict prose.
 
+- 2026-10-16 · allocator A/B (mimalloc on bgpd, the S14-b
+  recommendation, owner-ratified "proceed") · host=darwin-vm (same
+  OrbStack VM/kernel as every §R entry; ISOLATED placement while
+  sibling stream S15-a held the default: net bench-net-s15b
+  172.31.253.0/24, SUT cpus 12-16, injector cpu 17, container prefix
+  ab-s15b-; §F's same-host/same-engine holds inside the comparison —
+  both sides same rig, same feed, same injector) · versions: rouster
+  tree `ea6f5d2` (= baseline `a6c11bc` + this stream's alloc-mimalloc
+  manifest lines `48d2124` + sibling S15-a's env-gated F10
+  establishment instrumentation `ea6f5d2`, landed in-tree before the
+  snapshot and carried IDENTICALLY by both sides, not activated by
+  this protocol — no env set; S15-a's later rib change `147a0cd` is
+  NOT in the tree; the sibling's src lane disclosed per the S14
+  precedent); binaries CONTAINER-built in rust:alpine (rustc 1.99.1,
+  native aarch64-unknown-linux-musl, both sides same compiler and
+  flags — the host musl cross-build has no C toolchain for
+  libmimalloc-sys's cc build, so the container is the reproducible
+  path, disclosed); side B = the same snapshot + the 3-line
+  cfg-gated `#[global_allocator]` activation point applied to the
+  SNAPSHOT COPY's `crates/bgpd/src/bin/bgpd.rs` (hook.diff in the
+  artifact dir; the repo's bgpd src untouched — S15-a's lane); side A
+  = the same snapshot, feature off (the hook cfg-stripped: A/B differ
+  by exactly the allocator + dep); mimalloc 0.1.52 /
+  libmimalloc-sys 0.1.49 (mimalloc v3.3.2, DEFAULT options, no env
+  tuning); lockfile delta additive (mimalloc + libmimalloc-sys + cc
+  1.8.0 + find-msvc-tools + shlex, all build-time) · harness
+  `scripts/bench-alloc-ab.sh` — the E1 100k protocol verbatim
+  (mrt-replay unpaced hold 90, P0-b rcvbuf sysctls on, bench-poll
+  observer, bench-summarize per side, the A/B fold) · feed: the
+  pinned dump (sha256 above), --limit 100000 · runs: 6+6 (1 warmup +
+  5 measured per side, warmups first then alternating) · receipts:
+  MIMALLOC_VERBOSE=1 in the daemon env on BOTH sides every run —
+  side B's bgpd log carries the mimalloc init banner all 6 runs,
+  side A's carries none (the negative control; the env var is inert
+  under the default allocator); binary symbol checks (B: 6 mimalloc
+  strings + mi_malloc; A: zero of either); the NOISE CONTROL:
+  rousterd is byte-identical on both sides and still shows a -13.85%
+  CPU delta between sides — the rig's CPU-delta noise scale at this
+  placement is ~10-14%, the scale the bgpd CPU delta below must be
+  read against · accepted 99,998/100,000 every run both sides;
+  malformed 0 / rejected 0 / rcvbuf overruns 0 on all 12 ·
+  | metric (median [p95]) | A: system | B: mimalloc | B vs A |
+  |---|---|---|---|
+  | speaker B/prefix (empty→final) | **451.88 [472.4]** | 714.73 [947.0] | **-58.2% (regression)** |
+  | bgpd empty RSS KiB | 2,072 [2,112] | 8,156 [8,167] | +6.1 MB eager floor |
+  | bgpd final RSS KiB | 46,232 [48,181] | 77,952 [100,629] | +68.6% |
+  | bgpd HWM KiB | 78,720 [80,500] | 90,232 [96,401] | +14.6% |
+  | bgpd CPU s | 0.46 [0.52] | 0.41 [0.44] | -10.9% (noise-scale, see control) |
+  | wall first-UPDATE→complete s | 1.859 [5.248] | 1.882 [1.979] | +1.2% |
+  | wall EOR (BGP-level) s | 0.267 [0.343] | 0.246 [0.277] | -7.9% |
+  · gate (pre-registered): ADOPT needs ≥5% B/prefix recovery with no
+  wall/CPU regression >5% — B/prefix recovery is **-58.2%**, so the
+  swap is **DECLINED by the receipt gate**; the secondary legs hold
+  (wall +1.2%, EOR -7.9%, CPU -10.9% = within the noise control's
+  scale) but the primary fails decisively · findings: with default
+  options on this single-peer burst-ingest shape mimalloc costs more
+  than it packs — a +6.1 MB eager-commit floor at startup (per-thread
+  heaps; the banner's eager-commit options) and retained small-object
+  bins at settle (final +68.6%; B-side run spread 454.8-903.1 B/pfx
+  with one run releasing to A-parity after purge — retention timing
+  variance, disclosed); the S14-b "plausibly 10-20% small-object RSS
+  recovery" estimate is refuted on this rig/shape; the M4 residual
+  (~185 B/pfx decode/drain transients + bins) is cheaper held under
+  the system allocator · side A independently re-validates the M3-era
+  449 B/pfx receipt in a different build environment (451.88 median,
+  +0.6%) · decision state: the feature stays OPT-IN (default OFF,
+  unchanged); the src-side hook stays unlanded (quoted in the
+  artifact for reproduction); mimalloc env tuning (purge delay /
+  eager-commit off) would be a different, unpre-registered experiment
+  — named here only as the path a future revisit would have to take ·
+  raw: `target/bench-logs/alloc-ab-20261016T222705Z/` (PROTOCOL.txt
+  with the hook diff + binary sha256s, verify/ banners + symbol
+  counts, per-run poll.csv + alloc-verify.txt, ab-summary.json) ·
+  harness bring-up disclosed: `alloc-ab-20261016T222036Z` was the
+  protocol-validation pass with a copy-order defect (both sides ran
+  the feature binary — diagnosed from BOTH banners showing mimalloc
+  init, fixed before any measured run; kept as the identical-binary
+  spread datum: 819.6 vs 861.6 B/pfx ≈ 4.9% single-run noise);
+  earlier aborted attempts `alloc-ab-20261016T221648Z` (relative
+  docker mount path) and `alloc-ab-20261016T221727Z` (rust:alpine
+  rust-lld proc-macro links need the native lib dirs on the search
+  path — fixed by passing -L/usr/lib and gcc's libgcc dir) are
+  superseded, not cited · wall p95 note: side A's 5.248 p95 is one
+  run at 3.88 s — completion-detection quantization against
+  rousterd's 10 s status refresh (the EOR-level wall is the finer
+  ingest metric, both published).
+
 - 2026-10-16 · allocator-share measurement (the PERF-M1/M3 escalated
   owner decision, resolved to a recommendation — NOT a dep adoption)
   · method per the escalation: the smaps rollups' anonymous-mapping

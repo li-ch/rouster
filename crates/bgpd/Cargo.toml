@@ -51,8 +51,9 @@ experimental-savnet = ["dep:sav", "sav/experimental-savnet"]
 mem-census = []
 # S15-b: opting in swaps bgpd's global allocator to mimalloc once the
 # src-side activation point (cfg-gated on this feature, in the bgpd
-# bin) lands; the measured A/B and the adoption/decline decision are
-# the §R allocator A/B entry (2026-10-16).
+# bin) lands; the measured A/B DECLINED the swap (§R 2026-10-16:
+# -58% B/prefix at 100k with default mimalloc options), so the
+# feature stays opt-in and the activation point stays unlanded.
 alloc-mimalloc = ["dep:mimalloc"]
 
 # start_paused tokio tests + duplex sockets, dev-only (sav precedent).
