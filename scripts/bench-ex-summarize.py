@@ -450,7 +450,8 @@ def summarize_e3(args):
         "per_run": runs,
         "aggregate": {},
     }
-    for key in ("wall_first_connect_to_all_s", "sessions_per_s",
+    for key in ("wall_first_connect_to_all_s", "wall_release_to_all_s",
+                "sessions_per_s",
                 "failures", "speaker_cpu_s", "core_cpu_s",
                 "speaker_rss_kb", "core_rss_kb", "start_spread_s",
                 "sut_established_final"):

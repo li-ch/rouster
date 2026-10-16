@@ -351,6 +351,52 @@ in the chat record. The "Your decision" column stays the owner's.
   (100–1000 cycles/s) and the full-table cell stay deferred per the
   addendum; the round shape at 100k is this entry. No verdict prose.
 
+- 2026-10-16 · E3+sessions matched grid (N ∈ {10, 50, 100} × SUT cores
+  ∈ {1, 2, 4}, both sides) · host=darwin-vm (same rig; SUT cpuset 4 /
+  4-5 / 4-7 per cell, the injector fleet 0-3, one container per
+  session from the `docker/bench/Dockerfile.mrt-replay` fleet image,
+  per-session table = the feed's first 100 prefixes) · versions: as
+  the E4/E2 entries above (tree `80cd7e7`+ over `429ab18`; FRR
+  10.2.2) · release: the fleet's containers run waiter commands and
+  are released by a shared GO file (all waiters armed before the
+  release epoch; actual start spread ≤ 29 ms median in every cell —
+  recorded per run) · runs: 6 per cell (1 warmup + 5 measured), 108
+  runs total · **failures 0 and SUT-side Established cross-count = N
+  on every run of every cell, both sides** · wall first-connect →
+  all-N Established (medians):
+  | N | cores | Rouster | FRR 10.2.2 |
+  |---|---|---|---|
+  | 10 | 1 / 2 / 4 | 4 / 5 / 4 ms | 4 / 4 / 4 ms |
+  | 50 | 1 / 2 / 4 | 35 / 29 / 27 ms | 19 / 20 / 18 ms |
+  | 100 | 1 | 93 ms (1,072 sess/s) | 41 ms (2,441 sess/s) |
+  | 100 | 2 | 167 ms (600 sess/s) | 39 ms (2,544 sess/s) |
+  | 100 | 4 | 157 ms (636 sess/s) | 41 ms (2,428 sess/s) |
+  both directions published: **FRR ahead at N=100 by 2.3× (1 core) to
+  4.3× (2 cores) — beyond the 2× bar, resolved under §F's darwin-vm
+  rule; ahead ~1.5× (sub-2×, unresolved) at N=50; parity at N=10** ·
+  SUT speaker CPU at N=100: Rouster 0.57-0.60 s vs FRR 0.05 s
+  (~5.7 ms vs ~0.5 ms CPU per establishment; core CPU 0.01 s both) ·
+  the multi-core architecture claim's own test outcome at this grid:
+  neither side's establishment wall improves with cores at any N —
+  Rouster's c1 cell is its FASTEST at N=100 (93 ms vs 157-167 ms) —
+  so establishment at N ≤ 100 on this rig is not a core-count-bound
+  workload; the claim remains unproven by this grid (disclosed, no
+  verdict prose) · new finding **F10** (escalated, not diagnosed
+  here): rouster bgpd's per-session establishment cost is ~11× FRR's
+  CPU at N=100 and its throughput degrades with N (2,286/s at 10 →
+  636/s at 100 on c4) while FRR stays flat (~2,400-2,800/s) —
+  candidate causes for a PERF stream: per-session task/allocator
+  setup, accept-loop serialization, or per-peer config recompute;
+  the harness gives the reproducible cell shape · raw:
+  `target/bench-logs/e3-20261016T160019Z/` (rouster) +
+  `e3-20261016T161507Z/` (frr) · harness disclosure: the first grid
+  attempt (aborted mid-run, rouster N=10/50 cells complete) measured
+  a docker-exec launch loop's skew as the wall at N ≥ 50 (diagnosed
+  from start_spread == wall; fixed by the GO-file release, commit
+  `794960b`); the aborted attempt's artifacts stay on disk at
+  `e3-20261016T154618Z/` (superseded, not cited) — all published
+  numbers are from the fixed harness.
+
 - 2026-10-15 · E1+FRR-full · host=darwin-vm (OrbStack 7.2.9-orbstack,
   macOS 27.0.1 host, linux/aarch64 VM, 18 CPUs, SUT pinned 4-11,
   injector 0-3) · versions: FRR 10.2.2 (`frr-testbed:10.2.2`), harness
