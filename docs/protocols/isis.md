@@ -311,13 +311,32 @@ LSP IDs display as dynamic hostnames (RFC 5301).
 
 `scripts/test-isis-broadcast-interop.sh` — the p2p smoke's LAN leg:
 FRR 10.2.2 in default broadcast mode against our `network broadcast`
-daemon at priority 100. Machine checks: ATTACH, ADJACENCY-BOTH (the
-CODE 6 dance), **DIS-US** (FRR's database holds OUR pseudonode LSP
-`rouster-r2.01-00` and no r1 one), LSDB-BOTH, REDIST both
-directions through the LAN, 30 s SOAK.
+daemon at priority 100. Machine checks: ATTACH, ADJACENCY-OURS (our
+"LAN adjacency UP" via the CODE 6 dance; FRR's neighbor table holds
+the record), **DIS-US** (FRR's database holds OUR pseudonode LSP
+`rouster-r2.01-00` and no r1 one), FRR-DB (our router LSP flooded
+across the LAN), 30 s SOAK. **Disclosed blocker — one root cause,
+three verified symptoms**: rousterd's zapi INTERFACE_ADD leaves
+`hw_addr` empty, so FRR's LAN circuit SNPA reads 0000.0000.0000 —
+(1) its §8.4.1.5 own-lANAddress test never matches (the adjacency
+stays Initializing; the p2p smoke is unaffected, RFC 5303 uses no
+SNPA); (2) FRR's `send_lsp()` refuses transmission with
+`upadjcount == 0`, so FRR never floods and our side cannot install
+FRR-derived routes (no REDIST legs in the smoke); (3) FRR's own LSP
+carries no LAN adjacency entry, so it could not route ours even with
+(2) fixed. The exact ask (four crates: IFLA_ADDRESS →
+`rib::InterfaceState` → `InterfaceMirror` → the server's `hw_addr`)
+sits first in §Deferred.
 
 ## §Deferred (the remaining list)
 
+- **rousterd's zapi `hw_addr`** (the broadcast-smoke blocker): the
+  zapi server's INTERFACE_ADD never fills `ZapiInterface::hw_addr`,
+  so FRR's LAN circuit SNPA is zeros and its §8.4.1.5 adjacency-Up
+  test can never match. The fix wants `IFLA_ADDRESS` parsed in
+  netlink-dp's link dump → `rib::InterfaceState` → `InterfaceMirror`
+  → the server's wire set (four crates — an owner-sized change, not
+  a stream one-liner).
 - **IPv6** (NLPID 0x8E, TLV 236, multi-topology): the AF-generic
   invariant's IS-IS seam is `tlv.rs`'s v4-specific entries.
 - **BFD for IS-IS adjacencies**; **MT routing** (RFC 5120) and its

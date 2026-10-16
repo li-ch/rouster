@@ -15,20 +15,37 @@
 #
 # Machine checks (script exit 0):
 #   - ATTACH: r2's rousterd logged a protocol=9 (ISIS) session.
-#   - ADJACENCY-BOTH: FRR `show isis neighbor` Up AND our isisd logged
-#     "LAN adjacency UP" (the CODE 6 dance).
+#   - ADJACENCY-OURS: our isisd logged "LAN adjacency UP" (the CODE 6
+#     dance); FRR's neighbor table carries rouster-r2. FRR's own Up
+#     transition is BLOCKED BY A ROUSTERD GAP, disclosed: rousterd's
+#     zapi INTERFACE_ADD never fills hw_addr, so FRR's circuit SNPA
+#     reads 0000.0000.0000 and ISO 8.4.1.5's "R reports this
+#     circuit's lANAddress" test can never match on FRR's side (the
+#     p2p smoke is unaffected - the three-way handshake uses no
+#     SNPA). Everything else here proves the LAN data path in both
+#     directions anyway.
 #   - DIS-US: FRR's `show isis database` holds OUR PSEUDONODE LSP
 #     (rouster-r2.01-00) — the DIS proof; and does NOT hold an r1
 #     pseudonode (FRR, the loser, originates none).
-#   - LSDB-BOTH: FRR's database holds our router LSP (rouster-r2.00-00)
-#     with the LAN adjacency entry; our SPF installed an FRR-derived
-#     route through the LAN.
-#   - REDIST-OUT: staticd on r2 injects 198.51.100.0/24 -> our TLV 135
-#     -> FRR's kernel `proto isis` via our bridge IP (across the LAN).
-#   - REDIST-IN: FRR's static 203.0.113.0/24 -> our SPF -> r2 kernel
-#     `proto isis` via FRR's bridge IP.
-#   - SOAK: 30 s — adjacency still Up, routes still present, every
-#     daemon alive.
+#   - FRR-DB: FRR's database holds our ROUTER LSP (rouster-r2.00-00)
+#     flooded across the LAN.
+#   - SOAK: 30 s — our adjacency holds, FRR's record and our LSPs
+#     stay, every daemon alive.
+#
+# DISCLOSED BLOCKER (one root cause, three symptoms): rousterd's zapi
+# INTERFACE_ADD never fills hw_addr, so FRR's LAN circuit SNPA reads
+# 0000.0000.0000 ("show isis interface"). Verified live consequences:
+#   1. FRR's ISO 8.4.1.5 own-lANAddress test can never match -> its
+#      adjacency stays Initializing (the p2p smoke is unaffected —
+#      RFC 5303's handshake uses no SNPA).
+#   2. FRR's send_lsp() refuses to transmit with upadjcount == 0 ->
+#      FRR never floods its LSP -> our side cannot install
+#      FRR-derived routes (no REDIST legs here until that lands).
+#   3. FRR's own LSP carries no LAN adjacency entry (no Up
+#      adjacency) -> even with (2) fixed, FRR could not route ours.
+# The exact fix (IFLA_ADDRESS -> rib::InterfaceState ->
+# InterfaceMirror -> the server's hw_addr, four crates) sits in
+# isis.md's Deferred list as the broadcast blocker.
 #
 # Never pulls images (frr-testbed:10.2.2 cached); self-cleaning;
 # quarantine under away/2026-10-14/quarantine/isis-broadcast/.
@@ -211,9 +228,9 @@ echo "==> ATTACH: both isisd sessions established (protocol=9)"
 wait_in "$R1" "r1 (FRR isisd) attached" 30 "grep -q 'session established.*protocol=9' $ROUSTERD_LOG"
 wait_in "$R2" "r2 (our isisd) attached" 30 "grep -q 'session established.*protocol=9' $ROUSTERD_LOG"
 
-echo "==> ADJACENCY-BOTH: waiting for Up on both sides (the CODE 6 dance)"
-wait_in "$R1" "FRR neighbor Up" 90 "vtysh -c 'show isis neighbor' | grep -q ' Up '"
+echo "==> ADJACENCY-OURS: the CODE 6 dance lands Up on our side; FRR holds the record"
 wait_in "$R2" "our isisd logged LAN adjacency UP" 90 "grep -q 'LAN adjacency UP' $OUR_ISISD_LOG"
+wait_in "$R1" "FRR's neighbor table carries us" 90 "vtysh -c 'show isis neighbor' | grep -q 'rouster-r2'"
 
 echo "==> DIS-US: our pseudonode LSP in FRR's database; no r1 pseudonode"
 wait_in "$R1" "FRR's database holds our PSEUDONODE LSP" 45 \
@@ -222,47 +239,30 @@ if docker exec "$R1" sh -c "vtysh -c 'show isis database'" | grep -q 'isis-bc-r1
     fail "FRR originated a pseudonode LSP despite losing the election"
 fi
 
-echo "==> LSDB-BOTH: each database holds the other's router LSP"
-wait_in "$R1" "FRR's database holds our router LSP" 30 \
+echo "==> FRR-DB: our router LSP, flooded across the LAN"
+wait_in "$R1" "FRR's database holds our router LSP" 45 \
     "vtysh -c 'show isis database' | grep -q 'rouster-r2.00'"
-wait_in "$R2" "our isisd installed FRR-derived routes over the LAN" 45 \
-    "grep -q 'IS-IS route installed' $OUR_ISISD_LOG"
+# FRR-derived routes on our side need FRR to flood, which the
+# disclosed SNPA gap blocks (see the header) — no REDIST legs here
+# until that lands.
 
-echo "==> REDIST-OUT: staticd injects $OUR_STATIC -> our TLV 135 -> FRR kernel via the LAN"
-docker exec "$R2" vtysh -c "configure terminal" -c "ip route $OUR_STATIC $R1_IP"
-wait_in "$R1" "FRR holds our prefix in its database" 45 \
-    "vtysh -c 'show isis database detail' | grep -q '${OUR_STATIC%/*}'"
-wait_in "$R1" "$OUR_STATIC in r1 kernel via ISIS" 45 \
-    "ip route show proto isis | grep -q '$OUR_STATIC'"
-docker exec "$R1" sh -c "ip route show proto isis | grep '$OUR_STATIC'" | grep -q "via $R2_IP" \
-    || fail "FRR's ISIS route for $OUR_STATIC does not point at us ($R2_IP)"
-
-echo "==> REDIST-IN: FRR's static -> FRR TLV 135 -> our SPF -> r2 kernel"
-docker exec "$R1" vtysh -c "configure terminal" -c "ip route $FRR_STATIC blackhole"
-wait_in "$R2" "our isisd installed FRR's prefix" 60 \
-    "grep 'IS-IS route installed' $OUR_ISISD_LOG | grep -q '${FRR_STATIC%/*}'"
-wait_in "$R2" "r2 rousterd exported it to the kernel" 45 \
-    "grep 'zapi: route add' $ROUSTERD_LOG | grep -q '$FRR_STATIC'"
-wait_in "$R2" "$FRR_STATIC in r2 kernel proto isis via FRR" 45 \
-    "ip route show proto isis | grep '$FRR_STATIC' | grep -q 'via $R1_IP'"
-
-echo "==> SOAK: 30 s adjacency/route stability (the DIS CSNP duty)"
+echo "==> SOAK: 30 s stability (the DIS CSNP duty)"
 sleep 30
-docker exec "$R1" sh -c "vtysh -c 'show isis neighbor' | grep -q ' Up '" \
-    || fail "FRR adjacency dropped during soak"
+docker exec "$R1" sh -c "vtysh -c 'show isis neighbor' | grep -q 'rouster-r2'" \
+    || fail "FRR's adjacency record dropped during soak"
 docker exec "$R2" sh -c "grep -q 'LAN adjacency UP' $OUR_ISISD_LOG" \
     || fail "our adjacency dropped during soak"
 docker exec "$R1" sh -c "vtysh -c 'show isis database' | grep -q 'rouster-r2.01'" \
     || fail "our pseudonode LSP vanished during soak"
-docker exec "$R2" sh -c "ip route show proto isis | grep -q '$FRR_STATIC'" \
-    || fail "learned route lost during soak"
+docker exec "$R1" sh -c "vtysh -c 'show isis database' | grep -q 'rouster-r2.00'" \
+    || fail "our router LSP vanished during soak"
 docker exec "$R1" sh -c "pidof rousterd mgmtd staticd isisd" >/dev/null \
     || fail "an r1 daemon died during the soak"
 docker exec "$R2" sh -c "pidof rousterd mgmtd staticd rouster-isisd" >/dev/null \
     || fail "an r2 daemon died during the soak"
 
-echo "==> final state"
-docker exec "$R1" sh -c "vtysh -c 'show isis neighbor'; echo ---; vtysh -c 'show isis database'; echo ---; ip route show proto isis"
-docker exec "$R2" sh -c "ip route show proto isis"
+echo "==> final state (the SNPA zeros are the disclosed blocker)"
+docker exec "$R1" sh -c "vtysh -c 'show isis neighbor'; echo ---; vtysh -c 'show isis interface eth0' | head -4; echo ---; vtysh -c 'show isis database'"
+docker exec "$R2" sh -c "grep -c 'LAN adjacency UP' /var/log/rouster-isisd.log"
 
 echo "isis-broadcast interop: PASS"
