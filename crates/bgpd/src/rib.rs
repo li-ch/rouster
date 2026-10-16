@@ -254,37 +254,61 @@ impl ExportPolicy for AcceptAll {
 
 /// The §9.1 decision process: pick the best route among candidates.
 /// Pure — callers feed Adj-RIB-In candidates for one prefix.
+///
+/// F10 lever 2: every candidate's §9.1 scalars (LOCAL_PREF, path
+/// length, ORIGIN, MED, neighbor AS, session type, BGP Identifier,
+/// peer address) are derived ONCE up front — the previous form
+/// re-derived them per step by scanning the candidate's attribute
+/// list, and the MED step compares candidates pairwise, so one
+/// recompute over same-feed peers cost O(candidates² × attributes)
+/// attribute walks. Semantics are unchanged step for step (the pure
+/// decision table tests below pin them).
 pub fn best_path(candidates: &[Route]) -> Option<&Route> {
-    let mut alive: Vec<usize> = (0..candidates.len()).collect();
-    if alive.is_empty() {
+    if candidates.is_empty() {
         return None;
     }
+    struct Score {
+        pref: u32,
+        path_len: usize,
+        origin: Origin,
+        med: u32,
+        neighbor_as: Option<u32>,
+        internal: bool,
+        bgp_id: Option<Ipv4Addr>,
+        addr: IpAddr,
+    }
+    let scores: Vec<Score> = candidates
+        .iter()
+        .map(|r| Score {
+            pref: r.local_pref(),
+            path_len: r.as_path_len(),
+            origin: r.origin(),
+            med: r.med(),
+            neighbor_as: r.neighbor_as(),
+            internal: r.internal,
+            bgp_id: r.source.bgp_id,
+            addr: r.source.address,
+        })
+        .collect();
+    let mut alive: Vec<usize> = (0..scores.len()).collect();
 
     // Degree of preference (LOCAL_PREF, higher wins).
-    let top_pref = alive
-        .iter()
-        .map(|&i| candidates[i].local_pref())
-        .max()
-        .unwrap();
-    alive.retain(|&i| candidates[i].local_pref() == top_pref);
+    let top_pref = alive.iter().map(|&i| scores[i].pref).max().unwrap();
+    alive.retain(|&i| scores[i].pref == top_pref);
     if alive.len() == 1 {
         return Some(&candidates[alive[0]]);
     }
 
     // a) smallest AS_PATH count (AS_SET = 1).
-    let shortest = alive
-        .iter()
-        .map(|&i| candidates[i].as_path_len())
-        .min()
-        .unwrap();
-    alive.retain(|&i| candidates[i].as_path_len() == shortest);
+    let shortest = alive.iter().map(|&i| scores[i].path_len).min().unwrap();
+    alive.retain(|&i| scores[i].path_len == shortest);
     if alive.len() == 1 {
         return Some(&candidates[alive[0]]);
     }
 
     // b) lowest ORIGIN number.
-    let best_origin = alive.iter().map(|&i| candidates[i].origin()).min().unwrap();
-    alive.retain(|&i| candidates[i].origin() == best_origin);
+    let best_origin = alive.iter().map(|&i| scores[i].origin).min().unwrap();
+    alive.retain(|&i| scores[i].origin == best_origin);
     if alive.len() == 1 {
         return Some(&candidates[alive[0]]);
     }
@@ -294,14 +318,10 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
     // strictly smaller MED; missing reads as 0).
     let mut med_alive: Vec<usize> = Vec::new();
     'outer: for &m in &alive {
-        if let Some(m_as) = candidates[m].neighbor_as() {
+        if let Some(m_as) = scores[m].neighbor_as {
             for &n in &alive {
-                if n != m {
-                    if let Some(n_as) = candidates[n].neighbor_as() {
-                        if n_as == m_as && candidates[n].med() < candidates[m].med() {
-                            continue 'outer; // dominated, remove m
-                        }
-                    }
+                if n != m && scores[n].neighbor_as == Some(m_as) && scores[n].med < scores[m].med {
+                    continue 'outer; // dominated, remove m
                 }
             }
         }
@@ -313,8 +333,8 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
     }
 
     // d) eBGP over iBGP.
-    if alive.iter().any(|&i| !candidates[i].internal) {
-        alive.retain(|&i| !candidates[i].internal);
+    if alive.iter().any(|&i| !scores[i].internal) {
+        alive.retain(|&i| !scores[i].internal);
         if alive.len() == 1 {
             return Some(&candidates[alive[0]]);
         }
@@ -324,22 +344,21 @@ pub fn best_path(candidates: &[Route]) -> Option<&Route> {
     // allows skipping when no cost can be determined).
 
     // f) lowest BGP Identifier.
-    let ids: Vec<Option<Ipv4Addr>> = alive.iter().map(|&i| candidates[i].source.bgp_id).collect();
-    if ids.iter().all(Option::is_some) {
-        let lowest = ids.iter().flatten().copied().min().unwrap();
-        alive.retain(|&i| candidates[i].source.bgp_id == Some(lowest));
+    if alive.iter().all(|&i| scores[i].bgp_id.is_some()) {
+        let lowest = alive
+            .iter()
+            .map(|&i| scores[i].bgp_id.unwrap())
+            .min()
+            .unwrap();
+        alive.retain(|&i| scores[i].bgp_id == Some(lowest));
         if alive.len() == 1 {
             return Some(&candidates[alive[0]]);
         }
     }
 
     // g) lowest peer address.
-    let lowest_addr = alive
-        .iter()
-        .map(|&i| candidates[i].source.address)
-        .min()
-        .unwrap();
-    alive.retain(|&i| candidates[i].source.address == lowest_addr);
+    let lowest_addr = alive.iter().map(|&i| scores[i].addr).min().unwrap();
+    alive.retain(|&i| scores[i].addr == lowest_addr);
     Some(&candidates[alive[0]])
 }
 
