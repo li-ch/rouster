@@ -10,6 +10,7 @@
 //!  metric-style wide
 //!  hostname rouster-r2
 //!  redistribute static
+//!  redistribute level-2 into level-1
 //!  interface eth0
 //!   address 172.16.0.2/24
 //!   circuit-type level-1-2
@@ -49,6 +50,9 @@ pub struct IsisdConfig {
     /// The dynamic hostname we advertise (TLV 137, RFC 5301).
     pub hostname: String,
     pub redistribute_static: bool,
+    /// RFC 5302 route leaking: advertise L2-derived prefixes into L1
+    /// with the up/down bit set (`redistribute level-2 into level-1`).
+    pub redistribute_level2_into_l1: bool,
     pub interface: InterfaceConfig,
 }
 
@@ -158,6 +162,7 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
         metric_style: MetricStyle::Wide,
         hostname: String::new(),
         redistribute_static: false,
+        redistribute_level2_into_l1: false,
         interface: InterfaceConfig::default(),
     };
     let mut in_router = false;
@@ -328,8 +333,17 @@ pub fn parse(text: &str) -> Result<IsisdConfig, crate::error::IsisError> {
             "redistribute" => {
                 if words.len() == 2 && words[1] == "static" {
                     config.redistribute_static = true;
+                } else if words.len() == 4
+                    && words[1] == "level-2"
+                    && words[2] == "into"
+                    && words[3] == "level-1"
+                {
+                    config.redistribute_level2_into_l1 = true;
                 } else {
-                    return Err(parse_error(line_no, "`redistribute static` (v1)"));
+                    return Err(parse_error(
+                        line_no,
+                        "`redistribute static` or `redistribute level-2 into level-1` (v1)",
+                    ));
                 }
             }
             "interface" => {
@@ -470,6 +484,39 @@ router isis ROUSTER
         assert_eq!(config.interface.hello_multiplier, 3);
         assert_eq!(config.interface.mtu, 1500);
         assert!(!config.redistribute_static);
+        assert!(!config.redistribute_level2_into_l1);
         assert_eq!(config.interface.circuit_type, Level::Level1And2);
+    }
+
+    /// RFC 5302 leaking is opt-in: `redistribute level-2 into level-1`
+    /// parses (and only that shape does).
+    #[test]
+    fn level2_into_level1_knob() {
+        let config = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n redistribute level-2 into level-1\n interface eth1\n",
+        )
+        .unwrap();
+        assert!(config.redistribute_level2_into_l1);
+        assert!(!config.redistribute_static);
+        // Both knobs together are fine.
+        let config = parse(
+            "router isis T\n net 49.0001.1921.6800.1001.00\n redistribute static\n redistribute level-2 into level-1\n interface eth1\n",
+        )
+        .unwrap();
+        assert!(config.redistribute_static && config.redistribute_level2_into_l1);
+        // The reverse direction is not a v1 directive.
+        for bad in [
+            "redistribute level-1 into level-2",
+            "redistribute level-2",
+            "redistribute level-2 into level-1 extra",
+        ] {
+            let text =
+                format!("router isis T\n net 49.0001.1921.6800.1001.00\n {bad}\n interface eth1\n");
+            let err = parse(&text).unwrap_err();
+            assert!(
+                err.to_string().contains("redistribute"),
+                "{err} for {bad:?}"
+            );
+        }
     }
 }

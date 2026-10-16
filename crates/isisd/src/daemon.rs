@@ -14,7 +14,7 @@
 //! 1195 §3.10.1); broadcast/DIS election, pseudonode LSPs, LSP
 //! fragmenting beyond the first, and synonymous NETs are §Deferred.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,15 @@ pub const DEFAULT_CIRCUIT_METRIC: u32 = 10;
 /// (ISO §7.3.14's periodic regeneration; FRR refreshes at MaxAge-300).
 const REFRESH_BELOW: u16 = 300;
 
+/// One inter-level advertised prefix: the prefix, its carried metric
+/// and the up/down bit it rides with (RFC 5302).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeakedPrefix {
+    pub prefix: (Ipv4Addr, u8),
+    pub metric: u32,
+    pub up_down: bool,
+}
+
 /// Per-level state.
 struct LevelState {
     db: Lspdb,
@@ -68,6 +77,13 @@ pub struct Daemon {
     levels: [Option<LevelState>; 2],
     /// Redistributed statics (TLV 135 content).
     redistributed: Vec<(Ipv4Addr, u8)>,
+    /// Inter-area prefixes currently advertised INTO our L1 LSP —
+    /// the L2→L1 leak, up/down set (RFC 5302).
+    leaked_down: Vec<LeakedPrefix>,
+    /// Inter-area prefixes currently advertised INTO our L2 LSP —
+    /// the L1-area reachability a border re-advertises up (RFC 1195
+    /// §3.10.2's L1→L2 movement), up/down clear.
+    moved_up: Vec<LeakedPrefix>,
     /// The zapi export edge (absent = standalone).
     zapi: Option<mpsc::UnboundedSender<ZedgeCommand>>,
     /// What we last told zebra (the route diff baseline).
@@ -117,6 +133,8 @@ impl Daemon {
             adjacency: Adjacency::new(SystemId::from_bytes([0; 6])),
             levels,
             redistributed: Vec::new(),
+            leaked_down: Vec::new(),
+            moved_up: Vec::new(),
             zapi: None,
             installed: HashMap::new(),
             config,
@@ -145,17 +163,30 @@ impl Daemon {
         self.start.elapsed().as_secs()
     }
 
-    /// The levels this daemon runs.
+    /// The levels this daemon runs, as `level2` flags (`false` = the
+    /// L1 slot, `true` = the L2 slot). S13-a fix: the iterator
+    /// previously yielded the slot's `is_some()` — an L1L2 daemon
+    /// iterated "level2 = true" twice and never ran its L1 database
+    /// (invisible while every config and smoke was L2-only; the M1
+    /// inter-area tests exposed it).
     fn active_levels(&self) -> impl Iterator<Item = bool> + '_ {
-        [self.levels[0].is_some(), self.levels[1].is_some()]
-            .into_iter()
-            .filter(|&active| active)
+        [
+            (self.levels[0].is_some(), false),
+            (self.levels[1].is_some(), true),
+        ]
+        .into_iter()
+        .filter(|(active, _)| *active)
+        .map(|(_, level2)| level2)
     }
 
     // ---- origination ---------------------------------------------
 
     /// The TLV set of our own LSP at `level` (pure — the test target).
-    fn own_tlvs(&self) -> Vec<Tlv> {
+    /// Own prefixes (interface + redistributed) ride every level we
+    /// run; the inter-area sets are level-specific: leaked-down
+    /// prefixes (up/down set, RFC 5302) only in the L1 LSP,
+    /// moved-up area prefixes (up/down clear) only in the L2 LSP.
+    fn own_tlvs(&self, level2: bool) -> Vec<Tlv> {
         let mut tlvs = vec![
             Tlv::AreaAddresses(self.areas.clone()),
             Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
@@ -185,6 +216,24 @@ impl Daemon {
                 sub_tlvs: vec![],
             }]));
         }
+        let inter_level: &[LeakedPrefix] = if level2 {
+            &self.moved_up
+        } else {
+            &self.leaked_down
+        };
+        for &LeakedPrefix {
+            prefix: (addr, plen),
+            metric,
+            up_down,
+        } in inter_level
+        {
+            tlvs.push(Tlv::ExtIpReachability(vec![WideIpReach {
+                metric,
+                up_down,
+                prefix: (addr, plen),
+                sub_tlvs: vec![],
+            }]));
+        }
         tlvs
     }
 
@@ -199,7 +248,7 @@ impl Daemon {
             overload: false,
             is_type: self.config.is_type,
         };
-        let tlvs = self.own_tlvs();
+        let tlvs = self.own_tlvs(level2);
         let now = self.now();
         let state = self.levels[level_index(level2)].as_mut()?;
         let seq = state.seq.take_next()?;
@@ -523,27 +572,48 @@ impl Daemon {
 
     // ---- SPF and export -------------------------------------------
 
+    /// Whether we already originate `prefix` ourselves (interface or
+    /// redistributed) — the inter-area sets skip those (no
+    /// self-shadowing duplicates in one LSP).
+    fn originates(&self, prefix: &(Ipv4Addr, u8)) -> bool {
+        if self.config.interface.address == Some(*prefix) {
+            return true;
+        }
+        self.redistributed.contains(prefix)
+    }
+
     /// Recompute routes from all active levels and flush the diff to
-    /// zebra. L1 beats L2 for the same prefix (RFC 1195 §3.10.1).
+    /// zebra, per RFC 1195 §3.10.2's preference ladder: for one
+    /// prefix, "routes learned via level 1 routing" beat level 2
+    /// routes; among same-level candidates, "routes using internal
+    /// metrics only are always preferred to routes using external
+    /// metrics"; then the shortest path (equal-cost load-splitting is
+    /// permitted — v1 keeps the deterministic first next hop).
     fn recompute_routes(&mut self, out: &mut Vec<Pdu>) {
         let now = self.now();
+        let results: Vec<(bool, SpfResult)> = self
+            .active_levels()
+            .map(|level2| {
+                let level = if level2 { Level::Level2 } else { Level::Level1 };
+                let state = self.levels[level_index(level2)].as_ref().unwrap();
+                (level2, spf::run(self.system_id, level, &state.db, now))
+            })
+            .collect();
+
         let mut wanted: HashMap<(Ipv4Addr, u8), RouteEntry> = HashMap::new();
-        for level2 in self.active_levels().collect::<Vec<_>>() {
-            let level = if level2 { Level::Level2 } else { Level::Level1 };
-            let state = self.levels[level_index(level2)].as_ref().unwrap();
-            let result = spf::run(self.system_id, level, &state.db, now);
-            for route in collect_routes(&result) {
-                // L1 preference: an L1 route already collected wins.
-                if !level2 && wanted.contains_key(&route.prefix) {
-                    continue;
-                }
-                if level2 && wanted.contains_key(&route.prefix) {
-                    continue;
-                }
+        // The ladder key per prefix: (level, external, metric).
+        let mut best: HashMap<(Ipv4Addr, u8), (u8, u8, u64)> = HashMap::new();
+        for (level2, result) in &results {
+            for route in &result.routes {
                 let Some(nexthop) = route.next_hops.first().and_then(|h| h.address) else {
                     warn!(prefix = ?route.prefix, "route without a usable nexthop (no TLV 132 on the path)");
                     continue;
                 };
+                let key = (u8::from(*level2), u8::from(route.external), route.metric);
+                let wins = best.get(&route.prefix).is_none_or(|&k| key < k);
+                if !wins {
+                    continue;
+                }
                 let Ok(prefix) = common::prefix::Ipv4Prefix::new(route.prefix.0, route.prefix.1)
                 else {
                     continue;
@@ -554,7 +624,8 @@ impl Daemon {
                     NexthopGroup::single(Nexthop::Ipv4(nexthop)),
                     route.metric as u32,
                 );
-                wanted.entry(route.prefix).or_insert(entry);
+                wanted.insert(route.prefix, entry);
+                best.insert(route.prefix, key);
             }
             // The L1 default route toward the nearest attached L2
             // (RFC 1195 §3.10.1): 0.0.0.0/0 at the attached
@@ -576,6 +647,73 @@ impl Daemon {
                         });
                     }
                 }
+            }
+        }
+
+        // ---- inter-area prefix movement ------------------------------
+
+        // L2→L1 (RFC 5302), only when configured and both levels run:
+        // the L2 view's prefixes re-advertised into our L1 LSP with
+        // the up/down bit set ("L1L2 routers MUST set this bit to one
+        // for prefixes that are derived from L2 routing and are
+        // advertised into L1 LSPs"). Excluded: prefixes the L1 area
+        // already reaches (leaking them would only shadow local
+        // routing), prefixes whose L2 copy already carries the bit
+        // (leaked down from an even higher domain — never re-leaked),
+        // and our own origins.
+        let mut new_leak: Vec<LeakedPrefix> = Vec::new();
+        if self.config.redistribute_level2_into_l1 && results.len() == 2 {
+            let (_, l2) = results.iter().find(|(l2, _)| *l2).expect("both levels");
+            let (_, l1) = results.iter().find(|(l2, _)| !l2).expect("both levels");
+            let l1_has: HashSet<(Ipv4Addr, u8)> = l1.routes.iter().map(|r| r.prefix).collect();
+            for route in &l2.routes {
+                if route.up_down || l1_has.contains(&route.prefix) {
+                    continue;
+                }
+                new_leak.push(LeakedPrefix {
+                    prefix: route.prefix,
+                    metric: route.metric.min(u32::MAX as u64) as u32,
+                    up_down: true,
+                });
+            }
+        }
+        new_leak.sort_by_key(|p| p.prefix);
+        new_leak.dedup_by_key(|p| p.prefix);
+        if new_leak != self.leaked_down {
+            info!(count = new_leak.len(), "L2->L1 leak set changed");
+            self.leaked_down = new_leak;
+            if let Some(pdu) = self.originate(false) {
+                out.push(pdu);
+            }
+        }
+
+        // L1→L2 (RFC 1195's area-prefix re-advertisement by the
+        // border): the L1 view's prefixes ride our L2 LSP with the
+        // bit clear — except the RFC 5302 MUST NOT: "Prefixes with
+        // the up/down bit set that are learned via L1 routing MUST
+        // NOT be advertised by L1L2 routers back into L2", and our
+        // own origins (already in both levels).
+        let mut new_up: Vec<LeakedPrefix> = Vec::new();
+        if results.len() == 2 {
+            let (_, l1) = results.iter().find(|(l2, _)| !l2).expect("both levels");
+            for route in &l1.routes {
+                if route.up_down || self.originates(&route.prefix) {
+                    continue;
+                }
+                new_up.push(LeakedPrefix {
+                    prefix: route.prefix,
+                    metric: route.metric.min(u32::MAX as u64) as u32,
+                    up_down: false,
+                });
+            }
+        }
+        new_up.sort_by_key(|p| p.prefix);
+        new_up.dedup_by_key(|p| p.prefix);
+        if new_up != self.moved_up {
+            info!(count = new_up.len(), "L1->L2 advertisement set changed");
+            self.moved_up = new_up;
+            if let Some(pdu) = self.originate(true) {
+                out.push(pdu);
             }
         }
 
@@ -734,6 +872,290 @@ router isis T
 
     fn daemon() -> Daemon {
         Daemon::new(parse_config(CONF).unwrap()).unwrap()
+    }
+
+    /// An L1L2 daemon (the inter-area configuration) with optional
+    /// RFC 5302 leaking.
+    fn l1l2_daemon(leak: bool) -> Daemon {
+        let conf = format!(
+            "\
+router isis T
+ net 49.0001.1921.6800.1002.00
+ is-type level-1-2
+ hostname r2
+ {}
+ interface eth0
+  address 172.16.0.2/24
+  circuit-type level-1-2
+",
+            if leak {
+                " redistribute level-2 into level-1"
+            } else {
+                ""
+            }
+        );
+        Daemon::new(parse_config(&conf).unwrap()).unwrap()
+    }
+
+    const PEER: SystemId = SystemId::from_bytes([0x19, 0x21, 0x68, 0, 0x10, 1]);
+
+    /// Bring the adjacency up (legacy hello) on an L1L2 daemon.
+    fn adjacency_up_l1l2(d: &mut Daemon, out: &mut Vec<Pdu>) {
+        let hello = crate::pdu::p2p_hello(
+            Level::Level1And2,
+            PEER,
+            30,
+            9,
+            vec![
+                Tlv::AreaAddresses(vec![vec![0x49, 0x00, 0x01]]),
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+            ],
+        );
+        d.handle_pdu(hello, out);
+        assert_eq!(d.adjacency.state, crate::adjacency::AdjacencyState::Up);
+    }
+
+    /// A peer LSP for `level2` carrying one wide prefix.
+    fn peer_lsp(level2: bool, prefix: (Ipv4Addr, u8), metric: u32, up_down: bool) -> Pdu {
+        lsp_pdu(
+            level2,
+            LspId::zero(PEER),
+            1,
+            1200,
+            LspBits::default(),
+            vec![
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+                Tlv::ExtIsReachability(vec![ExtIsNeighbor {
+                    id: crate::system::NeighborId::new(
+                        SystemId::from_bytes([0x19, 0x21, 0x68, 0, 0x10, 2]),
+                        0,
+                    ),
+                    metric: 10,
+                    sub_tlvs: vec![],
+                }]),
+                Tlv::ExtIpReachability(vec![WideIpReach {
+                    metric,
+                    up_down,
+                    prefix,
+                    sub_tlvs: vec![],
+                }]),
+            ],
+        )
+    }
+
+    /// RFC 5302 §2: with leaking configured, an L2-derived prefix is
+    /// re-advertised into our L1 LSP with the up/down bit set — the
+    /// wire control octet carries 0x80.
+    #[test]
+    fn l2_to_l1_leak_sets_updown() {
+        let mut d = l1l2_daemon(true);
+        let mut out = Vec::new();
+        adjacency_up_l1l2(&mut d, &mut out);
+        assert!(d.levels[0].is_some() && d.levels[1].is_some());
+        d.handle_pdu(
+            peer_lsp(true, (Ipv4Addr::new(10, 30, 0, 0), 24), 10, false),
+            &mut out,
+        );
+        assert_eq!(
+            d.leaked_down,
+            vec![LeakedPrefix {
+                prefix: (Ipv4Addr::new(10, 30, 0, 0), 24),
+                metric: 20,
+                up_down: true,
+            }],
+            "SPF distance 10 + prefix metric 10, leaked down"
+        );
+        // The re-originated L1 LSP carries the 0x80 control bit.
+        assert!(out.iter().any(|p| match &p.body {
+            PduBody::Lsp(l) => {
+                l.id == LspId::zero(d.system_id)
+                    && l.tlvs.iter().any(|t| {
+                        matches!(t, Tlv::ExtIpReachability(ps) if ps.iter().any(
+                            |p| p.up_down && p.prefix == (Ipv4Addr::new(10, 30, 0, 0), 24)
+                        ))
+                    })
+            }
+            _ => false,
+        }));
+    }
+
+    /// Without the knob there is no leaking (RFC 5302 leaking is
+    /// opt-in configuration, not a default).
+    #[test]
+    fn no_leak_without_the_knob() {
+        let mut d = l1l2_daemon(false);
+        let mut out = Vec::new();
+        adjacency_up_l1l2(&mut d, &mut out);
+        d.handle_pdu(
+            peer_lsp(true, (Ipv4Addr::new(10, 30, 0, 0), 24), 10, false),
+            &mut out,
+        );
+        assert!(d.leaked_down.is_empty());
+    }
+
+    /// The border's L1→L2 side (RFC 1195's area-prefix
+    /// re-advertisement): L1-learned prefixes ride the L2 LSP with
+    /// the up/down bit clear.
+    #[test]
+    fn l1_to_l2_movement() {
+        let mut d = l1l2_daemon(false);
+        let mut out = Vec::new();
+        adjacency_up_l1l2(&mut d, &mut out);
+        d.handle_pdu(
+            peer_lsp(false, (Ipv4Addr::new(10, 20, 0, 0), 24), 10, false),
+            &mut out,
+        );
+        assert_eq!(
+            d.moved_up,
+            vec![LeakedPrefix {
+                prefix: (Ipv4Addr::new(10, 20, 0, 0), 24),
+                metric: 20,
+                up_down: false,
+            }]
+        );
+        // The re-originated L2 LSP carries it with the bit clear.
+        assert!(out.iter().any(|p| match &p.body {
+            PduBody::Lsp(l) => {
+                l.id == LspId::zero(d.system_id)
+                    && l.tlvs.iter().any(|t| {
+                        matches!(t, Tlv::ExtIpReachability(ps) if ps.iter().any(
+                            |p| !p.up_down && p.prefix == (Ipv4Addr::new(10, 20, 0, 0), 24)
+                        ))
+                    })
+            }
+            _ => false,
+        }));
+    }
+
+    /// RFC 5302's loop-prevention MUST NOT: "Prefixes with the up/down
+    /// bit set that are learned via L1 routing MUST NOT be advertised
+    /// by L1L2 routers back into L2."
+    #[test]
+    fn updown_l1_routes_never_move_up() {
+        let mut d = l1l2_daemon(false);
+        let mut out = Vec::new();
+        adjacency_up_l1l2(&mut d, &mut out);
+        // The peer's L1 LSP carries a leaked-down prefix (bit set) —
+        // another border's leak reaching us over L1.
+        d.handle_pdu(
+            peer_lsp(false, (Ipv4Addr::new(10, 99, 0, 0), 24), 10, true),
+            &mut out,
+        );
+        assert!(d.moved_up.is_empty(), "leaked-down prefixes stay down");
+        // The route itself is still used for forwarding.
+        assert!(d.installed.contains_key(&(Ipv4Addr::new(10, 99, 0, 0), 24)));
+    }
+
+    /// RFC 1195 §3.10.2's ladder, both axes, with the daemon's own
+    /// forwarding table as the surface: L1 beats L2 regardless of
+    /// metric; internal beats external at the same level.
+    #[test]
+    fn preference_ladder() {
+        // L1 (metric 100) vs L2 (metric 5): the L1 route wins.
+        let mut d = l1l2_daemon(false);
+        let mut out = Vec::new();
+        adjacency_up_l1l2(&mut d, &mut out);
+        let pfx = (Ipv4Addr::new(10, 77, 0, 0), 24);
+        d.handle_pdu(peer_lsp(false, pfx, 100, false), &mut out);
+        d.handle_pdu(peer_lsp(true, pfx, 5, false), &mut out);
+        assert_eq!(d.installed.get(&pfx).unwrap().metric, 110, "10 + 100");
+
+        // L2 internal (metric 100) vs L2 external (metric 1): internal
+        // wins — narrow TLV 130 carries the external flag.
+        let mut d2 = daemon();
+        let mut out2 = Vec::new();
+        let hello = crate::pdu::p2p_hello(
+            Level::Level2,
+            PEER,
+            30,
+            9,
+            vec![
+                Tlv::AreaAddresses(vec![vec![0x49, 0x00, 0x01]]),
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+            ],
+        );
+        d2.handle_pdu(hello, &mut out2);
+        let ext = crate::tlv::NarrowIpReach {
+            default_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 1,
+            },
+            delay_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 0,
+            },
+            expense_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 0,
+            },
+            error_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 0,
+            },
+            address: Ipv4Addr::new(10, 88, 0, 0),
+            mask: Ipv4Addr::new(255, 255, 255, 0),
+            external: true,
+        };
+        let internal = crate::tlv::NarrowIpReach {
+            default_metric: crate::tlv::NarrowMetric {
+                flag: false,
+                up_down: false,
+                value: 100,
+            },
+            delay_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 0,
+            },
+            expense_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 0,
+            },
+            error_metric: crate::tlv::NarrowMetric {
+                flag: true,
+                up_down: false,
+                value: 0,
+            },
+            address: Ipv4Addr::new(10, 88, 0, 0),
+            mask: Ipv4Addr::new(255, 255, 255, 0),
+            external: false,
+        };
+        let narrow_lsp = lsp_pdu(
+            true,
+            LspId::zero(PEER),
+            1,
+            1200,
+            LspBits::default(),
+            vec![
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IpInterfaceAddress(vec![Ipv4Addr::new(172, 16, 0, 1)]),
+                Tlv::ExtIsReachability(vec![ExtIsNeighbor {
+                    id: crate::system::NeighborId::new(
+                        SystemId::from_bytes([0x19, 0x21, 0x68, 0, 0x10, 2]),
+                        0,
+                    ),
+                    metric: 10,
+                    sub_tlvs: vec![],
+                }]),
+                Tlv::IpInternalReachability(vec![internal]),
+                Tlv::IpExternalReachability(vec![ext]),
+            ],
+        );
+        d2.handle_pdu(narrow_lsp, &mut out2);
+        let pfx2 = (Ipv4Addr::new(10, 88, 0, 0), 24);
+        assert_eq!(
+            d2.installed.get(&pfx2).unwrap().metric,
+            110,
+            "internal (10 + 100) beats external (10 + 1)"
+        );
     }
 
     /// The IIH builder: circuit type, hold time, TLVs, TLV 240, and

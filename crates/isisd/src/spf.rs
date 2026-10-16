@@ -64,6 +64,14 @@ pub struct Route {
     pub next_hops: Vec<NextHop>,
     /// True when derived from TLV 130 (external reachability).
     pub external: bool,
+    /// RFC 5302's up/down bit as read from the advertisement: true
+    /// means the prefix was leaked **down** (L2→L1) by the advertising
+    /// border. Pure observability for path computation — every
+    /// prefix is routed — but the L1→L2 re-advertisement guard at the
+    /// border (RFC 5302 §2: "Prefixes with the up/down bit set that
+    /// are learned via L1 routing MUST NOT be advertised by L1L2
+    /// routers back into L2") reads it.
+    pub up_down: bool,
 }
 
 /// The SPF result for one level.
@@ -317,6 +325,7 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
                         metric: cost + p.metric as u64,
                         next_hops: hops.clone(),
                         external: false,
+                        up_down: p.up_down,
                     });
                 }
             }
@@ -334,6 +343,10 @@ pub fn run(self_id: SystemId, level: Level, db: &Lspdb, now: u64) -> SpfResult {
                         metric: cost + p.default_metric.metric() as u64,
                         next_hops: hops.clone(),
                         external,
+                        // RFC 5302 §2 redefined the default-metric
+                        // octet's bit 7 on TLVs 128/130 as the
+                        // up/down bit (the DP-10589 I/E-style flag).
+                        up_down: p.default_metric.up_down,
                     });
                 }
             }
@@ -786,6 +799,126 @@ mod tests {
         assert_eq!(purges.len(), 2); // both LSPs age out
         let result = run(R1, Level::Level1, &db, 1200);
         assert!(!result.distances.contains_key(&R2));
+    }
+
+    /// RFC 5302's up/down bit rides the computed `Route` from both
+    /// advertisement families — wide (TLV 135's control octet) and
+    /// narrow (the default-metric octet's bit 7 on TLV 128/130) — so
+    /// the border's re-advertisement guard can read it.
+    #[test]
+    fn updown_bit_propagates_to_routes() {
+        // Wide: control octet 0x80|24.
+        let mut db = Lspdb::new();
+        add_router(
+            &mut db,
+            R2,
+            vec![neighbor(R1, 10)],
+            vec![WideIpReach {
+                metric: 7,
+                up_down: true,
+                prefix: (Ipv4Addr::new(10, 40, 0, 0), 24),
+                sub_tlvs: vec![],
+            }],
+            Some(Ipv4Addr::new(10, 0, 0, 2)),
+            LspBits::default(),
+        );
+        add_router(
+            &mut db,
+            R1,
+            vec![neighbor(R2, 10)],
+            vec![],
+            None,
+            LspBits::default(),
+        );
+        let result = run(R1, Level::Level2, &db, 0);
+        let route = result
+            .routes
+            .iter()
+            .find(|r| r.prefix == (Ipv4Addr::new(10, 40, 0, 0), 24))
+            .unwrap();
+        assert!(route.up_down);
+
+        // Narrow: the default-metric octet carries the bit (RFC 5302
+        // §2 redefined it on TLVs 128/130).
+        let mut db = Lspdb::new();
+        let narrow = lsp_pdu(
+            false,
+            LspId::zero(R2),
+            1,
+            1200,
+            LspBits::default(),
+            vec![
+                Tlv::ProtocolsSupported(vec![NLPID_IPV4]),
+                Tlv::IsReachability(vec![crate::tlv::OldIsNeighbor {
+                    id: NeighborId::new(R1, 0),
+                    default_metric: crate::tlv::NarrowMetric {
+                        flag: false,
+                        up_down: false,
+                        value: 10,
+                    },
+                    delay_metric: crate::tlv::NarrowMetric {
+                        flag: true,
+                        up_down: false,
+                        value: 0,
+                    },
+                    expense_metric: crate::tlv::NarrowMetric {
+                        flag: true,
+                        up_down: false,
+                        value: 0,
+                    },
+                    error_metric: crate::tlv::NarrowMetric {
+                        flag: true,
+                        up_down: false,
+                        value: 0,
+                    },
+                }]),
+                Tlv::IpInternalReachability(vec![crate::tlv::NarrowIpReach {
+                    default_metric: crate::tlv::NarrowMetric {
+                        flag: false,
+                        up_down: true,
+                        value: 7,
+                    },
+                    delay_metric: crate::tlv::NarrowMetric {
+                        flag: true,
+                        up_down: false,
+                        value: 0,
+                    },
+                    expense_metric: crate::tlv::NarrowMetric {
+                        flag: true,
+                        up_down: false,
+                        value: 0,
+                    },
+                    error_metric: crate::tlv::NarrowMetric {
+                        flag: true,
+                        up_down: false,
+                        value: 0,
+                    },
+                    address: Ipv4Addr::new(10, 50, 0, 0),
+                    mask: Ipv4Addr::new(255, 255, 255, 0),
+                    external: false,
+                }]),
+            ],
+        );
+        let decoded = Pdu::decode(&narrow.encode()).unwrap();
+        let PduBody::Lsp(l) = decoded.body else {
+            unreachable!()
+        };
+        db.install(l, 0);
+        add_router(
+            &mut db,
+            R1,
+            vec![neighbor(R2, 10)],
+            vec![],
+            None,
+            LspBits::default(),
+        );
+        let result = run(R1, Level::Level2, &db, 0);
+        let route = result
+            .routes
+            .iter()
+            .find(|r| r.prefix == (Ipv4Addr::new(10, 50, 0, 0), 24))
+            .unwrap();
+        assert!(route.up_down, "the narrow bit reaches the route");
     }
 
     // ---- the brute-force oracle (the ospfd recipe) ----------------
