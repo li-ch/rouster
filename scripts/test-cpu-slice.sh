@@ -116,9 +116,12 @@ start_sut() { # name
     docker exec "$1" sh -c "printf '%s\n' \
         'zapi socket /run/rouster/zserv.api' > /etc/rouster.conf"
     # census mode arms the timers via the env var; the ablation's
-    # ROUSTERD_LOG rides along in both modes.
+    # ROUSTERD_LOG rides along in both modes. PERF-P3: ROUSTERD_MEM_CENSUS
+    # passthrough arms the rib memory census (same feature build,
+    # independent env arm).
     CENSUS_ENV=(-e ROUSTERD_LOG="${ROUSTERD_LOG:-info}")
     [ "$MODE" = census ] && CENSUS_ENV+=(-e ROUSTERD_CPU_CENSUS=1)
+    [ -n "${ROUSTERD_MEM_CENSUS:-}" ] && CENSUS_ENV+=(-e ROUSTERD_MEM_CENSUS="$ROUSTERD_MEM_CENSUS")
     docker exec -d ${CENSUS_ENV[@]+"${CENSUS_ENV[@]}"} "$1" sh -c \
         "rousterd --config /etc/rouster.conf > /var/log/rousterd.log 2>&1"
     # Socket-based wait (not the log line): the ablation runs with

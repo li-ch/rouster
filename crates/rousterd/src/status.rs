@@ -57,6 +57,8 @@ use std::path::Path;
 
 use common::IpPrefix;
 use common::TableId;
+#[cfg(feature = "cpu-census")]
+use rib::memcensus;
 use rib::{InterfaceState, Rib, MAIN_TABLE};
 
 /// Default status file (A21): refreshed by the main loop's status
@@ -142,6 +144,10 @@ fn census_text() -> String {
 /// write warns and never fails the caller (the savd/bfdd rule).
 pub fn publish(rib: &Rib) {
     let _census = crate::cpucensus::scope(&crate::cpucensus::RD_STATUS_PUBLISH);
+    // PERF-P3's memory census rides this cadence for its settled-state
+    // (plateau) dump — feature-gated, env-armed, no-op otherwise.
+    #[cfg(feature = "cpu-census")]
+    memcensus::plateau_maybe(rib);
     publish_to(Path::new(DEFAULT_STATUS_FILE), rib, std::process::id());
 }
 

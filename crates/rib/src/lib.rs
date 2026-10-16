@@ -5,7 +5,7 @@
 //! metric; the selected route is what gets programmed into the dataplane.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use common::{
@@ -17,6 +17,11 @@ use tracing::{debug, info, instrument, warn};
 /// PERF-P2's CPU-census phase timers (feature `cpu-census`; a no-op
 /// without it, runtime-inert unless `ROUSTERD_CPU_CENSUS=1`).
 pub mod cpucensus;
+/// PERF-P3's memory census — rides the same feature gate (the stream
+/// fence forbids manifest edits, so no separate `mem-census` feature
+/// exists; the module is runtime-inert unless `ROUSTERD_MEM_CENSUS=1`).
+#[cfg(feature = "cpu-census")]
+pub mod memcensus;
 
 /// Observed state of one network interface, mirrored from the dataplane.
 #[derive(Debug, Clone, Default)]
@@ -144,6 +149,19 @@ pub struct Rib {
     /// [`Rib::add_route`]; routes withdrawn through [`Rib::table_mut`] are
     /// picked up at the next rebuild.
     nht: BTreeMap<IpAddr, Option<Nexthop>>,
+    /// PERF-P3 (M3 L1): canonical nexthop-group storage. Every group
+    /// entering the RIB — the incoming candidate at [`Rib::add_route`],
+    /// the programmed belief at install — is interned here so equal
+    /// groups pin ONE heap buffer (the census: a single-upstream import
+    /// holds one distinct group per ~100k prefixes; the former storage
+    /// paid a duplicate buffer per copy). `Arc`'s value-equality does
+    /// the dedup; the cache holds the pinning reference and
+    /// [`Rib::sweep_nhgs`] drops entries nothing references. FRR's
+    /// shared nexthop objects (`zebra_nhg`) are the known art.
+    nhg_cache: HashSet<std::sync::Arc<Vec<(Nexthop, u8)>>>,
+    /// Intern counter for the sweep cadence (every 65,536 interns —
+    /// the PERF-M1 attribute-interner's cadence).
+    nhg_interns: usize,
 }
 
 /// Linux main table (RT_TABLE_MAIN) — the table the routed NHT lookup
@@ -776,7 +794,42 @@ impl Rib {
             let resolved = self.resolve_nexthop_recursive(gw);
             self.nht.entry(gw).or_insert(resolved);
         }
+        // PERF-P3 (M3 L1): the candidate stores the canonical group.
+        let mut entry = entry;
+        entry.nexthops = self.intern_nhg(&entry.nexthops);
         self.table_mut(table_id).add(entry);
+        // PERF-P3's memory census (feature-gated, env-armed): counts
+        // the add and fires any milestone dump due.
+        #[cfg(feature = "cpu-census")]
+        memcensus::note_add(self);
+    }
+
+    /// Interns a nexthop group into the canonical cache: equal groups
+    /// (Arc's value-equality) resolve to the same shared buffer
+    /// (PERF-P3 M3 L1). The returned group shares storage with every
+    /// other interned equal group.
+    fn intern_nhg(&mut self, group: &NexthopGroup) -> NexthopGroup {
+        if let Some(canonical) = self
+            .nhg_cache
+            .get(group.as_shared().as_ref())
+        {
+            return NexthopGroup::from_shared(canonical.clone());
+        }
+        let shared = group.as_shared().clone();
+        self.nhg_cache.insert(shared.clone());
+        self.nhg_interns += 1;
+        if self.nhg_interns % 65_536 == 0 {
+            self.sweep_nhgs();
+        }
+        NexthopGroup::from_shared(shared)
+    }
+
+    /// Drops cache entries nothing references (the stored candidates
+    /// and beliefs hold their own `Arc`s; a count of 1 means the cache
+    /// is the sole holder).
+    fn sweep_nhgs(&mut self) {
+        self.nhg_cache
+            .retain(|shared| std::sync::Arc::strong_count(shared) > 1);
     }
 
     /// Every (table, prefix) key holding a static-protocol candidate —
@@ -1008,10 +1061,15 @@ impl Rib {
             let keys: Vec<(TableId, IpPrefix)> = to_install.iter().map(|(key, _)| *key).collect();
             let entries: Vec<RouteEntry> = to_install.into_iter().map(|(_, entry)| entry).collect();
             let results = dp.route_replace_batch(&entries).await;
-            for ((key, entry), result) in keys.into_iter().zip(entries).zip(results) {
+            for ((key, mut entry), result) in keys.into_iter().zip(entries).zip(results) {
                 match result {
                     Ok(()) => {
                         debug!(prefix = %entry.prefix, table_id = entry.table, "installed best route");
+                        // PERF-P3 (M3 L1): the belief shares the
+                        // canonical group buffer (with the candidate
+                        // it mirrors — equal by construction on this
+                        // path, so this usually bumps a refcount).
+                        entry.nexthops = self.intern_nhg(&entry.nexthops);
                         self.programmed.insert(key, entry);
                         installed += 1;
                     }
@@ -1392,6 +1450,82 @@ mod tests {
         // Removing an absent route changes nothing.
         assert!(!table.remove(&"10.0.0.0/8".parse().unwrap(), RouteProtocol::Bgp));
         assert_eq!(table.counts(), (1, 1));
+    }
+
+    /// PERF-P3 (M3 L1): equal nexthop groups entering the RIB share
+    /// one buffer — the candidate and (post-install) the programmed
+    /// belief point at the SAME storage, and the sweep drops cache
+    /// entries nothing references once their routes are withdrawn.
+    #[test]
+    fn nexthop_groups_intern_and_share() {
+        let hop = Nexthop::Ipv4If("192.0.2.9".parse().unwrap(), 2);
+        let mut rib = Rib::new();
+        rib.apply_event(&link(2, "eth0", true));
+        rib.apply_event(&address(2, "192.0.2.1/24", true));
+        let route = |p: &str| {
+            RouteEntry::new(
+                p.parse().unwrap(),
+                RouteProtocol::Static,
+                NexthopGroup::single(hop),
+                0,
+            )
+        };
+        rib.add_route(route("198.51.100.0/24"));
+        rib.add_route(route("203.0.113.0/24"));
+        // Both candidates hold the canonical shared group.
+        let shared_a = rib
+            .table(254)
+            .unwrap()
+            .best(&"198.51.100.0/24".parse().unwrap())
+            .unwrap()
+            .nexthops
+            .as_shared()
+            .clone();
+        let shared_b = rib
+            .table(254)
+            .unwrap()
+            .best(&"203.0.113.0/24".parse().unwrap())
+            .unwrap()
+            .nexthops
+            .as_shared()
+            .clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&shared_a, &shared_b),
+            "equal groups intern to one buffer"
+        );
+        // The programmed belief shares it too after a reconcile.
+        let dp = MockDp::default();
+        block_on(rib.reconcile(&dp));
+        let believed_shared = rib
+            .programmed
+            .values()
+            .next()
+            .unwrap()
+            .nexthops
+            .as_shared()
+            .clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&believed_shared, &shared_a),
+            "the belief pins the same canonical group as the candidate"
+        );
+        // The test's own pins must go before the sweep's refcount check.
+        drop((shared_a, shared_b, believed_shared));
+        // Withdraw everything; the sweep drops the now-unreferenced
+        // canonical group from the cache.
+        rib.table_mut(254)
+            .remove(&"198.51.100.0/24".parse().unwrap(), RouteProtocol::Static);
+        rib.table_mut(254)
+            .remove(&"203.0.113.0/24".parse().unwrap(), RouteProtocol::Static);
+        block_on(rib.reconcile(&dp));
+        // The mock's evidence records hold entry clones — drop them so
+        // only the RIB's own storage pins the canonical group.
+        dp.installed.lock().unwrap().clear();
+        dp.removed.lock().unwrap().clear();
+        rib.sweep_nhgs();
+        assert!(
+            rib.nhg_cache.is_empty(),
+            "unreferenced canonical groups sweep away"
+        );
     }
 
     #[test]
