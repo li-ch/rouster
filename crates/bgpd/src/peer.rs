@@ -917,6 +917,48 @@ where
                     }
                     return self.step(Event::UpdateMsg, sink).await;
                 }
+                // F3: first-AS enforcement at import, RFC 4271 §6.3 —
+                // "If the UPDATE message is received from an external
+                // peer, the local system MAY check whether the leftmost
+                // (with respect to the position of octets in the
+                // protocol message) AS in the AS_PATH attribute is
+                // equal to the autonomous system number of the peer
+                // that sent the message. If the check determines this
+                // is not the case, the Error Subcode MUST be set to
+                // Malformed AS_PATH." The §6.3 preamble prescribes the
+                // wire answer for every detected error — "All errors
+                // detected while processing an UPDATE message MUST be
+                // indicated by sending the NOTIFICATION message with
+                // the Error Code UPDATE Message Error" — so the
+                // violation is UPDATE Message Error / Malformed AS_PATH
+                // (3/11) and the session resets (FRR's default-on
+                // `bgp enforce-first-as`, `aspath_firstas_check`).
+                // iBGP is exempt by the rule's own scope ("received
+                // from an external peer"): §9.2 dissemination leaves an
+                // internal peer's path untouched, so it may open with
+                // any AS. The check runs on the decoded path before
+                // the RFC 7606 disposition arms — FRR enforces at
+                // attribute-parse time, ahead of its own revised
+                // handling.
+                if self.peer.remote_as != self.local_as {
+                    if let Some(path) = update.as_path() {
+                        if path.leftmost_as() != Some(self.peer.remote_as) {
+                            warn!(peer = %self.peer.address,
+                                leftmost = ?path.leftmost_as(),
+                                expected = self.peer.remote_as,
+                                "bgpd: UPDATE rejected, first AS not the peer's (RFC 4271 §6.3)");
+                            return self
+                                .step(
+                                    Event::UpdateMsgErr(
+                                        error::error_code::UPDATE_MESSAGE,
+                                        error::update_subcode::MALFORMED_AS_PATH,
+                                    ),
+                                    sink,
+                                )
+                                .await;
+                        }
+                    }
+                }
                 // RFC 7606's structured outcome (B-1): the explicit
                 // third disposition. §3(d)'s missing well-known
                 // mandatory attributes and §5.2's escalation fold in
@@ -1589,6 +1631,7 @@ fn bgp_next_hop(update: &BgpUpdate) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attr::AsSegment;
     use crate::message::message_type;
     use tokio::io::duplex;
 
@@ -1741,6 +1784,391 @@ mod tests {
         assert_eq!(notification.subcode, error::open_subcode::BAD_PEER_AS);
         let end = driver.await.unwrap();
         assert!(matches!(end, SessionEnd::Notified(2, 2)));
+    }
+
+    // ---- F3: first-AS enforcement (RFC 4271 §6.3) ------------------
+
+    /// A received-route UPDATE: the mandatory triple plus the given
+    /// AS_PATH, announcing 203.0.113.0/24.
+    fn received_update(path: AsPath) -> BgpUpdate {
+        BgpUpdate {
+            withdrawn: vec![],
+            attrs: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(path),
+                PathAttribute::NextHop("192.0.2.9".parse().unwrap()),
+            ],
+            nlri: vec!["203.0.113.0/24".parse().unwrap()],
+        }
+    }
+
+    /// Reads frames until a NOTIFICATION arrives (KEEPALIVEs, our
+    /// End-of-RIB markers, and other traffic pass), returning the raw
+    /// frame for byte-level pins.
+    async fn until_notification_frame(io: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        loop {
+            let frame = read_bytes(io).await;
+            if frame[18] == message_type::NOTIFICATION {
+                return frame;
+            }
+        }
+    }
+
+    /// The exact NOTIFICATION §6.3 prescribes when the first-AS check
+    /// fails: marker | length 21 | type 3 | code 3 (UPDATE Message
+    /// Error) | subcode 11 (Malformed AS_PATH), no data octets —
+    /// 21 octets total.
+    fn malformed_as_path_notification_bytes() -> Vec<u8> {
+        let mut expected = vec![0xff; 16];
+        expected.extend_from_slice(&[0x00, 0x15, 0x03, 0x03, 0x0b]);
+        expected
+    }
+
+    /// RFC 4271 §6.3: "If the UPDATE message is received from an
+    /// external peer, the local system MAY check whether the leftmost
+    /// (with respect to the position of octets in the protocol
+    /// message) AS in the AS_PATH attribute is equal to the
+    /// autonomous system number of the peer that sent the message.
+    /// If the check determines this is not the case, the Error Subcode
+    /// MUST be set to Malformed AS_PATH." An eBGP UPDATE whose path
+    /// opens with 65099 (the peer speaks 65001) draws exactly that
+    /// NOTIFICATION, byte for byte, and the session resets.
+    #[tokio::test]
+    async fn ebgp_bad_first_as_gets_malformed_as_path_notification_bytes() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        let update = received_update(AsPath::sequence([65099, 65001]));
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+
+        let frame = until_notification_frame(&mut partner.io).await;
+        assert_eq!(frame, malformed_as_path_notification_bytes());
+        let end = driver.await.unwrap();
+        assert_eq!(
+            end,
+            SessionEnd::Notified(
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::MALFORMED_AS_PATH,
+            )
+        );
+        let sink = sink.0.lock().unwrap();
+        assert!(
+            sink.announced.is_empty(),
+            "the route never reached Adj-RIB-In"
+        );
+        assert_eq!(sink.cleared, 1, "the teardown clears the peer's routes");
+    }
+
+    /// The well-formed twin: the path opens with the peer's own AS
+    /// (65001) and the route imports normally.
+    #[tokio::test]
+    async fn ebgp_peer_first_as_imports_normally() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        let update = received_update(AsPath::sequence([65001, 65002]));
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+        write_bytes(
+            &mut partner.io,
+            &BgpMessage::Keepalive.encode(true).unwrap(),
+        )
+        .await;
+        partner.io.shutdown().await.unwrap();
+        let end = driver.await.unwrap();
+        assert!(matches!(end, SessionEnd::Transport(_)));
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.announced.len(), 1, "the route imports");
+        assert!(sink.announced.contains_key(&"203.0.113.0/24".parse().unwrap()));
+    }
+
+    /// §6.3's rule is scoped to "the UPDATE message ... received from
+    /// an external peer" — an internal peer's path may open with any
+    /// AS (§9.2 dissemination leaves it untouched), so iBGP is exempt
+    /// from the first-AS check.
+    #[tokio::test]
+    async fn ibgp_first_as_check_exempt() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65000, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65000,
+        };
+        partner.handshake(65000).await;
+
+        let update = received_update(AsPath::sequence([65099, 65001]));
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+        write_bytes(
+            &mut partner.io,
+            &BgpMessage::Keepalive.encode(true).unwrap(),
+        )
+        .await;
+        partner.io.shutdown().await.unwrap();
+        driver.await.unwrap();
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.announced.len(), 1, "iBGP path of any shape imports");
+    }
+
+    /// §5.1.2 a): the empty AS_PATH is the iBGP shape — from an
+    /// internal peer it imports (this test); from an external one it
+    /// has no leftmost AS to equal the peer and fails the §6.3 check
+    /// (the next test).
+    #[tokio::test]
+    async fn ibgp_empty_as_path_imports() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65000, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65000,
+        };
+        partner.handshake(65000).await;
+
+        let update = received_update(AsPath::default());
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+        write_bytes(
+            &mut partner.io,
+            &BgpMessage::Keepalive.encode(true).unwrap(),
+        )
+        .await;
+        partner.io.shutdown().await.unwrap();
+        driver.await.unwrap();
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.announced.len(), 1);
+    }
+
+    /// The empty path over eBGP: no leftmost AS can equal the peer's,
+    /// so the prescribed Malformed AS_PATH NOTIFICATION answers (FRR
+    /// parity — `aspath_firstas_check` returns false for a NULL/empty
+    /// path).
+    #[tokio::test]
+    async fn ebgp_empty_as_path_rejected() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        let update = received_update(AsPath::default());
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+
+        let frame = until_notification_frame(&mut partner.io).await;
+        assert_eq!(frame, malformed_as_path_notification_bytes());
+        let end = driver.await.unwrap();
+        assert_eq!(
+            end,
+            SessionEnd::Notified(
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::MALFORMED_AS_PATH,
+            )
+        );
+    }
+
+    /// A leading AS_SET has no leftmost sequence AS either — the same
+    /// rejection (FRR's `aspath_firstas_check` demands a first
+    /// segment of type AS_SEQUENCE).
+    #[tokio::test]
+    async fn ebgp_leading_as_set_rejected() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        let path = AsPath {
+            segments: vec![AsSegment::Set(vec![65001, 65002])],
+        };
+        let update = received_update(path);
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+
+        let frame = until_notification_frame(&mut partner.io).await;
+        assert_eq!(frame, malformed_as_path_notification_bytes());
+        let end = driver.await.unwrap();
+        assert_eq!(
+            end,
+            SessionEnd::Notified(
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::MALFORMED_AS_PATH,
+            )
+        );
+    }
+
+    /// §6.3 keys the check on the message's AS_PATH, not on its NLRI:
+    /// a withdrawal-only UPDATE carrying a bad path resets the session
+    /// too (FRR enforces at attribute-parse time, before it knows what
+    /// the routes were).
+    #[tokio::test]
+    async fn ebgp_withdrawal_with_bad_first_as_resets_session() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let mut sink = NullSink;
+        let driver = tokio::spawn(async move { sess.run(&mut sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        let update = BgpUpdate {
+            withdrawn: vec!["203.0.113.0/24".parse().unwrap()],
+            attrs: vec![PathAttribute::AsPath(AsPath::sequence([65099]))],
+            nlri: vec![],
+        };
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+
+        let frame = until_notification_frame(&mut partner.io).await;
+        assert_eq!(frame, malformed_as_path_notification_bytes());
+        let end = driver.await.unwrap();
+        assert_eq!(
+            end,
+            SessionEnd::Notified(
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::MALFORMED_AS_PATH,
+            )
+        );
+    }
+
+    /// The check runs on the decoded path BEFORE the RFC 7606
+    /// disposition arms — FRR enforces at attribute-parse time, ahead
+    /// of its revised handling — so a bad first AS resets the session
+    /// even when a second defect (a malformed ATOMIC_AGGREGATE, an
+    /// attribute-discard row that would otherwise log and process)
+    /// rides the same UPDATE.
+    #[tokio::test]
+    async fn first_as_check_precedes_rfc7606_disposition() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        // Hand-built frame: the mandatory triple with the bad path,
+        // plus a length-1 ATOMIC_AGGREGATE (RFC 7606 §7 attribute
+        // discard — must be length 0).
+        let mut attrs = Vec::new();
+        crate::attr::encode_attributes(
+            &received_update(AsPath::sequence([65099])).attrs,
+            &mut attrs,
+            true,
+            AddPathCtx::default(),
+        )
+        .unwrap();
+        attrs.extend_from_slice(&[0x40, 0x06, 0x01, 0x00]);
+        let mut body = vec![0x00, 0x00];
+        body.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        body.extend_from_slice(&attrs);
+        body.extend_from_slice(&[24, 203, 0, 113]); // 203.0.113.0/24
+        let mut frame = vec![0xff; 16];
+        frame.extend_from_slice(&((19 + body.len()) as u16).to_be_bytes());
+        frame.push(message_type::UPDATE);
+        frame.extend_from_slice(&body);
+        write_bytes(&mut partner.io, &frame).await;
+
+        // Sanction of the frame itself: under RFC 7606 alone it would
+        // decode to attribute-discard and process — pinned by decoding
+        // it directly.
+        let (decoded, outcome) = BgpUpdate::decode_with_handling(
+            &body,
+            true,
+            UpdateHandling::Rfc7606 { internal: false },
+            AddPathCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded.nlri.len(), 1);
+        assert!(
+            matches!(outcome, UpdateOutcome::Discarded(_)),
+            "without the first-AS check this UPDATE would process"
+        );
+
+        let frame = until_notification_frame(&mut partner.io).await;
+        assert_eq!(frame, malformed_as_path_notification_bytes());
+        let end = driver.await.unwrap();
+        assert_eq!(
+            end,
+            SessionEnd::Notified(
+                error::error_code::UPDATE_MESSAGE,
+                error::update_subcode::MALFORMED_AS_PATH,
+            )
+        );
+        let sink = sink.0.lock().unwrap();
+        assert!(sink.announced.is_empty());
+    }
+
+    /// A multi-segment path is judged by its FIRST segment only: the
+    /// leftmost AS is 65001 (the peer) even though later segments
+    /// (including an AS_SET) differ.
+    #[tokio::test]
+    async fn ebgp_multi_segment_path_first_segment_governs() {
+        let (ours, theirs) = duplex(8192);
+        let mut sess = session(ours, 65001, None);
+        let sink = SharedSink(Arc::new(Mutex::new(RecordingSink::default())));
+        let mut driver_sink = sink.clone();
+        let driver = tokio::spawn(async move { sess.run(&mut driver_sink).await });
+
+        let mut partner = TestPeer {
+            io: theirs,
+            asn: 65001,
+        };
+        partner.handshake(65000).await;
+
+        let path = AsPath {
+            segments: vec![
+                AsSegment::Sequence(vec![65001, 64512]),
+                AsSegment::Set(vec![65003, 65004]),
+            ],
+        };
+        let update = received_update(path);
+        write_bytes(&mut partner.io, &update.encode_frame(true).unwrap()).await;
+        write_bytes(
+            &mut partner.io,
+            &BgpMessage::Keepalive.encode(true).unwrap(),
+        )
+        .await;
+        partner.io.shutdown().await.unwrap();
+        driver.await.unwrap();
+        let sink = sink.0.lock().unwrap();
+        assert_eq!(sink.announced.len(), 1, "leftmost AS is the peer's");
     }
 
     #[tokio::test(start_paused = true)]

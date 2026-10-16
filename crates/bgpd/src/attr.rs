@@ -132,6 +132,21 @@ impl AsPath {
         self.segments.iter().map(|s| s.path_count()).sum()
     }
 
+    /// The leftmost AS of RFC 4271 §6.3's first-AS rule — "the
+    /// leftmost (with respect to the position of octets in the
+    /// protocol message) AS in the AS_PATH attribute": the first AS
+    /// of the first segment when that segment is an AS_SEQUENCE.
+    /// `None` for an empty path or a leading AS_SET — neither has a
+    /// leftmost AS that can equal the sender's, so both fail the
+    /// §6.3 equality (FRR's `aspath_firstas_check`: `NULL` path and
+    /// non-SEQUENCE first segment both return false).
+    pub fn leftmost_as(&self) -> Option<u32> {
+        match self.segments.first() {
+            Some(AsSegment::Sequence(v)) => v.first().copied(),
+            _ => None,
+        }
+    }
+
     /// The rightmost AS_SEQUENCE element (the neighbor-AS seed for the
     /// §9.1.2.2 c) MED comparability rule), if any.
     pub fn neighbor_as(&self) -> Option<u32> {
@@ -1588,6 +1603,36 @@ mod tests {
             ],
         };
         assert_eq!(path.neighbor_as(), Some(65001));
+    }
+
+    /// RFC 4271 §6.3's "leftmost (with respect to the position of
+    /// octets in the protocol message) AS": the first AS of the first
+    /// segment; a leading AS_SET or an empty path has none (FRR's
+    /// `aspath_firstas_check` parity — both fail the equality).
+    #[test]
+    fn leftmost_as_is_first_as_of_first_sequence() {
+        assert_eq!(AsPath::sequence([65001, 65002]).leftmost_as(), Some(65001));
+        assert_eq!(
+            AsPath {
+                segments: vec![
+                    AsSegment::Sequence(vec![65001, 64512]),
+                    AsSegment::Set(vec![7, 8]),
+                ],
+            }
+            .leftmost_as(),
+            Some(65001),
+            "a trailing AS_SET does not move the leftmost AS"
+        );
+        // A leading AS_SET has no leftmost AS the sender could equal.
+        assert_eq!(
+            AsPath {
+                segments: vec![AsSegment::Set(vec![65001, 65002])],
+            }
+            .leftmost_as(),
+            None
+        );
+        // Empty path (an iBGP shape; from eBGP it fails the rule).
+        assert_eq!(AsPath::default().leftmost_as(), None);
     }
 
     // ---- RFC 7606 revised error handling (N5 M1) ------------------
