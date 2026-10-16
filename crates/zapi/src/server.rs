@@ -3252,18 +3252,16 @@ mod tests {
         // Three frames as one blob, dribbled in chunks that split a
         // header (after 3 and after 9 bytes) and a body (after 25).
         let blob: Vec<u8> = [frame.clone(), frame.clone(), frame.clone()].concat();
-        for range in [
-            0usize..3,
-            3..9,
-            9..10,
-            10..25,
-            25..blob.len(),
-        ] {
+        for range in [0usize..3, 3..9, 9..10, 10..25, 25..blob.len()] {
             client.write_all(&blob[range]).await.expect("write");
             tokio::task::yield_now().await;
         }
         for _ in 0..3 {
-            let (header, body) = rx.recv().await.expect("frame delivered").expect("no io error");
+            let (header, body) = rx
+                .recv()
+                .await
+                .expect("frame delivered")
+                .expect("no io error");
             assert_eq!(header.command, 19, "HELLO");
             assert_eq!(body.as_slice(), &frame[ZAPI_HEADER_LEN..]);
         }

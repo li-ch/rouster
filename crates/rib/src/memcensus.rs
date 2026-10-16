@@ -152,15 +152,11 @@ fn dump(rib: &Rib, milestone: usize) {
             }
         }
     }
-        let mut distinct_in_programmed: HashSet<u64> = HashSet::new();
-        for belief in rib.programmed.values() {
-            distinct_in_programmed.insert(group_hash(belief.hops.hops()));
-        }
-    let kernel_mirror_prefixes: usize = rib
-        .kernel_mirror
-        .values()
-        .map(|t| t.iter().count())
-        .sum();
+    let mut distinct_in_programmed: HashSet<u64> = HashSet::new();
+    for belief in rib.programmed.values() {
+        distinct_in_programmed.insert(group_hash(belief.hops.hops()));
+    }
+    let kernel_mirror_prefixes: usize = rib.kernel_mirror.values().map(|t| t.iter().count()).sum();
     let walk = t0.elapsed();
     let (rss_kb, hwm_kb) = rss_pair().unzip();
     let base = rss_base_kb().load(Ordering::Relaxed);

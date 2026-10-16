@@ -103,17 +103,13 @@ impl Table {
                 slot @ Slot::One(_) => {
                     // Inline slot: same protocol replaces in place; a
                     // second protocol promotes to the heap Vec.
-                    let same_protocol =
-                        slot.as_slice()[0].protocol == entry.protocol;
+                    let same_protocol = slot.as_slice()[0].protocol == entry.protocol;
                     if same_protocol {
                         if let Slot::One(existing) = slot {
                             *existing = entry;
                         }
                     } else {
-                        let old = match std::mem::replace(
-                            slot,
-                            Slot::Many(Vec::with_capacity(2)),
-                        ) {
+                        let old = match std::mem::replace(slot, Slot::Many(Vec::with_capacity(2))) {
                             Slot::One(old) => old,
                             Slot::Many(_) => unreachable!("matched One above"),
                         };
@@ -183,7 +179,9 @@ impl Table {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&IpPrefix, &[RouteEntry])> {
-        self.entries.iter().map(|(prefix, slot)| (prefix, slot.as_slice()))
+        self.entries
+            .iter()
+            .map(|(prefix, slot)| (prefix, slot.as_slice()))
     }
 }
 
@@ -914,10 +912,7 @@ impl Rib {
     /// (PERF-P3 M3 L1). The returned group shares storage with every
     /// other interned equal group.
     fn intern_nhg(&mut self, group: &NexthopGroup) -> NexthopGroup {
-        if let Some(canonical) = self
-            .nhg_cache
-            .get(group.as_shared().as_ref())
-        {
+        if let Some(canonical) = self.nhg_cache.get(group.as_shared().as_ref()) {
             return NexthopGroup::from_shared(canonical.clone());
         }
         let shared = group.as_shared().clone();
