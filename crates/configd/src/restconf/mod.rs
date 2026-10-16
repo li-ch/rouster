@@ -31,10 +31,12 @@
 //! | `/restconf/data` | the CANDIDATE — the canonical file's bound trees (what the next apply pushes; RFC 8040 §3.4's datastore resource, mapped onto the file) | yes |
 //! | `/restconf/running` | the RUNNING tree — the last CONFIRMED generation's bound trees (what the daemons actually run; a Rouster extension — RFC 8040 has one datastore resource — keyed to RFC 6241 §8.1's running/candidate distinction) | no (405) |
 //!
-//! Security posture v1, PROMINENT: plain HTTP on loopback by
-//! default, **no authentication** — RFC 8040 §2 expects HTTPS+auth;
-//! the options (a local unix-socket alternative, TLS via rustls)
-//! are an owner dependency decision, §Deferred in docs/yang.md.
+//! Security posture v1.0 (S13-c), PROMINENT: the DEFAULT listener
+//! is the local unix socket (`server::bind_unix_socket` — mode
+//! 0660; filesystem permissions are the access control, the unix
+//! convention); the TCP plane is opt-in, plain HTTP, no TLS (RFC
+//! 8040 §2 expects HTTPS+auth — the TLS evaluation and owner
+//! decision live in docs/yang.md §restconf).
 //!
 //! gNMI stays the documented next step (decision C's own terms):
 //! the datastore semantics this edge pins are exactly the ones a
@@ -45,4 +47,4 @@ pub mod http;
 pub mod resources;
 pub mod server;
 
-pub use crate::yangmode::{RESTCONF_DEFAULT_BIND, RESTCONF_DEFAULT_PORT};
+pub use crate::yangmode::{RESTCONF_DEFAULT_BIND, RESTCONF_DEFAULT_PORT, RESTCONF_DEFAULT_SOCKET};

@@ -67,7 +67,7 @@ validation):
 | `<name>` ∈ {`rousterd`, `savd`, `bfdd`, `ospfd`, `bgpd`} | `unknown daemon` error listing the known names |
 | each daemon at most once | `duplicate` error at the second opener |
 | `router-id <ipv4>`, at most once, configd-owned | bad address / duplicate errors |
-| `restconf { port <n>; bind <addr>; }` at most once (S12-a — restconfd's plane; body validated against `rouster-vty`'s `restconf` container at bind time, rendered nowhere) | duplicate / nested / unclosed errors; type failures ride the linebind's pass-through discipline with the model defaults applied |
+| `restconf { socket <path>; port <n>; bind <addr>; token <hex>; }` at most once (S12-a + S13-c — restconfd's plane; body validated against `rouster-vty`'s `restconf` container at bind time, rendered nowhere; socket must be absolute, token even-length hex ≥ 32 chars) | duplicate / nested / unclosed errors; type failures ride the linebind's pass-through discipline with the model defaults applied |
 | anything else at top level | error (the canonical file is configd's own grammar and is strict — unlike the tolerant run-dir readers) |
 | body lines | pass-through verbatim (a body line is never a lone `}`; no daemon grammar uses braces — they are all token-per-line, so the terminator is unambiguous) |
 
@@ -275,7 +275,8 @@ binary discovery, default: configd's own dir then `PATH`):
 | `render <FILE> --dry-run` | prints each daemon's output with its destination, touches nothing | 0 · 1 · 2 |
 | `dump --json <FILE>` | the bound trees in the RFC 7951 JSON encoding (needs the YANG mode) | 0 · 1 · 2 |
 
-The same crate ships `restconfd` (S12-a): the RESTCONF-shaped
+The same crate ships `restconfd` (S12-a; the v1.0 security posture
+S13-c): the RESTCONF-shaped
 HTTP/1.1 northbound on these exact trees — `GET /restconf/data`
 (the candidate, this file), `GET /restconf/running` (the last
 confirmed generation, read-only), and PUT/POST/PATCH/DELETE
@@ -283,9 +284,12 @@ mutations that splice the canonical and run the apply pipeline
 above, answering with the per-daemon ack summary. Its contract,
 examples, and omissions table: [../yang.md §restconf](../yang.md).
 Server config: the canonical `restconf {}` stanza (flags beat the
-stanza; startup-only). Security posture v1: plain HTTP on loopback
-by default, **no auth** — [../yang.md §restconf](../yang.md) has
-the disclosure and the owner-decision options.
+stanza; startup-only). Security posture v1.0: the DEFAULT listener
+is the local unix socket `/run/rouster/restconf.sock` (mode 0660 —
+filesystem permissions are the access control); the TCP plane is
+`--tcp` opt-in, plain HTTP, no TLS, an optional bearer token —
+[../yang.md §restconf](../yang.md) has
+the disclosure and the TLS owner-decision block.
 
 Dead-pid daemons never fail an apply (exit 0, `not-running`
 recorded); a structurally- or semantically-rejected canonical file
@@ -336,7 +340,8 @@ exactly this shape for a writer; configd, not vtyd, is who landed):
 | `configd/generations/<seq>-<hash>/rouster.conf` | configd apply | written per apply; pruned to newest 8 |
 | `configd/current`, `configd/previous` | configd apply | one line each (the generation dir name); `previous` appears from the second apply on |
 | `configd.status` | configd apply | refreshed every apply (also on rollback applies) |
-| `restconf.status` | restconfd (S12-a) | written at start (mode/bind/port/canonical/dirs + the security line), removed on clean exit; a stale file survives only SIGKILL |
+| `restconf.status` | restconfd (S12-a; S13-c shape) | written at start (mode/listener socket\|tcp + socket-or-bind/port/canonical/dirs + the security line), removed on clean exit; a stale file survives only SIGKILL |
+| `restconf.sock` (name = the `socket` knob) | restconfd (S13-c — the DEFAULT listener) | stale file removed before bind, mode 0660 set at bind (the filesystem permission IS the access control), unlinked on clean exit; only SIGKILL leaves it behind |
 
 `rousterctl` stays read-only; `savd.pid`/`savd.status`/`bfdd.*`/
 `rousterd.status` ownership is unchanged. configd only READS those

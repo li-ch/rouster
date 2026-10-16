@@ -13,7 +13,7 @@ module rouster-vty {
     prefix rc;
   }
 
-  revision 2026-10-15;
+  revision 2026-10-16;
 
   // ---- display-only frr compatibility lines (B7's observed set) ----
 
@@ -44,8 +44,10 @@ module rouster-vty {
        stanza, bound here by prepending the stanza's opener to its
        body lines (the linebind's container-walk rule 3). Startup-only
        knobs for restconfd itself — the vtyd bind discipline; the
-       security posture v1 (loopback default, no auth, no TLS) is
-       disclosed in docs/yang.md's implementation section.";
+       security posture (S13-c: the local unix socket is the DEFAULT
+       listener, filesystem permissions are the access control, the
+       TCP plane is --tcp-opt-in) is disclosed in docs/yang.md's
+       implementation section.";
     leaf port {
       type uint16;
       default 8080;
@@ -53,6 +55,10 @@ module rouster-vty {
     leaf bind {
       type inet:ip-address;
       default 127.0.0.1;
+    }
+    leaf socket {
+      type string;
+      default /run/rouster/restconf.sock;
     }
   }
 

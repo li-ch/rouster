@@ -57,11 +57,14 @@ trust rc):
 | `show ip route summary`, `show rib summary` | `rousterd.status` | the FRR name and the rousterctl-parity name render the same summary (every table, both AFs — the dump is AF-agnostic) |
 | `show running-config`, config mode | session + canonical file | the merged canonical view (S8-c): session edits projected into the `rouster.conf` shape over everything the canonical file carries that the vty grammar cannot speak (verbatim); `write file`/`write memory` stage it and spawn `configd apply` ([protocols/vty.md](protocols/vty.md)) |
 
-### 1.3 restconfd (the RESTCONF northbound, S12-a)
+### 1.3 restconfd (the RESTCONF northbound, S12-a; the v1.0 posture S13-c)
 
 The YANG tree's primary HTTP surface (the owner's gNMI decision C —
-[../yang.md §restconf](../yang.md) is the contract; plain HTTP/1.1
-on loopback by default, **no auth** — the disclosed v1 posture).
+[../yang.md §restconf](../yang.md) is the contract; served on the
+LOCAL UNIX SOCKET `/run/rouster/restconf.sock` (mode 0660) by
+default — filesystem permissions are the access control; the TCP
+plane is `--tcp` opt-in, plain HTTP, an optional bearer token —
+the disclosed v1.0 posture).
 HTTP is the transport, the verbs are the commands:
 
 | Request | What it does | Status codes |
@@ -73,10 +76,15 @@ HTTP is the transport, the verbs are the commands:
 | `DELETE /restconf/data/path` | remove (a section-level DELETE wipes the daemon's config); answers 200 with the ack summary, not §4.7's bare 204 — disclosed | 200 · 404 |
 | `HEAD`/`OPTIONS` | GET's headers / the `Allow` set | 200 |
 | anything, in `--dry-run` | GETs/HEADs only; mutations refused (a Rouster extension, disclosed) | 503 |
+| anything, token configured, absent/wrong `Authorization: Bearer` | the constant-time token check (S13-c M2) | 401 (+`WWW-Authenticate: Bearer`, the §7.1 error form) |
 
-Server config: the canonical `restconf { port <n>; bind <addr>; }`
-stanza (flags beat it; startup-only). The `restconfd --help` text
-carries the verb table and the security posture.
+Server config: the canonical `restconf { socket <path>; port <n>;
+bind <addr>; token <hex>; }` stanza (flags beat it; startup-only;
+`--tcp` opts into the TCP plane — the v1.0 default flip, disclosed).
+The operator's one-liner: `curl --unix-socket
+/run/rouster/restconf.sock http://localhost/restconf/data`. The
+`restconfd --help` text carries the verb table and the security
+posture.
 
 ## 2. The run-dir contract (who writes what)
 
@@ -115,7 +123,8 @@ the mirrors is a separate owner call).
 | `*.sock` | rousterd (only when its config has a `zapi socket <PATH>` line — no canonical name yet) | while the ZAPI server runs | `status` (fallback candidates when no dump exists) |
 | `configd/generations/<seq>-<hash>/rouster.conf`, `configd/current`, `configd/previous` | configd apply ([protocols/config.md](protocols/config.md) §4.2 — the run-dir contract extension) | written per apply (the canonical bytes, the current pointer, the prior one); history pruned to the newest 8; `previous` appears from the second apply on; **`current` is also the auto-rollback's source** (S8-c: a refused reload re-applies the last CONFIRMED generation as a new one) | `configd rollback` (reads `previous`); the auto-rollback pass (reads `current`, pre-record) |
 | `configd.status` | configd apply (the last step of every apply, rollback and auto-rollback applies included) | refreshed per apply: generation, hash, per-daemon actuation results, and (S8-c) per-daemon `ack` verdicts — `confirmed`/`unverified`/`no-status`/`no-ack-surface` for signaled daemons; a `source auto-rollback to generation N` line marks an auto-reverted apply | `configd status` (prints it verbatim, the `savd --show` shape) |
-| `restconf.status` | restconfd (S12-a) | written at start (`mode serve\|dry-run`, `bind`, `port`, the canonical/run/etc dirs, the `security` disclosure line), removed on clean exit; only SIGKILL leaves it behind (its `pid` line makes staleness detectable) | operators, smokes (`scripts/test-restconf-smoke.sh` asserts `mode serve` + `port`) |
+| `restconf.status` | restconfd (S12-a; the S13-c shape) | written at start (`mode serve\|dry-run`, `listener socket\|tcp`, the socket-or-bind/port lines, the canonical/run/etc dirs, the `security` disclosure line), removed on clean exit; only SIGKILL leaves it behind (its `pid` line makes staleness detectable) | operators, smokes (`scripts/test-restconf-smoke.sh` asserts `mode serve` + `listener socket`) |
+| `restconf.sock` (name = the `socket` knob; the DEFAULT listener, S13-c) | restconfd | stale file removed before bind, mode 0660 at bind (the bits ARE the access control — the socket's group may connect), unlinked on clean exit; only SIGKILL leaves it behind | operators (connect), smokes (`scripts/test-restconf-smoke.sh` drives the API over it) |
 
 Consequences the consumers rely on:
 

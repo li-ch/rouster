@@ -13,6 +13,15 @@
 //!   effects. RFC 8040 has no dry-run; this is a Rouster extension,
 //!   disclosed.
 //!
+//! Two listeners over the ONE HTTP core (S13-c): the DEFAULT is the
+//! local unix socket ([`serve_unix`] — the v1.0 posture flip: the
+//! socket's filesystem permissions ARE the access control, the unix
+//! convention; the binary sets 0660 and owns the file's lifecycle),
+//! and the TCP plane ([`serve`]) stays available for operators that
+//! opt in (restconfd `--tcp`). The core is byte-identical over
+//! either — [`handle_connection`] is generic over any
+//! AsyncRead+AsyncWrite stream.
+//!
 //! Routing (RFC 8040 §4 vocabulary):
 //!
 //! | Method | `/restconf/data` | `/restconf/running` |
@@ -31,7 +40,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -57,8 +66,36 @@ impl Server {
     }
 }
 
-/// Serves until `shutdown` fires (SIGTERM/SIGINT wiring lives in the
-/// binary, the vtyd shape).
+/// Binds the unix socket the v1.0 way (S13-c): removes a stale
+/// socket file (a SIGKILLed predecessor — the zapi-server
+/// precedent; a live predecessor keeps its listener, the status
+/// file's pid line is the liveness check), binds, and sets the
+/// access-control bits. **The mode bits ARE the security model**:
+/// 0660 — the socket's group may drive the API, everyone else is
+/// refused by the kernel (connecting needs WRITE on a unix socket;
+/// the operator's grouping is the ACL — docs/yang.md §restconf). A
+/// chmod failure refuses the bind: serving with the umask's default
+/// bits would silently change the access policy.
+pub fn bind_unix_socket(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(
+        path,
+        std::os::unix::fs::PermissionsExt::from_mode(SOCKET_MODE),
+    )?;
+    Ok(listener)
+}
+
+/// The unix socket's mode bits (S13-c): owner+group read/write, no
+/// world access. Connect needs WRITE on a unix socket, so 0660 =
+/// "the socket's group may drive the API".
+pub const SOCKET_MODE: u32 = 0o660;
+
+/// Serves the TCP plane until `shutdown` fires (SIGTERM/SIGINT
+/// wiring lives in the binary, the vtyd shape). Opt-in since S13-c
+/// (restconfd `--tcp`); the default listener is [`serve_unix`].
 pub async fn serve(
     listener: TcpListener,
     server: Arc<Server>,
@@ -70,7 +107,7 @@ pub async fn serve(
             .map(|a| a.to_string())
             .unwrap_or_default(),
         dry_run = server.dry_run,
-        "restconfd: RESTCONF server listening (hand-rolled HTTP/1.1, no TLS — the disclosed v1 posture)"
+        "restconfd: RESTCONF server listening on TCP (hand-rolled HTTP/1.1, no TLS — the disclosed posture; docs/yang.md §restconf)"
     );
     loop {
         tokio::select! {
@@ -97,23 +134,70 @@ pub async fn serve(
     }
 }
 
-/// One connection: one request, one response, close (the disclosed
-/// no-keep-alive subset).
-async fn handle_connection(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let request = match http::read_request(&mut reader).await {
+/// Serves the DEFAULT plane (S13-c): the local unix socket, over the
+/// exact same HTTP core. The caller (the binary) owns the socket
+/// file's lifecycle — stale-file removal before bind, the 0660 mode
+/// bits after, unlink on clean exit; this fn only accepts.
+pub async fn serve_unix(
+    listener: UnixListener,
+    socket_path: std::path::PathBuf,
+    server: Arc<Server>,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    info!(
+        socket = %socket_path.display(),
+        dry_run = server.dry_run,
+        "restconfd: RESTCONF server listening on the local unix socket (mode 0660 — \
+         filesystem permissions are the access control, the unix convention)"
+    );
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        warn!(%err, "restconfd: accept failed");
+                        continue;
+                    }
+                };
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(stream, server).await {
+                        warn!(%err, "restconfd: connection ended with an IO error");
+                    }
+                });
+            }
+            _ = shutdown.changed() => {
+                info!("restconfd: shutdown signal; closing listener (the open connection, if any, closes with its response)");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// One connection (either plane): one request, one response, close
+/// (the disclosed no-keep-alive subset). Generic over the stream —
+/// TCP and unix sockets share the byte flow.
+async fn handle_connection<S>(mut stream: S, server: Arc<Server>) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = {
+        let mut reader = BufReader::new(&mut stream);
+        http::read_request(&mut reader).await
+    };
+    let request = match request {
         Ok(request) => request,
         Err(HttpError::Incomplete) => return Ok(()), // quiet close
         Err(err) => {
             let response = error_for_http(&err);
-            write_half.write_all(&response).await?;
+            stream.write_all(&response).await?;
             return Ok(());
         }
     };
     let response = respond(server, request).await;
-    write_half.write_all(&response).await?;
-    write_half.shutdown().await?;
+    stream.write_all(&response).await?;
+    stream.shutdown().await?;
     Ok(())
 }
 
@@ -294,6 +378,7 @@ fn render(reply: Reply, head: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::{TcpStream, UnixStream};
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -468,5 +553,120 @@ mod tests {
         let (_dir, port) = spawn_server("outside", false, CANONICAL).await;
         let (status, _) = roundtrip(port, "GET /vty HTTP/1.1\r\nHost: t\r\n\r\n").await;
         assert_eq!(status, 404);
+    }
+
+    // ---- the unix-socket plane (S13-c M1) ----
+
+    fn spawn_unix_server(
+        tag: &str,
+        dry_run: bool,
+        canonical: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = scratch(tag);
+        let canonical_path = dir.join("rouster.conf");
+        std::fs::write(&canonical_path, canonical).unwrap();
+        let server = Arc::new(Server::new(
+            Datastore {
+                canonical: canonical_path,
+                run_dir: dir.join("run"),
+                etc_dir: dir.join("etc"),
+            },
+            dry_run,
+        ));
+        // The socket needs a SHORT path (sun_path is ~104 bytes; the
+        // temp-dir scratch prefix alone can eat that).
+        let socket = std::env::temp_dir().join(format!("rc-srv-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = bind_unix_socket(&socket).expect("bind the unix socket");
+        let (_tx, rx) = watch::channel(false);
+        let path = socket.clone();
+        tokio::spawn(serve_unix(listener, path, server, rx));
+        std::mem::forget(_tx);
+        (dir, socket)
+    }
+
+    async fn unix_roundtrip(socket: &std::path::Path, wire: &str) -> (u16, String) {
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        stream.write_all(wire.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let _ = stream.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn the_socket_lands_with_the_0660_access_control_bits() {
+        let (_dir, socket) = spawn_unix_server("modebits", false, CANONICAL);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o660, "the filesystem bits ARE the ACL");
+    }
+
+    #[tokio::test]
+    async fn bind_unix_socket_replaces_a_stale_socket_file() {
+        let socket = std::env::temp_dir().join(format!("rc-srv-stale-{}.sock", std::process::id()));
+        std::fs::write(&socket, b"leftover bytes from a SIGKILLed run").unwrap();
+        // The leftover bytes would make connect() fail with ECONNREFUSED
+        // ("socket in use" shape); bind_unix_socket removes and rebinds.
+        bind_unix_socket(&socket).expect("stale removal + rebind");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(std::fs::metadata(&socket).unwrap().file_type().is_socket());
+    }
+
+    #[tokio::test]
+    async fn get_over_the_unix_socket_answers_the_same_bytes() {
+        let (_dir, socket) = spawn_unix_server("unixget", false, CANONICAL);
+        let (status, body) = unix_roundtrip(
+            &socket,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "{\"poll\":2}");
+    }
+
+    #[tokio::test]
+    async fn put_over_the_unix_socket_mutates_the_candidate() {
+        let (dir, socket) = spawn_unix_server("unixput", false, CANONICAL);
+        let (status, body) = unix_roundtrip(
+            &socket,
+            "PUT /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\nContent-Length: 1\r\n\r\n3",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(std::fs::read_to_string(dir.join("rouster.conf"))
+            .unwrap()
+            .contains("poll 3"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_over_the_socket_refuses_mutations() {
+        let (dir, socket) = spawn_unix_server("unixdry", true, CANONICAL);
+        let (status, _) = unix_roundtrip(
+            &socket,
+            "GET /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, _) = unix_roundtrip(
+            &socket,
+            "DELETE /restconf/data/savd/poll HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status, 503);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rouster.conf")).unwrap(),
+            CANONICAL
+        );
     }
 }

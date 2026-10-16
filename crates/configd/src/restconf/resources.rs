@@ -607,8 +607,8 @@ pub fn get(store: &Datastore, running: bool, tail: &str) -> Result<Reply, ApiErr
                 0 => Ok(Reply::json(
                     200,
                     format!(
-                        "{{\"restconf\":{{\"port\":{},\"bind\":\"{}\"}}}}",
-                        settings.port, settings.bind
+                        "{{\"restconf\":{{\"port\":{},\"bind\":\"{}\",\"socket\":\"{}\"}}}}",
+                        settings.port, settings.bind, settings.socket
                     ),
                 )),
                 1 if tail[0].name == "port" => {
@@ -618,8 +618,12 @@ pub fn get(store: &Datastore, running: bool, tail: &str) -> Result<Reply, ApiErr
                     200,
                     format!("{{\"bind\":\"{}\"}}", settings.bind),
                 )),
+                1 if tail[0].name == "socket" => Ok(Reply::json(
+                    200,
+                    format!("{{\"socket\":\"{}\"}}", settings.socket),
+                )),
                 _ => Err(ApiError::not_found(
-                    "the restconf stanza's members are `port` and `bind`",
+                    "the restconf stanza's members are `port`, `bind`, and `socket`",
                 )),
             }
         }
@@ -1311,15 +1315,18 @@ fn scalar_of(value: &Json) -> Result<String, ApiError> {
 fn stanza_tree(bound: &Bound) -> DataTree {
     let schema = yang::models::schema("rouster-vty");
     let mut tree = DataTree::empty(schema);
-    // The settings carry everything the model defines (port, bind —
-    // defaults filled at bind time); rebuild the subtree from them.
+    // The settings carry everything the model defines (port, bind,
+    // socket — defaults filled at bind time); rebuild the subtree
+    // from them.
     if let Some(settings) = &bound.restconf {
         let base = Path::parse("/restconf").expect("literal path");
         let _ = tree.set_container(&base);
         let port = Path::parse("/restconf/port").expect("literal path");
         let bind = Path::parse("/restconf/bind").expect("literal path");
+        let socket = Path::parse("/restconf/socket").expect("literal path");
         let _ = tree.set(&port, &settings.port.to_string(), None);
         let _ = tree.set(&bind, &settings.bind, None);
+        let _ = tree.set(&socket, &settings.socket, None);
     }
     tree
 }
@@ -1883,12 +1890,41 @@ mod tests {
         assert!(after.contains("port 8081"), "{after}");
         assert_eq!(
             get(&store, false, "/restconf").unwrap().body,
-            "{\"restconf\":{\"port\":8081,\"bind\":\"127.0.0.1\"}}"
+            "{\"restconf\":{\"port\":8081,\"bind\":\"127.0.0.1\",\"socket\":\"/run/rouster/restconf.sock\"}}"
         );
         assert_eq!(
             get(&store, false, "/restconf/port").unwrap().body,
             "{\"port\":8081}"
         );
+        // The socket leaf is addressable both ways (the S13-c knob).
+        assert_eq!(
+            get(&store, false, "/restconf/socket").unwrap().body,
+            "{\"socket\":\"/run/rouster/restconf.sock\"}"
+        );
+        // PUT of the socket leaf lands in the stanza (absolute paths
+        // only — the bind gate).
+        let reply = mutate(
+            &store,
+            false,
+            Verb::Merge,
+            "/restconf/socket",
+            b"\"/tmp/rc-smoke.sock\"",
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let after = std::fs::read_to_string(&store.canonical).unwrap();
+        assert!(after.contains("socket /tmp/rc-smoke.sock"), "{after}");
+        // A relative socket path is refused at the bind gate (the
+        // commit re-binds before writing — nothing moves).
+        let before = after.clone();
+        let reply = mutate(
+            &store,
+            false,
+            Verb::Merge,
+            "/restconf/socket",
+            b"\"run/relative.sock\"",
+        );
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert_eq!(std::fs::read_to_string(&store.canonical).unwrap(), before);
         // Merge changes the port; the daemon sections ride untouched.
         let reply = mutate(&store, false, Verb::Merge, "/restconf", b"{\"port\":8082}");
         assert_eq!(reply.status, 200, "{}", reply.body);

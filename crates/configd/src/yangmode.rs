@@ -48,6 +48,10 @@ pub const RESTCONF_DEFAULT_PORT: u16 = 8080;
 /// restconfd's default bind: loopback only — the v1 security
 /// posture (docs/yang.md's implementation section).
 pub const RESTCONF_DEFAULT_BIND: &str = "127.0.0.1";
+/// restconfd's default listener (S13-c): the local unix socket —
+/// the v1.0 posture flip, filesystem permissions as the access
+/// control (docs/yang.md §restconf has the model).
+pub const RESTCONF_DEFAULT_SOCKET: &str = "/run/rouster/restconf.sock";
 
 /// The env escape hatch for the YANG mode (the CLI's `--no-yang`
 /// sets it before any library call — the same pattern as
@@ -99,6 +103,9 @@ pub struct Bound {
 pub struct RestconfSettings {
     pub port: u16,
     pub bind: String,
+    /// The local unix socket path (S13-c — the DEFAULT listener;
+    /// absolute, model-defaulted).
+    pub socket: String,
     /// The stanza opener's line (errors point at the operator's file).
     pub header_line: usize,
 }
@@ -240,9 +247,22 @@ fn bind_restconf(stanza: &RestconfStanza) -> Result<RestconfSettings, YangError>
     let bind = tree
         .get_value(&Path::parse("/restconf/bind").expect("literal path"))
         .unwrap_or_else(|| RESTCONF_DEFAULT_BIND.to_string());
+    let socket = tree
+        .get_value(&Path::parse("/restconf/socket").expect("literal path"))
+        .unwrap_or_else(|| RESTCONF_DEFAULT_SOCKET.to_string());
+    if !socket.starts_with('/') {
+        return Err(YangError::Bind {
+            line: stanza.header_line,
+            reason: format!(
+                "the restconf socket path must be absolute (saw `{socket}`) — \
+                 a relative path would resolve against restconfd's cwd"
+            ),
+        });
+    }
     Ok(RestconfSettings {
         port,
         bind,
+        socket,
         header_line: stanza.header_line,
     })
 }
@@ -306,9 +326,11 @@ pub fn dump_json(bound: &Bound) -> String {
         None => parts.push("\"router-id\":null".to_string()),
     }
     if let Some(settings) = &bound.restconf {
+        // The member order is fixed (port, bind, socket): the smoke
+        // greps the prefix, the docs quote the whole shape.
         parts.push(format!(
-            "\"restconf\":{{\"port\":{},\"bind\":\"{}\"}}",
-            settings.port, settings.bind
+            "\"restconf\":{{\"port\":{},\"bind\":\"{}\",\"socket\":\"{}\"}}",
+            settings.port, settings.bind, settings.socket
         ));
     }
     for section in &bound.sections {
@@ -369,21 +391,31 @@ mod tests {
             Some(RestconfSettings {
                 port: RESTCONF_DEFAULT_PORT,
                 bind: RESTCONF_DEFAULT_BIND.to_string(),
+                socket: RESTCONF_DEFAULT_SOCKET.to_string(),
                 header_line: 1,
             })
         );
         // Explicit values win.
-        let bound = bind_text("restconf {\nport 8443\nbind 10.0.0.9\n}\n").unwrap();
+        let bound =
+            bind_text("restconf {\nport 8443\nbind 10.0.0.9\nsocket /tmp/rc.sock\n}\n").unwrap();
         assert_eq!(
             bound.restconf,
             Some(RestconfSettings {
                 port: 8443,
                 bind: "10.0.0.9".to_string(),
+                socket: "/tmp/rc.sock".to_string(),
                 header_line: 1,
             })
         );
         // No stanza, no settings.
         assert!(bind_text("daemon savd {\n}\n").unwrap().restconf.is_none());
+    }
+
+    #[test]
+    fn a_relative_restconf_socket_path_is_refused_with_the_line() {
+        let err = bind_text("restconf {\nsocket run/rouster/x.sock\n}\n").unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
+        assert!(err.to_string().contains("line 1"), "{err}");
     }
 
     #[test]
@@ -409,7 +441,9 @@ mod tests {
         let bound = bind_text("restconf {\nport 8081\n}\ndaemon savd {\nmode strict\n}\n").unwrap();
         let json = dump_json(&bound);
         assert!(
-            json.contains("\"restconf\":{\"port\":8081,\"bind\":\"127.0.0.1\"}"),
+            json.contains(
+                "\"restconf\":{\"port\":8081,\"bind\":\"127.0.0.1\",\"socket\":\"/run/rouster/restconf.sock\"}"
+            ),
             "{json}"
         );
     }

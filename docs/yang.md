@@ -1,6 +1,7 @@
 # The YANG core — the model reference and the gNMI-transport decision
 
-Status: S11-a (2026-10-15) + S12-a (2026-10-15): the YANG core is
+Status: S11-a (2026-10-15) + S12-a (2026-10-15) + S13-c (2026-10-16):
+the YANG core is
 LANDED as the internal source of truth (architecture invariant 5)
 and now has its PRIMARY NORTHBOUND — the RESTCONF-shaped HTTP/1.1
 edge (§restconf, decision C executed): a pure-Rust RFC 7950 subset
@@ -10,7 +11,11 @@ the Rouster model set (`yang/*.yang`), configd's flip
 files rendered FROM the trees), vtyd's translator seam
 (`docs/protocols/vty.md` — config-mode edits build tree operations),
 and `restconfd` (`crates/configd/src/restconf/` + the binary) — the
-tree's HTTP surface. This document is the model set's reference, the
+tree's HTTP surface, served on the local unix socket by default
+since S13-c (the v1.0 security posture: filesystem permissions as
+the access control, an optional constant-time bearer token, TLS a
+documented owner decision). This document is the model set's
+reference, the
 machine shapes' contract, and the §Deferred ledger;
 §gNMI-transport is the transport evaluation ending in an owner
 decision; §restconf is the decided edge's implementation section.
@@ -240,13 +245,14 @@ pure Rust where holo binds C libyang).
 authorized; gNMI stays the documented next step (option A's
 datastore semantics map identically when wanted).
 
-## §restconf — the implemented edge (S12-a, decision C executed)
+## §restconf — the implemented edge (S12-a, decision C executed; the v1.0 security posture S13-c)
 
 `restconfd` (`crates/configd/src/restconf/` — `http.rs` the
 hand-rolled HTTP/1.1 core, `resources.rs` the resource map and
-mutation flow, `server.rs` the tokio listener; the binary
+mutation flow, `server.rs` the tokio listeners (the local unix
+socket by default since S13-c, TCP opt-in); the binary
 `restconfd`) serves the canonical config's YANG trees over
-HTTP/1.1 on loopback. **A deliberate SUBSET of RFC 8040**: the
+HTTP/1.1. **A deliberate SUBSET of RFC 8040**: the
 operations on datastore subtrees, not the full protocol — the
 omissions table below carries every cut with its citation.
 
@@ -258,7 +264,7 @@ real answers from the smoke:
 
 | Request | Tree target | Answer (real JSON) |
 |---|---|---|
-| `GET /restconf/data` | the whole datastore | `{"router-id":null,"restconf":{"port":8080,"bind":"127.0.0.1"},"savd":{"mode":"strict","action":"monitor","i-understand-drop-mode":false,"poll":2,"hysteresis":3,"collision-policy":"ignore","backend":"rp_filter"}}` — the `configd dump --json` shape (§"The JSON form" above) |
+| `GET /restconf/data` | the whole datastore | `{"router-id":null,"restconf":{"port":8080,"bind":"127.0.0.1","socket":"/run/rouster/restconf.sock"},"savd":{"mode":"strict","action":"monitor","i-understand-drop-mode":false,"poll":2,"hysteresis":3,"collision-policy":"ignore","backend":"rp_filter"}}` — the `configd dump --json` shape (§"The JSON form" above) |
 | `GET /restconf/data/savd/poll` | a leaf | `{"poll":2}` |
 | `GET /restconf/data/bfdd/peer=192.0.2.9,false` | a list entry | `{"peer":{...}}` — positional keys (§3.5.3); the YANG predicate form `peer[address=192.0.2.9][multihop=false]` addresses it too |
 | `GET /restconf/running` | the last CONFIRMED generation (`<run>/configd/current`) | the same shape, read-only — 404 before the first apply |
@@ -312,29 +318,61 @@ speed.
 
 ### The server config + the surface
 
-`restconf { port <n>; bind <addr>; }` is a top-level canonical
-stanza (modeled in `rouster-vty.yang`'s `restconf` container;
-defaults port 8080 / bind 127.0.0.1; startup-only knobs — restart
-to change, the vtyd bind discipline). It is itself datastore data
+`restconf { socket <path>; port <n>; bind <addr>; }` is a top-level
+canonical stanza (modeled in `rouster-vty.yang`'s `restconf`
+container; defaults socket `/run/rouster/restconf.sock`, port 8080,
+bind 127.0.0.1; the socket path must be absolute — a relative path
+would resolve against restconfd's cwd, refused at bind with the
+stanza's line; startup-only knobs — restart to change, the vtyd bind
+discipline). It is itself datastore data
 (`GET/PUT/DELETE /restconf/data/restconf`). The stanza is rendered
 nowhere (configd-plane config, the `router-id` discipline) and
 rides applies verbatim. Flags beat the stanza beat defaults.
 
+**The v1.0 default flip (S13-c, a disclosed breaking change for v1
+users — there are none besides ourselves): restconfd now serves the
+LOCAL UNIX SOCKET by default** (`--socket` flag / stanza leaf /
+`/run/rouster/restconf.sock`); the TCP plane is opt-in (`--tcp`, or
+an explicit `--bind`/`--port` flag, which name the TCP plane). A
+stanza that carries `bind`/`port` under the socket default draws a
+startup NOTE naming `--tcp`. The HTTP core is byte-identical over
+either listener — `curl --unix-socket /run/rouster/restconf.sock
+http://localhost/restconf/data` is the operator's one-liner.
+
 `<run-dir>/restconf.status` (house format, written at start,
 removed on clean exit): `restconfd <ver> pid <n>` / `mode
-serve|dry-run` / `bind` / `port` / `canonical` / `run-dir` /
-`etc-dir` / the security line. `--dry-run` answers GETs/HEADs and
-refuses every mutation with 503 (a Rouster extension; RFC 8040
+serve|dry-run` / `listener socket|tcp` / (`socket <path>` — the
+socket plane's listener line) or (`bind` / `port` — the TCP
+plane's) / `canonical` / `run-dir` / `etc-dir` / the security line.
+The socket file's lifecycle is the status file's: stale file
+removed before bind (a SIGKILLed predecessor), mode 0660 set at
+bind (a chmod failure refuses the serve — the bits ARE the access
+control), unlinked on clean exit. `--dry-run` answers GETs/HEADs
+and refuses every mutation with 503 (a Rouster extension; RFC 8040
 defines no dry-run) — the smoke-probe surface.
 
-### Security posture v1 (read this)
+### Security posture v1.0 (read this)
 
-Plain HTTP on loopback by default, **NO AUTHENTICATION**. RFC 8040
-§2 expects HTTPS with client authentication; until the owner
-decides, the port is a management surface and the binary warns on
-any non-loopback bind. The §Deferred options: TLS via rustls (an
-owner dependency decision — the no-new-deps fence is why v1 ships
-without it), or a local unix-socket alternative (no TCP at all).
+**The default listener is the local unix socket, mode 0660 — the
+filesystem permissions ARE the access control** (the unix
+convention; the model the whole suite's `*.sock` surfaces use).
+Connecting to a unix socket needs WRITE permission on the socket
+file, so 0660 means exactly: the socket's owning user and the
+socket's group may drive the API (mutate the canonical config,
+trigger applies), everyone else is refused by the kernel before a
+byte of HTTP is read. The operator's grouping (`chgrp
+restconf-users /run/rouster/restconf.sock` or a pre-created group
+on the run dir) is the ACL — no credential ever crosses the wire
+by default. A stale socket file (SIGKILLed predecessor) is removed
+at startup; the status file's `pid` line is the liveness check.
+
+The TCP plane (loopback bind, plain HTTP, **no TLS**) is opt-in
+since the flip: `--tcp`, or `--bind`/`--port`. RFC 8040 §2 expects
+HTTPS with client authentication; until the owner decides (the
+§Deferred TLS evaluation and decision block below), a TCP-bound
+port is a management surface and the binary warns on any
+non-loopback bind. The optional bearer token (below, S13-c M2) is
+the one authentication check available on either plane.
 
 ### The omissions table (each cut cited; all §Deferred here)
 
