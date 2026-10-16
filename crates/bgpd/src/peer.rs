@@ -1015,13 +1015,28 @@ where
                     return self.step(Event::UpdateMsg, sink).await;
                 }
                 let withdrawn = update.withdrawn_all();
-                // F5: counts, never the full prefix list — building
-                // the string list was O(prefixes) per UPDATE on the
-                // hot path.
+                // F5 keeps the hot path O(1): counts, never the full
+                // announced-prefix string list — but a bounded
+                // four-entry preview rides along (path ids included:
+                // the ADD-PATH observability the interop smokes pin;
+                // bench feed updates pack 64 prefixes, so the preview
+                // stays tiny where the list was the problem).
+                let announced = update.announced();
+                let mut preview = String::new();
+                for nlri in announced.iter().take(4) {
+                    if !preview.is_empty() {
+                        preview.push_str(", ");
+                    }
+                    preview.push_str(&nlri.to_string());
+                }
+                if announced.len() > 4 {
+                    preview.push_str(", +");
+                }
                 info!(
                     peer = %self.peer.address,
-                    announced = update.announced().len(),
+                    announced = announced.len(),
                     withdrawn = withdrawn.len(),
+                    paths = %preview,
                     "bgpd: UPDATE received"
                 );
                 // The SAVNET route-event reports (experimental-savnet):

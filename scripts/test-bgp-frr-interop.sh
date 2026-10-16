@@ -27,6 +27,12 @@
 #   - SOAK: >= 40 s keepalive-driven stability (10 s keepalives, 30 s
 #     hold): still Established both sides, zero NOTIFICATIONs in
 #     either bgpd log.
+#   - F3-FIRST-AS (S13-b): a crafted peer (host python3, from the
+#     bridge gateway — a configured passive neighbor AS 65003) sends
+#     an UPDATE whose AS_PATH opens with 65099; our bgpd must answer
+#     the exact RFC 4271 §6.3 NOTIFICATION — UPDATE Message Error /
+#     Malformed AS_PATH (3/11), 21 octets, no data — and log the
+#     rejection.
 #   - TEARDOWN: SIGTERM to our bgpd -> NOTIFICATION Cease observed on
 #     the FRR side (bgpd.log "%NOTIFICATION: ... 6/2"), session down.
 #
@@ -149,6 +155,8 @@ docker exec "$R2" sh -c "printf '%s\n' \
   'router bgp 65000' \
   ' bgp router-id $R2_IP' \
   ' neighbor $R1_IP remote-as 65001' \
+  ' neighbor 127.0.0.1 remote-as 65003' \
+  ' neighbor 127.0.0.1 passive' \
   ' hold-time 30' \
   ' network $OUR_NET' \
   > /etc/rouster-bgp.conf"
@@ -251,6 +259,74 @@ docker exec "$R2" sh -c "grep -q 'session Established' $OUR_BGPD_LOG" \
     || fail "our bgpd received NOTIFICATIONs during soak"
 docker exec "$R2" sh -c "ip route show proto bgp | grep -q '$FRR_NET'" \
     || fail "kernel route lost during soak"
+
+echo "==> F3-FIRST-AS: crafted bad-path UPDATE -> exact §6.3 NOTIFICATION"
+# The z-smoke pattern: a hand-speaking third AS (AS 65003) connects
+# to our bgpd's listener from r2's own loopback — a passive neighbor
+# in the config since startup — announces 203.0.113.128/25 with
+# AS_PATH "65099 65003" (opens with the WRONG AS), and must draw the
+# exact RFC 4271 §6.3 NOTIFICATION: "If the UPDATE message is
+# received from an external peer, the local system MAY check whether
+# the leftmost ... AS in the AS_PATH attribute is equal to the
+# autonomous system number of the peer that sent the message. If the
+# check determines this is not the case, the Error Subcode MUST be
+# set to Malformed AS_PATH" — with the §6.3 preamble's Error Code
+# UPDATE Message Error: 3/11, no data, 21 octets. The exchange is a
+# byte-exact stream built on the host (OPEN[AS4] + KEEPALIVE + the
+# bad UPDATE — BGP pipelines them fine), piped through nc; the
+# NOTIFICATION is the session's final frame, asserted byte for byte.
+CRAFTED_BIN=$(mktemp /tmp/bgp-f3-crafted.XXXXXX.bin)
+python3 - "$CRAFTED_BIN" <<'PYEOF'
+import struct, sys
+
+MARKER = b"\xff" * 16
+
+def frame(t, body):
+    return MARKER + struct.pack(">HB", 19 + len(body), t) + body
+
+# OPEN: version 4, AS 65003, hold 30, id 10.9.9.9, AS4 capability.
+caps = b"\x41\x04" + struct.pack(">I", 65003)
+opt = b"\x02" + bytes([len(caps)]) + caps
+open_body = (
+    bytes([4]) + struct.pack(">HH", 65003, 30) + bytes([10, 9, 9, 9])
+    + bytes([len(opt)]) + opt
+)
+
+# The bad UPDATE: AS_PATH "65099 65003" — the leftmost AS is not the
+# peer's 65003. Mandatory triple + 203.0.113.128/25.
+aspath = bytes([2, 2]) + struct.pack(">II", 65099, 65003)
+attrs = (
+    bytes([0x40, 1, 1, 0])
+    + bytes([0x40, 2, len(aspath)]) + aspath
+    + bytes([0x40, 3, 4, 10, 9, 9, 9])
+)
+body = (
+    struct.pack(">H", 0) + struct.pack(">H", len(attrs)) + attrs
+    + bytes([25, 203, 0, 113, 128])
+)
+
+with open(sys.argv[1], "wb") as f:
+    f.write(frame(1, open_body))
+    f.write(frame(4, b""))
+    f.write(frame(2, body))
+PYEOF
+docker cp "$CRAFTED_BIN" "$R2:/tmp/f3-crafted.bin" >/dev/null
+rm -f "$CRAFTED_BIN"
+# Stream it: their OPEN/KEEPALIVE/dump and finally our NOTIFICATION
+# land in /tmp/f3-crafted.out; our side closes after notifying.
+docker exec "$R2" sh -c "timeout 25 nc 127.0.0.1 179 < /tmp/f3-crafted.bin > /tmp/f3-crafted.out; true"
+TAIL=$(docker exec "$R2" sh -c "tail -c 21 /tmp/f3-crafted.out | od -An -tx1 | tr -d ' \n'")
+WANT=ffffffffffffffffffffffffffffffff001503030b
+[ "$TAIL" = "$WANT" ] \
+    || fail "crafted-peer NOTIFICATION mismatch: got $TAIL want $WANT"
+echo "    CRAFTED-FIRST-AS-REJECT: exact §6.3 NOTIFICATION (3/11) observed"
+wait_in "$R2" "our bgpd logged the §6.3 rejection" 10 \
+    "grep -q 'first AS not the peer' $OUR_BGPD_LOG"
+# The main FRR session must have survived the crafted leg untouched.
+docker exec "$R1" sh -c "vtysh -c 'show bgp neighbor $R2_IP' | grep -q 'BGP state = Established'" \
+    || fail "FRR session dropped during the crafted F3 leg"
+
+
 
 echo "==> TEARDOWN: SIGTERM our bgpd -> Cease on the FRR side"
 docker exec "$R2" sh -c "kill -TERM \$(pidof rouster-bgpd)"
