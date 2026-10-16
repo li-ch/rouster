@@ -135,12 +135,35 @@ for SIZE in $SIZES; do
         docker exec -d "$SUT" sh -c "rouster-bgpd --config /etc/rouster-bgp.conf > /var/log/rouster-bgpd.log 2>&1"
         wait_up "$SUT" "rouster bgpd listening" 15 "grep -q 'bgpd: listening' /var/log/rouster-bgpd.log"
 
-        # --- the third-container observer (shares SUT netns, own pins)
+        # --- the third-container observer (shares SUT netns, own pins).
+        # The kernel-count loop runs INSIDE this container (a tight
+        # `ip route show proto 186 | grep -c .` loop on the observer's
+        # cpuset, rows "<epoch_ns> <count>" host-visible via the volume)
+        # — the host-side docker-exec cadence (~3-7 Hz) is coarser than
+        # the 1k-10k programming pass itself; the in-container loop
+        # resolves it (the dump's own RTNL cost is disclosed).
+        NEED=$(( SIZE - (SIZE / 200 > 2 ? SIZE / 200 : 2) ))
+        RUN_DIR_ABS=$(cd "$RUN_DIR" && pwd)
         docker run -d --name "$OBS" --network "container:$SUT" \
             --cpuset-cpus "$OBS_CPUS" \
+            -v "$RUN_DIR_ABS":/obs \
             --entrypoint sleep "$IMAGE" infinity >/dev/null
         base=$(docker exec "$OBS" sh -c "ip route show proto 186 2>/dev/null | grep -c ." || echo 0)
         echo "$base" > "$RUN_DIR/kernel-baseline.txt"
+        docker exec -d -e TARGET="$NEED" -e MAXS=900 "$OBS" bash -c '
+            : > /obs/poll.csv
+            end=$(( $(date +%s) + MAXS )); stable=0
+            while :; do
+                n=$(ip route show proto 186 2>/dev/null | grep -c .)
+                echo "$EPOCHREALTIME $n" >> /obs/poll.csv
+                if [ "$n" -ge "$TARGET" ] 2>/dev/null; then
+                    stable=$((stable + 1)); [ "$stable" -ge 5 ] && break
+                else
+                    stable=0
+                fi
+                [ "$(date +%s)" -gt "$end" ] && break
+                sleep 0.02
+            done'
 
         # --- injector ---------------------------------------------------
         docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
@@ -169,11 +192,14 @@ EOF
         echo "    launching observer + injector"
         T_LAUNCH=$(date +%s.%N)
         echo "$T_LAUNCH" > "$RUN_DIR/injector-launch.txt"
+        HOST_MINUS_VM=$(sed -n 's/.*host_minus_vm=\([0-9.-]*\).*/\1/p' "$RUN_DIR/clock-offset.txt")
         python3 scripts/bench-observe.py \
             --sut-container "$SUT" --kernel-container "$OBS" \
             --mode rouster --interval "$INTERVAL" --timeout 900 \
             --complete-on kernel --target-count "$SIZE" --streak 3 \
             --settle 15 --proc-every 3 --stall-after 120 \
+            --poll-file "$RUN_DIR/poll.csv" \
+            --poll-clock-offset "$HOST_MINUS_VM" \
             --csv "$RUN_DIR/observe.csv" > "$RUN_DIR/observer.log" 2>&1 &
         OBSERVER=$!
         sleep 2

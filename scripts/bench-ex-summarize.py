@@ -155,12 +155,28 @@ def summarize_e4(args):
         if not rows:
             continue
         m = {"run": run_dir.name}
-        # kernel series
-        kern = [(to_float(r["t_host"]), to_int(r.get("kernel_bgp")))
-                for r in rows if to_int(r.get("kernel_bgp")) is not None]
+        # kernel series: prefer the high-resolution in-container poll
+        # (VM-clock ns -> host epoch via clock-offset); fall back to
+        # the observer CSV's kernel column when absent.
+        kern = []
+        poll = run_dir / "poll.csv"
+        if poll.exists():
+            off = clock_offset(run_dir)
+            for line in poll.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        kern.append((float(parts[0]) + off, int(parts[1])))
+                    except ValueError:
+                        pass
+        if not kern:
+            kern = [(to_float(r["t_host"]), to_int(r.get("kernel_bgp")))
+                    for r in rows if to_int(r.get("kernel_bgp")) is not None]
         launch = to_float((run_dir / "injector-launch.txt").read_text().strip()) \
             if (run_dir / "injector-launch.txt").exists() else None
         t_first = next((t for t, k in kern if k > 0), None)
+        t_prev0 = next((kern[i - 1][0] for i, (t, k) in enumerate(kern)
+                        if k > 0 and i > 0), None)
         t_done = None
         for i in range(len(kern) - 2):
             if kern[i][1] >= need and kern[i + 1][1] >= need and kern[i + 2][1] >= need:
@@ -169,8 +185,20 @@ def summarize_e4(args):
         accepted = kern[-1][1] if kern else None
         m["accepted"] = accepted
         if t_first and t_done:
-            m["wall_program_s"] = round(t_done - t_first, 3)
-            m["routes_per_s"] = round((accepted or need) / (t_done - t_first), 1)
+            span = t_done - t_first
+            gap = (t_first - t_prev0) if t_prev0 else None
+            if span > max(0.02, (gap or 0)):
+                m["wall_program_s"] = round(span, 3)
+                m["routes_per_s"] = round((accepted or need) / span, 1)
+            else:
+                # the whole pass fit inside one poll gap: the honest
+                # statement is an upper bound on the wall (and thus a
+                # lower bound on the rate), not a measurement.
+                bound = t_done - t_prev0 if t_prev0 else None
+                m["wall_program_upper_bound_s"] = round(bound, 3) if bound else None
+                if bound and bound > 0:
+                    m["routes_per_s_lower_bound"] = round(
+                        (accepted or need) / bound, 1)
         if launch and t_done:
             m["wall_total_s"] = round(t_done - launch, 3)
         series = proc_series(rows)
@@ -179,6 +207,14 @@ def summarize_e4(args):
                 series, "sut_zebra", t_first - 0.5, t_done + 0.5, args.clk_tck)
             m["bgpd_cpu_window_s"] = cpu_between(
                 series, "sut_bgpd", t_first - 0.5, t_done + 0.5, args.clk_tck)
+        # full-run CPU (always available; window CPU is empty when the
+        # window is shorter than the /proc sampling cadence)
+        if series:
+            for tag, name in (("sut_zebra", "rousterd"), ("sut_bgpd", "bgpd")):
+                cpu = cpu_between(series, tag, series[0][0] - 1,
+                                  series[-1][0] + 1, args.clk_tck)
+                if cpu is not None:
+                    m[f"{name}_cpu_total_s"] = cpu
         for tag, name in (("sut_zebra", "rousterd"), ("sut_bgpd", "bgpd")):
             b = rss_bounds(rows, tag)
             for k, v in b.items():
@@ -208,8 +244,10 @@ def summarize_e4(args):
             "routes_per_cpu_s": round(1126490 / 9.67, 1),
         },
     }
-    for key in ("wall_program_s", "wall_total_s", "routes_per_s",
+    for key in ("wall_program_s", "wall_program_upper_bound_s",
+                "wall_total_s", "routes_per_s", "routes_per_s_lower_bound",
                 "rousterd_cpu_window_s", "bgpd_cpu_window_s",
+                "rousterd_cpu_total_s", "bgpd_cpu_total_s",
                 "rousterd_rss_peak_kb", "bgpd_rss_peak_kb",
                 "accepted", "malformed", "rejected",
                 "netlink_rcvbuf_overruns"):
@@ -233,7 +271,7 @@ def summarize_e2(args):
         marks = {}
         aborted = False
         for line in flap.read_text(errors="replace").splitlines():
-            mm = re.match(r"(FLAP-[A-Z0-9-]+) wall=([\d.]+)", line)
+            mm = re.match(r"(FLAP-[A-Z0-9-]+).*wall=([\d.]+)", line)
             if mm:
                 marks[mm.group(1)] = float(mm.group(2)) + off  # -> host clock
             if "FLAP-ABORT" in line or "FLAP-ERROR" in line:
@@ -244,11 +282,23 @@ def summarize_e2(args):
                     subset_n = int(sm.group(1))
         m = {"run": run_dir.name, "aborted": aborted,
              "flap_marks": len(marks)}
-        # main + kernel series
+        # main + kernel series; kernel prefers the high-resolution
+        # in-container poll (VM-clock -> host epoch via clock-offset)
         main = [(to_float(r["t_host"]), to_int(r.get("main_prefixes")))
                 for r in rows if to_int(r.get("main_prefixes")) is not None]
-        kern = [(to_float(r["t_host"]), to_int(r.get("kernel_bgp")))
-                for r in rows if to_int(r.get("kernel_bgp")) is not None]
+        kern = []
+        poll = run_dir / "poll.csv"
+        if poll.exists():
+            for line in poll.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        kern.append((float(parts[0]) + off, int(parts[1])))
+                    except ValueError:
+                        pass
+        if not kern:
+            kern = [(to_float(r["t_host"]), to_int(r.get("kernel_bgp")))
+                    for r in rows if to_int(r.get("kernel_bgp")) is not None]
         loaded = max((v for _, v in main), default=None)
         m["main_peak"] = loaded
         m["kernel_peak"] = max((v for _, v in kern), default=None)
@@ -365,7 +415,9 @@ def summarize_e3(args):
             lines = (run_dir / "poller.log").read_text().splitlines()
             csv_lines = [l for l in lines if re.match(r"^\d", l)]
             if csv_lines:
-                prows = list(csv.DictReader(csv_lines))
+                header = ("t_host,established,sut_established,bgpd_jiffies,"
+                          "zebra_jiffies,bgpd_rss_kb,zebra_rss_kb")
+                prows = list(csv.DictReader([header] + csv_lines))
         if prows:
             last = prows[-1]
             m["sut_established_final"] = to_int(last.get("sut_established"))

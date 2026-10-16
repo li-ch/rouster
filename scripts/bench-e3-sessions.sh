@@ -134,6 +134,7 @@ for N in $NS; do
         for run in $(seq 1 "$RUNS"); do
             RUN_DIR="$CELL_DIR/run-$run"
             mkdir -p "$RUN_DIR/fleet"
+            RUN_DIR_ABS=$(cd "$RUN_DIR" && pwd)
             SUT=e3x-sut-$TS-$N-$CORES-$run
             trap 'docker rm -f $(docker ps -aq --filter name=e3x-) >/dev/null 2>&1 || true' EXIT
             docker rm -f $(docker ps -aq --filter name=e3x-) >/dev/null 2>&1 || true
@@ -194,14 +195,16 @@ for N in $NS; do
                 docker run -d --name "e3x-inj-$i" --network "$NET_NAME" --ip "$IP" \
                     --cpuset-cpus "$INJ_CPUS" \
                     -v "$FEED_MRT":/feed.mrt:ro \
-                    -v "$RUN_DIR/fleet":/fleet \
+                    -v "$RUN_DIR_ABS/fleet":/fleet \
                     -e T0=$T0 -e SUT_IP=$SUT_IP -e OWN_IP=$IP -e INJ_AS=$INJ_AS \
                     -e SUT_AS=$SUT_AS -e TABLE=$TABLE -e HOLD=$HOLD -e IDX=$i \
                     --entrypoint sleep "$FLEET_TAG" infinity >/dev/null
                 docker exec -d "e3x-inj-$i" sh -c '
-                    T0_NS=$((T0 * 1000000000))
-                    while [ "$(date +%s%N)" -lt $((T0_NS - 2000000000)) ]; do sleep 0.2; done
-                    while [ "$(date +%s%N)" -lt "$T0_NS" ]; do :; done
+                    # busybox date has no %N: coarse-sleep to T0-1s, then
+                    # spin on the second flip (the fleet shares the VM
+                    # clock; the actual spread is recorded per run).
+                    while [ "$(date +%s)" -lt $((T0 - 1)) ]; do sleep 0.2; done
+                    while [ "$(date +%s)" -lt "$T0" ]; do :; done
                     exec mrt-replay --peer $SUT_IP:179 --local-addr $OWN_IP \
                         --local-as $INJ_AS --peer-as $SUT_AS --router-id $OWN_IP \
                         --mrt /feed.mrt --prepend-as $INJ_AS --next-hop $OWN_IP \

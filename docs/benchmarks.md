@@ -219,6 +219,138 @@ in the chat record. The "Your decision" column stays the owner's.
   {rouster, frr, bird, kernel}, feed checksum, runs, median, p95,
   raw-log path, notes}`)
 
+- 2026-10-16 · E4+FIB-rate · host=darwin-vm (OrbStack 7.2.9-orbstack,
+  macOS 27.0.1 host, linux/aarch64 VM, 18 CPUs, SUT pinned 4-11,
+  injector 0-3, the third-container observer 12-17 — it shares the
+  SUT's network namespace but NOT its cpuset pins) · versions: rouster
+  binaries from the S14 round tree (`80cd7e7` over baseline `429ab18`;
+  the only Rust delta vs the baseline is the sibling stream's in-flight
+  interface hw_addr mirror — link-event/interface-dump paths, the
+  route/RIB/netlink-install paths byte-identical, diff reviewed and
+  disclosed here); harness `scripts/bench-e4-fib.sh` +
+  `scripts/bench-observe.py` + `scripts/bench-ex-summarize.py`;
+  FRR 10.2.2 side DERIVED from the ledgered FRR-full entry, not re-run
+  (the pre-registered addendum above) · feed: same dump/pick/surgery
+  (sha256 above), mrt-replay --limit B, unpaced, hold 90 · runs: 6 per
+  size (1 warmup + 5 measured), sizes 1k / 10k / 100k · observation:
+  the in-observer-container kernel-count loop (`ip route show proto
+  186 | grep -c .`) at 39 / 38 / 28 rows/s for 1k / 10k / 100k (the
+  dump's own RTNL cost is inside every measurement — disclosed; the
+  wall is first-kernel-route → B−max(2, 0.5%) held, never a SUT
+  self-report) · **B=1k: the whole install pass fits inside one dump
+  gap — wall ≤ 24 ms median (upper bound), ≥ 42.1k routes/s (lower
+  bound; observer-resolution limited, disclosed)** · **B=10k: wall
+  median 0.089 s (p95 0.095, min 0.060) → 112.8k routes/s median
+  (min-run 166.4k)** · **B=100k: wall median 0.692 s (p95 1.152, min
+  0.612) → 144.6k routes/s median (min-run 163.3k)**; accepted
+  1000/1000, 10000/10000, 99998/100000 on every run; malformed 0,
+  rejected 0, netlink rcvbuf overruns 0 across all 18 runs · CPU
+  (cumulative per run): rousterd median 0.64 s at 100k (≈6.4 µs per
+  installed route; 0.07-0.08 s at 10k; ~0 at 1k), bgpd 0.50 s at 100k ·
+  RSS pair at 100k: rousterd peak 25,556 KiB, bgpd peak 62,304 KiB
+  (median; the transient ingest peak — the settled final is ≈44 MB,
+  matching the E5 basis)
+  · FRR side (derived): zebra 9.67 CPU-s / 1,126,490 routes =
+  **116.5k routes per CPU-s** from its ledgered full-table run;
+  Rouster's CPU-basis at the 100k cell = 100k / 0.64 CPU-s =
+  **156k routes per CPU-s** → 1.34× — sub-2×, so the comparative
+  direction stays unresolved under §F's darwin-vm rule (both
+  directions published); the per-size descriptive walls/rates on this
+  rig are licensed · raw: `target/bench-logs/e4-20261016T151635Z/`
+  (per-run poll.csv at the observer cadence, observe.csv, SUT logs,
+  summary.json per size; the resolution-limited first pass
+  `e4-20261016T150703Z` kept as the host-side-cadence comparison) ·
+  notes: the measured pass is the F8 pipelined route_replace_batch
+  reconcile overlapping the ingest tail (at these sizes bgpd's EOR
+  completes before the kernel pass ends — the 100k wall total from
+  injector launch is 3.9 s median, of which 0.69 s is the kernel-count
+  pass); wall_total medians 2.54 / 2.61 / 3.90 s for 1k / 10k / 100k.
+  No verdict prose.
+
+- 2026-10-16 · allocator-share measurement (the PERF-M1/M3 escalated
+  owner decision, resolved to a recommendation — NOT a dep adoption)
+  · method per the escalation: the smaps rollups' anonymous-mapping
+  share vs the RSS-growth-curve fit against the per-structure census ·
+  inputs (all this tree, same rig): three clean bench-profile runs
+  (10k/50k/100k, `profile-20261016T1459{24,50}Z` + `145752Z`), the
+  bgpd mem-census at 100k (`mem-logs/census-20261016T150016Z`), the
+  rousterd mem-census at 100k (`cpu-logs/census-20261016T150057Z`);
+  the fold: `target/bench-logs/allocator-20261016T1516/analysis.txt` ·
+  smaps at 100k final: the anonymous arena IS the table memory — bgpd
+  44,104/44,164 KB (99.9%), rousterd 23,080/23,128 KB (99.8%); no
+  file-backed or mapping growth · growth fit (LSQ over the three
+  sizes): bgpd **428.6 B/prefix marginal** (intercept 569 KiB),
+  rousterd **201.4 B/prefix marginal** (intercept 734 KiB) · census
+  structure on this tree: bgpd = interned attrs 90.7 B/pfx (measured
+  deep; 16,621 distinct tuples, per-route attr allocs ≈0) + keyed-map
+  inline ≈157 B/pfx (M3's measured 165 scaled Route 56→48 — an
+  estimate, disclosed) ≈ **248 B/pfx** → residual **≈181 B/pfx = 42%
+  of the marginal 429** (46% against the census-build marginal);
+  rousterd = node-model floor 114 B/pfx (tables 46 + programmed 68,
+  full-fill) to ≈165 B/pfx at realistic 69% B-tree fill → residual
+  **36-87 B/pfx = 18-43%** (fill-model sensitivity disclosed; 29%
+  against the ledger's 233 B/pfx at 100k) · the 15% bar (the
+  escalation's own rule): speaker 67 B/pfx, core 34 B/pfx — **both
+  residuals clear it** (speaker decisively; core at the bar's edge
+  under the most structure-favorable model), so the outcome is the
+  evaluation branch, not "not worth the dependency" · evaluation
+  (owner decision, nothing adopted): (a) mimalloc — one crate, no
+  transitive deps, `#[global_allocator]`, musl-compatible, ~x00 KB
+  binary cost; per-thread heaps fit the multi-core design; typical
+  small-object RSS recovery 10-20%; (b) tikv-jemallocator — heavier
+  dep tree (C build via jemalloc-sys), background-purge threads
+  optional, the least-tested musl path; (c) decline — the current
+  numbers already lead FRR 2.1×/2.27× on memory and the residual is
+  an UPPER bound (transients + node over-fill + unmodeled surfaces
+  share it; a swap recovers only the allocator-proper part, plausibly
+  ~50-100 B/pfx of the speaker's 181) · recommendation: if the owner
+  wants the speaker floor pushed, ratify a time-boxed mimalloc A/B on
+  bgpd only (the D2 one-crate-first pattern), receipt-gated per
+  §R/PERF-PLAN (±5% on every other metric); decline on any regression
+  or <5% recovery. No verdict prose.
+
+- 2026-10-16 · E2+churn matched comparison (10% of a 100k table
+  flapped ×10 rounds, identical injector both sides) · host=darwin-vm
+  (same rig: SUT pinned 4-11, injector 0-3, the kernel-count observer
+  loop 12-17 in a third container sharing the SUT netns) · versions:
+  Rouster binaries as in the E4 entry above (tree `80cd7e7` over
+  `429ab18`; perf paths byte-identical, disclosed there); FRR 10.2.2;
+  harness `scripts/bench-e2-churn.sh` + `scripts/bench-flap.py` (the
+  flap-capable injector: the mrt-replay announce content — see the
+  addendum above — with protocol-level withdraw/reannounce on the
+  announcing session; SAME tool, SAME bytes, SAME schedule on both
+  SUTs per §F) · feed: `announce-100k.announce` (sha256
+  6c9f4f7d7369cb25a6f4c35fc64d0da481b7116cb7346597c26f0484c45d7ced,
+  the bench-mrt2announce derivative of the pinned dump above), 100k
+  routes announced in ~2.2-2.4k UPDATEs, subset = every 10th prefix
+  (10,000), 10 rounds, 2 s inter-burst gaps · runs: 6+6 (1 warmup + 5
+  measured each) · observation: the kernel-count loop at ~7 rows/s
+  symmetric (its dump cost rides both sides equally); the SUT-own
+  count basis is rouster's status file (1 s refresh cadence, the SUT's
+  own surface) vs FRR's live vtysh — the kernel basis is the
+  symmetric one and leads the table · **per-round reconvergence
+  (reannounce-done → kernel count restored): Rouster median 0.330 s
+  (p95 0.446) vs FRR 10.2.2 median 0.235 s (p95 0.327) — FRR ahead
+  1.40×, sub-2×, unresolved under §F's darwin-vm rule (both
+  directions published)** · SUT-own-count basis: Rouster 0.252 s
+  (0.620) vs FRR 0.170 s (0.293) — same direction, same disclosure ·
+  full round wall (withdraw-start → restored): Rouster 2.317 s
+  (2.686) vs FRR 2.227 s (2.357) — parity within noise · withdraw
+  trough exact on both sides every round (Rouster 99,998 → 89,998;
+  FRR main Totals 100,001 → 90,001; 10,000 prefixes withdrawn and
+  restored ×10 rounds ×5 measured runs ×2 sides) · storm CPU
+  (steady → rounds-done, ~80 s window): speaker Rouster 0.81 s vs
+  FRR bgpd 1.16 s (Rouster 1.43× fewer); core Rouster 1.26 s vs FRR
+  zebra 2.24 s (1.78× fewer) — both sub-2×, unresolved · session
+  survival: the injector's own timeline — zero NOTIFICATION, zero
+  aborts, FLAP-LINGER-END reached on all 12 runs (FRR's final-vtysh
+  "Active" state is the post-linger injector close, a capture-timing
+  artifact disclosed here); malformed 0 / rejected 0 on every run ·
+  raw: `target/bench-logs/e2-20261016T152650Z/` (rouster) +
+  `e2-20261016T153522Z/` (frr) · notes: the pre-registered rate sweep
+  (100–1000 cycles/s) and the full-table cell stay deferred per the
+  addendum; the round shape at 100k is this entry. No verdict prose.
+
 - 2026-10-15 · E1+FRR-full · host=darwin-vm (OrbStack 7.2.9-orbstack,
   macOS 27.0.1 host, linux/aarch64 VM, 18 CPUs, SUT pinned 4-11,
   injector 0-3) · versions: FRR 10.2.2 (`frr-testbed:10.2.2`), harness

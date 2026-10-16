@@ -45,7 +45,12 @@ NET_SUBNET=${BENCH_NET_SUBNET:-172.31.255.0/24}
 SUT_IP=${BENCH_SUT_IP:-172.31.255.20}
 INJ_IP=${BENCH_INJ_IP:-172.31.255.10}
 IMAGE=frr-testbed:10.2.2
-INJ_IMAGE=python:3.12-alpine
+# The injector base carries python3 for bench-flap.py. docker.io was
+# unreachable from this rig (registry Bad Gateway), so the pinned
+# bench-exabgp:local image (docker/bench/Dockerfile.exabgp — the D1
+# pre-switch record, Python 3.12 inside) is repurposed as the flap
+# driver's base; the harness pins its tag in the entry.
+INJ_IMAGE=${BENCH_E2_INJ_IMAGE:-bench-exabgp:local}
 SUT_CPUS=${BENCH_SUT_CPUS:-4-11}
 INJ_CPUS=${BENCH_INJ_CPUS:-0-3}
 OBS_CPUS=${BENCH_E2_OBS_CPUS:-12-17}
@@ -124,8 +129,8 @@ for run in $(seq 1 "$RUNS"); do
             'router bgp 65000' \
             ' no bgp network import-check' \
             ' no bgp ebgp-requires-policy' \
-            " neighbor $INJ_IP remote-as $INJ_AS" \
-            " neighbor $INJ_IP timers 30 $HOLD" \
+            ' neighbor $INJ_IP remote-as $INJ_AS' \
+            ' neighbor $INJ_IP timers 30 $HOLD' \
             ' address-family ipv4 unicast' \
             '  exit-address-family' \
             'line vty' \
@@ -168,11 +173,26 @@ for run in $(seq 1 "$RUNS"); do
     fi
 
     # --- observer container (shares SUT netns, off the SUT pins) --------
+    # Same high-resolution trick as E4: the kernel-count loop runs
+    # INSIDE the observer container (off the SUT pins), rows
+    # host-visible via the volume; it stops on the run's STOP file
+    # (the storm's count legitimately dips mid-run, so completion is
+    # harness-driven, not count-driven).
+    RUN_DIR_ABS=$(cd "$RUN_DIR" && pwd)
     docker run -d --name "$OBS" --network "container:$SUT" \
         --cpuset-cpus "$OBS_CPUS" \
+        -v "$RUN_DIR_ABS":/obs \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     docker exec "$OBS" sh -c "ip route show proto 186 2>/dev/null | grep -c ." \
         > "$RUN_DIR/kernel-baseline.txt" 2>/dev/null || echo 0 > "$RUN_DIR/kernel-baseline.txt"
+    rm -f "$RUN_DIR/STOP"
+    docker exec -d "$OBS" bash -c '
+        : > /obs/poll.csv
+        while [ ! -e /obs/STOP ]; do
+            n=$(ip route show proto 186 2>/dev/null | grep -c .)
+            echo "$EPOCHREALTIME $n" >> /obs/poll.csv
+            sleep 0.05
+        done'
 
     # --- injector: bench-flap.py on its own pinned container ------------
     docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \

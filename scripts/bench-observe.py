@@ -118,6 +118,13 @@ def main():
     ap.add_argument("--stall-after", type=int, default=0)
     ap.add_argument("--status-file", default="/run/rouster/rousterd.status")
     ap.add_argument("--bgpd-log", default="/var/log/rouster-bgpd.log")
+    # --poll-file: a host-visible file of "<epoch_ns> <count>" rows a
+    # tight in-container loop writes (the E4 high-resolution kernel
+    # series — the loop lives in the third-container observer, off
+    # the SUT cpuset; rows are VM-clock, reconciled via clock-offset).
+    ap.add_argument("--poll-file")
+    ap.add_argument("--poll-clock-offset", type=float, default=0.0,
+                    help="host_minus_vm seconds applied to poll-file rows")
     args = ap.parse_args()
 
     kernel_c = args.kernel_container or args.sut_container
@@ -153,10 +160,22 @@ def main():
             row["t_host"] = f"{now:.6f}"
             row["t_mono"] = f"{mono:.6f}"
 
-            kout, row["kernel_ms"] = timed_sh(
-                kernel_c, "ip route show proto 186 2>/dev/null | grep -c .")
-            if kout.isdigit():
-                row["kernel_bgp"] = kout
+            if args.poll_file:
+                # tail of the high-resolution series (completion check
+                # only; the summarizer reads the whole file)
+                try:
+                    with open(args.poll_file) as pf:
+                        lines = pf.read().strip().splitlines()
+                    if lines:
+                        _, cnt = lines[-1].split()
+                        row["kernel_bgp"] = cnt
+                except (OSError, ValueError):
+                    pass
+            else:
+                kout, row["kernel_ms"] = timed_sh(
+                    kernel_c, "ip route show proto 186 2>/dev/null | grep -c .")
+                if kout.isdigit():
+                    row["kernel_bgp"] = kout
 
             if args.mode == "rouster":
                 text, row["main_ms"] = timed_sh(
