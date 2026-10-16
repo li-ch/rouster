@@ -84,3 +84,36 @@ suite, and Linux CI.
 - MIT license; public mirrors on Gitee and GitHub.
 
 [0.1.0]: https://gitee.com/drchenli/rouster/releases/tag/v0.1.0
+
+## [1.0.0] — 2026-10-16
+
+The goals-metting release: every plan pillar landed and live-proven.
+
+### Added since 0.1.0
+
+- **IS-IS** (`isisd`): the full TLV stack — RFC 5302 inter-area
+  with the §3.10.2 preference ladder, broadcast/LAN circuits with
+  DIS election and pseudonode LSPs, RFC 5304 HMAC-MD5 auth with
+  key chains, LSP fragment families with §7.3.15 pacing and
+  RFC 7987 lifetimes, the administrative knobs — at Full adjacency
+  with real FRR isisd and routes exchanged both directions.
+- **BGP hardening**: RFC 7606 revised error handling (structured
+  outcomes, treat-as-withdraw), graceful restart both roles with
+  Hard Reset, ADD-PATH both directions, route-server mode,
+  RFC 4271 §6.3 first-AS enforcement, iBGP ROV-validity
+  propagation, route reflection.
+- **Management plane complete**: the YANG core (pure-Rust RFC 7950
+  subset, seven models, configd's tree-as-source-of-truth flip,
+  vtyd the translator), the RESTCONF-shaped HTTP northbound with
+  Unix-socket default + constant-time bearer token.
+- **Security**: BFD receive-side TTL enforcement on both address
+  families (kernel-proven), OSPFv3's v6 cmsg read-back, key chains
+  across IS-IS and OSPF.
+- **Benchmarks**: the frozen-claim-policy program — full 1.126M-
+  prefix table in-kernel in 17.1 s median (FRR's ledgered 30.36 s
+  on the same rig; comparative claims stay closed under the
+  darwin-vm rule), 1845 tests, 39 smoke scripts, nightly docker CI
+  + fuzz CI (whose first dispatch caught a real OOB in the RTR
+  decoder).
+
+[1.0.0]: https://gitee.com/drchenli/rouster/releases/tag/v1.0.0
