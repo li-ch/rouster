@@ -1911,7 +1911,9 @@ mod tests {
         assert!(matches!(end, SessionEnd::Transport(_)));
         let sink = sink.0.lock().unwrap();
         assert_eq!(sink.announced.len(), 1, "the route imports");
-        assert!(sink.announced.contains_key(&"203.0.113.0/24".parse().unwrap()));
+        assert!(sink
+            .announced
+            .contains_key(&"203.0.113.0/24".parse().unwrap()));
     }
 
     /// §6.3's rule is scoped to "the UPDATE message ... received from
