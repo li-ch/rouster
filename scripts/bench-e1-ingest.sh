@@ -39,10 +39,16 @@ fi
 
 SUT_AS=65000
 INJ_AS=65412
-SUT_IP=172.31.255.20
-INJ_IP=172.31.255.10
-NET_NAME=bench-net
-NET_SUBNET=172.31.255.0/24
+# Rig placement is env-overridable so sibling campaign streams can run
+# concurrently (PERF-P0/PERF-M1 share this host): each session takes
+# its own bridge + subnet via BENCH_NET_NAME/BENCH_NET_SUBNET and the
+# matching SUT/injector IPs. Defaults reproduce the original rig
+# exactly (bench-net 172.31.255.0/24) — §F's same-host/same-engine
+# fairness is unaffected (a fresh private bridge per session).
+NET_NAME=${BENCH_NET_NAME:-bench-net}
+NET_SUBNET=${BENCH_NET_SUBNET:-172.31.255.0/24}
+SUT_IP=${BENCH_SUT_IP:-172.31.255.20}
+INJ_IP=${BENCH_INJ_IP:-172.31.255.10}
 IMAGE=frr-testbed:10.2.2
 SUT_CPUS=${BENCH_SUT_CPUS:-4-11}
 INJ_CPUS=${BENCH_INJ_CPUS:-0-3}
