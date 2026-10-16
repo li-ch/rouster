@@ -13,6 +13,15 @@ VmRSS/VmHWM) each poll — the E5 RSS series rides the same loop.
 
 The CSV plus the raw per-poll /proc samples are the run's evidence;
 bench-summarize.py folds them into the run metrics.
+
+P0-b instrumentation (2026-10-16): every row carries a monotonic
+iteration timestamp (t_mono) and the wall time of each subprocess
+call in the loop (poll_iter_ms whole iteration; proc_sut_ms and
+proc_inj_ms the /proc reads; status_ms/eor_ms the rouster status
+file and EOR tail; vtysh_bgp_ms/vtysh_zebra_ms the FRR legs). This
+is the timing evidence that separates "the observer's docker-exec
+round-trips starved" from "the SUT stopped advancing the observed
+value" — the poll-loss diagnosis turns on that distinction.
 """
 import argparse
 import csv
@@ -23,6 +32,7 @@ import time
 
 FIELDS = [
     "t_host",
+    "t_mono",
     "sut_prefixes_main",
     "sut_eor_seen",
     "sut_pfxrcd",
@@ -38,6 +48,13 @@ FIELDS = [
     "inj_stime",
     "inj_rss_kb",
     "inj_hwm_kb",
+    "poll_iter_ms",
+    "proc_sut_ms",
+    "proc_inj_ms",
+    "status_ms",
+    "eor_ms",
+    "vtysh_bgp_ms",
+    "vtysh_zebra_ms",
 ]
 
 # rouster: one docker exec reads both daemons' /proc records.
@@ -79,6 +96,13 @@ def sh(container, body, timeout=15):
         return ""
 
 
+def timed_sh(container, body, timeout=15):
+    """sh() plus the call's wall time in ms (the P0-b evidence)."""
+    t0 = time.monotonic()
+    out = sh(container, body, timeout)
+    return out, round((time.monotonic() - t0) * 1000.0, 3)
+
+
 def parse_proc(text):
     """'name utime stime rss hwm' lines -> dict keyed by name."""
     d = {}
@@ -90,24 +114,27 @@ def parse_proc(text):
 
 
 def poll_rouster(sut, status_file, bgpd_log):
+    text, status_ms = timed_sh(sut, f"cat {status_file} 2>/dev/null")
     prefixes = ""
-    m = re.search(r"^table 254 routes \d+ prefixes (\d+)", sh(
-        sut, f"cat {status_file} 2>/dev/null"), re.M)
+    m = re.search(r"^table 254 routes \d+ prefixes (\d+)", text, re.M)
     if m:
         prefixes = m.group(1)
-    eor = "yes" if "End-of-RIB received" in sh(
-        sut, f"tail -c 65536 {bgpd_log} 2>/dev/null") else "no"
-    return prefixes, eor
+    tail, eor_ms = timed_sh(sut, f"tail -c 65536 {bgpd_log} 2>/dev/null")
+    eor = "yes" if "End-of-RIB received" in tail else "no"
+    return prefixes, eor, status_ms, eor_ms
 
 
 def poll_frr(sut):
-    out = sh(sut, "vtysh -c 'show bgp ipv4 unicast summary json' 2>/dev/null")
+    out, vtysh_bgp_ms = timed_sh(
+        sut, "vtysh -c 'show bgp ipv4 unicast summary json' 2>/dev/null")
     m = re.search(r'"pfxRcd"\s*:\s*(\d+)', out)
     pfxrcd = m.group(1) if m else ""
-    zout = sh(sut, "vtysh -c 'show ip route summary' 2>/dev/null")
+    zout, vtysh_zebra_ms = timed_sh(
+        sut, "vtysh -c 'show ip route summary' 2>/dev/null")
     zm = re.search(r"^Totals\s+(\d+)", zout, re.M)
     # FRR 10.2 zebra summary: per-source rows then "Totals <routes> <fib>"
-    return pfxrcd, (zm.group(1) if zm else "")
+    return (pfxrcd, (zm.group(1) if zm else ""),
+            vtysh_bgp_ms, vtysh_zebra_ms)
 
 
 def main():
@@ -136,14 +163,20 @@ def main():
         w.writeheader()
         while True:
             now = time.time()
+            mono = time.monotonic()
             if now - t_start > args.timeout:
                 print("POLL-TIMEOUT", file=sys.stderr)
                 break
             row = {f: "" for f in FIELDS}
             row["t_host"] = f"{now:.6f}"
+            row["t_mono"] = f"{mono:.6f}"
 
-            sut_p = parse_proc(sh(args.sut_container, proc_sut))
-            inj_p = parse_proc(sh(args.inj_container, PROC_INJ))
+            sut_proc, row["proc_sut_ms"] = timed_sh(
+                args.sut_container, proc_sut)
+            inj_proc, row["proc_inj_ms"] = timed_sh(
+                args.inj_container, PROC_INJ)
+            sut_p = parse_proc(sut_proc)
+            inj_p = parse_proc(inj_proc)
             for name, tag in (("rouster-bgpd", "sut_bgpd"), ("rousterd", "sut_zebra"),
                               ("bgpd", "sut_bgpd"), ("zebra", "sut_zebra"),
                               ("inj", "inj")):
@@ -161,7 +194,8 @@ def main():
                     row[f"inj_hwm_kb"] = h
 
             if args.mode == "rouster":
-                prefixes, eor = poll_rouster(
+                (prefixes, eor, row["status_ms"],
+                 row["eor_ms"]) = poll_rouster(
                     args.sut_container, args.status_file, args.bgpd_log)
                 # Completion is count-based (the plan's own definition:
                 # RIB count reaching the dump's prefix count). exabgp
@@ -178,7 +212,8 @@ def main():
                     and int(prefixes) >= need
                 )
             else:
-                pfxrcd, ztotal = poll_frr(args.sut_container)
+                (pfxrcd, ztotal, row["vtysh_bgp_ms"],
+                 row["vtysh_zebra_ms"]) = poll_frr(args.sut_container)
                 row["sut_pfxrcd"] = pfxrcd
                 row["sut_prefixes_main"] = ztotal
                 # A SUT may legitimately reject a few feed routes
@@ -191,6 +226,8 @@ def main():
                 )
                 done = have >= need
 
+            row["poll_iter_ms"] = round(
+                (time.monotonic() - mono) * 1000.0, 3)
             w.writerow(row)
             fh.flush()
             if done:
@@ -200,8 +237,15 @@ def main():
                 if complete_streak >= 3:
                     print(f"POLL-COMPLETE {complete_at:.6f}", file=sys.stderr)
                     time.sleep(args.settle)
-                    # one final row after settle for final RSS
+                    # one final row after settle for final RSS; no observer
+                    # calls happen in the settle window, so the per-call
+                    # timing columns are blanked rather than left stale.
                     row["t_host"] = f"{time.time():.6f}"
+                    row["t_mono"] = f"{time.monotonic():.6f}"
+                    for f in ("poll_iter_ms", "proc_sut_ms", "proc_inj_ms",
+                              "status_ms", "eor_ms", "vtysh_bgp_ms",
+                              "vtysh_zebra_ms"):
+                        row[f] = ""
                     w.writerow(row)
                     break
             else:
