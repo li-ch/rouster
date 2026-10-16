@@ -697,7 +697,18 @@ impl ZapiSession {
                 match route.to_route_entry() {
                     Some(mut entry) => {
                         entry.table = DEFAULT_TABLE;
-                        info!(id = self.id, prefix = %entry.prefix, ?entry.protocol,
+                        // PERF-P3 M2b (the granted half of PERF-P2's
+                        // census item #2): the session layer's per-route
+                        // add line joins the driver's at debug — a mass
+                        // import logging one info line per route costs
+                        // ~0.5-0.7 s of daemon CPU per million and
+                        // buries the operator in noise FRR zebra also
+                        // avoids (its route adds log at debug). With
+                        // both layers demoted, the smokes that grep
+                        // 'zapi: route add' start their rousterd with
+                        // ROUSTERD_LOG=debug (the knob exists for
+                        // exactly this shape of need).
+                        debug!(id = self.id, prefix = %entry.prefix, ?entry.protocol,
                               "zapi: route add");
                         commands
                             .send(RibCommand::AddRoute(entry))
@@ -723,7 +734,10 @@ impl ZapiSession {
                 }
                 match route.protocol() {
                     Some(protocol) => {
-                        info!(id = self.id, prefix = %route.prefix, ?protocol,
+                        // PERF-P3 M2b: the delete twin of the add
+                        // demotion above (same census item, same
+                        // rationale).
+                        debug!(id = self.id, prefix = %route.prefix, ?protocol,
                               "zapi: route delete");
                         commands
                             .send(RibCommand::DeleteRoute {

@@ -131,7 +131,7 @@ for side in l1 l2; do
     name="$L1"; asn=65001; [ "$side" = l2 ] && { name="$L2"; asn=65002; }
     echo "==> $side: resident rousterd (zebra) + mgmtd + REAL FRR bgpd (AS $asn, network $PREFIX)"
     docker exec "$name" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-    docker exec -d "$name" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+    docker exec -d -e ROUSTERD_LOG=debug "$name" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
     wait_in "$name" "$side rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
     docker exec "$name" sh -c "/usr/lib/frr/mgmtd -d -z $ZAPI_SOCK --log file:/tmp/mgmtd.log --log-level debug"
     docker exec "$name" sh -c "/usr/lib/frr/bgpd -d -z $ZAPI_SOCK --log file:$BGPD_LOG --log-level debug"
@@ -164,7 +164,7 @@ done
 
 echo "==> hub: resident rousterd (zebra) + mgmtd + REAL FRR bgpd (AS 65010, config applied AFTER our listener is up — FRR's connect retry is 120 s, the first attempt must not hit a closed port)"
 docker exec "$HUB" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-docker exec -d "$HUB" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+docker exec -d -e ROUSTERD_LOG=debug "$HUB" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 wait_in "$HUB" "hub rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 docker exec "$HUB" sh -c "/usr/lib/frr/mgmtd -d -z $ZAPI_SOCK --log file:/tmp/mgmtd.log --log-level debug"
 docker exec "$HUB" sh -c "/usr/lib/frr/bgpd -d -z $ZAPI_SOCK --log file:$BGPD_LOG --log-level debug"
@@ -172,7 +172,7 @@ wait_in "$HUB" "hub bgpd vty socket" 30 "test -S /var/run/frr/bgpd.vty"
 
 echo "==> us: resident rousterd (zebra) + rouster bgpd (AS 65000, addpath rx, passive)"
 docker exec "$US" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-docker exec -d "$US" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+docker exec -d -e ROUSTERD_LOG=debug "$US" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 wait_in "$US" "us rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 docker exec "$US" sh -c "printf '%s\n' \
   'zapi socket $ZAPI_SOCK' \

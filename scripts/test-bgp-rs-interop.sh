@@ -140,7 +140,7 @@ echo "==> bridge addresses: rs=$RS_IP c1=$C1_IP c2=$C2_IP"
 
 echo "==> RS: resident rousterd (zebra)"
 docker exec "$RS" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-docker exec -d "$RS" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+docker exec -d -e ROUSTERD_LOG=debug "$RS" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 wait_in "$RS" "rs rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 
 echo "==> RS: rouster bgpd as the route server (both clients route-server + passive)"
@@ -160,7 +160,7 @@ docker exec "$RS" sh -c "cat /etc/rouster-bgp.conf"
 
 echo "==> c1: resident rousterd (zebra) + mgmtd + REAL FRR bgpd (AS 65001, MED 77 out)"
 docker exec "$C1" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-docker exec -d "$C1" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+docker exec -d -e ROUSTERD_LOG=debug "$C1" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 wait_in "$C1" "c1 rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 docker exec "$C1" sh -c "/usr/lib/frr/mgmtd -d -z $ZAPI_SOCK --log file:/tmp/mgmtd.log --log-level debug"
 docker exec "$C1" sh -c "/usr/lib/frr/bgpd -d -z $ZAPI_SOCK --log file:$BGPD_LOG --log-level debug"
@@ -211,7 +211,7 @@ wait_in "$RS" "our bgpd received the announced route" 30 \
 
 echo "==> c2: second FRR client (AS 65002) — connects after c1 announced"
 docker exec "$C2" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-docker exec -d "$C2" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+docker exec -d -e ROUSTERD_LOG=debug "$C2" sh -c "rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 wait_in "$C2" "c2 rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 docker exec "$C2" sh -c "/usr/lib/frr/mgmtd -d -z $ZAPI_SOCK --log file:/tmp/mgmtd.log --log-level debug"
 docker exec "$C2" sh -c "/usr/lib/frr/bgpd -d -z $ZAPI_SOCK --log file:$BGPD_LOG --log-level debug"

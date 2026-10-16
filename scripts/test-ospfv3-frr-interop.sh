@@ -169,7 +169,7 @@ echo "==> link-locals: r1=$R1_LL r2=$R2_LL"
 echo "==> resident rousterd (zebra) in both containers"
 for name in "$R1" "$R2"; do
     docker exec "$name" sh -c "printf '%s\n' 'zapi socket $ZAPI_SOCK' > $ROUSTERD_CONF"
-    docker exec -d "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
+    docker exec -d -e ROUSTERD_LOG=debug "$name" sh -c "NO_COLOR=1 rousterd --config $ROUSTERD_CONF > $ROUSTERD_LOG 2>&1"
 done
 wait_in "$R1" "r1 rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
 wait_in "$R2" "r2 rousterd listening" 30 "grep -q 'zapi: listening' $ROUSTERD_LOG"
