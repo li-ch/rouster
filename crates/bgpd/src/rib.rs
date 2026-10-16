@@ -50,12 +50,14 @@ pub struct Route {
     /// Learned over an internal (iBGP) session (§9.1.2.2 d).
     pub internal: bool,
     /// RFC 6811 §2 prefix-origin validity; `None` = RPKI not in use
-    /// for this route (no tables, or an iBGP-learned path — validity
-    /// is computed at the eBGP ingress edge, v1).
+    /// for this route (no tables). Recorded at import for eBGP AND
+    /// iBGP paths — the state is a pure prefix/origin function
+    /// (S13-b); enforcement (reject-invalid) stays the eBGP edge
+    /// posture.
     pub rov: Option<rpki::Validity>,
     /// ASPA verification outcome (draft-ietf-sidrops-aspa-verification
     /// §5.5/§5.6); `None` = not computed (no tables, no neighbor
-    /// role, or iBGP).
+    /// role, or iBGP — the procedure keys on the eBGP edge role).
     pub aspa: Option<rpki::AspaValidity>,
     /// Learned over a route-server-client session (N5): the route
     /// reflects to other clients transparently (no local-AS prepend,

@@ -136,9 +136,33 @@ pub struct ValidationGate {
 impl ValidationGate {
     /// Apply validation to one imported route: `None` = ineligible
     /// (rejected), `Some` = accepted (validity recorded, OTC possibly
-    /// synthesized). iBGP-learned routes pass untouched.
+    /// synthesized). iBGP-learned routes record ROV validity but are
+    /// never rejected here.
     pub fn apply(&self, mut route: Route) -> Option<Route> {
         if route.internal {
+            // iBGP propagation of validity (S13-b, the §Deferred
+            // anchor's ROV half): RFC 6811 §2's Prefix Validation
+            // State is a pure function of the prefix and origin AS
+            // against the VRP table — computable for an internal
+            // path exactly as at the eBGP edge (FRR validates every
+            // learned route), so the verdict rides the stored path
+            // for show output. Enforcement stays the eBGP posture:
+            // reject-invalid is an edge policy, so an Invalid
+            // internal path is recorded, not dropped. ASPA stays
+            // eBGP-only — §5.5's procedure keys on the configured
+            // role of the neighbor the path arrived from, which an
+            // internal peer never has — and the OTC ingress rules
+            // with it (§Deferred: ASPA/OTC for iBGP).
+            if let Some(tables) = &self.tables {
+                let validity = tables.with(|vrps, _| {
+                    let origin = match route.origin_as() {
+                        Some(asn) => OriginAsn::As(asn),
+                        None => OriginAsn::None,
+                    };
+                    vrps.validate(&route.prefix, origin)
+                });
+                route.rov = Some(validity);
+            }
             return Some(route);
         }
         let Some(tables) = &self.tables else {
@@ -457,8 +481,13 @@ mod tests {
         assert_eq!(out.aspa, None);
     }
 
+    /// iBGP-learned routes (S13-b): RFC 6811 §2 validity is a pure
+    /// prefix/origin function, so the verdict propagates to the
+    /// internal path for show output — but enforcement stays the eBGP
+    /// posture: even Invalid (and reject-invalid armed) an internal
+    /// path records and passes. ASPA/OTC stay eBGP-only.
     #[test]
-    fn ibgp_routes_skip_validation() {
+    fn ibgp_routes_record_rov_without_enforcement() {
         let gate = gate_with(
             tables(&[("192.0.2.0/24", 24, 64512)], &[]),
             &[("192.0.2.9", 65000, Role::Peer)],
@@ -466,7 +495,37 @@ mod tests {
         let mut route = route_from("192.0.2.0/24", "192.0.2.9", 65000, vec![64513]);
         route.internal = true;
         let out = gate.apply(route).unwrap();
-        assert_eq!(out.rov, None, "validity is an eBGP edge property (v1)");
+        assert_eq!(
+            out.rov,
+            Some(Validity::Invalid),
+            "origin 64513 against the 64512 ROA: recorded, not dropped"
+        );
+        assert_eq!(out.aspa, None, "ASPA procedure keys on an eBGP role");
+        assert_eq!(out.otc(), None, "OTC ingress rules are eBGP concepts");
+
+        // A matching origin reads Valid; NotFound outside the ROA.
+        let mut route = route_from("192.0.2.0/24", "192.0.2.9", 65000, vec![64512]);
+        route.internal = true;
+        assert_eq!(gate.apply(route).unwrap().rov, Some(Validity::Valid));
+        let mut route = route_from("198.51.100.0/24", "192.0.2.9", 65000, vec![64512]);
+        route.internal = true;
+        assert_eq!(
+            gate.apply(route).unwrap().rov,
+            Some(Validity::NotFound),
+            "non-intersecting prefix"
+        );
+
+        // Without RPKI tables nothing is recorded (v1 shape).
+        let bare = ValidationGate {
+            tables: None,
+            reject_invalid: true,
+            aspa: AspaMode::Enforce,
+            roles: BTreeMap::new(),
+        };
+        let mut route = route_from("192.0.2.0/24", "192.0.2.9", 65000, vec![64512]);
+        route.internal = true;
+        let out = bare.apply(route).unwrap();
+        assert_eq!(out.rov, None, "no tables, no verdict");
     }
 
     // ---- RFC 9234 §5 OTC, table-driven from the rules ------------
