@@ -443,7 +443,11 @@ where
         ..ZapiSession::default()
     };
     let (reader, mut writer) = tokio::io::split(io);
-    let (frames_tx, mut frames_rx) = mpsc::channel::<Result<(ZapiHeader, Vec<u8>), io::Error>>(8);
+    // PERF-P3 M2c: 64 frames of read-ahead (was 8) — with the chunked
+    // reader producing ~10³ frames per read, a deeper queue keeps the
+    // reader from parking per handful under a mass import; the bound
+    // stays trivial (~6 KiB of typical route frames).
+    let (frames_tx, mut frames_rx) = mpsc::channel::<Result<(ZapiHeader, Vec<u8>), io::Error>>(64);
     let reading = tokio::spawn(read_frames(id, reader, frames_tx));
     // A closed push channel downgrades the session to request/reply (the
     // RIB owner dropped this session's push sender — e.g. at driver
@@ -496,12 +500,23 @@ where
     result
 }
 
-/// The framing half of a session: reads exactly one 10-byte header, then
-/// exactly `length - header` body bytes, and forwards whole frames to the
-/// session handler. FRR clients always send whole frames, so `read_exact`
-/// framing is exact (no resync needed on clean peers). Header-level
-/// garbage loses framing — resync is not worth it for a versioned
-/// protocol — so it is reported as an error and the connection closes.
+/// The framing half of a session: reads length-delimited frames
+/// (10-byte header, then `length - header` body bytes) and forwards
+/// them whole to the session handler. FRR clients always send whole
+/// frames, so framing is exact (no resync needed on clean peers).
+/// Header-level garbage loses framing — resync is not worth it for a
+/// versioned protocol — so it is reported as an error and the
+/// connection closes.
+///
+/// PERF-P3 M2c: the reader is chunked, not per-field `read_exact` —
+/// a mass import paid two read syscalls (header, body) per route
+/// message on this task; one 64 KiB `read` now frames ~10³ typical
+/// IPV4_ROUTE_ADD messages (the census's "2 read_exact syscalls per
+/// message" residual). Semantics preserved exactly: any peer close
+/// (even mid-frame) is the clean `None`-equivalent return the old
+/// `UnexpectedEof` path produced, a bad header or unsupported version
+/// errors and closes before the body is consumed, and partial frames
+/// accumulate across reads until whole.
 async fn read_frames<IO>(
     id: u64,
     mut io: ReadHalf<IO>,
@@ -509,55 +524,67 @@ async fn read_frames<IO>(
 ) where
     IO: AsyncRead + Unpin,
 {
+    // One read's size. Frames larger than this simply accumulate
+    // across reads; frames smaller fill many per read.
+    const READ_CHUNK: usize = 64 * 1024;
+    // Unconsumed bytes (a possibly-partial frame at the front).
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+    // Offset of the first unconsumed byte (frames before it are sent).
+    let mut consumed = 0usize;
+    let mut chunk = vec![0u8; READ_CHUNK];
     loop {
-        let mut header_buf = [0u8; ZAPI_HEADER_LEN];
-        match io.read_exact(&mut header_buf).await {
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return,
-            Err(err) => {
-                let _ = frames.send(Err(err)).await;
-                return;
-            }
-        }
-        let header = match ZapiHeader::decode(&header_buf) {
-            Ok(header) => header,
-            Err(err) => {
-                warn!(id, %err, "zapi: malformed header, closing connection");
+        // Frame everything the buffer already holds.
+        while buf.len() - consumed >= ZAPI_HEADER_LEN {
+            let header = match ZapiHeader::decode(&buf[consumed..]) {
+                Ok(header) => header,
+                Err(err) => {
+                    warn!(id, %err, "zapi: malformed header, closing connection");
+                    let _ = frames
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            err.to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            if header.version != ZAPI_VERSION {
+                warn!(
+                    id,
+                    version = header.version,
+                    expected = ZAPI_VERSION,
+                    "zapi: unsupported ZAPI version, closing connection"
+                );
                 let _ = frames
                     .send(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        err.to_string(),
+                        format!("unsupported ZAPI version {}", header.version),
                     )))
                     .await;
                 return;
             }
-        };
-        if header.version != ZAPI_VERSION {
-            warn!(
-                id,
-                version = header.version,
-                expected = ZAPI_VERSION,
-                "zapi: unsupported ZAPI version, closing connection"
-            );
-            let _ = frames
-                .send(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported ZAPI version {}", header.version),
-                )))
-                .await;
-            return;
+            let total = header.length as usize;
+            if buf.len() - consumed < total {
+                break; // partial body: read more below
+            }
+            let body = buf[consumed + ZAPI_HEADER_LEN..consumed + total].to_vec();
+            consumed += total;
+            if frames.send(Ok((header, body))).await.is_err() {
+                return; // session handler gone
+            }
         }
-        let mut body = vec![0u8; header.length as usize - ZAPI_HEADER_LEN];
-        match io.read_exact(&mut body).await {
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return,
+        // Drop the consumed front, then fill the buffer with one read.
+        buf.drain(..consumed);
+        consumed = 0;
+        match io.read(&mut chunk).await {
+            // Peer went away — the old shape's UnexpectedEof twin:
+            // a normal close whether or not a partial frame waits.
+            Ok(0) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(err) => {
                 let _ = frames.send(Err(err)).await;
                 return;
             }
-        }
-        if frames.send(Ok((header, body))).await.is_err() {
-            return; // session handler gone
         }
     }
 }
@@ -3199,5 +3226,55 @@ mod tests {
             .chunks(2)
             .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    /// PERF-P3 M2c: the chunked framing reader keeps the exact
+    /// per-field `read_exact` contract under adversarial chunking —
+    /// byte-dribbled writes that split inside a header and inside a
+    /// body still yield exactly the frames written, and a peer close
+    /// mid-frame is the clean end-of-stream the old `UnexpectedEof`
+    /// path produced (partial data is dropped, never mis-framed).
+    #[tokio::test]
+    async fn chunked_read_frames_handle_splits_and_midframe_close() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let (tx, mut rx) = mpsc::channel(8);
+        let reader = tokio::spawn(read_frames(1, server_read, tx));
+
+        let frame = ZapiMessage::Hello(ZapiHello {
+            redist_default: 10,
+            instance: 0,
+            session_id: 0,
+            synchronous: 0,
+        })
+        .encode_frame(0)
+        .expect("hello encodes");
+        // Three frames as one blob, dribbled in chunks that split a
+        // header (after 3 and after 9 bytes) and a body (after 25).
+        let blob: Vec<u8> = [frame.clone(), frame.clone(), frame.clone()].concat();
+        for range in [
+            0usize..3,
+            3..9,
+            9..10,
+            10..25,
+            25..blob.len(),
+        ] {
+            client.write_all(&blob[range]).await.expect("write");
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..3 {
+            let (header, body) = rx.recv().await.expect("frame delivered").expect("no io error");
+            assert_eq!(header.command, 19, "HELLO");
+            assert_eq!(body.as_slice(), &frame[ZAPI_HEADER_LEN..]);
+        }
+        // Half a header, then close: the reader must finish cleanly and
+        // deliver nothing for the partial frame.
+        client.write_all(&blob[..5]).await.expect("partial write");
+        drop(client);
+        reader.await.expect("reader ended cleanly on close");
+        assert!(
+            rx.try_recv().is_err(),
+            "partial frame dropped at close, never mis-framed"
+        );
     }
 }
