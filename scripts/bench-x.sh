@@ -260,7 +260,7 @@ PYEOF
 e5recover)
     LIMIT=${BENCH_X_LIMIT:-100000}
     NEED=$((LIMIT > 2000 ? LIMIT - LIMIT/200 : LIMIT - 2))
-    for SIDE in frr rouster; do
+    for SIDE in ${BENCH_X_E5_SIDES:-frr rouster}; do
       for SCN in speaker core; do
         SUT=x5-sut-$TS-$SIDE-$SCN; INJ=x5-inj-$TS-$SIDE-$SCN
         trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
@@ -419,7 +419,7 @@ e7overload)
         T0=$(date +%s.%N)
         docker exec -d "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
-            --announce /feed.announce --limit $LIMIT --flap-every 2 \
+            --announce /feed.announce --limit $LIMIT --flap-every ${BENCH_X_FLAP_EVERY:-2} \
             --rounds $ROUNDS --hold $HOLD --steady-wait 8 --round-gap 0.5 \
             --linger 600 > /var/log/flap-run.txt 2>&1"
         # storm end = the tool's ROUNDS-DONE marker (the process keeps
@@ -443,6 +443,266 @@ e7overload)
         RSS=$(docker exec "$SUT" sh -c "awk '/VmRSS/{print \$2}' /proc/\$(pidof zebra rousterd | awk '{print \$1}')/status" 2>/dev/null || echo "?")
         note "side=$SIDE storm_wall_s=$(python3 -c "print(f'{$T1-$T0:.1f}')") drain_s=$(python3 -c "print(f'{$T2-$T1:.1f}')") final=$(kern_count "$SUT") core_rss_kb=$RSS"
         docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+        sleep 3
+    done
+    ;;
+
+e1seq)
+    # E1's generated event-sequence differential: scripted ops against
+    # the loaded table, kernel-dump oracle incl. exact prefix sets.
+    LIMIT=${BENCH_X_LIMIT:-10000}
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e1seq needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    for SIDE in frr rouster; do
+        SUT=x1-sut-$TS-$SIDE; INJ=x1-inj-$TS-$SIDE
+        trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
+        note "=== e1seq side=$SIDE limit=$LIMIT"
+        new_sut "$SUT"
+        if [ "$SIDE" = frr ]; then start_frr_daemons "$SUT"
+        else start_rousterd "$SUT"; start_rouster_bgpd "$SUT"; fi
+        docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+            --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+            --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+        docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+        docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+        # SEQ-1: announce, withdraw every 3rd, re-announce every 3rd
+        # (novel attrs), withdraw every 5th -> expected = not-5th.
+        docker exec "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+            --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+            --announce /feed.announce --limit $LIMIT \
+            --ops A,W3,R3,W5 --gap 3" > "$OUT_DIR/seq1-$SIDE.txt" 2>&1
+        sleep 3
+        awk 'NR % 5 != 0 {print $2}' "$ANN_CP" | head -$LIMIT | sort > "$OUT_DIR/seq1-expected.txt"
+        kern_dump "$SUT" > "$OUT_DIR/seq1-$SIDE-kernel.txt"
+        C1=$(wc -l < "$OUT_DIR/seq1-$SIDE-kernel.txt")
+        D1=$(comm -3 "$OUT_DIR/seq1-expected.txt" "$OUT_DIR/seq1-$SIDE-kernel.txt" | grep -c . || true)
+        note "seq1 side=$SIDE count=$C1 expected=$(( $(wc -l < "$OUT_DIR/seq1-expected.txt") )) diff-lines=$D1"
+        [ "$D1" = 0 ] && pass "e1seq seq1 $SIDE: exact prefix set after interleave" \
+                       || fail "e1seq seq1 $SIDE: diff-lines=$D1"
+        # SEQ-2: replace all attrs (same prefixes); no dupes, count exact.
+        docker exec "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+            --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+            --announce /feed.announce --limit $LIMIT \
+            --ops A,R1 --gap 3" > "$OUT_DIR/seq2-$SIDE.txt" 2>&1
+        sleep 3
+        kern_dump "$SUT" > "$OUT_DIR/seq2-$SIDE-kernel.txt"
+        C2=$(wc -l < "$OUT_DIR/seq2-$SIDE-kernel.txt")
+        DUP2=$(awk '{print $1}' "$OUT_DIR/seq2-$SIDE-kernel.txt" | uniq -d | wc -l)
+        note "seq2 side=$SIDE count=$C2 duplicate-prefixes=$DUP2"
+        [ "$C2" = "$LIMIT" ] && [ "$DUP2" = 0 ] \
+            && pass "e1seq seq2 $SIDE: replacement exact, no duplicates" \
+            || fail "e1seq seq2 $SIDE: count=$C2 dups=$DUP2"
+        # SEQ-3: session close + re-open over the SAME table (Rouster
+        # persists per the disclosed deviation; re-add must replace,
+        # never duplicate). FRR withdraws on close.
+        docker exec "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+            --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+            --announce /feed.announce --limit $LIMIT \
+            --ops A,X,A --gap 3" > "$OUT_DIR/seq3-$SIDE.txt" 2>&1
+        sleep 3
+        kern_dump "$SUT" > "$OUT_DIR/seq3-$SIDE-kernel.txt"
+        C3=$(wc -l < "$OUT_DIR/seq3-$SIDE-kernel.txt")
+        DUP3=$(awk '{print $1}' "$OUT_DIR/seq3-$SIDE-kernel.txt" | uniq -d | wc -l)
+        note "seq3 side=$SIDE final-count=$C3 duplicates=$DUP3"
+        [ "$C3" = "$LIMIT" ] && [ "$DUP3" = 0 ] \
+            && pass "e1seq seq3 $SIDE: reset+re-add exact, no duplicates" \
+            || fail "e1seq seq3 $SIDE: count=$C3 dups=$DUP3"
+        docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+        sleep 3
+    done
+    ;;
+e45igp)
+    # IGP-under-BGP convergence + the E6 mixed variant. The announced
+    # next hop is OSPF-learned (10.99.0.1 via the peer's dummy /24), so
+    # every BGP route resolves through the IGP; killing the peer's
+    # ospfd must withdraw them, its return must restore them.
+    LIMIT=${BENCH_X_LIMIT:-10000}
+    MODE=${BENCH_X_IGP_MODE:-native}   # native: rouster bgpd + rouster
+    # ospfd;  mixed: FRR bgpd + rouster ospfd;  frr: FRR bgpd + FRR
+    # ospfd (the incumbent comparator)
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e45igp needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    PEER_IP=172.31.255.30
+    OSPF_NET=10.99.0.0/24
+    OSPF_NH=10.99.0.1
+    # announce with next hops rewritten to the OSPF-learned address
+    sed "s/next-hop [0-9.]*/next-hop $OSPF_NH/" "$ANN_CP" | head -$LIMIT \
+        > "$OUT_DIR/announce-ospf.txt"
+    ANN_OSPF=$(cd "$OUT_DIR" && pwd)/announce-ospf.txt
+    SUT=x45-sut-$TS; INJ=x45-inj-$TS; PEER=x45-peer-$TS
+    trap 'docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true' EXIT
+    note "=== e45igp mode=$MODE limit=$LIMIT (bgp-via-ospf)"
+    new_sut "$SUT"
+    start_rousterd "$SUT"
+    if [ "$MODE" = frr ]; then
+        docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$LOG/mgmtd.log --log-level info"
+        wait_up "$SUT" "mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
+        docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$LOG/ospfd.log --log-level info"
+        wait_up "$SUT" "ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
+        docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$LOG/bgpd.log --log-level info"
+        wait_up "$SUT" "bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+        docker exec "$SUT" sh -c "printf '%s\n' \
+            'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
+            'router ospf' ' ospf router-id 1.1.1.1' \
+            ' network 172.31.255.0/24 area 0.0.0.0' \
+            ' timers throttle spf 0 50 100' \
+            'router bgp $SUT_AS' \
+            ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
+            " neighbor $INJ_IP remote-as $INJ_AS" \
+            " neighbor $INJ_IP timers 30 $HOLD" \
+            ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
+            > /etc/frr/frr.conf"
+        for _ in $(seq 1 10); do
+            docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; sleep 2
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP" && break
+        done
+    else
+        if [ "$MODE" = mixed ]; then
+            docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$LOG/mgmtd.log --log-level info"
+            wait_up "$SUT" "mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
+            docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$LOG/bgpd.log --log-level info"
+            wait_up "$SUT" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+            docker exec "$SUT" sh -c "printf '%s\n' \
+                'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
+                'router bgp $SUT_AS' \
+                ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
+                " neighbor $INJ_IP remote-as $INJ_AS" \
+                " neighbor $INJ_IP timers 30 $HOLD" \
+                ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
+                > /etc/frr/frr.conf"
+            for _ in $(seq 1 10); do
+                docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; sleep 2
+                docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP" && break
+            done
+        else
+            start_rouster_bgpd "$SUT"
+        fi
+        # native rouster ospfd on the rouster core
+        docker cp "$BIN_DIR/rouster-ospfd" "$SUT:/usr/local/bin/rouster-ospfd"
+        docker exec "$SUT" sh -c "printf '%s\n' \
+            'zapi socket /var/run/frr/zserv.api' \
+            'router ospf' ' router-id 1.1.1.1' \
+            ' area 0.0.0.0' \
+            '  interface eth0' \
+            '   network-type broadcast' \
+            '   hello-interval 2' \
+            '   dead-interval 8' \
+            > /etc/rouster-ospfd.conf"
+        docker exec -d "$SUT" sh -c "rouster-ospfd --config /etc/rouster-ospfd.conf > /var/log/rouster-ospfd.log 2>&1"
+        wait_up "$SUT" "rouster ospfd up" 20 "pidof rouster-ospfd"
+    fi
+    # the OSPF peer: FRR ospfd advertising the dummy /24
+    docker run -d --name "$PEER" --network "$NET_NAME" --ip "$PEER_IP" \
+        --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN \
+        --entrypoint sleep "$IMAGE" infinity >/dev/null
+    docker exec "$PEER" sh -c "ip addr add $OSPF_NH/24 dev lo 2>/dev/null || true; ip link set lo up"
+    docker exec "$PEER" sh -c "/usr/lib/frr/zebra -d --log file:$LOG/pzebra.log --log-level info"
+    wait_up "$PEER" "peer zebra vty" 30 "test -S /var/run/frr/zebra.vty"
+    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$LOG/pospfd.log --log-level info"
+    wait_up "$PEER" "peer ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
+    docker exec "$PEER" sh -c "printf '%s\n' \
+        'frr version 10.2' 'frr defaults traditional' 'hostname x45peer' \
+        'router ospf' ' ospf router-id 2.2.2.2' \
+        ' network 172.31.255.0/24 area 0.0.0.0' \
+        ' network $OSPF_NET area 0.0.0.0' \
+        ' timers throttle spf 0 50 100' \
+        'line vty' > /etc/frr/frr.conf"
+    for _ in $(seq 1 15); do
+        docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; sleep 2
+        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep -q Full && break
+    done
+    note "adjacency: $(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | tail -1 | tr -s ' ')"
+    # the BGP injector announcing via the OSPF next hop
+    docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+        --cpuset-cpus "$INJ_CPUS" -v "$ANN_OSPF":/feed.announce:ro \
+        --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+    docker cp scripts/bench-flap.py "$INJ:/bench-flap.py"
+    docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+    docker exec -d "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
+        --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+        --announce /feed.announce --limit $LIMIT --flap-every 999999 \
+        --rounds 0 --hold $HOLD --steady-wait 5 --linger 600 > /var/log/flap-run.txt 2>&1"
+    OSPF_ROUTES=$(docker exec "$SUT" sh -c "ip route show proto ospf 2>/dev/null | grep -c ." || echo 0)
+    for _ in $(seq 1 120); do
+        c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
+    done
+    BGP_FULL=$(kern_count "$SUT")
+    note "baseline: ospf-routes=$OSPF_ROUTES bgp-via-ospf=$BGP_FULL (expect ~$LIMIT)"
+    if [ "$BGP_FULL" -lt $((LIMIT - 20)) ]; then
+        fail "e45igp $MODE: BGP routes did not resolve via OSPF ($BGP_FULL)"
+    else
+        pass "e45igp $MODE: BGP table resolved through OSPF nexthop ($BGP_FULL)"
+    fi
+    # the event: kill the PEER's ospfd -> adjacency dies (dead 8s) ->
+    # OSPF route gone -> BGP nexthops unresolved -> withdraw.
+    timeline "$SUT" igp 1
+    TKILL=$(date +%s.%N)
+    docker exec "$PEER" sh -c "kill -9 \$(pidof ospfd)"
+    for _ in $(seq 1 60); do
+        c=$(kern_count "$SUT"); [ "$c" -le 10 ] 2>/dev/null && break; sleep 1
+    done
+    TW=$(date +%s.%N)
+    # restore the peer's ospfd -> adjacency re-forms -> routes return
+    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$LOG/pospfd2.log --log-level info"
+    for _ in $(seq 1 15); do
+        docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; sleep 2
+        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep -q Full && break
+    done
+    for _ in $(seq 1 180); do
+        c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
+    done
+    TR=$(date +%s.%N)
+    TL=$OUT_DIR/tl-$MODE.csv
+    timeline_stop "$SUT" igp "$TL"
+    python3 - "$TKILL" "$TW" "$TR" >> "$OUT_DIR/notes.txt" <<'PYEOF'
+import sys
+tk, tw, tr = map(float, sys.argv[1:4])
+print(f"X-NOTE e45igp timeline: kill_to_withdrawn_s={tw-tk:.1f} "
+      f"peer_restart_to_restored_s={tr-tw:.1f} total_event_s={tr-tk:.1f}")
+PYEOF
+    docker exec "$INJ" sh -c "cat /var/log/flap-run.txt" > "$OUT_DIR/flap-$MODE.txt" 2>/dev/null || true
+    docker cp "$SUT:/var/log/rouster-ospfd.log" "$OUT_DIR/rouster-ospfd-$MODE.log" 2>/dev/null || true
+    ;;
+e5cycles)
+    # Reconnection during replay + repeated cycles: kill the injector
+    # mid-replay, restart it, verify exact recovery; 3 cycles.
+    LIMIT=${BENCH_X_LIMIT:-100000}
+    NEED=$((LIMIT > 2000 ? LIMIT - LIMIT/200 : LIMIT - 2))
+    for SIDE in frr rouster; do
+        SUT=x5c-sut-$TS-$SIDE
+        trap 'docker rm -f "$SUT" >/dev/null 2>&1 || true; docker ps -aq --filter name=x5c-inj | xargs -r docker rm -f >/dev/null 2>&1 || true' EXIT
+        note "=== e5cycles side=$SIDE limit=$LIMIT"
+        new_sut "$SUT"
+        if [ "$SIDE" = frr ]; then start_frr_daemons "$SUT"
+        else start_rousterd "$SUT"; start_rouster_bgpd "$SUT"; fi
+        for CYC in 1 2 3; do
+            INJ=x5c-inj-$TS-$SIDE-$CYC
+            start_injector "$INJ"
+            docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+            T0=$(date +%s.%N)
+            docker exec -d "$INJ" sh -c "mrt-replay $(INJ_ARGS_FOR $LIMIT) > /var/log/replay.txt 2>&1"
+            # kill mid-replay: after ~2s of sending (roughly 20-40% in)
+            sleep 2
+            TC=$(date +%s.%N)
+            docker rm -f "$INJ" >/dev/null 2>&1
+            # reconnect: fresh injector, full replay
+            INJ=x5c-inj2-$TS-$SIDE-$CYC
+            start_injector "$INJ"
+            docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+            docker exec -d "$INJ" sh -c "mrt-replay $(INJ_ARGS_FOR $LIMIT) > /var/log/replay.txt 2>&1"
+            for _ in $(seq 1 240); do
+                c=$(kern_count "$SUT"); [ "$c" -ge "$NEED" ] 2>/dev/null && break; sleep 1
+            done
+            T1=$(date +%s.%N)
+            FINAL=$(kern_count "$SUT")
+            DUPS=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null" | awk '{print $1}' | sort | uniq -d | wc -l)
+            note "side=$SIDE cycle=$CYC midkill_at=$(python3 -c "print(f'{$TC-$T0:.1f}')")s recover_s=$(python3 -c "print(f'{$T1-$TC:.1f}')") final=$FINAL dups=$DUPS"
+            if [ "$FINAL" -ge "$NEED" ] && [ "$DUPS" = 0 ]; then
+                pass "e5cycles $SIDE cycle=$CYC exact, no duplicates"
+            else
+                fail "e5cycles $SIDE cycle=$CYC final=$FINAL dups=$DUPS"
+            fi
+            docker rm -f "$INJ" >/dev/null 2>&1 || true
+        done
+        docker rm -f "$SUT" >/dev/null 2>&1 || true
         sleep 3
     done
     ;;
