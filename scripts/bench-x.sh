@@ -615,10 +615,17 @@ e45igp)
     docker exec "$PEER" sh -c "ip addr add $OSPF_NH/24 dev lo 2>/dev/null || true; ip link set lo up"
     docker exec "$PEER" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pzebra.log --log-level info"
     wait_up "$PEER" "peer zebra vty" 30 "test -S /var/run/frr/zebra.vty"
+    # mgmtd is load-bearing on the peer too: without it vtysh -b never
+    # delivers frr.conf and the adjacency silently never forms
+    docker exec "$PEER" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pmgmtd.log --log-level info"
+    wait_up "$PEER" "peer mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
     docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd.log --log-level info"
     wait_up "$PEER" "peer ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
     docker exec "$PEER" sh -c "printf '%s\n' \
         'frr version 10.2' 'frr defaults traditional' 'hostname x45peer' \
+        'interface eth0' \
+        ' ip ospf hello-interval 2' \
+        ' ip ospf dead-interval 8' \
         'router ospf' ' ospf router-id 2.2.2.2' \
         ' network 172.31.255.0/24 area 0.0.0.0' \
         ' network $OSPF_NET area 0.0.0.0' \
@@ -630,6 +637,10 @@ e45igp)
     done
     ADJ=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk 'END{print $0}')
     note "adjacency: $ADJ"
+    case "$ADJ" in
+        Full*|*" "Full*) : ;;
+        *) fail "e45igp $MODE: OSPF adjacency never formed"; docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true; exit 1 ;;
+    esac
     # the BGP injector announcing via the OSPF next hop
     docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
         --cpuset-cpus "$INJ_CPUS" -v "$ANN_OSPF":/feed.announce:ro \
@@ -640,14 +651,19 @@ e45igp)
         --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
         --announce /feed.announce --limit $LIMIT --flap-every 999999 \
         --rounds 0 --hold $HOLD --steady-wait 5 --linger 600 > /var/log/flap-run.txt 2>&1"
-    OSPF_ROUTES=$(docker exec "$SUT" sh -c "ip route show proto ospf 2>/dev/null | grep -c ." || echo 0)
+    OSPF_ROUTES=$(docker exec "$SUT" sh -c "ip route show proto 187 2>/dev/null | grep -c ." || echo 0)
     for _ in $(seq 1 120); do
         c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
     done
     BGP_FULL=$(kern_count "$SUT")
-    note "baseline: ospf-routes=$OSPF_ROUTES bgp-via-ospf=$BGP_FULL (expect ~$LIMIT)"
+    note "baseline: ospf-proto187-routes=$OSPF_ROUTES bgp-via-ospf=$BGP_FULL (expect ~$LIMIT)"
+    case "$BGP_FULL" in
+        *[!0-9]*|"") fail "e45igp $MODE: count not numeric"; docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true; exit 1 ;;
+    esac
     if [ "$BGP_FULL" -lt $((LIMIT - 20)) ]; then
         fail "e45igp $MODE: BGP routes did not resolve via OSPF ($BGP_FULL)"
+        docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true
+        exit 1
     else
         pass "e45igp $MODE: BGP table resolved through OSPF nexthop ($BGP_FULL)"
     fi
