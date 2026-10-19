@@ -103,6 +103,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sut-container", required=True)
     ap.add_argument("--kernel-container")
+    # Read the kernel count from the in-netns event monitor's file
+    # (host-visible via the run dir) instead of dumping the table:
+    # state dumps hold RTNL for seconds once the table is large and
+    # starve the SUT's install path (measured: FRR zebra freezes).
+    ap.add_argument("--kernel-from-file")
     ap.add_argument("--inj-container")
     ap.add_argument("--mode", choices=["rouster", "frr"], required=True)
     ap.add_argument("--interval", type=float, default=0.3)
@@ -172,8 +177,19 @@ def main():
                 except (OSError, ValueError):
                     pass
             else:
-                kout, row["kernel_ms"] = timed_sh(
-                    kernel_c, "ip route show proto 186 2>/dev/null | grep -c .")
+                if args.kernel_from_file:
+                    try:
+                        with open(args.kernel_from_file) as kfh:
+                            line = None
+                            for line in kfh:
+                                pass
+                        kout = line.split()[1] if line else "0"
+                    except OSError:
+                        kout = ""
+                    row["kernel_ms"] = 0.0
+                else:
+                    kout, row["kernel_ms"] = timed_sh(
+                        kernel_c, "ip route show proto 186 2>/dev/null | grep -c .")
                 if kout.isdigit():
                     row["kernel_bgp"] = kout
 

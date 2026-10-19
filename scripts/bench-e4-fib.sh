@@ -49,6 +49,20 @@ INJ_CPUS=${BENCH_INJ_CPUS:-0-3}
 # Observer cpuset: MUST be disjoint from the SUT pins (the whole point
 # of the third container). Default 12-17 (the rig's spare cores).
 OBS_CPUS=${BENCH_E4_OBS_CPUS:-12-17}
+# The in-observer kernel-count loop sleep: 0.02s is the original
+# cadence; on the bare-metal host it starves FRR zebra dataplane
+# thread via RTNL dump contention (bgpd backpressured through
+# zserv, a 45s freeze at 85k routes) - raise for low-pressure
+# observation.
+TIGHT_SECS=${BENCH_E4_TIGHT_SECS:-0.02}
+# BENCH_E4_MONITOR=1 replaces the state-dump counting loop with an
+# event counter (`ip monitor route`): zero RTNL dump pressure on the
+# SUT. The dump loop holds RTNL for seconds once the table is large
+# (one `ip route show` of 85k rows ~ 3s on the bench box), which
+# starves FRR zebra's synchronous install path (bgpd freezes through
+# zserv backpressure); E1's dump-free observation shows no freeze.
+# E4 is a pure-add workload, so cumulative events == table size.
+E4_MONITOR=${BENCH_E4_MONITOR:-0}
 HOLD=${BENCH_HOLD:-90}
 # rouster (default): the F8 pipelined reconcile measured; frr: the
 # same-run FRR comparator (zebra's own install stream) — the paper's
@@ -184,20 +198,35 @@ for SIZE in $SIZES; do
             --entrypoint sleep "$IMAGE" infinity >/dev/null
         base=$(docker exec "$OBS" sh -c "ip route show proto 186 2>/dev/null | grep -c ." || echo 0)
         echo "$base" > "$RUN_DIR/kernel-baseline.txt"
-        docker exec -d -e TARGET="$NEED" -e MAXS=900 "$OBS" bash -c '
-            : > /obs/poll.csv
-            end=$(( $(date +%s) + MAXS )); stable=0
-            while :; do
-                n=$(ip route show proto 186 2>/dev/null | grep -c .)
-                echo "$EPOCHREALTIME $n" >> /obs/poll.csv
-                if [ "$n" -ge "$TARGET" ] 2>/dev/null; then
-                    stable=$((stable + 1)); [ "$stable" -ge 5 ] && break
-                else
-                    stable=0
-                fi
-                [ "$(date +%s)" -gt "$end" ] && break
-                sleep 0.02
-            done'
+        if [ "$E4_MONITOR" = 1 ]; then
+            docker exec -d -e TARGET="$NEED" -e MAXS=900 "$OBS" bash -c '
+                : > /obs/poll.csv
+                n=0
+                ip monitor route 2>/dev/null | while IFS= read -r line; do
+                    case "$line" in
+                        Deleted*) continue ;;
+                        *"proto bgp"*) n=$((n + 1)) ;;
+                        *) continue ;;
+                    esac
+                    echo "$EPOCHREALTIME $n" >> /obs/poll.csv
+                    [ "$n" -ge "$TARGET" ] && break
+                done'
+        else
+            docker exec -d -e TARGET="$NEED" -e MAXS=900 "$OBS" bash -c '
+                : > /obs/poll.csv
+                end=$(( $(date +%s) + MAXS )); stable=0
+                while :; do
+                    n=$(ip route show proto 186 2>/dev/null | grep -c .)
+                    echo "$EPOCHREALTIME $n" >> /obs/poll.csv
+                    if [ "$n" -ge "$TARGET" ] 2>/dev/null; then
+                        stable=$((stable + 1)); [ "$stable" -ge 5 ] && break
+                    else
+                        stable=0
+                    fi
+                    [ "$(date +%s)" -gt "$end" ] && break
+                    sleep $TIGHT_SECS
+                done'
+        fi
 
         # --- injector ---------------------------------------------------
         docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
@@ -230,6 +259,7 @@ EOF
         python3 scripts/bench-observe.py \
             --sut-container "$SUT" --kernel-container "$OBS" \
             --mode "$MODE" --interval "$INTERVAL" --timeout 900 \
+            $( [ "$E4_MONITOR" = 1 ] && echo "--kernel-from-file $RUN_DIR/poll.csv" ) \
             --complete-on kernel --target-count "$SIZE" --streak 3 \
             --settle 15 --proc-every 3 --stall-after 120 \
             --poll-file "$RUN_DIR/poll.csv" \

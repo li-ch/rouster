@@ -769,3 +769,46 @@ in the chat record. The "Your decision" column stays the owner's.
   bench-logs/{frr,hybrid,rouster}-20261019T*; receipts mirrored at
   away/2026-10-19/bench/dgx-e1/ (PROTOCOL.md + summaries + median
   poll.csvs + MHz samples + governor). No verdict prose.
+
+- 2026-10-19 · E2+E3+E7+E4 on the bare-metal host · host=dgx-spark-1
+  (rig/platform identical to the 2026-10-19 bare-metal E1 entry: SUT
+  cpus 5-9 single L3 cluster, injector 0-3, observers 10-14 / host,
+  rmem at kernel default, 0 overruns on every run; binaries tree
+  5fa1856) · **E2 churn (both sides ×6): Rouster reconvergence
+  0.285 s med (p95 0.387) vs FRR 0.130 s (p95 0.206) — FRR ahead
+  2.19× (darwin-vm: 1.40×); round wall 2.496 vs 2.316; storm CPU
+  speaker 1.27 vs 2.04 (Rouster fewer), core 3.17 vs 2.90; 10/10
+  rounds, 0 malformed.** · **E3 grid (both sides ×9 cells ×6 runs =
+  108 runs/side): 0 failures, exact established counts everywhere;
+  N=100 walls Rouster 103/102/127 ms (c1/c2/c4) vs FRR 116/89/87;
+  speaker CPU 0.12-0.29 vs 0.07-0.08 s — same shape as the VM grid
+  (FRR ahead on wall at N=100, CPU gap ~2×).** · **E7 long-lived
+  memory (rouster ×3, the novel-attribute shape: 10 rounds × 10k
+  per-round-unique communities + 2 full withdraw/reannounce cycles =
+  300k novel tuples): speaker RSS plateau 45.2 → 56.5 MB stable
+  (56.2/56.8/56.9); the +11.3 MB increment = one 65,536-tuple sweep
+  window at ~175 B/tuple (census) — the designed bound, quantitatively;
+  core drains to ~baseline after full withdrawal + session loss;
+  speaker post-withdrawal floor ~27 MB = allocator retention (table
+  empty).** · **E4: Rouster 100k kernel-programming wall 1.18 s med
+  (84.8k routes/s, core window CPU 1.345 s; dump-mode observer —
+  Rouster finishes before observer dump pressure grows; 10k 0.108 s,
+  1k 0.025 s). The same-run FRR comparator was NOT obtainable on this
+  host: under every in-netns kernel observation (state dumps at 0.02/
+  0.5 s + vtysh 5 s; an ip-monitor event counter) FRR's kernel-install
+  stream stalls at a table fraction (85k / 10.8k) while its RIB
+  completes (injector wire fully delivered; pfxRcd frozen with the
+  stall); the event monitor ALSO stalls rousterd (22.2k) — withdrawn.
+  E1-frr (no in-netns observer) shows no stall and a full kernel at
+  capture; E1 oracles are RIB-basis on both sides. Prime suspect: the
+  locked netlink buffer defaults (no sudo; the VM rig ran 32 MiB).
+  Incumbent kernel-basis stays on the VM CPU-derived 116.5k routes/
+  CPU-s with its standing caveat.** · harness deltas this session:
+  bench-e4 BENCH_E4_MODE=frr + BENCH_E4_TIGHT_SECS + BENCH_E4_MONITOR,
+  bench-observe --kernel-from-file, bench-flap --novel-rounds/
+  --full-cycles, e2 BENCH_E2_NOVEL/BENCH_E2_FULL_CYCLES/
+  BENCH_E2_INJ_IMAGE, e3 BENCH_E3_CPU{1,2,4}, all harnesses
+  BENCH_BIN_DIR + probe-on-bench-net (the DGX lacks docker0; custom
+  bridges work) · receipts: away/2026-10-19/bench/{dgx-e2-e7,dgx-e4}/
+  (PROTOCOL.md + summaries + diagnostic observe.csvs); raw on
+  dgx-spark-1:~/rouster-bench/target/bench-logs/. No verdict prose.

@@ -85,10 +85,14 @@ perl -e 'alarm 15; exec @ARGV' docker run --rm --network "$NET_NAME" --entrypoin
 docker rm -f $(docker ps -aq --filter name=e3x-) >/dev/null 2>&1 || true
 
 if [ "$MODE" = rouster ]; then
-    if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
-        rustup target add "$MUSL_TARGET"
+    if [ -z "${BENCH_BIN_DIR:-}" ]; then
+        if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
+            rustup target add "$MUSL_TARGET"
+        fi
+        cargo build --release --target "$MUSL_TARGET" -p rousterd --bin rousterd \
+            -p rousterctl --bin rousterctl -p bgpd --bin bgpd -p bgpd --bin mrt-replay
     fi
-                        # The fleet image (built once per session; binary baked in).
+    # The fleet image (built once per session; binary baked in).
     if ! docker image inspect "$FLEET_TAG" >/dev/null 2>&1; then
         CTX=target/bench-ctx-mrt
         rm -rf "$CTX" && mkdir -p "$CTX"

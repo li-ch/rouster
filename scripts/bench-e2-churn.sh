@@ -86,11 +86,13 @@ perl -e 'alarm 15; exec @ARGV' docker run --rm --network "$NET_NAME" --entrypoin
     || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
 docker rm -f $(docker ps -aq --filter name=e2x-) >/dev/null 2>&1 || true
 
-if [ "$MODE" = rouster ]; then
+if [ "$MODE" = rouster ] && [ -z "${BENCH_BIN_DIR:-}" ]; then
     if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
         rustup target add "$MUSL_TARGET"
     fi
-                fi
+    cargo build --release --target "$MUSL_TARGET" -p rousterd --bin rousterd \
+        -p rousterctl --bin rousterctl -p bgpd --bin bgpd -p bgpd --bin mrt-replay
+fi
 docker ps --format '{{.Names}}' > "$OUT_DIR/docker-ps-snapshot.txt" 2>/dev/null || true
 
 wait_up() { # container desc attempts cmd
