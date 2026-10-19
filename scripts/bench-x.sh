@@ -609,7 +609,8 @@ e45igp)
         docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; sleep 2
         docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep -q Full && break
     done
-    note "adjacency: $(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | tail -1 | tr -s ' ')"
+    ADJ=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk 'END{print $0}')
+    note "adjacency: $ADJ"
     # the BGP injector announcing via the OSPF next hop
     docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
         --cpuset-cpus "$INJ_CPUS" -v "$ANN_OSPF":/feed.announce:ro \
