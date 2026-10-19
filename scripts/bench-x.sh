@@ -466,10 +466,14 @@ e1seq)
         docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
         # SEQ-1: announce, withdraw every 3rd, re-announce every 3rd
         # (novel attrs), withdraw every 5th -> expected = not-5th.
-        docker exec "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+        docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
-            --announce /feed.announce --limit $LIMIT \
-            --ops A,W3,R3,W5 --gap 3" > "$OUT_DIR/seq1-$SIDE.txt" 2>&1
+            --announce /feed.announce --limit $LIMIT --linger 90 \
+            --ops A,W3,R3,W5 --gap 3 > /var/log/seq-run.txt 2>&1"
+        for _ in $(seq 1 240); do
+            docker exec "$INJ" sh -c "grep -q SEQ-ALL-DONE /var/log/seq-run.txt 2>/dev/null" && break
+            sleep 1
+        done
         sleep 3
         awk -v n="$LIMIT" 'NR <= n && NR % 5 != 0 {print $2}' "$ANN_CP" | sort > "$OUT_DIR/seq1-expected.txt"
         kern_dump "$SUT" > "$OUT_DIR/seq1-$SIDE-kernel.txt"
@@ -479,10 +483,14 @@ e1seq)
         [ "$D1" = 0 ] && pass "e1seq seq1 $SIDE: exact prefix set after interleave" \
                        || fail "e1seq seq1 $SIDE: diff-lines=$D1"
         # SEQ-2: replace all attrs (same prefixes); no dupes, count exact.
-        docker exec "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+        docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
-            --announce /feed.announce --limit $LIMIT \
-            --ops A,R1 --gap 3" > "$OUT_DIR/seq2-$SIDE.txt" 2>&1
+            --announce /feed.announce --limit $LIMIT --linger 90 \
+            --ops A,R1 --gap 3 > /var/log/seq-run.txt 2>&1"
+        for _ in $(seq 1 240); do
+            docker exec "$INJ" sh -c "grep -q SEQ-ALL-DONE /var/log/seq-run.txt 2>/dev/null" && break
+            sleep 1
+        done
         sleep 3
         kern_dump "$SUT" > "$OUT_DIR/seq2-$SIDE-kernel.txt"
         C2=$(wc -l < "$OUT_DIR/seq2-$SIDE-kernel.txt")
@@ -494,10 +502,14 @@ e1seq)
         # SEQ-3: session close + re-open over the SAME table (Rouster
         # persists per the disclosed deviation; re-add must replace,
         # never duplicate). FRR withdraws on close.
-        docker exec "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+        docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
-            --announce /feed.announce --limit $LIMIT \
-            --ops A,X,A --gap 3" > "$OUT_DIR/seq3-$SIDE.txt" 2>&1
+            --announce /feed.announce --limit $LIMIT --linger 90 \
+            --ops A,X,A --gap 3 > /var/log/seq-run.txt 2>&1"
+        for _ in $(seq 1 240); do
+            docker exec "$INJ" sh -c "grep -q SEQ-ALL-DONE /var/log/seq-run.txt 2>/dev/null" && break
+            sleep 1
+        done
         sleep 3
         kern_dump "$SUT" > "$OUT_DIR/seq3-$SIDE-kernel.txt"
         C3=$(wc -l < "$OUT_DIR/seq3-$SIDE-kernel.txt")
@@ -506,6 +518,7 @@ e1seq)
         [ "$C3" = "$LIMIT" ] && [ "$DUP3" = 0 ] \
             && pass "e1seq seq3 $SIDE: reset+re-add exact, no duplicates" \
             || fail "e1seq seq3 $SIDE: count=$C3 dups=$DUP3"
+        docker exec "$INJ" sh -c "cat /var/log/seq-run.txt" > "$OUT_DIR/seq3-$SIDE.txt" 2>/dev/null || true
         docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
         sleep 3
     done
