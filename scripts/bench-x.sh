@@ -301,7 +301,8 @@ e5recover)
         timeline_stop "$SUT" "$SIDE-$SCN" "$TL"
         python3 - "$TKILL" "$TRESTART" "$TFULL" "$TL" >> "$OUT_DIR/notes.txt" <<'PYEOF'
 import sys
-tk, tr, tf, tl = (float(x) for x in sys.argv[1:5])
+tk, tr, tf = map(float, sys.argv[1:4])
+tl = sys.argv[4]
 kc = [(float(t), int(n)) for t, n in (l.split() for l in open(tl) if l.strip())]
 during = [n for t, n in kc if tk <= t <= tr + 2]
 after_kill = [n for t, n in kc if tk <= t <= tf]
