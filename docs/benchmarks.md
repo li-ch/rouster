@@ -812,3 +812,28 @@ in the chat record. The "Your decision" column stays the owner's.
   bridges work) · receipts: away/2026-10-19/bench/{dgx-e2-e7,dgx-e4}/
   (PROTOCOL.md + summaries + diagnostic observe.csvs); raw on
   dgx-spark-1:~/rouster-bench/target/bench-logs/. No verdict prose.
+
+- 2026-10-19 · X-cells (bench-x.sh: e1diff/e4conv/e5recover/e6mixed/
+  e7overload) · host=dgx-spark-1 (rig as the 2026-10-19 bare-metal E1
+  entry) · **e1diff (100k slice): installed (prefix,nexthop) sets
+  FRR 99,997 vs Rouster 99,998; ZERO FRR-only; ONE Rouster-only = the
+  announced default 0/0 (Rouster installs, incumbent does not) —
+  99,997 pairs identical.** · **e4conv (10k, eth0 down 4 s): both
+  systems' installed count → 0 during the outage; NEITHER restores
+  within 120 s of link-up (no session event; kernel-side link-down
+  deletion invisible to desired-vs-believed reconcile on both sides —
+  shared restoration gap, symmetric).** · **e5recover (100k):
+  Rouster speaker crash = kernel routes persist (99,998 through the
+  kill window), 5.7 s total recovery; Rouster core crash = forwarding
+  intact, 8.8 s total. FRR speaker crash = immediate cleanup (kernel
+  0), 40.6 s total with config re-push + replay; FRR zebra crash =
+  stale-persist (99,997), recovery NOT completed in the 300 s window
+  (bgpd zserv reconnect sends nothing — pinned-doc finding 5;
+  harness-limited, no system claim).** · **e6mixed (rousterd + FRR
+  mgmtd+staticd + rouster bgpd, 100k): static adds exact (3/3), BGP
+  installed stable at 99,998 through static churn; static withdrawal
+  unconfirmed in the 30 s window (disclosed).** · **e7overload (30
+  rounds x 50%): storm ~60 s; drain to stable full 2.3 s both sides;
+  timelines sustain 99,997-8; core RSS 8.1 MB post-storm.** ·
+  receipts away/2026-10-19/bench/dgx-x-cells/; raw on the box under
+  target/bench-logs/x-*. No verdict prose.
