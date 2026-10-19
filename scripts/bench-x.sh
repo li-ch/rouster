@@ -288,6 +288,11 @@ e5recover)
         if [ "$SCN" = speaker ]; then
             if [ "$SIDE" = frr ]; then
                 docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
+                for _ in $(seq 1 15); do
+                    docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+                    sleep 2
+                    docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP" && break
+                done
             else
                 docker exec -d "$SUT" sh -c "rouster-bgpd --config /etc/rouster-bgp.conf > /var/log/rouster-bgpd.log 2>&1"
             fi
@@ -412,18 +417,27 @@ e7overload)
         docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
         timeline "$SUT" "$SIDE" 1
         T0=$(date +%s.%N)
-        docker exec "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
+        docker exec -d "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
             --announce /feed.announce --limit $LIMIT --flap-every 2 \
             --rounds $ROUNDS --hold $HOLD --steady-wait 8 --round-gap 0.5 \
-            --linger 300" > "$OUT_DIR/flap-$SIDE.txt" 2>&1
+            --linger 600 > /var/log/flap-run.txt 2>&1"
+        # storm end = the tool's ROUNDS-DONE marker (the process keeps
+        # the session alive through the linger; measuring drain from
+        # process exit would measure the post-close withdrawal)
+        for _ in $(seq 1 600); do
+            docker exec "$INJ" sh -c "grep -q 'FLAP-ROUNDS-DONE' /var/log/flap-run.txt 2>/dev/null" && break
+            sleep 1
+        done
         T1=$(date +%s.%N)
-        # drain: wait for the count to stabilize at full
+        # drain: stabilize at full WITH the session still lingering
         for _ in $(seq 1 180); do
             c1=$(kern_count "$SUT"); sleep 2; c2=$(kern_count "$SUT")
             [ "$c1" = "$c2" ] && [ "$c1" -ge $((LIMIT - 20)) ] 2>/dev/null && break
         done
         T2=$(date +%s.%N)
+        docker exec "$INJ" sh -c "cat /var/log/flap-run.txt" > "$OUT_DIR/flap-$SIDE.txt" 2>/dev/null || true
+        docker rm -f "$INJ" >/dev/null 2>&1 || true
         TL=$OUT_DIR/tl-$SIDE.csv
         timeline_stop "$SUT" "$SIDE" "$TL"
         RSS=$(docker exec "$SUT" sh -c "awk '/VmRSS/{print \$2}' /proc/\$(pidof zebra rousterd | awk '{print \$1}')/status" 2>/dev/null || echo "?")
