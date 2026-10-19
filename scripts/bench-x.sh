@@ -537,8 +537,9 @@ e45igp)
     OSPF_NET=10.99.0.0/24
     OSPF_NH=10.99.0.1
     # announce with next hops rewritten to the OSPF-learned address
-    sed "s/next-hop [0-9.]*/next-hop $OSPF_NH/" "$ANN_CP" | head -$LIMIT \
-        > "$OUT_DIR/announce-ospf.txt"
+    awk -v n="$LIMIT" -v nh="$OSPF_NH" \
+        'NR <= n && /next-hop/ {sub(/next-hop [0-9.]*/, "next-hop " nh)} NR <= n' \
+        "$ANN_CP" > "$OUT_DIR/announce-ospf.txt"
     ANN_OSPF=$(cd "$OUT_DIR" && pwd)/announce-ospf.txt
     SUT=x45-sut-$TS; INJ=x45-inj-$TS; PEER=x45-peer-$TS
     trap 'docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true' EXIT
