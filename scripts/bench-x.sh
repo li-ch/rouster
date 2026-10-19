@@ -477,8 +477,11 @@ e1seq)
         sleep 3
         awk -v n="$LIMIT" 'NR <= n && NR % 5 != 0 {print $2}' "$ANN_CP" | sort > "$OUT_DIR/seq1-expected.txt"
         kern_dump "$SUT" > "$OUT_DIR/seq1-$SIDE-kernel.txt"
-        C1=$(wc -l < "$OUT_DIR/seq1-$SIDE-kernel.txt")
-        D1=$(comm -3 "$OUT_DIR/seq1-expected.txt" "$OUT_DIR/seq1-$SIDE-kernel.txt" | grep -c . || true)
+        awk '{print $1}' "$OUT_DIR/seq1-$SIDE-kernel.txt" | sort > "$OUT_DIR/seq1-$SIDE-prefixes.txt"
+        C1=$(wc -l < "$OUT_DIR/seq1-$SIDE-prefixes.txt")
+        D1=$(comm -3 "$OUT_DIR/seq1-expected.txt" "$OUT_DIR/seq1-$SIDE-prefixes.txt" | grep -c . || true)
+        docker exec "$INJ" sh -c "pkill -f bench-seq 2>/dev/null" >/dev/null 2>&1 || true
+        sleep 2
         note "seq1 side=$SIDE count=$C1 expected=$(( $(wc -l < "$OUT_DIR/seq1-expected.txt") )) diff-lines=$D1"
         [ "$D1" = 0 ] && pass "e1seq seq1 $SIDE: exact prefix set after interleave" \
                        || fail "e1seq seq1 $SIDE: diff-lines=$D1"
@@ -495,6 +498,8 @@ e1seq)
         kern_dump "$SUT" > "$OUT_DIR/seq2-$SIDE-kernel.txt"
         C2=$(wc -l < "$OUT_DIR/seq2-$SIDE-kernel.txt")
         DUP2=$(awk '{print $1}' "$OUT_DIR/seq2-$SIDE-kernel.txt" | uniq -d | wc -l)
+        docker exec "$INJ" sh -c "pkill -f bench-seq 2>/dev/null" >/dev/null 2>&1 || true
+        sleep 2
         note "seq2 side=$SIDE count=$C2 duplicate-prefixes=$DUP2"
         [ "$C2" = "$LIMIT" ] && [ "$DUP2" = 0 ] \
             && pass "e1seq seq2 $SIDE: replacement exact, no duplicates" \
@@ -547,11 +552,11 @@ e45igp)
     new_sut "$SUT"
     start_rousterd "$SUT"
     if [ "$MODE" = frr ]; then
-        docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$LOG/mgmtd.log --log-level info"
+        docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/mgmtd.log --log-level info"
         wait_up "$SUT" "mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
-        docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$LOG/ospfd.log --log-level info"
+        docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
         wait_up "$SUT" "ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
-        docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$LOG/bgpd.log --log-level info"
+        docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
         wait_up "$SUT" "bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
         docker exec "$SUT" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
@@ -570,9 +575,9 @@ e45igp)
         done
     else
         if [ "$MODE" = mixed ]; then
-            docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$LOG/mgmtd.log --log-level info"
+            docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/mgmtd.log --log-level info"
             wait_up "$SUT" "mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
-            docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$LOG/bgpd.log --log-level info"
+            docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
             wait_up "$SUT" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
             docker exec "$SUT" sh -c "printf '%s\n' \
                 'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
@@ -608,9 +613,9 @@ e45igp)
         --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     docker exec "$PEER" sh -c "ip addr add $OSPF_NH/24 dev lo 2>/dev/null || true; ip link set lo up"
-    docker exec "$PEER" sh -c "/usr/lib/frr/zebra -d --log file:$LOG/pzebra.log --log-level info"
+    docker exec "$PEER" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pzebra.log --log-level info"
     wait_up "$PEER" "peer zebra vty" 30 "test -S /var/run/frr/zebra.vty"
-    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$LOG/pospfd.log --log-level info"
+    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd.log --log-level info"
     wait_up "$PEER" "peer ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
     docker exec "$PEER" sh -c "printf '%s\n' \
         'frr version 10.2' 'frr defaults traditional' 'hostname x45peer' \
@@ -656,7 +661,7 @@ e45igp)
     done
     TW=$(date +%s.%N)
     # restore the peer's ospfd -> adjacency re-forms -> routes return
-    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$LOG/pospfd2.log --log-level info"
+    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd2.log --log-level info"
     for _ in $(seq 1 15); do
         docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; sleep 2
         docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep -q Full && break
