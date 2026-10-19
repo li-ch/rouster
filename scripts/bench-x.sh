@@ -130,12 +130,24 @@ INJ_ARGS_FOR() { # limit
 kern_count() { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null | grep -c ." || echo 0; }
 kern_dump()  { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null" \
     | awk '{nh="-"; for(i=2;i<=NF;i++){if($i=="via")nh=$(i+1)}; print $1, nh}' | sort; }
-timeline() { # sut out.csv interval target  — timestamped kernel counts
-    ( while :; do
-        echo "$(date +%s.%N) $(kern_count "$1")" >> "$2"
-        sleep "$3"
-      done ) &
-    echo $!
+# The timeline runs INSIDE the SUT as a detached process: host-side
+# concurrent docker-exec streams stalled the harness on the bench box
+# (both loops froze in pipe_read); one in-container loop, copied out
+# at capture, has no host-side contention at all.
+timeline() { # sut name interval — starts the in-SUT counter
+    docker exec -d "$1" sh -c '
+        : > /tl-'"$2"'.csv
+        end=$(( $(date +%s) + 1800 ))
+        while :; do
+            echo "$(date +%s.%N) $(ip route show proto 186 2>/dev/null | grep -c .)" >> /tl-'"$2"'.csv
+            [ "$(date +%s)" -gt "$end" ] && break
+            sleep '"$3"'
+        done'
+}
+timeline_stop() { # sut name out.csv
+    docker exec "$1" sh -c "pkill -f tl- 2>/dev/null" >/dev/null 2>&1 || true
+    sleep 1
+    docker cp "$1:/tl-$2.csv" "$3" 2>/dev/null || true
 }
 note() { echo "X-NOTE $*" | tee -a "$OUT_DIR/notes.txt"; }
 pass() { echo "X-PASS $*" | tee -a "$OUT_DIR/notes.txt"; }
@@ -195,8 +207,7 @@ e4conv)
             c=$(kern_count "$SUT"); [ "$c" -ge "$NEED" ] 2>/dev/null && break; sleep 1
         done
         sleep 3
-        TL=$OUT_DIR/timeline-$SIDE.csv
-        POLL=$(timeline "$SUT" "$TL" 0.3)
+        timeline "$SUT" "$SIDE" 0.3
         note "side=$SIDE steady-kernel=$(kern_count "$SUT") — flapping eth0 down"
         T0=$(date +%s.%N)
         docker exec "$SUT" ip link set eth0 down
@@ -208,7 +219,8 @@ e4conv)
             c=$(kern_count "$SUT"; ); [ "${c:-0}" -ge "$NEED" ] 2>/dev/null && break; sleep 0.5
         done
         T2=$(date +%s.%N)
-        kill "$POLL" 2>/dev/null || true
+        TL=$OUT_DIR/timeline-$SIDE.csv
+        timeline_stop "$SUT" "$SIDE" "$TL"
         python3 - "$T0" "$T1" "$T2" "$TL" >> "$OUT_DIR/notes.txt" <<'PYEOF'
 import sys
 t0, t1, t2, tl = sys.argv[1:5]
@@ -250,8 +262,7 @@ e5recover)
             c=$(kern_count "$SUT"); [ "$c" -ge "$NEED" ] 2>/dev/null && break; sleep 1
         done
         sleep 3
-        TL=$OUT_DIR/tl-$SIDE-$SCN.csv
-        POLL=$(timeline "$SUT" "$TL" 1)
+        timeline "$SUT" "$SIDE-$SCN" 1
         TKILL=$(date +%s.%N)
         if [ "$SCN" = speaker ]; then
             docker exec "$SUT" sh -c "kill -9 \$(pidof bgpd rouster-bgpd 2>/dev/null | awk '{print \$NF}') 2>/dev/null || kill -9 \$(pidof bgpd)"
@@ -286,7 +297,8 @@ e5recover)
             c=$(kern_count "$SUT"); [ "$c" -ge "$NEED" ] 2>/dev/null && break; sleep 1
         done
         TFULL=$(date +%s.%N)
-        kill "$POLL" 2>/dev/null || true
+        TL=$OUT_DIR/tl-$SIDE-$SCN.csv
+        timeline_stop "$SUT" "$SIDE-$SCN" "$TL"
         python3 - "$TKILL" "$TRESTART" "$TFULL" "$TL" >> "$OUT_DIR/notes.txt" <<'PYEOF'
 import sys
 tk, tr, tf, tl = (float(x) for x in sys.argv[1:5])
@@ -387,8 +399,7 @@ e7overload)
             --entrypoint sleep bench-exabgp:local infinity
         docker cp scripts/bench-flap.py "$INJ:/bench-flap.py"
         docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
-        TL=$OUT_DIR/tl-$SIDE.csv
-        POLL=$(timeline "$SUT" "$TL" 1)
+        timeline "$SUT" "$SIDE" 1
         T0=$(date +%s.%N)
         docker exec "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
@@ -402,7 +413,8 @@ e7overload)
             [ "$c1" = "$c2" ] && [ "$c1" -ge $((LIMIT - 20)) ] 2>/dev/null && break
         done
         T2=$(date +%s.%N)
-        kill "$POLL" 2>/dev/null || true
+        TL=$OUT_DIR/tl-$SIDE.csv
+        timeline_stop "$SUT" "$SIDE" "$TL"
         RSS=$(docker exec "$SUT" sh -c "awk '/VmRSS/{print \$2}' /proc/\$(pidof zebra rousterd | awk '{print \$1}')/status" 2>/dev/null || echo "?")
         note "side=$SIDE storm_wall_s=$(python3 -c "print(f'{$T1-$T0:.1f}')") drain_s=$(python3 -c "print(f'{$T2-$T1:.1f}')") final=$(kern_count "$SUT") core_rss_kb=$RSS"
         docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
