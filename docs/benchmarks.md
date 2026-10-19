@@ -837,3 +837,25 @@ in the chat record. The "Your decision" column stays the owner's.
   timelines sustain 99,997-8; core RSS 8.1 MB post-storm.** ·
   receipts away/2026-10-19/bench/dgx-x-cells/; raw on the box under
   target/bench-logs/x-*. No verdict prose.
+
+- 2026-10-19/20 · X round-2 cells (bench-seq.py + bench-x e1seq/
+  e5cycles/e7overload-sweep/e45igp) · host=dgx-spark-1 (rig as the
+  2026-10-19 bare-metal E1 entry) · **e1seq (10k, both systems,
+  kernel-dump oracles): SEQ-1 interleave — Rouster installed set
+  EXACTLY the computed 8,000-prefix expected set; FRR 7,999 with the
+  one residual = the known default-route delta. SEQ-2 replacement —
+  Rouster 10,000/10,000, ZERO duplicate prefixes; FRR 9,999, zero
+  dups. SEQ-3 session-reset+re-add — Rouster 10,000/10,000 exact,
+  zero dups (re-announce over the persisted table REPLACES); FRR
+  9,999, zero dups.** · **e5cycles (mid-replay kill + reconnect ×3,
+  both systems): 6/6 cells recover to the exact full count with zero
+  duplicates.** · **e7 sweep (10% and 25% subsets, 10 rounds):
+  sustained 99,997-8 through/after; drain 2.3 s both systems both
+  shapes (subset-insensitive at these sizes).** · e45igp (IGP-under-
+  BGP + mixed): CLOSED attempted-with-finding — topology proven by
+  two manual replications (OSPF p2p adjacency FULL ~20 s both shapes;
+  native side installs the OSPF-learned /32 into the core), automated
+  cell fails at the peer's config delivery (daemons alive, config
+  never applied; earlier "passes" were comparison-error artifacts,
+  now guarded); E4/E6 IGP cells stay placeholders · receipts:
+  away/2026-10-19/bench/dgx-x2/; raw on the box. No verdict prose.
