@@ -724,3 +724,48 @@ in the chat record. The "Your decision" column stays the owner's.
 - When a result lands, the campaign fact sheet gains a measured
   section (the "no `fast` without benchmarks" rule in
   FACTS §8b/plan §1 lifts for exactly the measured dimensions).
+
+- 2026-10-19 · E1 matrix on BARE METAL (the plan §11.1 controlled
+  host; the rewrite's E2-configB close-out) · host=dgx-spark-1
+  (NVIDIA DGX Spark, GB10, 20 aarch64 cores in two L3 clusters:
+  cpus 5-9 @3900MHz and 15-19 @3978-4004MHz are the fast pairs;
+  Ubuntu 24.04.3, docker 28.3.3; governor performance, SUSTAINED
+  2964 MHz sampled on the SUT cores under load vs the 3.9-4.0 rating;
+  no sudo → netlink rcvbuf at kernel default 212992, carried by the
+  SUT-side F9 hardening with ZERO rcvbuf overruns and zero
+  resync/ack-timeout lines in every rousterd log) · rig: bench-net
+  172.31.255.0/24, SUT .20 on ONE L3 cluster (cpus 5-9), injector
+  .10 on 0-3, host-side observer; binaries = the same
+  aarch64-musl static builds as the 2026-10-19 hybrid receipt (tree
+  5fa1856; BENCH_BIN_DIR prebuilts) · feed: the pinned dump (sha256
+  above), full 1,126,490, same surgery · 6 runs per leg (1 warmup +
+  5 measured) · **single-cluster matrix: A (frr/frr): wall 30.556 s
+  med (p95 30.60), bgpd CPU 13.57, zebra CPU 11.48, speaker
+  (1,022,132−10,476 KiB) = 919.5 B/pfx, core (592,748−7,300) =
+  532.8 B/pfx. B (frr bgpd+mgmtd on rousterd): wall 30.515, bgpd
+  13.30, rousterd 16.96, speaker 919.3, core 229.4. D
+  (rouster/rousterd): wall 13.522 (p95 13.55), bgpd 9.37, rousterd
+  17.56, speaker (501,348−1,708) = 453.1 B/pfx, core (254,792−2,228)
+  = 229.4. All runs reach the full table (A basis 1,126,484 zebra
+  summary; B/D 1,126,481 = feed−9), 0 overruns.** · **D/A wall =
+  2.26× on this host (darwin-vm: 3.79×). B ≡ A on wall on BOTH
+  platforms (30.515 vs 30.556 here; 31.07 vs 30.36 there) while B's
+  core memory = D's core memory (229.4 vs 532.8 = 2.32×) — the
+  stage attribution REPLICATES. Memory reproduces cross-platform to
+  ≤0.1% (919/533/229) except D's speaker (453 vs 420-428 on the VM,
+  +6-8%, disclosed).** · split-L3 finding (first pass, SUT on
+  5-9,15-19): D wall 17.513 / rousterd CPU 25.84 / bgpd 13.46; A
+  30.533/13.10/11.18; B 30.539 — collapsing the SUT to one cluster
+  cut D's wall 23% and rousterd's CPU 32% while FRR moved ~nothing:
+  the async daemons are placement-sensitive on this host, the C
+  daemons are not. Residual D-core CPU factor vs the VM (17.56 vs
+  6.95 = 2.5×): ~1.35× effective clock (measured) + ~1.9× named
+  candidates (cluster L3/TLB geometry, allocator) — disclosed, not
+  decomposed further. CPU-parity note: A pair 25.05 CPU-s vs D 26.93
+  here (the wall advantage is overlap, while on the VM D also spent
+  less CPU — both directions published) · harness:
+  scripts/bench-e1-ingest.sh (BENCH_BIN_DIR/BENCH_SUT_CPUS/
+  BENCH_SUT_RMEM=0) · raw: dgx-spark-1:~/rouster-bench/target/
+  bench-logs/{frr,hybrid,rouster}-20261019T*; receipts mirrored at
+  away/2026-10-19/bench/dgx-e1/ (PROTOCOL.md + summaries + median
+  poll.csvs + MHz samples + governor). No verdict prose.
