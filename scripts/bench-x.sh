@@ -644,7 +644,15 @@ e45igp)
     note "adjacency: $ADJ"
     case "$ADJ" in
         Full*|*" "Full*) : ;;
-        *) fail "e45igp $MODE: OSPF adjacency never formed"; docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true; exit 1 ;;
+        *)
+            note "peer-daemons: $(docker exec "$PEER" sh -c "pidof zebra mgmtd ospfd" 2>/dev/null | tr '\n' ' ')"
+            note "peer-ospf-if: $(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf interface eth0'" 2>/dev/null | awk 'END{print $0}')"
+            docker exec "$PEER" sh -c "cat /tmp/frrrun/pospfd.log 2>/dev/null" > "$OUT_DIR/peer-ospfd.log" 2>/dev/null || true
+            docker exec "$SUT" sh -c "cat /var/log/rouster-ospfd.log 2>/dev/null" > "$OUT_DIR/sut-ospfd.log" 2>/dev/null || true
+            docker exec "$SUT" sh -c "cat /tmp/frrrun/ospfd.log 2>/dev/null" >> "$OUT_DIR/sut-ospfd.log" 2>/dev/null || true
+            fail "e45igp $MODE: OSPF adjacency never formed"
+            docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true
+            exit 1 ;;
     esac
     # the BGP injector announcing via the OSPF next hop
     docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
