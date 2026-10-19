@@ -50,6 +50,10 @@ INJ_CPUS=${BENCH_INJ_CPUS:-0-3}
 # of the third container). Default 12-17 (the rig's spare cores).
 OBS_CPUS=${BENCH_E4_OBS_CPUS:-12-17}
 HOLD=${BENCH_HOLD:-90}
+# rouster (default): the F8 pipelined reconcile measured; frr: the
+# same-run FRR comparator (zebra's own install stream) — the paper's
+# cross-run-derivation caveat retires when this leg runs.
+MODE=${BENCH_E4_MODE:-rouster}
 SUT_RMEM=${BENCH_SUT_RMEM:-33554432}
 SUT_SYSCTLS=""
 if [ "$SUT_RMEM" != 0 ]; then
@@ -62,25 +66,24 @@ case "$(uname -m)" in
     *)             echo "unknown arch $(uname -m)" >&2; exit 1 ;;
 esac
 
+# Prebuilt static binaries (BENCH_BIN_DIR) let the harness run on
+# hosts without a Rust toolchain (e.g. the bare-metal bench boxes);
+# unset, the paths reproduce the in-tree cargo layout.
+BIN_DIR=${BENCH_BIN_DIR:-target/$MUSL_TARGET/release}
+
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR="target/bench-logs/e4-$TS"
 mkdir -p "$OUT_DIR"
-echo "bench-e4-fib: feed=$FEED_MRT sizes=[$SIZES] runs=$RUNS out=$OUT_DIR"
+echo "bench-e4-fib: mode=$MODE feed=$FEED_MRT sizes=[$SIZES] runs=$RUNS out=$OUT_DIR"
 
-perl -e 'alarm 15; exec @ARGV' docker run --rm --entrypoint true "$IMAGE" \
-    || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
 docker network inspect "$NET_NAME" >/dev/null 2>&1 \
     || docker network create --subnet "$NET_SUBNET" "$NET_NAME"
+# Probe on the run network: some hosts lack the default docker0
+# while daemon-created custom bridges work (the bench boxes).
+perl -e 'alarm 15; exec @ARGV' docker run --rm --network "$NET_NAME" --entrypoint true "$IMAGE" \
+    || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
 docker rm -f $(docker ps -aq --filter name=e4x-) >/dev/null 2>&1 || true
 
-if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
-    rustup target add "$MUSL_TARGET"
-fi
-echo "==> building rousterd + bgpd + mrt-replay ($MUSL_TARGET, release)"
-cargo build --release --target "$MUSL_TARGET" -p rousterd --bin rousterd
-cargo build --release --target "$MUSL_TARGET" -p rousterctl --bin rousterctl
-cargo build --release --target "$MUSL_TARGET" -p bgpd --bin bgpd
-cargo build --release --target "$MUSL_TARGET" -p bgpd --bin mrt-replay
 
 docker ps --format '{{.Names}}' > "$OUT_DIR/docker-ps-snapshot.txt" 2>/dev/null || true
 
@@ -114,10 +117,40 @@ for SIZE in $SIZES; do
             --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
             --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
             --entrypoint sleep "$IMAGE" infinity >/dev/null
+        if [ "$MODE" = frr ]; then
+            # The FRR comparator: zebra's own install stream, same rig,
+            # same observer, same counting basis (proto 186).
+            docker exec "$SUT" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
+            docker exec "$SUT" sh -c "/usr/lib/frr/zebra -d --log file:/tmp/zebra.log --log-level info"
+            for _ in $(seq 1 30); do docker exec "$SUT" sh -c "test -S /var/run/frr/zebra.vty" >/dev/null 2>&1 && break; sleep 1; done
+            docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:/tmp/mgmtd.log --log-level info"
+            docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:/tmp/bgpd.log --log-level info"
+            for _ in $(seq 1 30); do docker exec "$SUT" sh -c "test -S /var/run/frr/bgpd.vty" >/dev/null 2>&1 && break; sleep 1; done
+            docker exec "$SUT" sh -c "printf '%s\n' \
+                'frr version 10.2' \
+                'frr defaults traditional' \
+                'hostname bench-e4-frr' \
+                'router bgp $SUT_AS' \
+                ' no bgp network import-check' \
+                ' no bgp ebgp-requires-policy' \
+                ' neighbor $INJ_IP remote-as $INJ_AS' \
+                ' neighbor $INJ_IP timers 30 $HOLD' \
+                ' address-family ipv4 unicast' \
+                '  exit-address-family' \
+                'line vty' \
+                > /etc/frr/frr.conf"
+            for _ in $(seq 1 10); do
+                docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+                sleep 2
+                docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP" && break
+            done
+            docker exec "$SUT" sh -c "grep -qi '00B3' /proc/net/tcp"
+        fi
+        if [ "$MODE" != frr ]; then
         for b in rousterd rousterctl; do
-            docker cp "target/$MUSL_TARGET/release/$b" "$SUT:/usr/local/bin/$b"
+            docker cp "$BIN_DIR/$b" "$SUT:/usr/local/bin/$b"
         done
-        docker cp "target/$MUSL_TARGET/release/bgpd" "$SUT:/usr/local/bin/rouster-bgpd"
+        docker cp "$BIN_DIR/bgpd" "$SUT:/usr/local/bin/rouster-bgpd"
         docker exec "$SUT" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
         docker exec "$SUT" sh -c "printf '%s\n' \
             'zapi socket /run/rouster/zserv.api' > /etc/rouster.conf"
@@ -134,6 +167,7 @@ for SIZE in $SIZES; do
         docker exec "$SUT" sh -c "rouster-bgpd --validate-config /etc/rouster-bgp.conf"
         docker exec -d "$SUT" sh -c "rouster-bgpd --config /etc/rouster-bgp.conf > /var/log/rouster-bgpd.log 2>&1"
         wait_up "$SUT" "rouster bgpd listening" 15 "grep -q 'bgpd: listening' /var/log/rouster-bgpd.log"
+        fi
 
         # --- the third-container observer (shares SUT netns, own pins).
         # The kernel-count loop runs INSIDE this container (a tight
@@ -170,7 +204,7 @@ for SIZE in $SIZES; do
             --cpuset-cpus "$INJ_CPUS" \
             -v "$FEED_MRT":/feed.mrt:ro \
             --entrypoint sleep alpine:3.20 infinity >/dev/null
-        docker cp "target/$MUSL_TARGET/release/mrt-replay" "$INJ:/usr/local/bin/mrt-replay"
+        docker cp "$BIN_DIR/mrt-replay" "$INJ:/usr/local/bin/mrt-replay"
         INJ_ARGS="--peer $SUT_IP:179 --local-addr $INJ_IP --local-as $INJ_AS \
             --peer-as $SUT_AS --router-id $INJ_IP --mrt /feed.mrt \
             --prepend-as $INJ_AS --next-hop $INJ_IP --limit $SIZE \
@@ -195,7 +229,7 @@ EOF
         HOST_MINUS_VM=$(sed -n 's/.*host_minus_vm=\([0-9.-]*\).*/\1/p' "$RUN_DIR/clock-offset.txt")
         python3 scripts/bench-observe.py \
             --sut-container "$SUT" --kernel-container "$OBS" \
-            --mode rouster --interval "$INTERVAL" --timeout 900 \
+            --mode "$MODE" --interval "$INTERVAL" --timeout 900 \
             --complete-on kernel --target-count "$SIZE" --streak 3 \
             --settle 15 --proc-every 3 --stall-after 120 \
             --poll-file "$RUN_DIR/poll.csv" \
@@ -210,6 +244,11 @@ EOF
 
         # --- capture ----------------------------------------------------
         docker cp "$INJ:/var/log/replay.txt" "$RUN_DIR/injector.txt" 2>/dev/null || true
+        if [ "$MODE" = frr ]; then
+            for fl in bgpd zebra mgmtd; do
+                docker cp "$SUT:/tmp/$fl.log" "$RUN_DIR/$fl.log" 2>/dev/null || true
+            done
+        fi
         docker cp "$SUT:/var/log/rouster-bgpd.log" "$RUN_DIR/sut-bgpd.log" 2>/dev/null || true
         docker cp "$SUT:/var/log/rousterd.log" "$RUN_DIR/rousterd.log" 2>/dev/null || true
         docker cp "$SUT:/run/rouster/rousterd.status" "$RUN_DIR/final-status.txt" 2>/dev/null || true

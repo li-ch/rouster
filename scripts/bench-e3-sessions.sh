@@ -63,6 +63,11 @@ case "$(uname -m)" in
     *)             echo "unknown arch $(uname -m)" >&2; exit 1 ;;
 esac
 
+# Prebuilt static binaries (BENCH_BIN_DIR) let the harness run on
+# hosts without a Rust toolchain (e.g. the bare-metal bench boxes);
+# unset, the paths reproduce the in-tree cargo layout.
+BIN_DIR=${BENCH_BIN_DIR:-target/$MUSL_TARGET/release}
+
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR="target/bench-logs/e3-$TS"
 mkdir -p "$OUT_DIR"
@@ -71,26 +76,23 @@ echo "  table/session=$TABLE runs=$RUNS out=$OUT_DIR diagnose=$DIAGNOSE"
 [ "$DIAGNOSE" = 1 ] && [ "$MODE" = rouster ] \
     && echo "diagnose=BGPD_EST_PROFILE=1 (SUT)" >> "$OUT_DIR/PROTOCOL.txt"
 
-perl -e 'alarm 15; exec @ARGV' docker run --rm --entrypoint true "$IMAGE" \
-    || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
 docker network inspect "$NET_NAME" >/dev/null 2>&1 \
     || docker network create --subnet "$NET_SUBNET" "$NET_NAME"
+# Probe on the run network: some hosts lack the default docker0
+# while daemon-created custom bridges work (the bench boxes).
+perl -e 'alarm 15; exec @ARGV' docker run --rm --network "$NET_NAME" --entrypoint true "$IMAGE" \
+    || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
 docker rm -f $(docker ps -aq --filter name=e3x-) >/dev/null 2>&1 || true
 
 if [ "$MODE" = rouster ]; then
     if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
         rustup target add "$MUSL_TARGET"
     fi
-    echo "==> building bgpd + mrt-replay ($MUSL_TARGET, release)"
-    cargo build --release --target "$MUSL_TARGET" -p rousterd --bin rousterd
-    cargo build --release --target "$MUSL_TARGET" -p rousterctl --bin rousterctl
-    cargo build --release --target "$MUSL_TARGET" -p bgpd --bin bgpd
-    cargo build --release --target "$MUSL_TARGET" -p bgpd --bin mrt-replay
-    # The fleet image (built once per session; binary baked in).
+                        # The fleet image (built once per session; binary baked in).
     if ! docker image inspect "$FLEET_TAG" >/dev/null 2>&1; then
         CTX=target/bench-ctx-mrt
         rm -rf "$CTX" && mkdir -p "$CTX"
-        cp "target/$MUSL_TARGET/release/mrt-replay" "$CTX/mrt-replay"
+        cp "$BIN_DIR/mrt-replay" "$CTX/mrt-replay"
         docker build -f docker/bench/Dockerfile.mrt-replay "$CTX" -t "$FLEET_TAG"
     fi
 fi
@@ -129,9 +131,9 @@ write_configs() { # n out-rouster out-frr
 for N in $NS; do
     for CORES in $CORESES; do
         case "$CORES" in
-            1) SUT_CPUS=4 ;;
-            2) SUT_CPUS=4-5 ;;
-            4) SUT_CPUS=4-7 ;;
+            1) SUT_CPUS=${BENCH_E3_CPU1:-4} ;;
+            2) SUT_CPUS=${BENCH_E3_CPU2:-4-5} ;;
+            4) SUT_CPUS=${BENCH_E3_CPU4:-4-7} ;;
             *) SUT_CPUS=${BENCH_SUT_CPUS:-4-11} ;;
         esac
         CELL_DIR="$OUT_DIR/$MODE/n$N-c$CORES"
@@ -179,9 +181,9 @@ for N in $NS; do
                     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
                     --entrypoint sleep "$IMAGE" infinity >/dev/null
                 for b in rousterd rousterctl; do
-                    docker cp "target/$MUSL_TARGET/release/$b" "$SUT:/usr/local/bin/$b"
+                    docker cp "$BIN_DIR/$b" "$SUT:/usr/local/bin/$b"
                 done
-                docker cp "target/$MUSL_TARGET/release/bgpd" "$SUT:/usr/local/bin/rouster-bgpd"
+                docker cp "$BIN_DIR/bgpd" "$SUT:/usr/local/bin/rouster-bgpd"
                 docker exec "$SUT" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
                 docker exec "$SUT" sh -c "printf '%s\n' \
                     'zapi socket /run/rouster/zserv.api' > /etc/rouster.conf"

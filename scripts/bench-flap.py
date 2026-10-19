@@ -26,6 +26,7 @@ The summarizer joins these marks against bench-observe.py's count
 series to compute per-round reconvergence walls.
 """
 import argparse
+import copy
 import re
 import socket
 import sys
@@ -92,6 +93,14 @@ class Attrs:
         self.origin = {"igp": 0, "egp": 1, "incomplete": 2}[origin]
         self.communities = m.group(6).split() if m.group(6) else []
         self.large = m.group(7).split() if m.group(7) else []
+
+    def with_community(self, asn, val):
+        """A copy of these attrs plus one community (asn, val) — the
+        E7 novelty lever: each round/cycle mints tuples never seen
+        before, exercising the intern stores' sweep-and-plateau path."""
+        clone = copy.copy(self)
+        clone.communities = list(self.communities) + [f"{asn}:{val}"]
+        return clone
 
     def key(self):
         return (self.next_hop, self.med, tuple(self.as_path), self.origin,
@@ -174,6 +183,14 @@ def main():
     ap.add_argument("--steady-wait", type=float, default=15.0)
     ap.add_argument("--round-gap", type=float, default=2.0)
     ap.add_argument("--linger", type=float, default=20.0)
+    # E7 long-lived-memory shape: --novel-rounds makes every round's
+    # re-announcement carry a per-round unique community (novel intern
+    # tuples each round); --full-cycles appends that many full-table
+    # withdraw/re-announce cycles (novel tuples each cycle when
+    # --novel-rounds is set).
+    ap.add_argument("--novel-rounds", action="store_true")
+    ap.add_argument("--novel-comm-as", type=int, default=65412)
+    ap.add_argument("--full-cycles", type=int, default=0)
     args = ap.parse_args()
 
     entries = []  # (prefix_str, Attrs)
@@ -304,13 +321,42 @@ def main():
         log(f"FLAP-ROUND-{r}-WITHDRAW-DONE msgs={wmsgs}")
         time.sleep(args.round_gap)
         log(f"FLAP-ROUND-{r}-ANNOUNCE-START")
-        routes, msgs = send_grouped(subset, "announce")
-        log(f"FLAP-ROUND-{r}-ANNOUNCE-DONE routes={routes} msgs={msgs}")
+        if args.novel_rounds:
+            novel = [(p, a.with_community(args.novel_comm_as, r))
+                     for p, a in subset]
+        else:
+            novel = subset
+        routes, msgs = send_grouped(novel, "announce")
+        log(f"FLAP-ROUND-{r}-ANNOUNCE-DONE routes={routes} msgs={msgs}"
+            f" novel={args.novel_rounds}")
         time.sleep(args.round_gap)
         if not running:
             print(f"FLAP-ABORT round={r} session lost", file=sys.stderr, flush=True)
             return 1
     log("FLAP-ROUNDS-DONE")
+
+    for c in range(1, args.full_cycles + 1):
+        log(f"FLAP-CYCLE-{c}-FULL-WITHDRAW-START prefixes={len(entries)}")
+        wmsgs = send_withdraws([p for p, _ in entries])
+        log(f"FLAP-CYCLE-{c}-FULL-WITHDRAW-DONE msgs={wmsgs}")
+        time.sleep(args.round_gap)
+        if args.novel_rounds:
+            cyc = [(p, a.with_community(args.novel_comm_as, 10000 + c))
+                   for p, a in entries]
+        else:
+            cyc = entries
+        routes, msgs = send_grouped(cyc, "announce")
+        send(bgp_frame(2, b"\x00\x00\x00\x00"))
+        log(f"FLAP-CYCLE-{c}-REANNOUNCED routes={routes} msgs={msgs + 1}")
+        time.sleep(args.round_gap)
+        if not running:
+            print(f"FLAP-ABORT cycle={c} session lost", file=sys.stderr, flush=True)
+            return 1
+    if args.full_cycles:
+        # settle on a full, stable table so the final RSS is the
+        # post-churn plateau the E7 question asks about.
+        time.sleep(args.steady_wait)
+        log("FLAP-POST-CYCLE-STEADY")
 
     time.sleep(args.linger)
     log("FLAP-LINGER-END")

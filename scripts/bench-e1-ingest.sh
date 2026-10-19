@@ -94,6 +94,11 @@ case "$(uname -m)" in
     *)             echo "unknown arch $(uname -m)" >&2; exit 1 ;;
 esac
 
+# Prebuilt static binaries (BENCH_BIN_DIR) let the harness run on
+# hosts without a Rust toolchain (e.g. the bare-metal bench boxes);
+# unset, the paths reproduce the in-tree cargo layout.
+BIN_DIR=${BENCH_BIN_DIR:-target/$MUSL_TARGET/release}
+
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR="target/bench-logs/$MODE-$TS"
 mkdir -p "$OUT_DIR"
@@ -101,23 +106,19 @@ echo "bench-e1-ingest: mode=$MODE feed=$FEED_MRT limit=$FEED_LIMIT (target $FEED
 echo "  sut cpus=$SUT_CPUS  injector cpus=$INJ_CPUS  rate=$REPLAY_RATE  out=$OUT_DIR"
 
 # --- images -----------------------------------------------------------
-perl -e 'alarm 15; exec @ARGV' docker run --rm --entrypoint true "$IMAGE" \
-    || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
+# Network first, then the probe on it: some hosts run a daemon whose
+# default docker0 bridge is absent, while daemon-created custom
+# bridges work fine (bench boxes); the probe must exercise the network
+# the runs will actually use.
 docker network inspect "$NET_NAME" >/dev/null 2>&1 \
     || docker network create --subnet "$NET_SUBNET" "$NET_NAME"
+perl -e 'alarm 15; exec @ARGV' docker run --rm --network "$NET_NAME" --entrypoint true "$IMAGE" \
+    || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
 # Any leftover bench container would hold the fixed IPs (a killed
 # harness run leaves no trap behind).
 docker rm -f $(docker ps -aq --filter name=b1-) >/dev/null 2>&1 || true
 
 # --- binaries (rouster modes need the musl build) ----------------------
-if ! rustup target list --installed | grep -q "$MUSL_TARGET"; then
-    rustup target add "$MUSL_TARGET"
-fi
-echo "==> building rousterd + bgpd + rousterctl + mrt-replay ($MUSL_TARGET, release)"
-cargo build --release --target "$MUSL_TARGET" -p rousterd --bin rousterd
-cargo build --release --target "$MUSL_TARGET" -p rousterctl --bin rousterctl
-cargo build --release --target "$MUSL_TARGET" -p bgpd --bin bgpd
-cargo build --release --target "$MUSL_TARGET" -p bgpd --bin mrt-replay
 
 wait_up() { # container desc attempts cmd
     for _ in $(seq 1 "$3"); do
@@ -134,9 +135,9 @@ start_sut_rouster() { # name
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     for b in rousterd rousterctl; do
-        docker cp "target/$MUSL_TARGET/release/$b" "$1:/usr/local/bin/$b"
+        docker cp "$BIN_DIR/$b" "$1:/usr/local/bin/$b"
     done
-    docker cp "target/$MUSL_TARGET/release/bgpd" "$1:/usr/local/bin/rouster-bgpd"
+    docker cp "$BIN_DIR/bgpd" "$1:/usr/local/bin/rouster-bgpd"
     docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
     docker exec "$1" sh -c "printf '%s\n' \
         'zapi socket /run/rouster/zserv.api' > /etc/rouster.conf"
@@ -198,7 +199,7 @@ start_sut_hybrid() { # name — config B: FRR 10.2.2 bgpd+mgmtd on the ROUSTER c
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     for b in rousterd rousterctl; do
-        docker cp "target/$MUSL_TARGET/release/$b" "$1:/usr/local/bin/$b"
+        docker cp "$BIN_DIR/$b" "$1:/usr/local/bin/$b"
     done
     docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
     # rousterd's zapi socket at the FRR-conventional path (the z5b
@@ -242,7 +243,7 @@ start_injector() { # name - mrt-replay on the other pinned cpuset
         --cpuset-cpus "$INJ_CPUS" \
         -v "$FEED_MRT":/feed.mrt:ro \
         --entrypoint sleep alpine:3.20 infinity >/dev/null
-    docker cp "target/$MUSL_TARGET/release/mrt-replay" "$1:/usr/local/bin/mrt-replay"
+    docker cp "$BIN_DIR/mrt-replay" "$1:/usr/local/bin/mrt-replay"
     LIMIT_ARG=""
     [ "$FEED_LIMIT" != 0 ] && LIMIT_ARG="--limit $FEED_LIMIT"
     INJ_ARGS="--peer $SUT_IP:179 --local-addr $INJ_IP --local-as $INJ_AS \
