@@ -16,6 +16,8 @@
 //! The BGP-signaling SAVNET hook is deliberately absent
 //! (`experimental-savnet`, §Deferred — anchor in the stream report).
 
+#![forbid(unsafe_code)]
+
 pub mod attr;
 pub mod capability;
 #[cfg(feature = "mem-census")]

@@ -29,6 +29,8 @@
 //!   interface stanzas, the zapi client edge (route type 9 — ISIS),
 //!   the run loop.
 
+#![forbid(unsafe_code)]
+
 pub mod adjacency;
 pub mod auth;
 pub mod checksum;

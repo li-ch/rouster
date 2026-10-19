@@ -6,6 +6,8 @@
 //!
 //! Usage: `isisd --config <PATH>`.
 
+#![forbid(unsafe_code)]
+
 #[cfg(target_os = "linux")]
 mod linux_main {
     use isisd::config::parse as parse_config;

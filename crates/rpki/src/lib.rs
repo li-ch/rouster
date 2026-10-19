@@ -21,6 +21,8 @@
 //! - [`client`]: the RTR session client (tokio, clock-injected) that
 //!   drives a cache connection into those tables.
 
+#![forbid(unsafe_code)]
+
 pub mod aspa;
 pub mod client;
 pub mod pdu;

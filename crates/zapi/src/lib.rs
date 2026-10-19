@@ -7,6 +7,8 @@
 //! Wire format reference: `docs/interop/zapi-10.2-pinned.md` (empirical
 //! capture against FRR 10.2.2) plus the crate docs on each body type.
 
+#![forbid(unsafe_code)]
+
 pub mod client;
 pub mod header;
 pub mod message;

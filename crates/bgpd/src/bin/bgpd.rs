@@ -10,6 +10,8 @@
 //! to parse a candidate config and exit 0/1 (the configd pre-apply
 //! gate's daemon half, S8-c).
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
