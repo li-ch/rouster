@@ -628,6 +628,7 @@ e45igp)
     docker exec "$PEER" sh -c "printf '%s\n' \
         'frr version 10.2' 'frr defaults traditional' 'hostname x45peer' \
         'interface eth0' \
+        ' ip ospf network point-to-point' \
         ' ip ospf hello-interval 2' \
         ' ip ospf dead-interval 8' \
         'router ospf' ' ospf router-id 2.2.2.2' \
