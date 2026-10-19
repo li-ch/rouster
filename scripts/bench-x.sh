@@ -560,6 +560,10 @@ e45igp)
         wait_up "$SUT" "bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
         docker exec "$SUT" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
+            'interface eth0' \
+            ' ip ospf network point-to-point' \
+            ' ip ospf hello-interval 2' \
+            ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id 1.1.1.1' \
             ' network 172.31.255.0/24 area 0.0.0.0' \
             ' timers throttle spf 0 50 100' \
@@ -601,7 +605,7 @@ e45igp)
             'router ospf' ' router-id 1.1.1.1' \
             ' area 0.0.0.0' \
             '  interface eth0' \
-            '   network-type broadcast' \
+            '   network-type point-to-point' \
             '   hello-interval 2' \
             '   dead-interval 8' \
             > /etc/rouster-ospfd.conf"
