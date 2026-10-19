@@ -107,9 +107,22 @@ start_frr_daemons() { # name  (zebra + mgmtd + bgpd)
     wait_up "$1" "frr bgpd bound :179" 30 "grep -qi '00B3' /proc/net/tcp"
 }
 
-start_staticd() { # name  (FRR staticd on the rouster core)
+start_staticd() { # name  (FRR staticd on the rouster core; the z5
+    # recipe: mgmtd must run alongside - staticd's config transaction
+    # commits asynchronously through the mgmtd-backed vtysh -b push)
+    docker exec "$1" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/mgmtd.log --log-level info"
+    wait_up "$1" "frr mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
     docker exec "$1" sh -c "/usr/lib/frr/staticd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/staticd.log --log-level info"
     wait_up "$1" "frr staticd vty" 30 "test -S /var/run/frr/staticd.vty"
+}
+wait_static() { # name expected
+    for _ in $(seq 1 30); do
+        c=$(docker exec "$1" sh -c "ip route show proto static 2>/dev/null | grep -c ." || echo 0)
+        [ "$c" = "$2" ] 2>/dev/null && return 0
+        docker exec "$1" vtysh -b >/dev/null 2>&1 || true
+        sleep 1
+    done
+    docker exec "$1" sh -c "ip route show proto static 2>/dev/null | grep -c ." || echo 0
 }
 
 start_injector() { # name  (mrt-replay)
@@ -336,8 +349,7 @@ e6mixed)
         'ip route 203.0.113.0/25 172.31.255.10' \
         > /etc/frr/frr.conf"
     docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-    sleep 3
-    S_COUNT=$(docker exec "$SUT" sh -c "ip route show proto static | grep -c ." || echo 0)
+    S_COUNT=$(wait_static "$SUT" 3)
     note "static routes installed: $S_COUNT (expect 3)"
     start_injector "$INJ"
     docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
@@ -355,8 +367,7 @@ e6mixed)
         'ip route 198.51.100.0/24 172.31.255.10' \
         > /etc/frr/frr.conf"
     docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-    sleep 3
-    S_MID=$(docker exec "$SUT" sh -c "ip route show proto static | grep -c ." || echo 0)
+    S_MID=$(wait_static "$SUT" 1)
     BGP_MID=$(kern_count "$SUT")
     docker exec "$SUT" sh -c "printf '%s\n' \
         'frr version 10.2' 'frr defaults traditional' 'hostname bench-x6' \
@@ -365,8 +376,7 @@ e6mixed)
         'ip route 203.0.113.0/25 172.31.255.10' \
         > /etc/frr/frr.conf"
     docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-    sleep 3
-    S_END=$(docker exec "$SUT" sh -c "ip route show proto static | grep -c ." || echo 0)
+    S_END=$(wait_static "$SUT" 3)
     BGP_END=$(kern_count "$SUT")
     T1=$(date +%s.%N)
     note "churn: static $S_COUNT->$S_MID->$S_END (expect 3->1->3); bgp $BGP_FULL->$BGP_MID->$BGP_END; churn_wall_s=$(python3 -c "print(f'{$T1-$T0:.1f}')")"
@@ -406,7 +416,7 @@ e7overload)
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
             --announce /feed.announce --limit $LIMIT --flap-every 2 \
             --rounds $ROUNDS --hold $HOLD --steady-wait 8 --round-gap 0.5 \
-            --linger 10" > "$OUT_DIR/flap-$SIDE.txt" 2>&1
+            --linger 300" > "$OUT_DIR/flap-$SIDE.txt" 2>&1
         T1=$(date +%s.%N)
         # drain: wait for the count to stabilize at full
         for _ in $(seq 1 180); do
