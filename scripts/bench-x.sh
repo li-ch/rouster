@@ -475,7 +475,7 @@ e1seq)
             sleep 1
         done
         sleep 3
-        awk -v n="$LIMIT" 'NR <= n && NR % 5 != 0 {print $2}' "$ANN_CP" | sort > "$OUT_DIR/seq1-expected.txt"
+        awk -v n="$LIMIT" 'NR <= n && NR % 5 != 0 {print $3}' "$ANN_CP" | sort > "$OUT_DIR/seq1-expected.txt"
         kern_dump "$SUT" > "$OUT_DIR/seq1-$SIDE-kernel.txt"
         awk '{print $1}' "$OUT_DIR/seq1-$SIDE-kernel.txt" | sort > "$OUT_DIR/seq1-$SIDE-prefixes.txt"
         C1=$(wc -l < "$OUT_DIR/seq1-$SIDE-prefixes.txt")
@@ -610,7 +610,7 @@ e45igp)
     fi
     # the OSPF peer: FRR ospfd advertising the dummy /24
     docker run -d --name "$PEER" --network "$NET_NAME" --ip "$PEER_IP" \
-        --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN \
+        --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     docker exec "$PEER" sh -c "ip addr add $OSPF_NH/24 dev lo 2>/dev/null || true; ip link set lo up"
     docker exec "$PEER" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pzebra.log --log-level info"
