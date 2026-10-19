@@ -471,7 +471,7 @@ e1seq)
             --announce /feed.announce --limit $LIMIT \
             --ops A,W3,R3,W5 --gap 3" > "$OUT_DIR/seq1-$SIDE.txt" 2>&1
         sleep 3
-        awk 'NR % 5 != 0 {print $2}' "$ANN_CP" | head -$LIMIT | sort > "$OUT_DIR/seq1-expected.txt"
+        awk -v n="$LIMIT" 'NR <= n && NR % 5 != 0 {print $2}' "$ANN_CP" | sort > "$OUT_DIR/seq1-expected.txt"
         kern_dump "$SUT" > "$OUT_DIR/seq1-$SIDE-kernel.txt"
         C1=$(wc -l < "$OUT_DIR/seq1-$SIDE-kernel.txt")
         D1=$(comm -3 "$OUT_DIR/seq1-expected.txt" "$OUT_DIR/seq1-$SIDE-kernel.txt" | grep -c . || true)
