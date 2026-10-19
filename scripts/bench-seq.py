@@ -189,6 +189,7 @@ def main():
     ap.add_argument("--ops", required=True)
     ap.add_argument("--novel-as", type=int, default=65412)
     ap.add_argument("--gap", type=float, default=2.0)
+    ap.add_argument("--linger", type=float, default=120.0)
     args = ap.parse_args()
 
     entries = []
@@ -339,7 +340,10 @@ def main():
             return 1
         time.sleep(args.gap)
     log("SEQ-ALL-DONE")
-    time.sleep(3)
+    # Linger with the session up: closing at exit would withdraw the
+    # table before the harness can assert on the installed state.
+    time.sleep(args.linger)
+    log("SEQ-LINGER-END")
     try:
         sock.close()
     except OSError:
