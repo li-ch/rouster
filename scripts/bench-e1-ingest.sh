@@ -8,6 +8,12 @@
 #   rouster  S1: N runs (1 warmup + N-1 measured) of the full feed
 #            into rouster bgpd + rousterd.
 #   frr      S3: same shape with FRR 10.2.2 bgpd + zebra.
+#   hybrid   config B (the rewrite plan's E2-configB): the SAME FRR
+#            10.2.2 bgpd (with mgmtd) speaking against the ROUSTER
+#            core (rousterd) as its zebra — isolates core
+#            replacement. Poller mode 'hybrid': the main-table oracle
+#            is rousterd's status file (symmetric with config D) and
+#            the BGP-level curve comes from vtysh pfxRcd.
 #
 # Shape (§F): both SUT and injector are containers on bench-net
 # (172.31.255.0/24, SUT .20, injector .10) with disjoint pinned CPUs.
@@ -23,7 +29,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-MODE=${1:?usage: bench-e1-ingest.sh gate|rouster|frr <raw-mrt> [runs] [limit]}
+MODE=${1:?usage: bench-e1-ingest.sh gate|rouster|frr|hybrid <raw-mrt> [runs] [limit]}
 # FEED is the RAW TABLE_DUMP_V2 MRT (bunzip2'd); LIMIT slices the
 # first N prefixes (0 = the whole dump). The injector is the in-repo
 # mrt-replay tool (D1(c) switch: exabgp measured ~36 msg/s sustained
@@ -186,6 +192,51 @@ start_sut_frr() { # name — zebra + mgmtd + real bgpd, vtysh -b push
     wait_up "$1" "frr bgpd bound :179" 30 "grep -qi '00B3' /proc/net/tcp"
 }
 
+start_sut_hybrid() { # name — config B: FRR 10.2.2 bgpd+mgmtd on the ROUSTER core
+    docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
+        --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+        --entrypoint sleep "$IMAGE" infinity >/dev/null
+    for b in rousterd rousterctl; do
+        docker cp "target/$MUSL_TARGET/release/$b" "$1:/usr/local/bin/$b"
+    done
+    docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
+    # rousterd's zapi socket at the FRR-conventional path (the z5b
+    # recipe: unmodified daemons find their socket where they expect).
+    docker exec "$1" sh -c "printf '%s\n' \
+        'zapi socket /var/run/frr/zserv.api' > /etc/rouster.conf"
+    docker exec -d "$1" sh -c "rousterd --config /etc/rouster.conf > /var/log/rousterd.log 2>&1"
+    wait_up "$1" "rousterd zapi listening" 30 "grep -q 'zapi: listening' /var/log/rousterd.log"
+    wait_up "$1" "zapi socket" 10 "test -S /var/run/frr/zserv.api"
+    docker exec "$1" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:/tmp/mgmtd.log --log-level info"
+    wait_up "$1" "frr mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
+    docker exec "$1" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:/tmp/bgpd.log --log-level info"
+    wait_up "$1" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+    docker exec "$1" sh -c "printf '%s\n' \
+        'frr version 10.2' \
+        'frr defaults traditional' \
+        'hostname bench-hybrid' \
+        'router bgp $SUT_AS' \
+        ' no bgp network import-check' \
+        ' no bgp ebgp-requires-policy' \
+        ' neighbor $INJ_IP remote-as $INJ_AS' \
+        ' neighbor $INJ_IP timers 30 $HOLD' \
+        ' address-family ipv4 unicast' \
+        '  exit-address-family' \
+        'line vty' \
+        > /etc/frr/frr.conf"
+    local applied=0
+    for _ in $(seq 1 10); do
+        docker exec "$1" vtysh -b >/dev/null 2>&1 || true
+        sleep 2
+        if docker exec "$1" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP"; then
+            applied=1; break
+        fi
+    done
+    [ "$applied" = 1 ] || { echo "FAIL: FRR neighbor config never applied" >&2; return 1; }
+    wait_up "$1" "frr bgpd bound :179" 30 "grep -qi '00B3' /proc/net/tcp"
+}
+
 start_injector() { # name - mrt-replay on the other pinned cpuset
     docker run -d --name "$1" --network "$NET_NAME" --ip "$INJ_IP" \
         --cpuset-cpus "$INJ_CPUS" \
@@ -209,7 +260,11 @@ for run in $(seq 1 "$RUNS"); do
     docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
     echo "==> run $run/$RUNS"
 
-    if [ "$MODE" = frr ]; then start_sut_frr "$SUT"; else start_sut_rouster "$SUT"; fi
+    case "$MODE" in
+        frr)    start_sut_frr "$SUT" ;;
+        hybrid) start_sut_hybrid "$SUT" ;;
+        *)      start_sut_rouster "$SUT" ;;
+    esac
     start_injector "$INJ"
 
     # ARP seeding (the M3 NHT gate wants lladdr before session start).
@@ -226,15 +281,16 @@ print(f"host_minus_vm={(h1+h2)/2-v:.6f} sampling_span={h2-h1:.6f}")
 EOF
     docker exec "$SUT" getconf CLK_TCK > "$RUN_DIR/clk-tck.txt" 2>/dev/null || echo 100 > "$RUN_DIR/clk-tck.txt"
 
-    if [ "$MODE" = frr ]; then
+    if [ "$MODE" = frr ] || [ "$MODE" = hybrid ]; then
         docker exec "$SUT" sh -c "vtysh -c 'show bgp neighbor $INJ_IP'" | head -20 > "$RUN_DIR/pre-run-neighbor.txt" || true
     fi
 
     echo "    launching poller + injector"
     python3 scripts/bench-poll.py \
         --sut-container "$SUT" --inj-container "$INJ" \
-        --mode "$([ "$MODE" = frr ] && echo frr || echo rouster)" \
+        --mode "$(if [ "$MODE" = frr ]; then echo frr; elif [ "$MODE" = hybrid ]; then echo hybrid; else echo rouster; fi)" \
         --target-count "$FEED_COUNT" --timeout "$TIMEOUT" \
+        $( [ "$MODE" = hybrid ] && echo "--bgpd-log /tmp/bgpd.log" ) \
         --csv "$RUN_DIR/poll.csv" > "$RUN_DIR/poller.log" 2>&1 &
     POLLER=$!
     sleep 2
@@ -254,6 +310,15 @@ EOF
             docker cp "$SUT:/tmp/$f.log" "$RUN_DIR/$f.log" 2>/dev/null || true
         done
         docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary'; vtysh -c 'show ip route summary'; ip route show proto bgp | wc -l" > "$RUN_DIR/final-vtysh.txt" 2>&1 || true
+    elif [ "$MODE" = hybrid ]; then
+        for f in bgpd mgmtd; do
+            docker cp "$SUT:/tmp/$f.log" "$RUN_DIR/$f.log" 2>/dev/null || true
+        done
+        docker cp "$SUT:/var/log/rousterd.log" "$RUN_DIR/rousterd.log" 2>/dev/null || true
+        docker cp "$SUT:/run/rouster/rousterd.status" "$RUN_DIR/final-status.txt" 2>/dev/null || true
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary'; ip route show proto bgp | wc -l" > "$RUN_DIR/final-vtysh.txt" 2>&1 || true
+        docker exec "$SUT" sh -c "cat /proc/\$(pidof bgpd | awk '{print \$1}')/stat /proc/\$(pidof rousterd | awk '{print \$1}')/stat" > "$RUN_DIR/final-proc-stat.txt" 2>/dev/null || true
+        docker exec "$SUT" sh -c "cat /proc/\$(pidof bgpd)/status /proc/\$(pidof rousterd)/status" > "$RUN_DIR/final-proc-status.txt" 2>/dev/null || true
     else
         docker cp "$SUT:/var/log/rouster-bgpd.log" "$RUN_DIR/sut-bgpd.log" 2>/dev/null || true
         docker cp "$SUT:/var/log/rousterd.log" "$RUN_DIR/rousterd.log" 2>/dev/null || true
@@ -267,5 +332,6 @@ EOF
 done
 
 CLK=$(head -1 "$OUT_DIR/run-1/clk-tck.txt" 2>/dev/null || echo 100)
-python3 scripts/bench-summarize.py --out-dir "$OUT_DIR" --mode "$([ "$MODE" = frr ] && echo frr || echo rouster)" --target-count "$FEED_COUNT" --clk-tck "$CLK" || true
+SUMM_MODE=rouster; [ "$MODE" = frr ] && SUMM_MODE=frr
+python3 scripts/bench-summarize.py --out-dir "$OUT_DIR" --mode "$SUMM_MODE" --target-count "$FEED_COUNT" --clk-tck "$CLK" || true
 echo "bench-e1-ingest: done — $OUT_DIR/summary.json"

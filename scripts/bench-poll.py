@@ -67,6 +67,15 @@ PROC_ROUSTER = (
     "echo \"$n $a $r $h\"; done"
 )
 # frr: bgpd + zebra.
+PROC_HYBRID = (
+    "for n in bgpd rousterd; do p=$(pidof $n | awk '{print $1}'); "
+    "[ -n \"$p\" ] || continue; "
+    "a=$(awk '{print $14, $15}' /proc/$p/stat); "
+    "r=$(awk '/VmRSS/{print $2}' /proc/$p/status); "
+    "h=$(awk '/VmHWM/{print $2}' /proc/$p/status); "
+    "echo \"$n $a $r $h\"; done"
+)
+# frr: bgpd + zebra.
 PROC_FRR = (
     "for n in bgpd zebra; do p=$(pidof $n | awk '{print $1}'); "
     "[ -n \"$p\" ] || continue; "
@@ -141,7 +150,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sut-container", required=True)
     ap.add_argument("--inj-container", required=True)
-    ap.add_argument("--mode", choices=["rouster", "frr"], required=True)
+    ap.add_argument("--mode", choices=["rouster", "frr", "hybrid"], required=True)
     ap.add_argument("--target-count", type=int, required=True)
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--settle", type=int, default=30)
@@ -159,7 +168,7 @@ def main():
     ap.add_argument("--stall-after", type=int, default=180)
     args = ap.parse_args()
 
-    proc_sut = PROC_ROUSTER if args.mode == "rouster" else PROC_FRR
+    proc_sut = {"rouster": PROC_ROUSTER, "hybrid": PROC_HYBRID}.get(args.mode, PROC_FRR)
     complete_at = None
     eor_at = None
     eor_seen_sticky = False
@@ -203,10 +212,17 @@ def main():
                     row[f"inj_rss_kb"] = r
                     row[f"inj_hwm_kb"] = h
 
-            if args.mode == "rouster":
+            if args.mode in ("rouster", "hybrid"):
                 (prefixes, eor, row["status_ms"],
                  row["eor_ms"]) = poll_rouster(
                     args.sut_container, args.status_file, args.bgpd_log)
+                if args.mode == "hybrid":
+                    # The BGP-level curve from the FRR speaker (the
+                    # main-table completion oracle stays the rousterd
+                    # status file, symmetric with config D).
+                    (pfxrcd_h, _z, row["vtysh_bgp_ms"],
+                     row["vtysh_zebra_ms"]) = poll_frr(args.sut_container)
+                    row["sut_pfxrcd"] = pfxrcd_h
                 # Completion is count-based (the plan's own definition:
                 # RIB count reaching the dump's prefix count). exabgp
                 # sends an EOR marker right at session establishment,
@@ -245,7 +261,7 @@ def main():
             # count + frozen CPU on both daemons for --stall-after
             # seconds = the wedged-SUT signature; fail fast instead
             # of burning the timeout. Missing values reset the timer.
-            if args.mode == "rouster" and args.stall_after and eor_at is not None:
+            if args.mode in ("rouster", "hybrid") and args.stall_after and eor_at is not None:
                 jiffies = []
                 for tag in ("sut_bgpd", "sut_zebra"):
                     u, s = row.get(f"{tag}_utime", ""), row.get(f"{tag}_stime", "")
