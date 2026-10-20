@@ -639,9 +639,13 @@ e45igp)
         ' timers throttle spf 0 50 100' \
         'line vty' > /etc/frr/frr.conf"
     docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true
-    # Poll only: re-pushing frr.conf re-applies the OSPF interface
-    # statements and bounces the forming adjacency (found by probe
-    # divergence - manual runs pushed config once and formed Full).
+    # mgmtd's commit is asynchronous: verify the OSPF interface
+    # actually landed, retry once after 10 s if not (a lost first
+    # commit was observed on some runs). Then poll only - re-pushing
+    # in a tight loop bounces the forming adjacency.
+    sleep 5
+    docker exec "$PEER" sh -c "vtysh -c 'show ip ospf interface eth0' 2>/dev/null | grep -q 'eth0 is up'" \
+        || { sleep 10; docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; }
     for _ in $(seq 1 90); do
         sleep 2
         docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
@@ -683,6 +687,8 @@ e45igp)
             fail "e45igp $MODE: count not numeric"; docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true; exit 1 ;;
     esac
     if [ "$BGP_FULL" -lt $((LIMIT - 20)) ]; then
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary' 2>&1 | tail -3; vtysh -c 'show ip route 10.99.0.1' 2>&1 | tail -3" > "$OUT_DIR/diag-$MODE.txt" 2>/dev/null || true
+        docker exec "$INJ" sh -c "cat /var/log/flap-run.txt 2>/dev/null | head -8" > "$OUT_DIR/flap-head-$MODE.txt" 2>/dev/null || true
         fail "e45igp $MODE: BGP routes did not resolve via OSPF ($BGP_FULL)"
         docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true
         exit 1
