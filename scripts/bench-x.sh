@@ -578,8 +578,8 @@ e45igp)
             'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
             'router bgp $SUT_AS' \
             ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
-            " neighbor $INJ_IP remote-as $INJ_AS" \
-            " neighbor $INJ_IP timers 30 $HOLD" \
+            ' neighbor $INJ_IP remote-as $INJ_AS' \
+            ' neighbor $INJ_IP timers 30 $HOLD' \
             ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
             > /etc/frr/bgpd.conf"
         docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
@@ -600,8 +600,8 @@ e45igp)
                 'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
                 'router bgp $SUT_AS' \
                 ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
-                " neighbor $INJ_IP remote-as $INJ_AS" \
-                " neighbor $INJ_IP timers 30 $HOLD" \
+                ' neighbor $INJ_IP remote-as $INJ_AS' \
+                ' neighbor $INJ_IP timers 30 $HOLD' \
                 ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
                 > /etc/frr/bgpd.conf"
             docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -f /etc/frr/bgpd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
