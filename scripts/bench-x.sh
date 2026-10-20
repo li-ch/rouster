@@ -640,11 +640,11 @@ e45igp)
     # Poll only: re-pushing frr.conf re-applies the OSPF interface
     # statements and bounces the forming adjacency (found by probe
     # divergence - manual runs pushed config once and formed Full).
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 90); do
         sleep 2
         docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
     done
-    ADJ=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep Full | awk '{print $4}' | head -1)
+    ADJ=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
     note "adjacency: $ADJ"
     case "$ADJ" in
         Full*|*" "Full*) : ;;
