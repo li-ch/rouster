@@ -687,6 +687,10 @@ e45igp)
     # the event: kill the PEER's ospfd -> adjacency dies (dead 8s) ->
     # OSPF route gone -> BGP nexthops unresolved -> withdraw.
     timeline "$SUT" igp 1
+    # forwarding probe: ping the OSPF nexthop (10.99.0.1) from the SUT
+    # through the whole event; the kernel route to it carries the OSPF
+    # adjacency, so loss marks the forwarding-plane outage window.
+    docker exec -d "$SUT" sh -c "ping -i 0.2 -c 900 $OSPF_NH > /probe.txt 2>&1"
     TKILL=$(date +%s.%N)
     docker exec "$PEER" sh -c "kill -9 \$(pidof ospfd)"
     for _ in $(seq 1 60); do
@@ -705,13 +709,24 @@ e45igp)
         c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
     done
     TR=$(date +%s.%N)
+    docker exec "$SUT" sh -c "pkill -f 'ping -i 0.2' 2>/dev/null" >/dev/null 2>&1 || true
+    docker cp "$SUT:/probe.txt" "$OUT_DIR/probe-$MODE.txt" 2>/dev/null || true
     TL=$OUT_DIR/tl-$MODE.csv
     timeline_stop "$SUT" igp "$TL"
-    python3 - "$TKILL" "$TW" "$TR" >> "$OUT_DIR/notes.txt" <<'PYEOF'
-import sys
+    python3 - "$TKILL" "$TW" "$TR" "$OUT_DIR/probe-$MODE.txt" >> "$OUT_DIR/notes.txt" <<'PYEOF'
+import sys, re
 tk, tw, tr = map(float, sys.argv[1:4])
+try:
+    txt = open(sys.argv[4], errors="replace").read()
+    sent = int(re.search(r"(\d+) packets transmitted", txt).group(1))
+    recv = int(re.search(r"(\d+) received", txt).group(1))
+    loss_pct = (sent - recv) / sent * 100 if sent else 0.0
+    times = [float(x) for x in re.findall(r"icmp_seq=(\d+)", txt)]
+    probe = f" probe: {sent} sent, {recv} received ({loss_pct:.0f}% loss)"
+except Exception:
+    probe = " probe: unreadable"
 print(f"X-NOTE e45igp timeline: kill_to_withdrawn_s={tw-tk:.1f} "
-      f"peer_restart_to_restored_s={tr-tw:.1f} total_event_s={tr-tk:.1f}")
+      f"peer_restart_to_restored_s={tr-tw:.1f} total_event_s={tr-tk:.1f}{probe}")
 PYEOF
     docker exec "$INJ" sh -c "cat /var/log/flap-run.txt" > "$OUT_DIR/flap-$MODE.txt" 2>/dev/null || true
     docker cp "$SUT:/var/log/rouster-ospfd.log" "$OUT_DIR/rouster-ospfd-$MODE.log" 2>/dev/null || true
@@ -758,6 +773,56 @@ e5cycles)
             docker rm -f "$INJ" >/dev/null 2>&1 || true
         done
         docker rm -f "$SUT" >/dev/null 2>&1 || true
+        sleep 3
+    done
+    ;;
+
+e5backend)
+    # Backend failure during bulk install: SIGSTOP rousterd ~30% into
+    # the 100k ingest for 10 s (the daemon stops reading ACKs; the
+    # rcvbuf overruns and datagrams -- including install ACKs -- are
+    # dropped: the exact F9 wedge shape), then SIGCONT. The SUT-side
+    # hardening (bounded ACK re-issue + overrun resync) must recover
+    # without wedge; measure the wall penalty, overruns, final count.
+    LIMIT=${BENCH_X_LIMIT:-100000}
+    NEED=$((LIMIT > 2000 ? LIMIT - LIMIT/200 : LIMIT - 2))
+    STALL=${BENCH_X_STALL:-10}
+    for RUN in 1 2 3; do
+        SUT=x5b-sut-$TS-$RUN; INJ=x5b-inj-$TS-$RUN
+        trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
+        note "=== e5backend run=$RUN limit=$LIMIT stall=${STALL}s"
+        docker run -d --name "$SUT" --network "$NET_NAME" --ip "$SUT_IP" \
+            --cpuset-cpus "$SUT_CPUS" \
+            --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+            --entrypoint sleep "$IMAGE" infinity >/dev/null
+        docker exec "$SUT" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
+        start_rousterd "$SUT"
+        start_rouster_bgpd "$SUT"
+        start_injector "$INJ"
+        docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+        docker exec -d "$INJ" sh -c "mrt-replay $(INJ_ARGS_FOR $LIMIT) > /var/log/replay.txt 2>&1"
+        # stall at ~30% of the expected ingest
+        sleep 3
+        TSTOP=$(date +%s.%N)
+        docker exec "$SUT" sh -c "kill -STOP \$(pidof rousterd)"
+        sleep "$STALL"
+        docker exec "$SUT" sh -c "kill -CONT \$(pidof rousterd)"
+        TCONT=$(date +%s.%N)
+        for _ in $(seq 1 300); do
+            c=$(kern_count "$SUT"); [ "$c" -ge "$NEED" ] 2>/dev/null && break; sleep 1
+        done
+        TFULL=$(date +%s.%N)
+        OVER=$(docker exec "$SUT" sh -c "grep -c 'buffer full' /var/log/rousterd.log 2>/dev/null" || echo "?")
+        RESYNC=$(docker exec "$SUT" sh -c "grep -ci 'resync' /var/log/rousterd.log 2>/dev/null" || echo "?")
+        FINAL=$(kern_count "$SUT")
+        note "run=$RUN stall_s=$STALL cont_to_full_s=$(python3 -c "print(f'{$TFULL-$TCONT:.1f}')") final=$FINAL overruns=$OVER resync_lines=$RESYNC"
+        if [ "$FINAL" -ge "$NEED" ] 2>/dev/null; then
+            pass "e5backend run=$RUN: recovered from the mid-install stall, table exact"
+        else
+            fail "e5backend run=$RUN: final=$FINAL (wedge or loss)"
+        fi
+        docker cp "$SUT:/var/log/rousterd.log" "$OUT_DIR/rousterd-$RUN.log" 2>/dev/null || true
+        docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
         sleep 3
     done
     ;;
