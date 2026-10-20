@@ -416,6 +416,14 @@ e7overload)
         docker cp scripts/bench-flap.py "$INJ:/bench-flap.py"
         docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
         timeline "$SUT" "$SIDE" 1
+        docker exec -d "$SUT" sh -c '
+            : > /queues.csv
+            end=$(( $(date +%s) + 1500 ))
+            while :; do
+                echo "$(date +%s.%N) $(cat /run/rouster/rousterd.queues 2>/dev/null | tr "\n" " ")" >> /queues.csv
+                [ "$(date +%s)" -gt "$end" ] && break
+                sleep 1
+            done'
         T0=$(date +%s.%N)
         docker exec -d "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
             --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
@@ -440,6 +448,8 @@ e7overload)
         docker rm -f "$INJ" >/dev/null 2>&1 || true
         TL=$OUT_DIR/tl-$SIDE.csv
         timeline_stop "$SUT" "$SIDE" "$TL"
+        docker exec "$SUT" sh -c "pkill -f queues.csv 2>/dev/null" >/dev/null 2>&1 || true
+        docker cp "$SUT:/queues.csv" "$OUT_DIR/queues-$SIDE.csv" 2>/dev/null || true
         RSS=$(docker exec "$SUT" sh -c "awk '/VmRSS/{print \$2}' /proc/\$(pidof zebra rousterd | awk '{print \$1}')/status" 2>/dev/null || echo "?")
         note "side=$SIDE storm_wall_s=$(python3 -c "print(f'{$T1-$T0:.1f}')") drain_s=$(python3 -c "print(f'{$T2-$T1:.1f}')") final=$(kern_count "$SUT") core_rss_kb=$RSS"
         docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
@@ -574,6 +584,12 @@ e45igp)
             ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
             > /etc/frr/frr.conf"
         docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+        # The mgmtd commit is async and has been observed lost inside
+        # this cell (bgpd left with no BGP instance): verify the
+        # neighbor row landed, retry the push once after 10 s if not.
+        sleep 5
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
+            || { sleep 10; docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; }
         for _ in $(seq 1 20); do
             sleep 2
             docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
@@ -593,6 +609,9 @@ e45igp)
                 ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
                 > /etc/frr/frr.conf"
             docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+            sleep 5
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
+                || { sleep 10; docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; }
             for _ in $(seq 1 20); do
                 sleep 2
                 docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
