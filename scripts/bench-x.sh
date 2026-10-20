@@ -140,7 +140,7 @@ INJ_ARGS_FOR() { # limit
         --rate 0 --hold $HOLD"
 }
 
-kern_count() { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null | grep -c ." || echo 0; }
+kern_count() { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null | grep -c ." || true; }
 kern_dump()  { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null" \
     | awk '{nh="-"; for(i=2;i<=NF;i++){if($i=="via")nh=$(i+1)}; print $1, nh}' | sort; }
 # The timeline runs INSIDE the SUT as a detached process: host-side
@@ -573,9 +573,10 @@ e45igp)
             " neighbor $INJ_IP timers 30 $HOLD" \
             ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
             > /etc/frr/frr.conf"
-        for _ in $(seq 1 10); do
-            docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; sleep 2
-            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP" && break
+        docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+        for _ in $(seq 1 20); do
+            sleep 2
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
         done
     else
         if [ "$MODE" = mixed ]; then
@@ -591,9 +592,10 @@ e45igp)
                 " neighbor $INJ_IP timers 30 $HOLD" \
                 ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
                 > /etc/frr/frr.conf"
-            for _ in $(seq 1 10); do
-                docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; sleep 2
-                docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null" | grep -q "$INJ_IP" && break
+            docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+            for _ in $(seq 1 20); do
+                sleep 2
+                docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
             done
         else
             start_rouster_bgpd "$SUT"
@@ -675,7 +677,10 @@ e45igp)
     BGP_FULL=$(kern_count "$SUT")
     note "baseline: ospf-proto187-routes=$OSPF_ROUTES bgp-via-ospf=$BGP_FULL (expect ~$LIMIT)"
     case "$BGP_FULL" in
-        *[!0-9]*|"") fail "e45igp $MODE: count not numeric"; docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true; exit 1 ;;
+        *[!0-9]*|"")
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary' 2>&1 | tail -3; vtysh -c 'show ip route 10.99.0.1' 2>&1 | tail -3" > "$OUT_DIR/diag-$MODE.txt" 2>/dev/null || true
+            docker cp "$SUT:/var/log/rousterd.log" "$OUT_DIR/rousterd-$MODE.log" 2>/dev/null || true
+            fail "e45igp $MODE: count not numeric"; docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true; exit 1 ;;
     esac
     if [ "$BGP_FULL" -lt $((LIMIT - 20)) ]; then
         fail "e45igp $MODE: BGP routes did not resolve via OSPF ($BGP_FULL)"
