@@ -16,9 +16,13 @@ mod linux;
 mod stub;
 
 #[cfg(target_os = "linux")]
-pub use linux::NetlinkDataplane;
+pub use linux::{nl_queue_stats, NetlinkDataplane};
 #[cfg(not(target_os = "linux"))]
 pub use stub::NetlinkDataplane;
+#[cfg(not(target_os = "linux"))]
+pub fn nl_queue_stats() -> (usize, usize) {
+    (0, 0)
+}
 
 /// SAV program → rp_filter sysctl translation (pure, cross-platform so
 /// its unit tests run on dev machines; the Linux impl executes it).

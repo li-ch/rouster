@@ -378,6 +378,15 @@ async fn main() -> std::io::Result<()> {
             }
             _ = status_tick.tick() => {
                 rousterd::status::publish(&driver.rib);
+                // E7 queue observability: the install window's
+                // occupancy alongside the status snapshot. Best-effort
+                // (a failed write logs nothing extra — the status file
+                // remains the primary surface).
+                let (cur, peak) = netlink_dp::nl_queue_stats();
+                let _ = std::fs::write(
+                    "/run/rouster/rousterd.queues",
+                    format!("netlink_inflight {cur}\nnetlink_inflight_peak {peak}\n"),
+                );
             }
             Some(command) = zapi_rx.recv() => {
                 // Apply the batch that arrived with this command, then

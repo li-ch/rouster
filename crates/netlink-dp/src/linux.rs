@@ -914,6 +914,39 @@ impl NetlinkDataplane {
 /// `wmem_default`.
 const NL_ROUTE_PIPELINE: usize = 512;
 
+/// E7 queue-occupancy observability: the install window's current and
+/// peak in-flight request counts (process-wide — there is exactly one
+/// dataplane connection per daemon). Updated by the batch futures;
+/// read by rousterd's status tick for `/run/rouster/rousterd.queues`.
+/// The peak is since process start; a bench run that wants per-window
+/// peaks reads the file at its own marks (fresh container per run).
+pub static NL_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NL_INFLIGHT_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot of the install-window occupancy: `(current, peak)`.
+pub fn nl_queue_stats() -> (usize, usize) {
+    let cur = NL_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    let peak = NL_INFLIGHT_PEAK.load(std::sync::atomic::Ordering::Relaxed);
+    (cur, peak)
+}
+
+/// Tracks one in-flight request's occupancy slot (RAII decrement).
+struct InflightGuard;
+
+impl InflightGuard {
+    fn enter() -> Self {
+        let cur = NL_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        NL_INFLIGHT_PEAK.fetch_max(cur, std::sync::atomic::Ordering::Relaxed);
+        InflightGuard
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        NL_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// F9 (the PERF-P0 escalation): how long one netlink request may stay
 /// silent before it is re-issued. Sized from measurement, not guess:
 /// the F8 receipt's healthy install ACK latency is single-digit
@@ -1069,7 +1102,10 @@ impl Dataplane for NetlinkDataplane {
         // closure cannot be higher-ranked over that — capturing the
         // slice itself sidesteps the HRTB entirely.
         futures::stream::iter(0..entries.len())
-            .map(|i| async move { self.route_replace(&entries[i]).await })
+            .map(|i| async move {
+                let _slot = InflightGuard::enter();
+                self.route_replace(&entries[i]).await
+            })
             .buffered(NL_ROUTE_PIPELINE)
             .collect()
             .await
@@ -1078,7 +1114,10 @@ impl Dataplane for NetlinkDataplane {
     /// The delete-side twin of [`Self::route_replace_batch`].
     async fn route_delete_batch(&self, entries: &[RouteEntry]) -> Vec<Result<(), DataplaneError>> {
         futures::stream::iter(0..entries.len())
-            .map(|i| async move { self.route_delete(&entries[i]).await })
+            .map(|i| async move {
+                let _slot = InflightGuard::enter();
+                self.route_delete(&entries[i]).await
+            })
             .buffered(NL_ROUTE_PIPELINE)
             .collect()
             .await
