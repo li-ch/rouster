@@ -636,11 +636,15 @@ e45igp)
         ' network $OSPF_NET area 0.0.0.0' \
         ' timers throttle spf 0 50 100' \
         'line vty' > /etc/frr/frr.conf"
-    for _ in $(seq 1 15); do
-        docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; sleep 2
-        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep -q Full && break
+    docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true
+    # Poll only: re-pushing frr.conf re-applies the OSPF interface
+    # statements and bounces the forming adjacency (found by probe
+    # divergence - manual runs pushed config once and formed Full).
+    for _ in $(seq 1 30); do
+        sleep 2
+        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
     done
-    ADJ=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk 'END{print $0}')
+    ADJ=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep Full | awk '{print $4}' | head -1)
     note "adjacency: $ADJ"
     case "$ADJ" in
         Full*|*" "Full*) : ;;
@@ -691,9 +695,11 @@ e45igp)
     TW=$(date +%s.%N)
     # restore the peer's ospfd -> adjacency re-forms -> routes return
     docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd2.log --log-level info"
-    for _ in $(seq 1 15); do
-        docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; sleep 2
-        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | grep -q Full && break
+    sleep 3
+    docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+        sleep 2
+        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
     done
     for _ in $(seq 1 180); do
         c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
