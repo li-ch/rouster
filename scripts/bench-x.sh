@@ -591,7 +591,7 @@ e45igp)
             docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
         done
         docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
-            || { echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
+            || { docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>&1 | head -12; echo ---; cat /etc/frr/bgpd.conf 2>/dev/null | head -12; echo ---; tail -8 /tmp/frrrun/bgpd.log 2>/dev/null; echo ---; pidof bgpd" > "$OUT_DIR/gatediag-$MODE.txt" 2>&1 || true; echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
     else
         if [ "$MODE" = mixed ]; then
             # FRR bgpd with a deterministic -f file; OSPF is native
@@ -611,7 +611,7 @@ e45igp)
                 docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
             done
             docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
-                || { echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
+                || { docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>&1 | head -12; echo ---; cat /etc/frr/bgpd.conf 2>/dev/null | head -12; echo ---; tail -8 /tmp/frrrun/bgpd.log 2>/dev/null; echo ---; pidof bgpd" > "$OUT_DIR/gatediag-$MODE.txt" 2>&1 || true; echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
         else
             start_rouster_bgpd "$SUT"
         fi
