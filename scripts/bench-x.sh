@@ -586,7 +586,11 @@ e45igp)
         wait_up "$SUT" "ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
         docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -f /etc/frr/bgpd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
         wait_up "$SUT" "bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
-        docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -q $INJ_IP" \
+        for _ in $(seq 1 20); do
+            sleep 2
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
+        done
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
             || { echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
     else
         if [ "$MODE" = mixed ]; then
@@ -602,7 +606,11 @@ e45igp)
                 > /etc/frr/bgpd.conf"
             docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -f /etc/frr/bgpd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
             wait_up "$SUT" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
-            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -q $INJ_IP" \
+            for _ in $(seq 1 20); do
+                sleep 2
+                docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
+            done
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
                 || { echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
         else
             start_rouster_bgpd "$SUT"
