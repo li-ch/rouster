@@ -562,12 +562,8 @@ e45igp)
     new_sut "$SUT"
     start_rousterd "$SUT"
     if [ "$MODE" = frr ]; then
-        docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/mgmtd.log --log-level info"
-        wait_up "$SUT" "mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
-        docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
-        wait_up "$SUT" "ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
-        docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
-        wait_up "$SUT" "bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+        # Deterministic config: per-daemon files via -f (the mgmtd
+        # transaction was lost inside this cell; -f has no async step).
         docker exec "$SUT" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
             'interface eth0' \
@@ -576,30 +572,26 @@ e45igp)
             ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id 1.1.1.1' \
             ' network 172.31.255.0/24 area 0.0.0.0' \
-            ' timers throttle spf 0 50 100' \
+            ' timers throttle spf 0 50 100' 'line vty' \
+            > /etc/frr/ospfd.conf"
+        docker exec "$SUT" sh -c "printf '%s\n' \
+            'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
             'router bgp $SUT_AS' \
             ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
             " neighbor $INJ_IP remote-as $INJ_AS" \
             " neighbor $INJ_IP timers 30 $HOLD" \
             ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
-            > /etc/frr/frr.conf"
-        docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-        # The mgmtd commit is async and has been observed lost inside
-        # this cell (bgpd left with no BGP instance): verify the
-        # neighbor row landed, retry the push once after 10 s if not.
-        sleep 5
-        docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
-            || { sleep 10; docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; }
-        for _ in $(seq 1 20); do
-            sleep 2
-            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
-        done
+            > /etc/frr/bgpd.conf"
+        docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
+        wait_up "$SUT" "ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
+        docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -f /etc/frr/bgpd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
+        wait_up "$SUT" "bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -q $INJ_IP" \
+            || { echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
     else
         if [ "$MODE" = mixed ]; then
-            docker exec "$SUT" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/mgmtd.log --log-level info"
-            wait_up "$SUT" "mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
-            docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
-            wait_up "$SUT" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+            # FRR bgpd with a deterministic -f file; OSPF is native
+            # rouster-ospfd (file-config below)
             docker exec "$SUT" sh -c "printf '%s\n' \
                 'frr version 10.2' 'frr defaults traditional' 'hostname x45' \
                 'router bgp $SUT_AS' \
@@ -607,15 +599,11 @@ e45igp)
                 " neighbor $INJ_IP remote-as $INJ_AS" \
                 " neighbor $INJ_IP timers 30 $HOLD" \
                 ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
-                > /etc/frr/frr.conf"
-            docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-            sleep 5
-            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' \
-                || { sleep 10; docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; }
-            for _ in $(seq 1 20); do
-                sleep 2
-                docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -c $INJ_IP" 2>/dev/null | grep -q -v '^0$' && break
-            done
+                > /etc/frr/bgpd.conf"
+            docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -f /etc/frr/bgpd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
+            wait_up "$SUT" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+            docker exec "$SUT" sh -c "vtysh -c 'show bgp summary' 2>/dev/null | grep -q $INJ_IP" \
+                || { echo "FAIL: bgpd config did not load from -f file" >&2; exit 1; }
         else
             start_rouster_bgpd "$SUT"
         fi
@@ -640,12 +628,8 @@ e45igp)
     docker exec "$PEER" sh -c "ip addr add $OSPF_NH/24 dev lo 2>/dev/null || true; ip link set lo up"
     docker exec "$PEER" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pzebra.log --log-level info"
     wait_up "$PEER" "peer zebra vty" 30 "test -S /var/run/frr/zebra.vty"
-    # mgmtd is load-bearing on the peer too: without it vtysh -b never
-    # delivers frr.conf and the adjacency silently never forms
-    docker exec "$PEER" sh -c "/usr/lib/frr/mgmtd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pmgmtd.log --log-level info"
-    wait_up "$PEER" "peer mgmtd vty" 30 "test -S /var/run/frr/mgmtd.vty"
-    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd.log --log-level info"
-    wait_up "$PEER" "peer ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
+    # Deterministic config: ospfd reads its own file via -f (the mgmtd
+    # transaction path lost commits on some runs; -f cannot be lost).
     docker exec "$PEER" sh -c "printf '%s\n' \
         'frr version 10.2' 'frr defaults traditional' 'hostname x45peer' \
         'interface eth0' \
@@ -656,15 +640,9 @@ e45igp)
         ' network 172.31.255.0/24 area 0.0.0.0' \
         ' network $OSPF_NET area 0.0.0.0' \
         ' timers throttle spf 0 50 100' \
-        'line vty' > /etc/frr/frr.conf"
-    docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true
-    # mgmtd's commit is asynchronous: verify the OSPF interface
-    # actually landed, retry once after 10 s if not (a lost first
-    # commit was observed on some runs). Then poll only - re-pushing
-    # in a tight loop bounces the forming adjacency.
-    sleep 5
-    docker exec "$PEER" sh -c "vtysh -c 'show ip ospf interface eth0' 2>/dev/null | grep -q 'eth0 is up'" \
-        || { sleep 10; docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true; }
+        'line vty' > /etc/frr/ospfd.conf"
+    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd.log --log-level info"
+    wait_up "$PEER" "peer ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
     for _ in $(seq 1 90); do
         sleep 2
         docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
@@ -728,9 +706,7 @@ e45igp)
     done
     TW=$(date +%s.%N)
     # restore the peer's ospfd -> adjacency re-forms -> routes return
-    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd2.log --log-level info"
-    sleep 3
-    docker exec "$PEER" vtysh -b >/dev/null 2>&1 || true
+    docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/pospfd2.log --log-level info"
     for _ in $(seq 1 30); do
         sleep 2
         docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
