@@ -859,3 +859,22 @@ in the chat record. The "Your decision" column stays the owner's.
   never applied; earlier "passes" were comparison-error artifacts,
   now guarded); E4/E6 IGP cells stay placeholders · receipts:
   away/2026-10-19/bench/dgx-x2/; raw on the box. No verdict prose.
+
+- 2026-10-20 · X round-3 cells (e45igp native measured + probe;
+  e5backend; e7 queue occupancy) · host=dgx-spark-1 (rig as the
+  2026-10-19 bare-metal E1 entry; rousterd from tree d68efbe with the
+  install-window occupancy instrumentation) · **e45igp native (rouster
+  bgpd + rouster-ospfd; OSPF peer = FRR): adjacency Full; 10,000 BGP
+  routes installed through an OSPF-only nexthop; peer-ospfd kill →
+  withdrawn 9.7 s (63.2 s first run) → restart → restored 19.8 s
+  (27.2 s first run); forwarding probe: ONE 19.0 s loss window
+  (icmp_seq 43→139), no flap outside it.** Mixed/frr variants:
+  harness config-commit loss inside the cell (diag captured; z5 smokes
+  prove the attachments elsewhere) — recorded as finding, not claimed ·
+  **e5backend (SIGSTOP at 30% installed, 10 s): 3/3, 88 overrun/silent
+  events during the stall, recovery to exact 99,998 in 1.2-1.3 s
+  after CONT. First version stalled a finished daemon (fixed-sleep
+  bug, disclosed); receipts from the fixed cell.** · **e7 queues: peak
+  in-flight 512 (= the F8 bound, saturated under overload), quiescent
+  0 at 1 Hz sampling** · receipts away/2026-10-19/bench/dgx-x3/. No
+  verdict prose.
