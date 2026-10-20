@@ -831,8 +831,11 @@ e5backend)
         start_injector "$INJ"
         docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
         docker exec -d "$INJ" sh -c "mrt-replay $(INJ_ARGS_FOR $LIMIT) > /var/log/replay.txt 2>&1"
-        # stall at ~30% of the expected ingest
-        sleep 3
+        # stall when ~30% is installed (the 100k pass completes in
+        # ~2 s on this rig — a fixed sleep stalled a finished daemon)
+        for _ in $(seq 1 120); do
+            c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT / 3)) ] 2>/dev/null && break; sleep 0.2
+        done
         TSTOP=$(date +%s.%N)
         docker exec "$SUT" sh -c "kill -STOP \$(pidof rousterd)"
         sleep "$STALL"
