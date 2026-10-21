@@ -878,3 +878,29 @@ in the chat record. The "Your decision" column stays the owner's.
   in-flight 512 (= the F8 bound, saturated under overload), quiescent
   0 at 1 Hz sampling** · receipts away/2026-10-19/bench/dgx-x3/. No
   verdict prose.
+
+- 2026-10-21 · X round-4: the mixed-IGP cell MEASURED (e45igp all three
+  modes) · host=dgx-spark-1 (rig as the 2026-10-19 bare-metal E1 entry;
+  rousterd tree ab533d5) · two real fixes on the way, both found by
+  this cell: (harness) per-daemon `-f` config files replace the
+  mgmtd-backed vtysh -b push (the async commit was lost in-cell; a
+  printf quoting bug also wrote the file empty once) + FRR bgpd over
+  an OSPF-learned nexthop needs `ebgp-multihop 2` (the single-hop
+  connected-nexthop check rejects non-on-link next hops locally,
+  without consulting the core); (SUT defect, fixed ab533d5, gate
+  1860/0) NHT re-evaluation now rides the reconcile tick — bgpd's
+  10.99.0.1 registration raced the native OSPF route's arrival and
+  route events never re-armed NHT (link/address only), leaving
+  "#paths 10000 unresolved" forever; zebra re-evaluates NHT on route
+  changes; pinned by
+  tick_nht_flips_a_registration_after_the_covering_route_arrives ·
+  **measured (10k routes, OSPF-only nexthop, peer-ospfd kill+restore):
+  native 10,000 baseline / 9.7 s withdraw / 19.9 s restore / probe one
+  19.2 s loss window; mixed (FRR bgpd + native ospfd) 10,000 / 9.7 /
+  19.9 / one 16.8 s window; frr (FRR bgpd + FRR ospfd, same core)
+  10,000 / 9.7 / 10.5 / one 9.2 s window — withdrawal is
+  dead-interval-driven (identical 9.7 s all modes); the restore gap is
+  the OSPF speaker (FRR ospfd re-converges faster than the native
+  ospfd on restart — a native-speaker follow-up, not a core
+  difference)** · pre-fix failing runs kept with the diagnostics ·
+  receipts away/2026-10-19/bench/dgx-x4/. No verdict prose.
