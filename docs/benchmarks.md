@@ -904,3 +904,28 @@ in the chat record. The "Your decision" column stays the owner's.
   ospfd on restart — a native-speaker follow-up, not a core
   difference)** · pre-fix failing runs kept with the diagnostics ·
   receipts away/2026-10-19/bench/dgx-x4/. No verdict prose.
+
+- 2026-10-21 · X round-5 (e1rand generated campaign; e4partial
+  attempt; e6 staticd withdrawal; e7 queues 200 ms; ospfd restore
+  analysis) · host=dgx-spark-1 · **e1rand: 5 seed-driven random
+  schedules per system over {A, W<n>, R<n>}, computed oracles —
+  FRR 5/5 exact, Rouster 5/5 exact, zero duplicates both (0/0
+  excluded as the e1diff-known delta). Two harness bugs found and
+  fixed en route (index- vs lexicographic-sort; locale collation
+  hiding exact agreement), disclosed in the receipt.** · e4partial
+  closed attempted-with-finding: three-router shared-segment OSPF
+  stalls one adjacency in LSDB exchange (Loading, 180 s) with BOTH
+  the native and FRR speakers as SUT (not a Rouster defect); the
+  two-segment rebuild did not form adjacency in-window; the
+  per-nexthop isolation measurement stays a placeholder · **e6: FRR
+  staticd withdrawal does not propagate via ANY harness surface
+  (mgmtd push, SIGHUP, vtysh -c — live-probed; staticd EXIT leaves
+  routes per the disclosed no-owner-cleanup design); adds remain
+  deterministic 3/3; rouster's own staticd (z4) implements SIGHUP-diff
+  withdrawal** · **e7 queues at 200 ms (own tick, gate 1860/0 + the
+  known vty flake disclosed): peak 512 (F8 bound saturated), current
+  0 in all 31 intra-storm samples — bursts drain in under 200 ms** ·
+  ospfd restore decomposition (dgx-x4 logs): native 19.9 s = 9 s
+  adjacency re-form + constant ~5 s Full→/32 (present on first
+  bring-up too — LSA/SPF pacing, not restart damage) · receipts
+  away/2026-10-19/bench/dgx-x5/. No verdict prose.
