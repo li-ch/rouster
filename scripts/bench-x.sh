@@ -954,8 +954,10 @@ e4partial)
     LIMIT=${BENCH_X_LIMIT:-10000}
     MODE=${BENCH_X_IGP_MODE:-native}
     ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e4partial needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
-    PEER1_IP=172.31.255.30; PEER2_IP=172.31.255.31
+    PEER1_IP=172.31.255.30; PEER2_IP=172.31.254.31
     NH1=10.99.0.1; NH2=10.99.1.1
+    NET2_NAME=${BENCH_NET2_NAME:-bench-net2}
+    NET2_SUBNET=${BENCH_NET2_SUBNET:-172.31.254.0/24}
     # split the feed: odd-index prefixes via NH1, even via NH2
     awk -v n="$LIMIT" -v nh1="$NH1" -v nh2="$NH2" \
         'NR <= n && /next-hop/ { sub(/next-hop [0-9.]*/, "next-hop " ((NR % 2 == 1) ? nh1 : nh2)) } NR <= n' \
@@ -964,7 +966,13 @@ e4partial)
     SUT=x4p-sut-$TS; INJ=x4p-inj-$TS; PEER=x4p-p1-$TS; PEER2=x4p-p2-$TS
     trap 'docker rm -f "$SUT" "$INJ" "$PEER" "$PEER2" >/dev/null 2>&1 || true' EXIT
     note "=== e4partial mode=$MODE limit=$LIMIT (half $NH1, half $NH2)"
+    docker network inspect "$NET2_NAME" >/dev/null 2>&1 \
+        || docker network create --subnet "$NET2_SUBNET" "$NET2_NAME"
     new_sut "$SUT"
+    # second segment: two p2p adjacencies need two links (a shared
+    # segment with three routers stalls LSDB exchange for one peer in
+    # every speaker combination tried — the finding that shaped this)
+    docker network connect --ip "$PEER2_IP" "$NET2_NAME" "$SUT"
     start_rousterd "$SUT"
     if [ "$MODE" = mixed ]; then
         docker exec "$SUT" sh -c "printf '%s\n' \
@@ -987,11 +995,13 @@ e4partial)
         # disclosed finding this variant works around)
         docker exec "$SUT" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname x4p' \
-            'interface eth0' \
-            ' ip ospf hello-interval 2' \
-            ' ip ospf dead-interval 8' \
+            'interface eth0' ' ip ospf network point-to-point' \
+            ' ip ospf hello-interval 2' ' ip ospf dead-interval 8' \
+            'interface eth1' ' ip ospf network point-to-point' \
+            ' ip ospf hello-interval 2' ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id 1.1.1.1' \
             ' network 172.31.255.0/24 area 0.0.0.0' \
+            ' network 172.31.254.0/24 area 0.0.0.0' \
             'line vty' > /etc/frr/ospfd.conf"
         docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
         wait_up "$SUT" "frr ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
@@ -1002,18 +1012,22 @@ e4partial)
             'router ospf' ' router-id 1.1.1.1' \
             ' area 0.0.0.0' \
             '  interface eth0' \
-            '   network-type broadcast' \
-            '   hello-interval 2' \
-            '   dead-interval 8' \
+            '   network-type point-to-point' \
+            '   hello-interval 2' '   dead-interval 8' \
+            '  interface eth1' \
+            '   network-type point-to-point' \
+            '   hello-interval 2' '   dead-interval 8' \
             > /etc/rouster-ospfd.conf"
         docker exec -d "$SUT" sh -c "rouster-ospfd --config /etc/rouster-ospfd.conf > /var/log/rouster-ospfd.log 2>&1"
         wait_up "$SUT" "rouster ospfd up" 20 "pidof rouster-ospfd"
     fi
     # two OSPF peers, each advertising its own dummy /24
-    for PSPEC in "$PEER $PEER1_IP $NH1 2.2.2.2" "$PEER2 $PEER2_IP $NH2 3.3.3.3"; do
+    for PSPEC in "$PEER $PEER1_IP $NH1 2.2.2.2 0" "$PEER2 $PEER2_IP $NH2 3.3.3.3 1"; do
         set -- $PSPEC
-        PNAME=$1; PIP=$2; PNH=$3; PRID=$4
-        docker run -d --name "$PNAME" --network "$NET_NAME" --ip "$PIP" \
+        PNAME=$1; PIP=$2; PNH=$3; PRID=$4; PNET2=$5
+        PNET_ATTACH=""
+        [ "$PNET2" = 1 ] && PNET_ATTACH="$NET2_NAME" || PNET_ATTACH="$NET_NAME"
+        docker run -d --name "$PNAME" --network "$PNET_ATTACH" --ip "$PIP" \
             --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
             --entrypoint sleep "$IMAGE" infinity >/dev/null
         docker exec "$PNAME" sh -c "ip addr add $PNH/24 dev lo 2>/dev/null || true; ip link set lo up"
@@ -1022,11 +1036,10 @@ e4partial)
         PNET="${PNH%.*}.0/24"
         docker exec "$PNAME" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname $PNAME' \
-            'interface eth0' \
+            'interface eth0' ' ip ospf network point-to-point' \
             ' ip ospf hello-interval 2' \
             ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id $PRID' \
-            ' network 172.31.255.0/24 area 0.0.0.0' \
             ' network $PNET area 0.0.0.0' \
             'line vty' > /etc/frr/ospfd.conf"
         docker exec "$PNAME" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/po.log --log-level info"
