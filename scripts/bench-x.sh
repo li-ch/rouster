@@ -372,6 +372,7 @@ e6mixed)
         'ip route 198.51.100.0/24 172.31.255.10' \
         > /etc/frr/frr.conf"
     docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+    docker exec "$SUT" sh -c 'kill -HUP "$(pidof staticd)"' 2>/dev/null || true
     S_MID=$(wait_static "$SUT" 1)
     BGP_MID=$(kern_count "$SUT")
     docker exec "$SUT" sh -c "printf '%s\n' \
@@ -381,6 +382,7 @@ e6mixed)
         'ip route 203.0.113.0/25 172.31.255.10' \
         > /etc/frr/frr.conf"
     docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
+    docker exec "$SUT" sh -c 'kill -HUP "$(pidof staticd)"' 2>/dev/null || true
     S_END=$(wait_static "$SUT" 3)
     BGP_END=$(kern_count "$SUT")
     T1=$(date +%s.%N)
