@@ -696,6 +696,8 @@ e45igp)
     if [ "$BGP_FULL" -lt $((LIMIT - 20)) ]; then
         docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary' 2>&1 | tail -3; vtysh -c 'show ip route 10.99.0.1' 2>&1 | tail -3" > "$OUT_DIR/diag-$MODE.txt" 2>/dev/null || true
         docker exec "$INJ" sh -c "cat /var/log/flap-run.txt 2>/dev/null | head -8" > "$OUT_DIR/flap-head-$MODE.txt" 2>/dev/null || true
+        docker cp "$SUT:/var/log/rousterd.log" "$OUT_DIR/rousterd-$MODE.log" 2>/dev/null || true
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast COUNT' 2>&1; vtysh -c 'show bgp nexthop' 2>&1 | head -12" >> "$OUT_DIR/diag-$MODE.txt" 2>/dev/null || true
         fail "e45igp $MODE: BGP routes did not resolve via OSPF ($BGP_FULL)"
         docker rm -f "$SUT" "$INJ" "$PEER" >/dev/null 2>&1 || true
         exit 1
