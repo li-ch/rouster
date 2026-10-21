@@ -366,26 +366,17 @@ e6mixed)
     S_AFTER=$(docker exec "$SUT" sh -c "ip route show proto static | grep -c ." || echo 0)
     note "bgp kernel count under static coexistence: $BGP_FULL; static still: $S_AFTER"
     # static churn under the loaded table: withdraw + re-add via config swap
+    # static churn: vtysh -c drives it deterministically (SIGHUP
+    # reloads a daemon file mgmtd never wrote; config swaps race
+    # the async commit)
     T0=$(date +%s.%N)
-    docker exec "$SUT" sh -c "printf '%s\n' \
-        'frr version 10.2' 'frr defaults traditional' 'hostname bench-x6' \
-        'ip route 198.51.100.0/24 172.31.255.10' \
-        > /etc/frr/frr.conf"
-    docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-    docker exec "$SUT" sh -c 'kill -HUP "$(pidof staticd)"' 2>/dev/null || true
+    docker exec "$SUT" sh -c "vtysh -c 'configure terminal' -c 'no ip route 198.51.200.0/24 172.31.255.10' -c 'no ip route 203.0.113.0/25 172.31.255.10'"
     S_MID=$(wait_static "$SUT" 1)
     BGP_MID=$(kern_count "$SUT")
-    docker exec "$SUT" sh -c "printf '%s\n' \
-        'frr version 10.2' 'frr defaults traditional' 'hostname bench-x6' \
-        'ip route 198.51.100.0/24 172.31.255.10' \
-        'ip route 198.51.200.0/24 172.31.255.10' \
-        'ip route 203.0.113.0/25 172.31.255.10' \
-        > /etc/frr/frr.conf"
-    docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true
-    docker exec "$SUT" sh -c 'kill -HUP "$(pidof staticd)"' 2>/dev/null || true
+    docker exec "$SUT" sh -c "vtysh -c 'configure terminal' -c 'ip route 198.51.200.0/24 172.31.255.10' -c 'ip route 203.0.113.0/25 172.31.255.10'"
     S_END=$(wait_static "$SUT" 3)
     BGP_END=$(kern_count "$SUT")
-    T1=$(date +%s.%N)
+    T1=$(date +%s.%N)    T1=$(date +%s.%N)
     note "churn: static $S_COUNT->$S_MID->$S_END (expect 3->1->3); bgp $BGP_FULL->$BGP_MID->$BGP_END; churn_wall_s=$(python3 -c "print(f'{$T1-$T0:.1f}')")"
     if [ "$S_COUNT" = 3 ] && [ "$S_MID" = 1 ] && [ "$S_END" = 3 ] \
        && [ "$BGP_FULL" -ge "$NEED" ] && [ "$BGP_MID" -ge "$NEED" ] && [ "$BGP_END" -ge "$NEED" ]; then
@@ -908,8 +899,9 @@ for op in ops:
     else:
         expected |= nth(int(op[1:]))
 with open(f"{out}/rand-{seed}-expected.txt", "w") as fh:
-    for i in sorted(expected):
-        fh.write(prefixes[i] + "\n")
+    # comm needs lexicographic order, NOT index order
+    for p in sorted(prefixes[i] for i in expected):
+        fh.write(p + "\n")
 print(f"OPS={','.join(ops)}")
 print(f"EXPECTED={len(expected)}")
 GENEOF
@@ -988,7 +980,7 @@ e4partial)
         'router ospf' ' router-id 1.1.1.1' \
         ' area 0.0.0.0' \
         '  interface eth0' \
-        '   network-type point-to-point' \
+        '   network-type broadcast' \
         '   hello-interval 2' \
         '   dead-interval 8' \
         > /etc/rouster-ospfd.conf"
@@ -1007,7 +999,6 @@ e4partial)
         docker exec "$PNAME" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname $PNAME' \
             'interface eth0' \
-            ' ip ospf network point-to-point' \
             ' ip ospf hello-interval 2' \
             ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id $PRID' \
