@@ -918,9 +918,16 @@ GENEOF
             done
             sleep 3
             kern_dump "$SUT" > "$OUT_DIR/rand-$SD-$SIDE-kernel.txt"
-            awk '{print $1}' "$OUT_DIR/rand-$SD-$SIDE-kernel.txt" | sort > "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt"
+            # LC_ALL=C: the C-locale vs UTF-8 collation of '/' breaks
+            # comm otherwise; 'default' is iproute2's rendering of the
+            # 0/0 route — normalize it; 0/0 itself is the known
+            # cross-system delta (e1diff), excluded from both sides.
+            awk '{print $1}' "$OUT_DIR/rand-$SD-$SIDE-kernel.txt" \
+                | sed 's/^default$/0.0.0.0\x2f0/' | grep -v '^0.0.0.0/0$' \
+                | LC_ALL=C sort > "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt"
+            grep -v '^0.0.0.0/0$' "$OUT_DIR/rand-$SD-expected.txt" | LC_ALL=C sort > "$OUT_DIR/rand-$SD-expected-c.txt"
             C=$(wc -l < "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt")
-            D=$(comm -3 "$OUT_DIR/rand-$SD-expected.txt" "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt" | grep -c . || true)
+            D=$(LC_ALL=C comm -3 "$OUT_DIR/rand-$SD-expected-c.txt" "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt" | grep -c . || true)
             DUP=$(awk 'seen[$0]++' "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt" | wc -l)
             note "side=$SIDE sched#$K seed=$SD count=$C expected=$EXP diff=$D dups=$DUP"
             if [ "$D" = 0 ] && [ "$DUP" = 0 ]; then
