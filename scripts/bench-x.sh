@@ -972,7 +972,8 @@ e4partial)
     # second segment: two p2p adjacencies need two links (a shared
     # segment with three routers stalls LSDB exchange for one peer in
     # every speaker combination tried — the finding that shaped this)
-    docker network connect --ip "$PEER2_IP" "$NET2_NAME" "$SUT"
+    SUT2_IP="${NET2_SUBNET%.*}.20"
+    docker network connect --ip "$SUT2_IP" "$NET2_NAME" "$SUT"
     start_rousterd "$SUT"
     if [ "$MODE" = mixed ]; then
         docker exec "$SUT" sh -c "printf '%s\n' \
