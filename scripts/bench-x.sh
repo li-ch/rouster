@@ -981,18 +981,34 @@ e4partial)
     else
         start_rouster_bgpd "$SUT"
     fi
-    docker cp "$BIN_DIR/rouster-ospfd" "$SUT:/usr/local/bin/rouster-ospfd"
-    docker exec "$SUT" sh -c "printf '%s\n' \
-        'zapi socket /var/run/frr/zserv.api' \
-        'router ospf' ' router-id 1.1.1.1' \
-        ' area 0.0.0.0' \
-        '  interface eth0' \
-        '   network-type broadcast' \
-        '   hello-interval 2' \
-        '   dead-interval 8' \
-        > /etc/rouster-ospfd.conf"
-    docker exec -d "$SUT" sh -c "rouster-ospfd --config /etc/rouster-ospfd.conf > /var/log/rouster-ospfd.log 2>&1"
-    wait_up "$SUT" "rouster ospfd up" 20 "pidof rouster-ospfd"
+    if [ "$MODE" = frrspf ]; then
+        # FRR ospfd as the SUT's OSPF speaker (multi-neighbor broadcast
+        # exchange; the native speaker's two-neighbor stall is the
+        # disclosed finding this variant works around)
+        docker exec "$SUT" sh -c "printf '%s\n' \
+            'frr version 10.2' 'frr defaults traditional' 'hostname x4p' \
+            'interface eth0' \
+            ' ip ospf hello-interval 2' \
+            ' ip ospf dead-interval 8' \
+            'router ospf' ' ospf router-id 1.1.1.1' \
+            ' network 172.31.255.0/24 area 0.0.0.0' \
+            'line vty' > /etc/frr/ospfd.conf"
+        docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
+        wait_up "$SUT" "frr ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
+    else
+        docker cp "$BIN_DIR/rouster-ospfd" "$SUT:/usr/local/bin/rouster-ospfd"
+        docker exec "$SUT" sh -c "printf '%s\n' \
+            'zapi socket /var/run/frr/zserv.api' \
+            'router ospf' ' router-id 1.1.1.1' \
+            ' area 0.0.0.0' \
+            '  interface eth0' \
+            '   network-type broadcast' \
+            '   hello-interval 2' \
+            '   dead-interval 8' \
+            > /etc/rouster-ospfd.conf"
+        docker exec -d "$SUT" sh -c "rouster-ospfd --config /etc/rouster-ospfd.conf > /var/log/rouster-ospfd.log 2>&1"
+        wait_up "$SUT" "rouster ospfd up" 20 "pidof rouster-ospfd"
+    fi
     # two OSPF peers, each advertising its own dummy /24
     for PSPEC in "$PEER $PEER1_IP $NH1 2.2.2.2" "$PEER2 $PEER2_IP $NH2 3.3.3.3"; do
         set -- $PSPEC
