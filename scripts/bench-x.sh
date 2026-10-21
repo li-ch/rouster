@@ -1003,6 +1003,7 @@ e4partial)
         docker exec "$PNAME" sh -c "ip addr add $PNH/24 dev lo 2>/dev/null || true; ip link set lo up"
         docker exec "$PNAME" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pz.log --log-level info"
         wait_up "$PNAME" "$PNAME zebra" 30 "test -S /var/run/frr/zebra.vty"
+        PNET="${PNH%.*}.0/24"
         docker exec "$PNAME" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname $PNAME' \
             'interface eth0' \
@@ -1010,7 +1011,7 @@ e4partial)
             ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id $PRID' \
             ' network 172.31.255.0/24 area 0.0.0.0' \
-            " network $(dirname $PNH).0/24 area 0.0.0.0" \
+            ' network $PNET area 0.0.0.0' \
             'line vty' > /etc/frr/ospfd.conf"
         docker exec "$PNAME" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/po.log --log-level info"
         wait_up "$PNAME" "$PNAME ospfd" 30 "test -S /var/run/frr/ospfd.vty"
