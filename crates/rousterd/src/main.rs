@@ -311,6 +311,10 @@ async fn main() -> std::io::Result<()> {
     // (same Delay hygiene — a publish skipped behind a long install
     // batch collapses into the next tick, never bursts).
     let mut status_tick = tokio::time::interval(STATUS_REFRESH_INTERVAL);
+    // The queues file rides its own faster tick (sub-second sampling
+    // for the E7 occupancy cell; a 200 ms file write is ~500 B/s).
+    let mut queues_tick = tokio::time::interval(Duration::from_millis(200));
+    queues_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -386,10 +390,12 @@ async fn main() -> std::io::Result<()> {
             }
             _ = status_tick.tick() => {
                 rousterd::status::publish(&driver.rib);
-                // E7 queue observability: the install window's
-                // occupancy alongside the status snapshot. Best-effort
-                // (a failed write logs nothing extra — the status file
-                // remains the primary surface).
+            }
+            _ = queues_tick.tick() => {
+                // E7 queue observability on a 200 ms tick of its own:
+                // sub-second sampling resolves the install window's
+                // occupancy DURING a burst (the 1 s status cadence
+                // undersampled it). Best-effort.
                 let (cur, peak) = netlink_dp::nl_queue_stats();
                 let _ = std::fs::write(
                     "/run/rouster/rousterd.queues",
