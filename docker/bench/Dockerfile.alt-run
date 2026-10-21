@@ -1,0 +1,17 @@
+# The Rust-alternative SUT/observer runtime image (2026-10-21
+# Rust-baselines plan): the Rust systems link glibc (rustybgpd also
+# links tikv-jemallocator, whose musl path is the least-tested one),
+# so their containers are debian-slim rather than the alpine
+# frr-testbed base. §F's fairness rules care about same host +
+# engine; the image base differs and is disclosed in the §R entry.
+# Build on a host whose default docker bridge works; on the DGX bench
+# box (no docker0) use: DOCKER_BUILDKIT=0 docker build --network
+# <working-bridge> --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+# -t bench-alt-run:trixie -f Dockerfile.alt-run .
+ARG APT_MIRROR=deb.debian.org
+FROM debian:trixie-slim
+ARG APT_MIRROR
+RUN printf 'deb http://%s/debian trixie main\ndeb http://%s/debian trixie-updates main\ndeb http://%s/debian-security trixie-security main\n' "$APT_MIRROR" "$APT_MIRROR" "$APT_MIRROR" > /etc/apt/sources.list.d/alt.list \
+ && rm -f /etc/apt/sources.list.d/debian.sources \
+ && apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping procps sysvinit-utils && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["sleep", "infinity"]

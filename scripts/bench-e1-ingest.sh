@@ -14,6 +14,29 @@
 #            replacement. Poller mode 'hybrid': the main-table oracle
 #            is rousterd's status file (symmetric with config D) and
 #            the BGP-level curve comes from vtysh pfxRcd.
+#   rustybgp the Rust-baselines plan's S-R speaker cell: RustyBGP
+#            (osrg/rustybgp, GoBGP-compatible config + gRPC v4 API)
+#            in its DEFAULT configuration, which programs no kernel
+#            FIB (its kernel integration is an opt-in zebra.config
+#            block) — speaker-level numbers only: completion = the
+#            received-prefix count over gRPC (BENCH_GOBGP, the gobgp
+#            v4 CLI on the host). Runtime image BENCH_ALT_IMAGE
+#            (debian-slim; the binary links glibc + jemalloc).
+#   holo     the Rust-baselines plan's E-R end-to-end cell: Holo
+#            (holo-routing/holo, one holod process = speaker + core)
+#            configured over its gRPC northbound by holo-cli --file;
+#            it installs BGP routes with rtnetlink protocol 186 (the
+#            same tag rousterd uses), so the completion oracle is the
+#            kernel proto-186 count from a THIRD observer container
+#            sharing the SUT netns, pinned to BENCH_OBS_CPUS (off the
+#            SUT cpuset), paced dumps (bench-poll.py --kernel-pace).
+#            Binaries from BENCH_ALT_BIN_DIR: rustybgpd, holod,
+#            holo-cli, gobgp. BENCH_INJECTOR_BIN overrides the
+#            injector binary (sha256 recorded per run) — the 2026-10-21
+#            cells use an out-of-tree mrt-replay variant whose OPEN
+#            advertises the multiprotocol IPv4-unicast capability
+#            (RustyBGP negotiates families only from that capability;
+#            UPDATE bytes unchanged), run IDENTICALLY on every mode.
 #
 # Shape (§F): both SUT and injector are containers on bench-net
 # (172.31.255.0/24, SUT .20, injector .10) with disjoint pinned CPUs.
@@ -29,7 +52,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-MODE=${1:?usage: bench-e1-ingest.sh gate|rouster|frr|hybrid <raw-mrt> [runs] [limit]}
+MODE=${1:?usage: bench-e1-ingest.sh gate|rouster|frr|hybrid|rustybgp|holo <raw-mrt> [runs] [limit]}
 # FEED is the RAW TABLE_DUMP_V2 MRT (bunzip2'd); LIMIT slices the
 # first N prefixes (0 = the whole dump). The injector is the in-repo
 # mrt-replay tool (D1(c) switch: exabgp measured ~36 msg/s sustained
@@ -98,6 +121,15 @@ esac
 # hosts without a Rust toolchain (e.g. the bare-metal bench boxes);
 # unset, the paths reproduce the in-tree cargo layout.
 BIN_DIR=${BENCH_BIN_DIR:-target/$MUSL_TARGET/release}
+
+# Rust-alternative modes (2026-10-21 plan): runtime image, binaries,
+# host-side gRPC CLI, observer cpuset, injector-binary override.
+ALT_IMAGE=${BENCH_ALT_IMAGE:-bench-alt-run:trixie}
+ALT_BIN_DIR=${BENCH_ALT_BIN_DIR:-target/alt-bin}
+INJECTOR_BIN=${BENCH_INJECTOR_BIN:-$BIN_DIR/mrt-replay}
+GOBGP=${BENCH_GOBGP:-$ALT_BIN_DIR/gobgp}
+OBS_CPUS=${BENCH_OBS_CPUS:-12-17}
+KERNEL_PACE=${BENCH_KERNEL_PACE:-2.0}
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR="target/bench-logs/$MODE-$TS"
@@ -243,7 +275,8 @@ start_injector() { # name - mrt-replay on the other pinned cpuset
         --cpuset-cpus "$INJ_CPUS" \
         -v "$FEED_MRT":/feed.mrt:ro \
         --entrypoint sleep alpine:3.20 infinity >/dev/null
-    docker cp "$BIN_DIR/mrt-replay" "$1:/usr/local/bin/mrt-replay"
+    docker cp "$INJECTOR_BIN" "$1:/usr/local/bin/mrt-replay"
+    sha256sum "$INJECTOR_BIN" | awk '{print $1}' > "$OUT_DIR/injector-sha256.txt"
     LIMIT_ARG=""
     [ "$FEED_LIMIT" != 0 ] && LIMIT_ARG="--limit $FEED_LIMIT"
     INJ_ARGS="--peer $SUT_IP:179 --local-addr $INJ_IP --local-as $INJ_AS \
@@ -252,21 +285,99 @@ start_injector() { # name - mrt-replay on the other pinned cpuset
         --rate $REPLAY_RATE --hold $HOLD"
 }
 
+start_sut_rustybgp() { # name — default-config RustyBGP (speaker only)
+    docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
+        --cpuset-cpus "$SUT_CPUS" \
+        --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+        --entrypoint sleep "$ALT_IMAGE" infinity >/dev/null
+    docker cp "$ALT_BIN_DIR/rustybgpd" "$1:/usr/local/sbin/rustybgpd"
+    docker exec "$1" sh -c "printf '%s\n' \
+        '[global.config]' \
+        '  as = $SUT_AS' \
+        '  router-id = \"$SUT_IP\"' \
+        '' \
+        '[[neighbors]]' \
+        '  [neighbors.config]' \
+        '    neighbor-address = \"$INJ_IP\"' \
+        '    peer-as = $INJ_AS' \
+        '  [neighbors.transport.config]' \
+        '    passive-mode = true' \
+        > /etc/rustybgp.toml"
+    docker exec -d "$1" sh -c "RUST_LOG=info rustybgpd -f /etc/rustybgp.toml > /tmp/rustybgpd.txt 2>&1"
+    wait_up "$1" "rustybgpd bound :179" 30 "grep -qi ':00B3' /proc/net/tcp"
+    wait_up "$1" "rustybgpd gRPC :50051" 30 "grep -q ':C383' /proc/net/tcp /proc/net/tcp6 2>/dev/null"
+}
+
+start_sut_holo() { # name — holod (speaker+core in one process) + CLI config
+    docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
+        --cpuset-cpus "$SUT_CPUS" \
+        --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+        --entrypoint sleep "$ALT_IMAGE" infinity >/dev/null
+    docker cp "$ALT_BIN_DIR/holod" "$1:/usr/local/sbin/holod"
+    docker cp "$ALT_BIN_DIR/holo-cli" "$1:/usr/local/bin/holo-cli"
+    docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
+    # holod drops to the holo user; dirs and the file-log path must exist.
+    docker exec "$1" sh -c "
+        echo 'holo:x:200:200::/var/opt/holo:/sbin/nologin' >> /etc/passwd
+        echo 'holo:x:200:' >> /etc/group
+        mkdir -p /var/opt/holo /var/log
+        chown -R holo:holo /var/opt/holo"
+    docker cp "$(dirname "$0")/../docker/bench/holod.toml" "$1:/etc/holod.toml"
+    docker exec -d "$1" sh -c "RUST_LOG=holo=info holod > /tmp/holod-stderr.txt 2>&1"
+    wait_up "$1" "holod gRPC :50051" 30 "grep -q ':C383' /proc/net/tcp"
+    # BGP neighbor over the gRPC northbound (the only config surface).
+    # default-import-policy accept-route is required for the session to
+    # accept anything (the ietf-bgp default is reject-route, the same
+    # class of flag as FRR's ebgp-requires-policy, which this harness
+    # also disables) — disclosed in the ledger entry.
+    docker exec "$1" sh -c "printf '%s\n' \
+        'routing control-plane-protocols control-plane-protocol ietf-bgp:bgp main' \
+        ' bgp global as $SUT_AS' \
+        ' bgp global identifier $SUT_IP' \
+        ' bgp global afi-safis afi-safi iana-bgp-types:ipv4-unicast' \
+        '  enabled true' \
+        ' !' \
+        ' bgp neighbors neighbor $INJ_IP' \
+        '  peer-as $INJ_AS' \
+        '  transport passive-mode true' \
+        '  afi-safis afi-safi iana-bgp-types:ipv4-unicast' \
+        '   enabled true' \
+        '   apply-policy default-import-policy accept-route' \
+        '   apply-policy default-export-policy accept-route' \
+        '  !' \
+        ' !' \
+        '!' \
+        > /tmp/holo-bgp.cli"
+    docker exec "$1" sh -c "timeout 60 holo-cli -a http://127.0.0.1:50051 --file /tmp/holo-bgp.cli" \
+        && echo "    holo config committed"
+    wait_up "$1" "holod bound :179" 30 "grep -qi ':00B3' /proc/net/tcp"
+    wait_up "$1" "holo passive neighbor configured" 30 "timeout 20 holo-cli -a http://127.0.0.1:50051 -c 'show bgp summary' | grep -q $INJ_IP"
+}
+
 for run in $(seq 1 "$RUNS"); do
     RUN_DIR="$OUT_DIR/run-$run"
     mkdir -p "$RUN_DIR"
     SUT=b1-sut-$TS-$run
     INJ=b1-inj-$TS-$run
-    trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
-    docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+    OBS=b1-obs-$TS-$run
+    trap 'docker rm -f "$SUT" "$INJ" "$OBS" >/dev/null 2>&1 || true' EXIT
+    docker rm -f "$SUT" "$INJ" "$OBS" >/dev/null 2>&1 || true
     echo "==> run $run/$RUNS"
 
     case "$MODE" in
-        frr)    start_sut_frr "$SUT" ;;
-        hybrid) start_sut_hybrid "$SUT" ;;
-        *)      start_sut_rouster "$SUT" ;;
+        frr)      start_sut_frr "$SUT" ;;
+        hybrid)   start_sut_hybrid "$SUT" ;;
+        rustybgp) start_sut_rustybgp "$SUT" ;;
+        holo)     start_sut_holo "$SUT" ;;
+        *)        start_sut_rouster "$SUT" ;;
     esac
     start_injector "$INJ"
+    # holo's kernel oracle: third container in the SUT's netns, pinned
+    # off the SUT cpuset (the 2026-10-19 E2/E4 observer convention).
+    if [ "$MODE" = holo ]; then
+        docker run -d --name "$OBS" --network "container:$SUT" \
+            --cpuset-cpus "$OBS_CPUS" --entrypoint sleep "$ALT_IMAGE" infinity >/dev/null
+    fi
 
     # ARP seeding (the M3 NHT gate wants lladdr before session start).
     docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
@@ -287,11 +398,18 @@ EOF
     fi
 
     echo "    launching poller + injector"
+    POLL_MODE=$MODE; [ "$MODE" = gate ] && POLL_MODE=rouster
+    EXTRA_POLL_ARGS=""
+    case "$MODE" in
+        rustybgp) EXTRA_POLL_ARGS="--gobgp-bin $GOBGP --sut-ip $SUT_IP --inj-ip $INJ_IP" ;;
+        holo)     EXTRA_POLL_ARGS="--obs-container $OBS --kernel-pace $KERNEL_PACE" ;;
+    esac
     python3 scripts/bench-poll.py \
         --sut-container "$SUT" --inj-container "$INJ" \
-        --mode "$(if [ "$MODE" = frr ]; then echo frr; elif [ "$MODE" = hybrid ]; then echo hybrid; else echo rouster; fi)" \
+        --mode "$POLL_MODE" \
         --target-count "$FEED_COUNT" --timeout "$TIMEOUT" \
         $( [ "$MODE" = hybrid ] && echo "--bgpd-log /tmp/bgpd.log" ) \
+        $EXTRA_POLL_ARGS \
         --csv "$RUN_DIR/poll.csv" > "$RUN_DIR/poller.log" 2>&1 &
     POLLER=$!
     sleep 2
@@ -320,6 +438,18 @@ EOF
         docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary'; ip route show proto bgp | wc -l" > "$RUN_DIR/final-vtysh.txt" 2>&1 || true
         docker exec "$SUT" sh -c "cat /proc/\$(pidof bgpd | awk '{print \$1}')/stat /proc/\$(pidof rousterd | awk '{print \$1}')/stat" > "$RUN_DIR/final-proc-stat.txt" 2>/dev/null || true
         docker exec "$SUT" sh -c "cat /proc/\$(pidof bgpd)/status /proc/\$(pidof rousterd)/status" > "$RUN_DIR/final-proc-status.txt" 2>/dev/null || true
+    elif [ "$MODE" = rustybgp ]; then
+        docker cp "$SUT:/tmp/rustybgpd.txt" "$RUN_DIR/rustybgpd.txt" 2>/dev/null || true
+        "$GOBGP" -u "$SUT_IP" -p 50051 neighbor "$INJ_IP" > "$RUN_DIR/final-gobgp-neighbor.txt" 2>&1 || true
+        "$GOBGP" -u "$SUT_IP" -p 50051 global rib summary -a ipv4 > "$RUN_DIR/final-gobgp-rib-summary.txt" 2>&1 || true
+        docker exec "$SUT" sh -c "ip -4 route | wc -l; ip -4 route | awk '{for(i=1;i<=NF;i++) if(\$i==\"proto\") print \$(i+1)}' | sort | uniq -c" > "$RUN_DIR/final-kernel-routes.txt" 2>&1 || true
+        docker exec "$SUT" sh -c "cat /proc/\$(pidof rustybgpd | awk '{print \$1}')/stat /proc/\$(pidof rustybgpd | awk '{print \$1}')/status" > "$RUN_DIR/final-proc-stat.txt" 2>/dev/null || true
+    elif [ "$MODE" = holo ]; then
+        docker cp "$SUT:/var/log/holod.log" "$RUN_DIR/holod.log" 2>/dev/null || true
+        docker cp "$SUT:/tmp/holod-stderr.txt" "$RUN_DIR/holod-stderr.txt" 2>/dev/null || true
+        docker exec "$SUT" sh -c "timeout 60 holo-cli -a http://127.0.0.1:50051 -c 'show bgp summary'" > "$RUN_DIR/final-holo-summary.txt" 2>&1 || true
+        docker exec "$SUT" sh -c "ip -4 route show proto 186 | wc -l" > "$RUN_DIR/final-kernel-186.txt" 2>&1 || true
+        docker exec "$SUT" sh -c "cat /proc/\$(pidof holod | awk '{print \$1}')/stat /proc/\$(pidof holod | awk '{print \$1}')/status" > "$RUN_DIR/final-proc-stat.txt" 2>/dev/null || true
     else
         docker cp "$SUT:/var/log/rouster-bgpd.log" "$RUN_DIR/sut-bgpd.log" 2>/dev/null || true
         docker cp "$SUT:/var/log/rousterd.log" "$RUN_DIR/rousterd.log" 2>/dev/null || true
@@ -328,11 +458,11 @@ EOF
         docker exec "$SUT" sh -c "cat /proc/\$(pidof rouster-bgpd | awk '{print \$1}')/stat /proc/\$(pidof rousterd | awk '{print \$1}')/stat" > "$RUN_DIR/final-proc-stat.txt" 2>/dev/null || true
         docker exec "$SUT" sh -c "grep -Vm1 'VmHWM\|^$' /dev/null; cat /proc/\$(pidof rouster-bgpd)/status /proc/\$(pidof rousterd)/status" > "$RUN_DIR/final-proc-status.txt" 2>/dev/null || true
     fi
-    docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+    docker rm -f "$SUT" "$INJ" "$OBS" >/dev/null 2>&1 || true
     echo "    run $run artifacts: $RUN_DIR"
 done
 
 CLK=$(head -1 "$OUT_DIR/run-1/clk-tck.txt" 2>/dev/null || echo 100)
-SUMM_MODE=rouster; [ "$MODE" = frr ] && SUMM_MODE=frr
+SUMM_MODE=$MODE; [ "$MODE" = gate ] && SUMM_MODE=rouster
 python3 scripts/bench-summarize.py --out-dir "$OUT_DIR" --mode "$SUMM_MODE" --target-count "$FEED_COUNT" --clk-tck "$CLK" || true
 echo "bench-e1-ingest: done — $OUT_DIR/summary.json"

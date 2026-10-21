@@ -94,13 +94,16 @@ def parse_injector_log(path):
     return out
 
 
-def parse_poll(path):
+def parse_poll(path, target_count=None):
     rows = []
     with path.open() as fh:
         for row in csv.DictReader(fh):
             rows.append(row)
     if not rows:
         return {}
+    need = None
+    if target_count:
+        need = target_count - max(2, target_count // 200)
     def fnum(row, key):
         v = row.get(key, "")
         return float(v) if v not in ("", None) else None
@@ -117,6 +120,35 @@ def parse_poll(path):
             return None
     out["main_prefixes_last"] = to_int(rows[-1].get("sut_prefixes_main"))
     out["pfxrcd_last"] = to_int(rows[-1].get("sut_pfxrcd"))
+    out["kernel_count_last"] = to_int(rows[-1].get("sut_kernel_count"))
+    # speaker-complete: first row whose pfxrcd reached the need count
+    # (1 Hz quantized; the rouster EOR-log basis stays in
+    # wall_bgp_level_s, computed from its own log)
+    if need:
+        for r in rows:
+            v = to_int(r.get("sut_pfxrcd"))
+            if v is not None and v >= need:
+                out["t_pfxrcd_complete_s"] = float(r["t_host"])
+                break
+    out["t_pfxrcd_complete_s"] = out.get("t_pfxrcd_complete_s")
+    # speaker-full: first row reaching the run's own final plateau
+    # (the need-count rule can fire before the table tail; the
+    # plateau-bounded wall is the honest full-RIB-complete time)
+    plateau = max(
+        (to_int(r.get("sut_pfxrcd")) or 0) for r in rows) if rows else 0
+    if plateau:
+        for r in rows:
+            v = to_int(r.get("sut_pfxrcd"))
+            if v is not None and v >= plateau:
+                out["t_pfxrcd_full_s"] = float(r["t_host"])
+                break
+    # kernel-dump observer cost (holo mode): the quantization evidence
+    dms = [fnum(r, "kernel_dump_ms") for r in rows]
+    dms = [x for x in dms if x is not None]
+    if dms:
+        out["kernel_dump_ms_max"] = round(max(dms), 1)
+        out["kernel_dump_ms_median"] = round(
+            statistics.median(dms), 1)
     peak_main = 0
     for r in rows:
         v = to_int(r.get("sut_prefixes_main"))
@@ -165,12 +197,12 @@ def parse_poll_complete(path):
     return float(m.group(1)) if m else None
 
 
-def run_metrics(run_dir, clk_tck):
+def run_metrics(run_dir, clk_tck, target_count=None):
     m = {"run": run_dir.name}
     m.update(parse_bgpd_log(run_dir / "sut-bgpd.log"))
     m.update(parse_rousterd_log(run_dir / "rousterd.log"))
     m.update(parse_injector_log(run_dir / "injector.log"))
-    m.update(parse_poll(run_dir / "poll.csv"))
+    m.update(parse_poll(run_dir / "poll.csv", target_count))
     m["poll_complete_s"] = parse_poll_complete(run_dir / "poller.log")
     off = run_dir / "clock-offset.txt"
     if off.exists():
@@ -185,6 +217,21 @@ def run_metrics(run_dir, clk_tck):
     # derived wall times
     if m.get("first_update_s") and m.get("eor_s"):
         m["wall_bgp_level_s"] = m["eor_s"] - m["first_update_s"]
+    # injector-side delivery wall: first-UPDATE sent -> last-UPDATE
+    # sent, on the injector's clock — defined identically for every
+    # SUT (measures how fast the SUT drains the wire).
+    if m.get("driver_first_wall") and m.get("driver_last_wall"):
+        m["wall_injector_s"] = round(
+            m["driver_last_wall"] - m["driver_first_wall"], 3)
+    # speaker-complete wall: the SUT's own RIB surface reaching the
+    # target (1 Hz quantized for the polled surfaces; the rouster
+    # EOR-log basis is wall_bgp_level_s).
+    if m.get("t_pfxrcd_complete_s") and m.get("driver_first_wall"):
+        m["wall_speaker_s"] = round(
+            m["t_pfxrcd_complete_s"] - m["driver_first_wall"], 3)
+    if m.get("t_pfxrcd_full_s") and m.get("driver_first_wall"):
+        m["wall_speaker_full_s"] = round(
+            m["t_pfxrcd_full_s"] - m["driver_first_wall"], 3)
     t0 = m.get("driver_first_wall") or m.get("first_route_poll_s")
     if t0 and m.get("poll_complete_s"):
         m["wall_external_s"] = m["poll_complete_s"] - t0
@@ -197,18 +244,20 @@ def run_metrics(run_dir, clk_tck):
 
 
 AGG = [
-    "wall_bgp_level_s", "wall_external_s",
+    "wall_bgp_level_s", "wall_external_s", "wall_injector_s",
+    "wall_speaker_s", "wall_speaker_full_s",
     "sut_bgpd_cpu_s", "sut_zebra_cpu_s", "inj_cpu_s",
     "sut_bgpd_hwm_kb", "sut_zebra_hwm_kb",
     "sut_bgpd_rss_final_kb", "sut_zebra_rss_final_kb",
     "sut_bgpd_rss_empty_kb", "sut_zebra_rss_empty_kb",
+    "kernel_dump_ms_max",
 ]
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["rouster", "frr", "hybrid", "rustybgp", "holo"], required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--mode", choices=["rouster", "frr"], required=True)
     ap.add_argument("--target-count", type=int, required=True)
     ap.add_argument("--clk-tck", type=float, default=100.0)
     args = ap.parse_args()
@@ -218,7 +267,7 @@ def main():
     for run_dir in sorted(out.glob("run-*")):
         if not (run_dir / "poll.csv").exists():
             continue
-        m = run_metrics(run_dir, args.clk_tck)
+        m = run_metrics(run_dir, args.clk_tck, args.target_count)
         (run_dir / "metrics.json").write_text(json.dumps(m, indent=1) + "\n")
         runs.append(m)
 

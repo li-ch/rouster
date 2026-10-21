@@ -929,3 +929,69 @@ in the chat record. The "Your decision" column stays the owner's.
   adjacency re-form + constant ~5 s Full→/32 (present on first
   bring-up too — LSA/SPF pacing, not restart damage) · receipts
   away/2026-10-19/bench/dgx-x5/. No verdict prose.
+
+- 2026-10-21 · Rust-alternative baselines (reviews/
+  rust-alternatives-plan.md, owner-ratified; RustyBGP speaker-level
+  S-R + Holo end-to-end E-R; M-R rides the same runs) ·
+  host=dgx-spark-1 (rig as the 2026-10-19 bare-metal E1 entries:
+  SUT .20 cpus 5-9 single L3 cluster, injector .10 cpus 0-3, holo's
+  kernel observer a third container sharing the SUT netns on
+  10-14, rmem kernel-default, 0 overruns every rouster leg) ·
+  versions: RustyBGP osrg/rustybgp @3dbf3e1 (2026-10-19 master,
+  ACTIVELY maintained — the plan's unmaintained-vintage anticipation
+  inverted; glibc + default tikv-jemallocator, lto workspace
+  profile); Holo v0.9.0 (947daeb, 2026-02-21, latest release) with
+  holo-cli pinned 6cffb9c (the contemporaneous CLI; master-era CLI
+  speaks a newer gRPC API); gobgp v4.10.0 as the read-only oracle
+  client (RustyBGP implements the GoBGP v4 API); all built rustc
+  1.99.1 in rust:1-slim (trixie; 1.85 refused: tonic 0.14.6 needs
+  1.88, uuid 1.28 needs 1.89); binary sha256s in versions.txt ·
+  runtime image bench-alt-run:trixie (debian:trixie-slim +
+  iproute2; the Rust systems link glibc — image base differs from
+  frr-testbed:10.2.2, disclosed per §F same-host/engine rule) ·
+  injector: OUT-OF-TREE mrt-replay variant + the RFC 4760
+  multiprotocol IPv4-unicast capability in the OPEN (6 bytes;
+  UPDATE stream unchanged; RustyBGP negotiates families ONLY from
+  the MP-capability intersection and NOTIFICATION-3/1's IPv4 NLRI
+  without it — reproduced); the SAME variant binary ran ALL FOUR
+  legs; FRR/Rouster re-run with it reproduce the 2026-10-19 matrix
+  (wall 30.657 vs 30.556, 12.663 vs 13.522; CPU/mem within 2%) ·
+  feed: the pinned dump, full 1,126,490 · runs: 6 per leg (1 warmup
+  + 5 measured) · oracles: RustyBGP = gobgp global-rib Destination
+  count at 1 Hz (speaker-level ONLY — the default config programs
+  no kernel FIB; verified every run; the kernel integration EXISTS
+  at this rev as an opt-in [zebra.config] block, probe-confirmed to
+  install proto bgp/186 at 2k); Holo = kernel proto-186 count from
+  the paced observer (Holo installs BGP routes with the SAME
+  rtnetlink tag as rousterd, holo-routing netlink.rs:225; dump cost
+  1.65-1.75 s at full table recorded per row — completion carries
+  up to one dump of quantization); FRR/Rouster = their established
+  §R oracles · **S-R speaker ingest (first-UPDATE→speaker RIB
+  full): FRR bgpd 30.657 s [p95 30.67] / RustyBGP 1.643 [3.36,
+  min 0.66 — 1 Hz poll vs sub-second fill] / Rouster bgpd 4.888
+  [4.95] (own-log EOR); speaker CPU 13.61 / 2.73 / 9.52 s; speaker
+  B/pfx 919.3 / 1,026.0 (jemalloc default) / 452.8; RustyBGP RIB =
+  1,126,481 = feed−9 (same accept count as Rouster)** · **E-R
+  end-to-end (first-UPDATE→kernel complete): FRR (A) 30.657 [30.67]
+  / Holo 32.666 [36.38] / Rouster (D) 12.663 [13.67]; SUT CPU
+  25.27 (pair) / 47.65 (single process) / 27.01 (pair); suite B/pfx
+  1,452.3 / 4,846.0 / 682.2; accepted kernel counts 1,126,484 /
+  1,126,282 (= feed−208: Holo RFC 7606 treat-as-withdraw on AS_PATH
+  parse strictness, deterministic every run, 0 injector
+  NOTIFICATIONs) / 1,126,481** · Holo v0.9.0 robustness findings
+  (disclosed): a northbound gRPC session racing bulk ingest panics
+  the daemon (iana-bgp-community-types:no-export identity
+  unresolvable in generated YANG serialization; reproduced 3/3 with
+  1 Hz holo-cli polling, clean 4/4 without — the harness makes NO
+  mid-run CLI calls); `show bgp summary` fails post-settle at 100k+
+  (state fetch Cancelled); all measured cells 0 panics · both
+  directions published: RustyBGP leads the speaker wall 3x over
+  Rouster's EOR at 2.3x less speaker CPU while carrying 2.27x the
+  speaker memory and no kernel table by default; Holo trails the
+  incumbent wall by 6.5% (within oracle quantization) at 1.9x pair
+  CPU and 3.34x pair memory; the native configuration leads every
+  end-to-end metric · raw: dgx-spark-1 target/bench-logs/
+  {rustybgp,holo,frr,rouster}-20261021T*; receipts
+  away/2026-10-21/bench/rust-baselines/ (PROTOCOL.md + summaries +
+  fold + median-run polls + versions + injector diff). No verdict
+  prose.
