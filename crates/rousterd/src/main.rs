@@ -375,6 +375,14 @@ async fn main() -> std::io::Result<()> {
             }
             _ = reconcile_tick.tick() => {
                 driver.rib.reconcile(&dp).await;
+                // NHT re-evaluation rides the tick: route events (a
+                // protocol daemon installing the covering route after a
+                // client registered) must flip tracked nexthops, as
+                // zebra does — the mixed-IGP cell measured a
+                // registration stuck unresolved otherwise (bgpd's
+                // register raced the OSPF route's arrival; only
+                // link/address events re-armed before).
+                driver.tick_nht();
             }
             _ = status_tick.tick() => {
                 rousterd::status::publish(&driver.rib);

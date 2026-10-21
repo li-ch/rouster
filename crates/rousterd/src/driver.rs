@@ -691,6 +691,12 @@ impl RibDriver {
 
     /// The resolution table every registered interest is re-checked
     /// against; only actual flips produce pushes.
+    /// The tick's NHT re-evaluation entry (route-change coverage; see
+    /// the main loop's reconcile arm).
+    pub fn tick_nht(&mut self) {
+        self.reevaluate_nht();
+    }
+
     fn reevaluate_nht(&mut self) {
         let rib = &self.rib;
         let mut flips: Vec<(u64, IpPrefix, Option<Nexthop>)> = Vec::new();
@@ -1313,8 +1319,9 @@ mod tests {
         }
     }
 
-    /// Route events never re-run resolution (direct resolution depends
-    /// only on the interface mirror).
+    /// Route events still never re-evaluate synchronously (that path
+    /// stays link/address-driven); the reconcile TICK is what covers
+    /// route-change flips now — pinned by the next test.
     #[test]
     fn route_events_do_not_re_evaluate_nht() {
         let mut driver = RibDriver::new();
@@ -1330,8 +1337,47 @@ mod tests {
         });
         assert!(
             pushes.try_recv().is_err(),
-            "a kernel route event is not a resolution flip"
+            "a kernel route event is not a synchronous resolution flip"
         );
+    }
+
+    /// The mixed-IGP receipt: a client registers a nexthop BEFORE the
+    /// covering protocol route exists (unresolved immediate answer),
+    /// then the route arrives — the reconcile tick's NHT re-evaluation
+    /// must push the flip (zebra re-evaluates NHT on route changes; a
+    /// registration stuck unresolved was measured on the bench with
+    /// FRR bgpd + native OSPF: 10,000 paths parked on an unresolved
+    /// nexthop).
+    #[test]
+    fn tick_nht_flips_a_registration_after_the_covering_route_arrives() {
+        let mut driver = RibDriver::new();
+        let mut pushes = attach(&mut driver, 1);
+        driver.apply_event(&link_up(2));
+        driver.apply_event(&addr_new(2, "203.0.113.1/24"));
+
+        // Register before any covering route: unresolved.
+        assert_eq!(register_nht(&mut driver, 1, "198.51.100.9/32", false), None);
+
+        // The protocol route arrives (a gateway inside the connected
+        // prefix). Route adds themselves push nothing to NHT...
+        let mut ospf = static_entry(
+            "198.51.100.0/24",
+            Nexthop::Ipv4("203.0.113.2".parse().unwrap()),
+            0,
+        );
+        ospf.protocol = RouteProtocol::Ospf;
+        driver.apply(RibCommand::AddRoute(ospf));
+        assert!(pushes.try_recv().is_err(), "no synchronous flip");
+
+        // ...the tick delivers the flip the client needs.
+        driver.tick_nht();
+        match pushes.try_recv() {
+            Ok(SessionPush::NexthopResolution { prefix, resolution }) => {
+                assert_eq!(prefix, "198.51.100.9/32".parse().unwrap());
+                assert!(resolution.is_some(), "the covering OSPF route resolves it");
+            }
+            other => panic!("expected the tick's NHT flip, got {other:?}"),
+        }
     }
 
     /// Zebra-faithful NHT (owner decision 2026-10-10): resolution is
