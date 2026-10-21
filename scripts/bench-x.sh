@@ -41,7 +41,7 @@ docker network inspect "$NET_NAME" >/dev/null 2>&1 \
     || docker network create --subnet "$NET_SUBNET" "$NET_NAME"
 perl -e 'alarm 15; exec @ARGV' docker run --rm --network "$NET_NAME" --entrypoint true "$IMAGE" \
     || { echo "docker pre-flight probe failed/wedged" >&2; exit 1; }
-for pfx in x1 x4 x5 x6 x7; do
+for pfx in x1 x1r x4 x4p x5 x6 x7; do
     docker rm -f $(docker ps -aq --filter name="$pfx-") >/dev/null 2>&1 || true
 done
 
@@ -712,7 +712,7 @@ e45igp)
     # adjacency, so loss marks the forwarding-plane outage window.
     docker exec -d "$SUT" sh -c "ping -i 0.2 -c 900 $OSPF_NH > /probe.txt 2>&1"
     TKILL=$(date +%s.%N)
-    docker exec "$PEER" sh -c "kill -9 \$(pidof ospfd)"
+    docker exec "$PEER" sh -c 'kill -9 "$(pidof ospfd)"' 
     for _ in $(seq 1 60); do
         c=$(kern_count "$SUT"); [ "$c" -le 10 ] 2>/dev/null && break; sleep 1
     done
@@ -846,6 +846,257 @@ e5backend)
         docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
         sleep 3
     done
+    ;;
+
+e1rand)
+    # E1's generated campaign: random schedules over {A, W<n>, R<n>},
+    # seed-driven, computed oracle. X (session reset) is excluded —
+    # the two systems differ BY DESIGN on close (the disclosed
+    # persistence deviation), so a shared oracle over X is not
+    # meaningful; reset behavior has its own cells (e1seq SEQ-3,
+    # e5cycles).
+    LIMIT=${BENCH_X_LIMIT:-10000}
+    SCHEDULES=${BENCH_X_SCHEDULES:-5}
+    SEED=${BENCH_X_SEED:-1}
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e1rand needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    mkdir -p "$OUT_DIR"
+    for SIDE in frr rouster; do
+        SUT=x1r-sut-$TS-$SIDE; INJ=x1r-inj-$TS-$SIDE
+        trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
+        note "=== e1rand side=$SIDE limit=$LIMIT schedules=$SCHEDULES seed-base=$SEED"
+        new_sut "$SUT"
+        if [ "$SIDE" = frr ]; then start_frr_daemons "$SUT"
+        else start_rousterd "$SUT"; start_rouster_bgpd "$SUT"; fi
+        docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+            --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+            --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+        docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+        docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+        for K in $(seq 1 "$SCHEDULES"); do
+            SD=$((SEED + K))
+            # generate schedule + expected set from the same seed
+            python3 - "$SD" "$LIMIT" "$ANN_CP" "$OUT_DIR" > /tmp/e1rand-$K.env <<'GENEOF'
+import random, sys
+seed, limit, ann, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+rng = random.Random(seed)
+prefixes = []
+with open(ann, errors="replace") as fh:
+    for line in fh:
+        if len(prefixes) >= limit:
+            break
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "announce" and parts[1] == "route":
+            prefixes.append(parts[2])
+lens = [len(prefixes)]
+# schedule: A first (empty-table announce is the interesting start), then
+# 4-8 random ops over W/R with n in 2..25
+ops = ["A"]
+for _ in range(rng.randint(4, 8)):
+    n = rng.randint(2, 25)
+    ops.append(f"{'W' if rng.random() < 0.5 else 'R'}{n}")
+# oracle: same arithmetic the driver performs
+allset = set(range(len(prefixes)))
+expected = set()
+nth = lambda n: {i for i in allset if (i + 1) % n == 0}
+for op in ops:
+    if op == "A":
+        expected = set(allset)
+    elif op.startswith("W"):
+        expected -= nth(int(op[1:]))
+    else:
+        expected |= nth(int(op[1:]))
+with open(f"{out}/rand-{seed}-expected.txt", "w") as fh:
+    for i in sorted(expected):
+        fh.write(prefixes[i] + "\n")
+print(f"OPS={','.join(ops)}")
+print(f"EXPECTED={len(expected)}")
+GENEOF
+            OPS=$(grep '^OPS=' /tmp/e1rand-$K.env | cut -d= -f2-)
+            EXP=$(grep '^EXPECTED=' /tmp/e1rand-$K.env | cut -d= -f2-)
+            note "side=$SIDE sched#$K seed=$SD ops=$OPS expected=$EXP"
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 45 \
+                --ops $OPS --gap 2 > /var/log/seq-run.txt 2>&1"
+            for _ in $(seq 1 240); do
+                docker exec "$INJ" sh -c "grep -q SEQ-ALL-DONE /var/log/seq-run.txt 2>/dev/null" && break
+                sleep 1
+            done
+            sleep 3
+            kern_dump "$SUT" > "$OUT_DIR/rand-$SD-$SIDE-kernel.txt"
+            awk '{print $1}' "$OUT_DIR/rand-$SD-$SIDE-kernel.txt" | sort > "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt"
+            C=$(wc -l < "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt")
+            D=$(comm -3 "$OUT_DIR/rand-$SD-expected.txt" "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt" | grep -c . || true)
+            DUP=$(awk 'seen[$0]++' "$OUT_DIR/rand-$SD-$SIDE-prefixes.txt" | wc -l)
+            note "side=$SIDE sched#$K seed=$SD count=$C expected=$EXP diff=$D dups=$DUP"
+            if [ "$D" = 0 ] && [ "$DUP" = 0 ]; then
+                pass "e1rand $SIDE seed=$SD: exact, no duplicates"
+            else
+                fail "e1rand $SIDE seed=$SD: diff=$D dups=$DUP"
+            fi
+            docker exec "$INJ" sh -c "pkill -f bench-seq 2>/dev/null" >/dev/null 2>&1 || true
+            docker exec "$INJ" sh -c "cat /var/log/seq-run.txt" > "$OUT_DIR/rand-$SD-$SIDE-driver.txt" 2>/dev/null || true
+            sleep 2
+        done
+        docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+        sleep 3
+    done
+    ;;
+
+e4partial)
+    # E4's last cell: PARTIAL-visibility failure. Half the announced
+    # prefixes resolve via OSPF peer 1 (10.99.0.1), half via peer 2
+    # (10.99.1.1). Kill ONLY peer 1's ospfd: the routes through .0.1
+    # must withdraw (dead-interval paced) while the routes through
+    # .1.1 stay installed, and the forwarding probes must show the
+    # loss isolated to the failed nexthop's stream.
+    LIMIT=${BENCH_X_LIMIT:-10000}
+    MODE=${BENCH_X_IGP_MODE:-native}
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e4partial needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    PEER1_IP=172.31.255.30; PEER2_IP=172.31.255.31
+    NH1=10.99.0.1; NH2=10.99.1.1
+    # split the feed: odd-index prefixes via NH1, even via NH2
+    awk -v n="$LIMIT" -v nh1="$NH1" -v nh2="$NH2" \
+        'NR <= n && /next-hop/ { sub(/next-hop [0-9.]*/, "next-hop " ((NR % 2 == 1) ? nh1 : nh2)) } NR <= n' \
+        "$ANN_CP" > "$OUT_DIR/announce-split.txt"
+    ANN_SPLIT=$(cd "$OUT_DIR" && pwd)/announce-split.txt
+    SUT=x4p-sut-$TS; INJ=x4p-inj-$TS; PEER=x4p-p1-$TS; PEER2=x4p-p2-$TS
+    trap 'docker rm -f "$SUT" "$INJ" "$PEER" "$PEER2" >/dev/null 2>&1 || true' EXIT
+    note "=== e4partial mode=$MODE limit=$LIMIT (half $NH1, half $NH2)"
+    new_sut "$SUT"
+    start_rousterd "$SUT"
+    if [ "$MODE" = mixed ]; then
+        docker exec "$SUT" sh -c "printf '%s\n' \
+            'frr version 10.2' 'frr defaults traditional' 'hostname x4p' \
+            'router bgp $SUT_AS' \
+            ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
+            ' neighbor $INJ_IP remote-as $INJ_AS' \
+            ' neighbor $INJ_IP ebgp-multihop 2' \
+            ' neighbor $INJ_IP timers 30 $HOLD' \
+            ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
+            > /etc/frr/bgpd.conf"
+        docker exec "$SUT" sh -c "/usr/lib/frr/bgpd -d -f /etc/frr/bgpd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/bgpd.log --log-level info"
+        wait_up "$SUT" "frr bgpd vty" 30 "test -S /var/run/frr/bgpd.vty"
+    else
+        start_rouster_bgpd "$SUT"
+    fi
+    docker cp "$BIN_DIR/rouster-ospfd" "$SUT:/usr/local/bin/rouster-ospfd"
+    docker exec "$SUT" sh -c "printf '%s\n' \
+        'zapi socket /var/run/frr/zserv.api' \
+        'router ospf' ' router-id 1.1.1.1' \
+        ' area 0.0.0.0' \
+        '  interface eth0' \
+        '   network-type point-to-point' \
+        '   hello-interval 2' \
+        '   dead-interval 8' \
+        > /etc/rouster-ospfd.conf"
+    docker exec -d "$SUT" sh -c "rouster-ospfd --config /etc/rouster-ospfd.conf > /var/log/rouster-ospfd.log 2>&1"
+    wait_up "$SUT" "rouster ospfd up" 20 "pidof rouster-ospfd"
+    # two OSPF peers, each advertising its own dummy /24
+    for PSPEC in "$PEER $PEER1_IP $NH1 2.2.2.2" "$PEER2 $PEER2_IP $NH2 3.3.3.3"; do
+        set -- $PSPEC
+        PNAME=$1; PIP=$2; PNH=$3; PRID=$4
+        docker run -d --name "$PNAME" --network "$NET_NAME" --ip "$PIP" \
+            --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
+            --entrypoint sleep "$IMAGE" infinity >/dev/null
+        docker exec "$PNAME" sh -c "ip addr add $PNH/24 dev lo 2>/dev/null || true; ip link set lo up"
+        docker exec "$PNAME" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pz.log --log-level info"
+        wait_up "$PNAME" "$PNAME zebra" 30 "test -S /var/run/frr/zebra.vty"
+        docker exec "$PNAME" sh -c "printf '%s\n' \
+            'frr version 10.2' 'frr defaults traditional' 'hostname $PNAME' \
+            'interface eth0' \
+            ' ip ospf network point-to-point' \
+            ' ip ospf hello-interval 2' \
+            ' ip ospf dead-interval 8' \
+            'router ospf' ' ospf router-id $PRID' \
+            ' network 172.31.255.0/24 area 0.0.0.0' \
+            " network $(dirname $PNH).0/24 area 0.0.0.0" \
+            'line vty' > /etc/frr/ospfd.conf"
+        docker exec "$PNAME" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/po.log --log-level info"
+        wait_up "$PNAME" "$PNAME ospfd" 30 "test -S /var/run/frr/ospfd.vty"
+    done
+    for _ in $(seq 1 90); do
+        sleep 2
+        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
+    done
+    ADJ1=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
+    ADJ2=$(docker exec "$PEER2" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
+    note "adjacency peer1=$ADJ1 peer2=$ADJ2"
+    case "$ADJ1$ADJ2" in FullFull) ;; *)
+        fail "e4partial: adjacency incomplete ($ADJ1/$ADJ2)"; exit 1 ;;
+    esac
+    docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+        --cpuset-cpus "$INJ_CPUS" -v "$ANN_SPLIT":/feed.announce:ro \
+        --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+    docker cp scripts/bench-flap.py "$INJ:/bench-flap.py"
+    docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+    docker exec -d "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
+        --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+        --announce /feed.announce --limit $LIMIT --flap-every 999999 \
+        --rounds 0 --hold $HOLD --steady-wait 5 --linger 900 > /var/log/flap-run.txt 2>&1"
+    for _ in $(seq 1 180); do
+        c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
+    done
+    VIA1=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH1'" || true)
+    VIA2=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH2'" || true)
+    note "baseline: total=$(kern_count "$SUT") via-$NH1=$VIA1 via-$NH2=$VIA2"
+    # dual forwarding probes + per-nexthop route counters through the event
+    docker exec -d "$SUT" sh -c "ping -i 0.2 -c 900 $NH1 > /probe1.txt 2>&1"
+    docker exec -d "$SUT" sh -c "ping -i 0.2 -c 900 $NH2 > /probe2.txt 2>&1"
+    docker exec -d "$SUT" sh -c '
+        : > /via.csv
+        end=$(( $(date +%s) + 300 ))
+        while :; do
+            v1=$(ip route show proto 186 2>/dev/null | grep -c "via 10.99.0.1")
+            v2=$(ip route show proto 186 2>/dev/null | grep -c "via 10.99.1.1")
+            echo "$(date +%s.%N) $v1 $v2" >> /via.csv
+            [ "$(date +%s)" -gt "$end" ] && break
+            sleep 1
+        done'
+    TKILL=$(date +%s.%N)
+    docker exec "$PEER" sh -c 'kill -9 "$(pidof ospfd)"' 
+    for _ in $(seq 1 90); do
+        v1=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH1'" || true)
+        [ "$v1" = 0 ] 2>/dev/null && break; sleep 1
+    done
+    TW=$(date +%s.%N)
+    for _ in $(seq 1 240); do
+        c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT / 2 - 20)) ] 2>/dev/null && break; sleep 1
+    done
+    TSTABLE=$(date +%s.%N)
+    V2END=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH2'" || true)
+    sleep 3
+    docker exec "$SUT" sh -c "pkill -f 'ping -i 0.2' 2>/dev/null; pkill -f via.csv 2>/dev/null" >/dev/null 2>&1 || true
+    docker cp "$SUT:/probe1.txt" "$OUT_DIR/probe1.txt" 2>/dev/null || true
+    docker cp "$SUT:/probe2.txt" "$OUT_DIR/probe2.txt" 2>/dev/null || true
+    docker cp "$SUT:/via.csv" "$OUT_DIR/via.csv" 2>/dev/null || true
+    python3 - "$TKILL" "$TW" "$TSTABLE" "$VIA1" "$VIA2" "$V2END" "$OUT_DIR" >> "$OUT_DIR/notes.txt" <<'PYEOF'
+import sys, re
+tk, tw, ts = map(float, sys.argv[1:4])
+via1_0, via2_0, via2_end = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+out = sys.argv[7]
+def probe(name):
+    try:
+        txt = open(f"{out}/probe{name}.txt", errors="replace").read()
+        seqs = sorted(int(x) for x in re.findall(r"icmp_seq=(\d+)", txt))
+        recv = len(seqs); span = seqs[-1] - seqs[0] + 1 if seqs else 0
+        gaps = [(b, a) for b, a in zip(seqs, seqs[1:]) if a - b > 1]
+        gs = "; ".join(f"seq {b}->{a} ({(a-b-1)*0.2:.1f}s)" for b, a in gaps) or "none"
+        return f"{recv} recv, {span-recv} lost; gaps: {gs}"
+    except Exception:
+        return "unreadable"
+print(f"X-NOTE e4partial: via-nh1 {via1_0}->0 in {tw-tk:.1f}s; via-nh2 {via2_0}->{via2_end} "
+      f"(healthy half {'STABLE' if via2_end >= via2_0 - 20 else 'DISTURBED'}); "
+      f"stable-at-half in {ts-tk:.1f}s")
+print(f"X-NOTE e4partial probe-nh1(dead): {probe(1)}")
+print(f"X-NOTE e4partial probe-nh2(healthy): {probe(2)}")
+PYEOF
+    if [ "$V2END" -ge $((LIMIT / 2 - 20)) ] 2>/dev/null; then
+        pass "e4partial: failure isolated to the dead nexthop's half"
+    else
+        fail "e4partial: healthy half disturbed ($V2END)"
+    fi
+    docker exec "$INJ" sh -c "cat /var/log/flap-run.txt" > "$OUT_DIR/flap.txt" 2>/dev/null || true
     ;;
 *) echo "unknown cell $CELL" >&2; exit 1 ;;
 esac
