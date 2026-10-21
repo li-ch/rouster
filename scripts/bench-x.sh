@@ -579,6 +579,7 @@ e45igp)
             'router bgp $SUT_AS' \
             ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
             ' neighbor $INJ_IP remote-as $INJ_AS' \
+            ' neighbor $INJ_IP ebgp-multihop 2' \
             ' neighbor $INJ_IP timers 30 $HOLD' \
             ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
             > /etc/frr/bgpd.conf"
@@ -601,6 +602,7 @@ e45igp)
                 'router bgp $SUT_AS' \
                 ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
                 ' neighbor $INJ_IP remote-as $INJ_AS' \
+                ' neighbor $INJ_IP ebgp-multihop 2' \
                 ' neighbor $INJ_IP timers 30 $HOLD' \
                 ' address-family ipv4 unicast' '  exit-address-family' 'line vty' \
                 > /etc/frr/bgpd.conf"
