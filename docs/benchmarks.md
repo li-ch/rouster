@@ -995,3 +995,27 @@ in the chat record. The "Your decision" column stays the owner's.
   away/2026-10-21/bench/rust-baselines/ (PROTOCOL.md + summaries +
   fold + median-run polls + versions + injector diff). No verdict
   prose.
+
+- 2026-10-28 · X full-table e1diff (bench-x.sh e1diff, the 100k
+  slice lifted to the full feed; cell unchanged except the limit)
+  · host=dgx-spark-1 (rig as the 2026-10-19 X-cells entry; both
+  legs sequential on bench-net, SUT .20 cpus 5-9, injector .10
+  cpus 0-3) · versions: FRR 10.2.2 (frr-testbed:10.2.2), Rouster
+  1.1.0 prebuilts ~/rouster-bench/bin (rousterd cd588377…, bgpd
+  b06eb5cc…), injector the OUT-OF-TREE mrt-replay variant
+  440f9f7f… for ALL legs via BENCH_BIN_DIR (stock bin/mrt-replay
+  786935be… not used); LC_ALL=C on all sort/comm (host locale
+  en_US.utf8) · feed: the pinned dump, full 1,126,490 (sha256
+  61f0d40d…; REPLAY-PARSED routes=1126490 both legs, 556,132 msgs,
+  EOR after the full request) · 2k smoke first (A=1,999 D=2,000,
+  onlyA=0, onlyD=1) · **full run: installed (prefix,nexthop)
+  kernel sets FRR 1,126,480 vs Rouster 1,126,481; ZERO FRR-only;
+  ONE Rouster-only = the announced default 0/0 via 172.31.255.10
+  (Rouster installs, incumbent does not) — 1,126,480 pairs
+  identical; Rouster = feed−9, matching the 2026-10-21
+  rust-baselines accept/kernel counts with the same injector;
+  cell wall 80 s** · receipts away/2026-10-27/e1diff-full/
+  (counts, NOTES.md with versions + injector sha256, replay logs,
+  dump head/tails, full onlyA/onlyD); raw on the box
+  target/bench-logs/x-e1diff-20261028T{102456Z,102545Z}. No verdict
+  prose.
