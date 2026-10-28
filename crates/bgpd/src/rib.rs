@@ -680,7 +680,30 @@ impl LocRib {
     /// full-table recompute per UPDATE made ingestion O(n²)); F10
     /// lever 3: candidates stay borrowed (one clone of the winner
     /// beats N clones for the election).
+    ///
+    /// speaker-opt lever 2 (`BGPD_FAST_ELECTION=1`, default OFF): a
+    /// single-candidate fast path. `best_path` over one candidate
+    /// returns it by construction (the ladder only removes
+    /// candidates while more than one remains), so the generic arm's
+    /// score/alive vectors and unconditional winner clone are pure
+    /// overhead there — and the unchanged-destination check (the
+    /// stale-ignoring [`Route::eq`], Arc pointer-shortcut) runs
+    /// BEFORE any clone, making a re-announcement of the identical
+    /// path allocation-free. The bulk-ingest shape (one peer, fresh
+    /// prefixes) is exactly this arm; the 2026-10-28 decomposition
+    /// put the sink at 1.56 s of the 4.91 s EOR window. Semantics
+    /// are the generic arm's, pinned by
+    /// `single_candidate_fast_path_agrees_with_bulk_recompute`.
     pub fn recompute_prefix(&mut self, prefix: IpPrefix) -> Vec<BestChange> {
+        self.recompute_prefix_mode(prefix, crate::fast_election())
+    }
+
+    /// [`Self::recompute_prefix`]'s mode-switchable core (the
+    /// speaker-opt lever-2 gate's testability seam: the equivalence
+    /// tests drive both arms without env mutation). The fast arms
+    /// early-return; every other shape falls through to the generic
+    /// tail below (the F10-lever-3 body, unchanged).
+    fn recompute_prefix_mode(&mut self, prefix: IpPrefix, fast: bool) -> Vec<BestChange> {
         let lo = Nlri {
             prefix,
             path_id: u32::MIN,
@@ -689,11 +712,42 @@ impl LocRib {
             prefix,
             path_id: u32::MAX,
         };
-        let candidates: Vec<&Route> = self
-            .adj_in
-            .values()
-            .flat_map(|rib| rib.range(lo..=hi).map(|(_, r)| r))
-            .collect();
+        let candidates: Vec<&Route> = if fast {
+            let mut candidates = self
+                .adj_in
+                .values()
+                .flat_map(|rib| rib.range(lo..=hi).map(|(_, r)| r));
+            let first = candidates.next();
+            let second = candidates.next();
+            match (first, second) {
+                // Zero candidates: the generic tail's withdrawal
+                // change, reached identically.
+                (None, _) => Vec::new(),
+                (Some(only), None) => {
+                    // Unchanged destination: no change event, no clone.
+                    if self.best.get(&prefix).is_some_and(|b| *b == *only) {
+                        return Vec::new();
+                    }
+                    let new_best = only.clone();
+                    let old_best = self.best.insert(prefix, new_best.clone());
+                    return vec![BestChange {
+                        prefix,
+                        best: Some(new_best),
+                        old: old_best,
+                    }];
+                }
+                (Some(a), Some(b)) => {
+                    let mut all = vec![a, b];
+                    all.extend(candidates);
+                    all
+                }
+            }
+        } else {
+            self.adj_in
+                .values()
+                .flat_map(|rib| rib.range(lo..=hi).map(|(_, r)| r))
+                .collect()
+        };
         let new_best = best_path(&candidates).map(|r| (*r).clone());
         let old_best = self.best.get(&prefix).cloned();
         if new_best.as_ref() == old_best.as_ref() {
@@ -1504,6 +1558,94 @@ mod tests {
         bulk_sorted.sort_by_key(|c| c.prefix);
         incr_sorted.sort_by_key(|c| c.prefix);
         assert_eq!(bulk_sorted, incr_sorted, "same change stream");
+        assert!(bulk.best.is_empty(), "everything withdrawn");
+    }
+
+    #[test]
+    fn single_candidate_fast_path_agrees_with_bulk_recompute() {
+        // speaker-opt lever 2's equivalence bar (the F1
+        // incremental_recompute_matches_bulk shape): the
+        // BGPD_FAST_ELECTION single-candidate arm lands the same best
+        // table and the same change stream as the bulk recompute —
+        // across fresh insert, identical re-announcement (the
+        // unchanged-destination arm: no change, no clone), contested
+        // prefixes (two candidates → the generic arm), replacement,
+        // and withdrawal.
+        let mut bulk = LocRib::new(65000);
+        let mut fast = LocRib::new(65000);
+        let p1 = peer("192.0.2.1", 65001, 1);
+        let p2 = peer("192.0.2.2", 65002, 2);
+        let px: Vec<IpPrefix> = ["203.0.113.0/24", "198.51.100.0/24", "192.0.2.128/25"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        let mut bulk_changes = Vec::new();
+        let mut fast_changes = Vec::new();
+
+        // Step 1: p1 announces all three — the single-candidate bulk
+        // shape (fresh prefixes).
+        let u1 = BgpUpdate {
+            attrs: base_attrs(vec![65001], None),
+            nlri: px.iter().map(|p| Nlri::from(*p)).collect(),
+            ..Default::default()
+        };
+        bulk.announce(&p1, &u1);
+        bulk_changes.extend(bulk.recompute());
+        fast.announce(&p1, &u1);
+        for p in &px {
+            fast_changes.extend(fast.recompute_prefix_mode(*p, true));
+        }
+
+        // Step 2: p1 re-announces one prefix IDENTICALLY — the
+        // unchanged-destination arm must yield no change at all.
+        let u1b = BgpUpdate {
+            attrs: base_attrs(vec![65001], None),
+            nlri: vec![Nlri::from(px[0])],
+            ..Default::default()
+        };
+        bulk.announce(&p1, &u1b);
+        bulk_changes.extend(bulk.recompute());
+        fast.announce(&p1, &u1b);
+        let before = fast_changes.len();
+        fast_changes.extend(fast.recompute_prefix_mode(px[0], true));
+        assert_eq!(fast_changes.len(), before, "identical re-announce is quiet");
+
+        // Step 3: p2 announces a shorter path for the middle prefix —
+        // two candidates, the generic arm under the flag.
+        let u2 = BgpUpdate {
+            attrs: base_attrs(vec![], None),
+            nlri: vec![Nlri::from(px[1])],
+            ..Default::default()
+        };
+        bulk.announce(&p2, &u2);
+        bulk_changes.extend(bulk.recompute());
+        fast.announce(&p2, &u2);
+        fast_changes.extend(fast.recompute_prefix_mode(px[1], true));
+
+        // Step 4: p2 withdraws → the best falls back to p1.
+        let nlri2 = Nlri::from(px[1]);
+        bulk.withdraw(&p2, &[nlri2]);
+        bulk_changes.extend(bulk.recompute());
+        fast.withdraw(&p2, &[nlri2]);
+        fast_changes.extend(fast.recompute_prefix_mode(px[1], true));
+
+        // Step 5: p1 withdraws everything → all prefixes vanish (the
+        // zero-candidate withdrawal arm).
+        let nlris: Vec<Nlri> = px.iter().map(|p| Nlri::from(*p)).collect();
+        bulk.withdraw(&p1, &nlris);
+        bulk_changes.extend(bulk.recompute());
+        fast.withdraw(&p1, &nlris);
+        for p in &px {
+            fast_changes.extend(fast.recompute_prefix_mode(*p, true));
+        }
+
+        assert_eq!(bulk.best, fast.best, "same best table");
+        let mut bulk_sorted = bulk_changes;
+        let mut fast_sorted = fast_changes;
+        bulk_sorted.sort_by_key(|c| c.prefix);
+        fast_sorted.sort_by_key(|c| c.prefix);
+        assert_eq!(bulk_sorted, fast_sorted, "same change stream");
         assert!(bulk.best.is_empty(), "everything withdrawn");
     }
 

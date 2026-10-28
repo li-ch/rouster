@@ -1233,3 +1233,40 @@ in the chat record. The "Your decision" column stays the owner's.
   124111Z sweep; 125254Z estprof; 132055Z smoke; 132440Z gate-ON;
   133011Z control-OFF} + x-e1diff-20261028T{132149Z OFF,132253Z ON}.
   No verdict prose.
+
+- 2026-10-28 · speaker-opt stage 3 — the ladder's second lever
+  (BGPD_FAST_ELECTION, the Stage-1 table's next rank after
+  BGPD_QUIET_INGEST landed) · same rig/binaries discipline (bgpd
+  8219cab7… = stage-2 tree + the lever, ~/rouster-bench/bin-q6b;
+  rousterd cd588377…; injector 440f9f7f…) · mechanism: the
+  single-candidate fast path in LocRib::recompute_prefix — with
+  exactly one candidate the §9.1 ladder returns it by construction,
+  so the generic arm's score/alive vectors and unconditional winner
+  clone are skipped, and an identical re-announcement compares
+  (Arc pointer-shortcut Route::eq) before any clone; default OFF,
+  equivalence pinned by single_candidate_fast_path_agrees_with_bulk_
+  recompute (the F1 incremental-vs-bulk shape extended with the
+  unchanged-destination arm) · **gate**: workspace 1,864/0 (stage-2's
+  1,863 + the equivalence test); 100k e1diff installed sets: OFF vs
+  BGPD_FAST_ELECTION=1 and OFF vs both-flags — 99,998 = 99,998 with
+  0/0 deltas both comparisons (each leg's onlyD=1 = the known
+  announced-default 0/0, unchanged) · **readouts**: full feed × 6
+  runs with the flag ALONE: EOR median 4.489 s [4.575, 4.429..4.575]
+  vs the receipted 4.888 = −8.2%; bgpd CPU 8.86 vs 9.52 = −6.9%
+  (vs the stage-2 same-binary OFF control 4.918/9.67: −8.7%/−8.4%)
+  — **below the frozen 15% LANDED bar; tests green, deltas zero →
+  the NO-GAIN disposition (the mimalloc precedent): committed behind
+  the default-off flag with the honest share** · stacked with
+  BGPD_QUIET_INGEST (both flags ON, 6 runs): EOR median 3.439 s
+  [3.447, 3.414..3.461] / bgpd CPU 6.33 = vs the receipted baseline
+  −29.6% EOR / −33.5% CPU; vs lever-1 alone (3.639/6.58) the
+  increment is −5.5% EOR / −3.8% CPU; kernel 1,126,481 = feed−9
+  every run of every leg; 0 malformed · both directions: the
+  election fast path is worth single digits alone and stacks
+  additively; the speaker-gap ladder's two landed flags together
+  leave EOR 3.439 vs RustyBGP's receipted 1.643 and CPU 6.33 vs
+  2.73 · receipts away/2026-10-27/speaker-opt/ (stage-3 e1diff
+  kernel sets + the two full-feed folds); raw on the box
+  target/bench-logs/rouster-20261028T{134440Z stacked, 134948Z
+  fast-only} + x-e1diff-20261028T{134103Z OFF, 134207Z ON2,
+  134311Z ON12}. No verdict prose.

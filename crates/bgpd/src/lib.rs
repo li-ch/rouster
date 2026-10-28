@@ -55,11 +55,29 @@ pub const AS_TRANS: u16 = 23456;
 /// every line logs exactly as before.
 pub fn quiet_ingest() -> bool {
     static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *QUIET.get_or_init(|| quiet_from_env(std::env::var_os("BGPD_QUIET_INGEST").as_deref()))
+    *QUIET.get_or_init(|| env_flag(std::env::var_os("BGPD_QUIET_INGEST").as_deref()))
 }
 
-/// [`quiet_ingest`]'s pure core (unit-tested): set and not `0`.
-fn quiet_from_env(v: Option<&std::ffi::OsStr>) -> bool {
+/// speaker-opt lever 2 (away/2026-10-27 Q6): `BGPD_FAST_ELECTION=1`
+/// arms the single-candidate fast path in
+/// [`LocRib::recompute_prefix`](crate::rib::LocRib::recompute_prefix):
+/// with exactly one candidate the §9.1 ladder returns it by
+/// construction, so the generic arm's score/alive vectors and
+/// unconditional winner clone are skipped, and a re-announcement of
+/// the identical path compares (Arc pointer-shortcut `Route::eq`)
+/// before any clone — allocation-free unchanged. The 2026-10-28
+/// decomposition put the sink (announce + per-prefix recompute) at
+/// 1.56 s of the 4.91 s EOR window; the bulk-ingest shape is one
+/// peer, one fresh candidate per prefix. Runtime-gated like
+/// [`quiet_ingest`]; default OFF = the generic arm everywhere.
+pub fn fast_election() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| env_flag(std::env::var_os("BGPD_FAST_ELECTION").as_deref()))
+}
+
+/// The BGPD_* runtime gates' pure core (unit-tested): set and not `0`
+/// (the `BGPD_EST_PROFILE` shape).
+fn env_flag(v: Option<&std::ffi::OsStr>) -> bool {
     v.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
@@ -82,12 +100,13 @@ mod tests {
     #[test]
     fn quiet_ingest_env_parsing() {
         // The BGPD_EST_PROFILE shape: unset/0/empty off, anything
-        // else on. OsStr comparisons, so no lossy UTF-8 assumption.
-        assert!(!quiet_from_env(None));
-        assert!(!quiet_from_env(Some(std::ffi::OsStr::new("0"))));
-        assert!(!quiet_from_env(Some(std::ffi::OsStr::new(""))));
-        assert!(quiet_from_env(Some(std::ffi::OsStr::new("1"))));
-        assert!(quiet_from_env(Some(std::ffi::OsStr::new("on"))));
+        // else on. OsStr comparisons, so no lossy UTF-8 assumption
+        // (shared by quiet_ingest and fast_election).
+        assert!(!env_flag(None));
+        assert!(!env_flag(Some(std::ffi::OsStr::new("0"))));
+        assert!(!env_flag(Some(std::ffi::OsStr::new(""))));
+        assert!(env_flag(Some(std::ffi::OsStr::new("1"))));
+        assert!(env_flag(Some(std::ffi::OsStr::new("on"))));
     }
 
     #[test]
