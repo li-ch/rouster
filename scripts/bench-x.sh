@@ -946,18 +946,32 @@ GENEOF
 
 e4partial)
     # E4's last cell: PARTIAL-visibility failure. Half the announced
-    # prefixes resolve via OSPF peer 1 (10.99.0.1), half via peer 2
-    # (10.99.1.1). Kill ONLY peer 1's ospfd: the routes through .0.1
-    # must withdraw (dead-interval paced) while the routes through
-    # .1.1 stay installed, and the forwarding probes must show the
-    # loss isolated to the failed nexthop's stream.
+    # prefixes resolve via OSPF peer 1 (10.99.0.1, segment 1), half
+    # via peer 2 (10.99.1.1, segment 2). Kill ONLY peer 1's ospfd:
+    # the routes through .0.1 must withdraw (dead-interval paced)
+    # while the routes through .1.1 stay installed; restarting peer
+    # 1's ospfd must restore the exact prior counts. RUNS runs.
+    #
+    # 2026-10-28 rebuild (round-5 post-mortem): the round-5 cell died
+    # on two harness bugs, not the topology — (1) the peer ospfd
+    # configs dropped the transit `network <segment>/24 area 0`
+    # statement (OSPF ran on lo alone; no hellos on eth0; empty
+    # neighbor tables) and (2) the adjacency gate compared `Full`
+    # against p2p's `Full/-` state and could never pass. Both fixed
+    # here; both segments are now env-parameterized so the cell runs
+    # on one lane end to end (segment 1 = $NET_NAME, segment 2 =
+    # $NET2_NAME; on lane B: BENCH_NET_NAME=bench-net2 +
+    # BENCH_NET2_NAME=bench-net3, created on demand).
     LIMIT=${BENCH_X_LIMIT:-10000}
     MODE=${BENCH_X_IGP_MODE:-native}
+    RUNS=${BENCH_X_RUNS:-2}
     ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e4partial needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
-    PEER1_IP=172.31.255.30; PEER2_IP=172.31.254.31
-    NH1=10.99.0.1; NH2=10.99.1.1
     NET2_NAME=${BENCH_NET2_NAME:-bench-net2}
     NET2_SUBNET=${BENCH_NET2_SUBNET:-172.31.254.0/24}
+    PEER1_IP="${NET_SUBNET%.*}.30"; PEER2_IP="${NET2_SUBNET%.*}.31"
+    SUT2_IP="${NET2_SUBNET%.*}.20"
+    NH1=10.99.0.1; NH2=10.99.1.1
+    export LC_ALL=C
     # split the feed: odd-index prefixes via NH1, even via NH2
     awk -v n="$LIMIT" -v nh1="$NH1" -v nh2="$NH2" \
         'NR <= n && /next-hop/ { sub(/next-hop [0-9.]*/, "next-hop " ((NR % 2 == 1) ? nh1 : nh2)) } NR <= n' \
@@ -965,14 +979,13 @@ e4partial)
     ANN_SPLIT=$(cd "$OUT_DIR" && pwd)/announce-split.txt
     SUT=x4p-sut-$TS; INJ=x4p-inj-$TS; PEER=x4p-p1-$TS; PEER2=x4p-p2-$TS
     trap 'docker rm -f "$SUT" "$INJ" "$PEER" "$PEER2" >/dev/null 2>&1 || true' EXIT
-    note "=== e4partial mode=$MODE limit=$LIMIT (half $NH1, half $NH2)"
+    note "=== e4partial mode=$MODE limit=$LIMIT runs=$RUNS (half $NH1 on $NET_NAME, half $NH2 on $NET2_NAME)"
     docker network inspect "$NET2_NAME" >/dev/null 2>&1 \
         || docker network create --subnet "$NET2_SUBNET" "$NET2_NAME"
     new_sut "$SUT"
-    # second segment: two p2p adjacencies need two links (a shared
-    # segment with three routers stalls LSDB exchange for one peer in
-    # every speaker combination tried — the finding that shaped this)
-    SUT2_IP="${NET2_SUBNET%.*}.20"
+    # two p2p adjacencies need two links (a shared segment with three
+    # routers stalls LSDB exchange for one peer in every speaker
+    # combination tried — the finding that shaped this shape)
     docker network connect --ip "$SUT2_IP" "$NET2_NAME" "$SUT"
     start_rousterd "$SUT"
     if [ "$MODE" = mixed ]; then
@@ -991,9 +1004,8 @@ e4partial)
         start_rouster_bgpd "$SUT"
     fi
     if [ "$MODE" = frrspf ]; then
-        # FRR ospfd as the SUT's OSPF speaker (multi-neighbor broadcast
-        # exchange; the native speaker's two-neighbor stall is the
-        # disclosed finding this variant works around)
+        # FRR ospfd as the SUT's OSPF speaker (only the OSPF speaker
+        # swaps; the core and the bgpd stay rouster's)
         docker exec "$SUT" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname x4p' \
             'interface eth0' ' ip ospf network point-to-point' \
@@ -1001,8 +1013,9 @@ e4partial)
             'interface eth1' ' ip ospf network point-to-point' \
             ' ip ospf hello-interval 2' ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id 1.1.1.1' \
-            ' network 172.31.255.0/24 area 0.0.0.0' \
-            ' network 172.31.254.0/24 area 0.0.0.0' \
+            ' network $NET_SUBNET area 0.0.0.0' \
+            ' network $NET2_SUBNET area 0.0.0.0' \
+            ' timers throttle spf 0 50 100' \
             'line vty' > /etc/frr/ospfd.conf"
         docker exec "$SUT" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/ospfd.log --log-level info"
         wait_up "$SUT" "frr ospfd vty" 30 "test -S /var/run/frr/ospfd.vty"
@@ -1022,40 +1035,64 @@ e4partial)
         docker exec -d "$SUT" sh -c "rouster-ospfd --config /etc/rouster-ospfd.conf > /var/log/rouster-ospfd.log 2>&1"
         wait_up "$SUT" "rouster ospfd up" 20 "pidof rouster-ospfd"
     fi
-    # two OSPF peers, each advertising its own dummy /24
-    for PSPEC in "$PEER $PEER1_IP $NH1 2.2.2.2 0" "$PEER2 $PEER2_IP $NH2 3.3.3.3 1"; do
+    # two OSPF peers, each on its own segment, each advertising its
+    # own dummy /24 — with BOTH the transit AND the lo network
+    # statements (the round-5 rebuild dropped the transit one, which
+    # is why no hello ever left eth0)
+    for PSPEC in "$PEER $PEER1_IP $NH1 2.2.2.2 $NET_NAME $NET_SUBNET" "$PEER2 $PEER2_IP $NH2 3.3.3.3 $NET2_NAME $NET2_SUBNET"; do
         set -- $PSPEC
-        PNAME=$1; PIP=$2; PNH=$3; PRID=$4; PNET2=$5
-        PNET_ATTACH=""
-        [ "$PNET2" = 1 ] && PNET_ATTACH="$NET2_NAME" || PNET_ATTACH="$NET_NAME"
-        docker run -d --name "$PNAME" --network "$PNET_ATTACH" --ip "$PIP" \
+        PNAME=$1; PIP=$2; PNH=$3; PRID=$4; PSEG=$5; PSEGS=$6
+        docker run -d --name "$PNAME" --network "$PSEG" --ip "$PIP" \
             --cpuset-cpus "$INJ_CPUS" --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
             --entrypoint sleep "$IMAGE" infinity >/dev/null
         docker exec "$PNAME" sh -c "ip addr add $PNH/24 dev lo 2>/dev/null || true; ip link set lo up"
-        docker exec "$PNAME" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pz.log --log-level info"
+        docker exec "$PNAME" sh -c "/usr/lib/frr/zebra -d --log file:$FRRLOG/pz-$PNAME.log --log-level info"
         wait_up "$PNAME" "$PNAME zebra" 30 "test -S /var/run/frr/zebra.vty"
-        PNET="${PNH%.*}.0/24"
         docker exec "$PNAME" sh -c "printf '%s\n' \
             'frr version 10.2' 'frr defaults traditional' 'hostname $PNAME' \
             'interface eth0' ' ip ospf network point-to-point' \
             ' ip ospf hello-interval 2' \
             ' ip ospf dead-interval 8' \
             'router ospf' ' ospf router-id $PRID' \
-            ' network $PNET area 0.0.0.0' \
+            ' network $PSEGS area 0.0.0.0' \
+            ' network ${PNH%.*}.0/24 area 0.0.0.0' \
+            ' timers throttle spf 0 50 100' \
             'line vty' > /etc/frr/ospfd.conf"
-        docker exec "$PNAME" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/po.log --log-level info"
+        docker exec "$PNAME" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/po-$PNAME.log --log-level info"
         wait_up "$PNAME" "$PNAME ospfd" 30 "test -S /var/run/frr/ospfd.vty"
     done
-    for _ in $(seq 1 90); do
-        sleep 2
-        docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor' | grep -c Full" 2>/dev/null | grep -q -v '^0$' && break
-    done
+    # adjacency gate — `case` glob, NOT `[ = Full ]`: a p2p neighbor
+    # renders as Full/- and the POSIX test has no patterns
     ADJ1=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
+    for _ in $(seq 1 60); do
+        case "$ADJ1" in Full*) break ;; esac
+        sleep 2
+        ADJ1=$(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
+    done
     ADJ2=$(docker exec "$PEER2" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
+    for _ in $(seq 1 60); do
+        case "$ADJ2" in Full*) break ;; esac
+        sleep 2
+        ADJ2=$(docker exec "$PEER2" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | awk '/^[0-9]+\./ {print $3; exit}')
+    done
     note "adjacency peer1=$ADJ1 peer2=$ADJ2"
-    case "$ADJ1$ADJ2" in FullFull) ;; *)
-        fail "e4partial: adjacency incomplete ($ADJ1/$ADJ2)"; exit 1 ;;
+    case "${ADJ1}${ADJ2}" in
+        Full*Full*) : ;;
+        *)
+            note "peer1-neighbors: $(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | tr '\n' '|')"
+            note "peer2-neighbors: $(docker exec "$PEER2" sh -c "vtysh -c 'show ip ospf neighbor'" 2>/dev/null | tr '\n' '|')"
+            note "peer1-ospf-if: $(docker exec "$PEER" sh -c "vtysh -c 'show ip ospf interface eth0'" 2>/dev/null | sed -n '1,4p' | tr '\n' '|')"
+            docker exec "$PEER" sh -c "cat /tmp/frrrun/po-$PEER.log 2>/dev/null" > "$OUT_DIR/peer1-ospfd.log" 2>/dev/null || true
+            docker exec "$PEER2" sh -c "cat /tmp/frrrun/po-$PEER2.log 2>/dev/null" > "$OUT_DIR/peer2-ospfd.log" 2>/dev/null || true
+            docker exec "$SUT" sh -c "cat /var/log/rouster-ospfd.log 2>/dev/null" > "$OUT_DIR/sut-ospfd.log" 2>/dev/null || true
+            docker exec "$SUT" sh -c "cat /tmp/frrrun/ospfd.log 2>/dev/null" >> "$OUT_DIR/sut-ospfd.log" 2>/dev/null || true
+            docker exec "$SUT" sh -c "ip addr show" > "$OUT_DIR/sut-addr.txt" 2>/dev/null || true
+            fail "e4partial: adjacency incomplete ($ADJ1/$ADJ2)"; exit 1 ;;
     esac
+    sleep 8   # Full -> /32 installs on the SPF pacing constant (~5 s)
+    docker exec "$SUT" sh -c "ip route show proto ospf" > "$OUT_DIR/ospf-routes.txt" 2>/dev/null || true
+    note "ospf proto-ospf routes: $(grep -c . "$OUT_DIR/ospf-routes.txt" || true) — $(tr '\n' ';' < "$OUT_DIR/ospf-routes.txt")"
+    # the BGP injector announcing the split feed (odd lines NH1, even NH2)
     docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
         --cpuset-cpus "$INJ_CPUS" -v "$ANN_SPLIT":/feed.announce:ro \
         --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
@@ -1064,70 +1101,130 @@ e4partial)
     docker exec -d "$INJ" sh -c "python3 /bench-flap.py --peer $SUT_IP:179 \
         --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
         --announce /feed.announce --limit $LIMIT --flap-every 999999 \
-        --rounds 0 --hold $HOLD --steady-wait 5 --linger 900 > /var/log/flap-run.txt 2>&1"
-    for _ in $(seq 1 180); do
+        --rounds 0 --hold $HOLD --steady-wait 5 --linger $((RUNS * 800 + 400)) > /var/log/flap-run.txt 2>&1"
+    # per-set readouts. The kernel carries the RESOLVED programming
+    # form (rib.rs: gateway hops rewritten through the IGP route), so
+    # the per-set discriminator is the SEGMENT GATEWAY (peer address),
+    # 1:1 with the announced recursive nexthop (NH1/NH2). All sampling
+    # runs INSIDE the SUT (the 1 Hz poller writes /dualseg.csv; host
+    # gates read its tail — a file read, never a busy-netns query)
+    via_count() { docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $1'" || true; }
+    set1_dump() { docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep 'via $PEER1_IP' || true" | LC_ALL=C sort; }
+    set2_dump() { docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep 'via $PEER2_IP' || true" | LC_ALL=C sort; }
+    dup_count() { docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null" | LC_ALL=C sort | uniq -d | grep -c . || true; }
+    seg_tail() { docker exec "$SUT" sh -c "tail -1 /dualseg.csv" 2>/dev/null; }
+    docker exec -d "$SUT" sh -c "
+        : > /dualseg.csv
+        end=\$(( \$(date +%s) + $((RUNS * 500 + 600)) ))
+        while :; do
+            t=\$(ip route show proto 186 2>/dev/null | grep -c .)
+            v1=\$(ip route show proto 186 2>/dev/null | grep -c 'via $PEER1_IP')
+            v2=\$(ip route show proto 186 2>/dev/null | grep -c 'via $PEER2_IP')
+            o=\$(ip route show proto ospf 2>/dev/null | grep -c .)
+            echo \"\$(date +%s.%N) \$t \$v1 \$v2 \$o\" >> /dualseg.csv
+            [ \"\$(date +%s)\" -gt \"\$end\" ] && break
+            sleep 1
+        done"
+    for _ in $(seq 1 240); do
         c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT - 20)) ] 2>/dev/null && break; sleep 1
     done
-    VIA1=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH1'" || true)
-    VIA2=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH2'" || true)
-    note "baseline: total=$(kern_count "$SUT") via-$NH1=$VIA1 via-$NH2=$VIA2"
-    # dual forwarding probes + per-nexthop route counters through the event
-    docker exec -d "$SUT" sh -c "ping -i 0.2 -c 900 $NH1 > /probe1.txt 2>&1"
-    docker exec -d "$SUT" sh -c "ping -i 0.2 -c 900 $NH2 > /probe2.txt 2>&1"
-    docker exec -d "$SUT" sh -c '
-        : > /via.csv
-        end=$(( $(date +%s) + 300 ))
-        while :; do
-            v1=$(ip route show proto 186 2>/dev/null | grep -c "via 10.99.0.1")
-            v2=$(ip route show proto 186 2>/dev/null | grep -c "via 10.99.1.1")
-            echo "$(date +%s.%N) $v1 $v2" >> /via.csv
-            [ "$(date +%s)" -gt "$end" ] && break
-            sleep 1
-        done'
-    TKILL=$(date +%s.%N)
-    docker exec "$PEER" sh -c 'kill -9 "$(pidof ospfd)"' 
-    for _ in $(seq 1 90); do
-        v1=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH1'" || true)
-        [ "$v1" = 0 ] 2>/dev/null && break; sleep 1
-    done
-    TW=$(date +%s.%N)
-    for _ in $(seq 1 240); do
-        c=$(kern_count "$SUT"); [ "$c" -ge $((LIMIT / 2 - 20)) ] 2>/dev/null && break; sleep 1
-    done
-    TSTABLE=$(date +%s.%N)
-    V2END=$(docker exec "$SUT" sh -c "ip route show proto 186 2>/dev/null | grep -c 'via $NH2'" || true)
-    sleep 3
-    docker exec "$SUT" sh -c "pkill -f 'ping -i 0.2' 2>/dev/null; pkill -f via.csv 2>/dev/null" >/dev/null 2>&1 || true
-    docker cp "$SUT:/probe1.txt" "$OUT_DIR/probe1.txt" 2>/dev/null || true
-    docker cp "$SUT:/probe2.txt" "$OUT_DIR/probe2.txt" 2>/dev/null || true
-    docker cp "$SUT:/via.csv" "$OUT_DIR/via.csv" 2>/dev/null || true
-    python3 - "$TKILL" "$TW" "$TSTABLE" "$VIA1" "$VIA2" "$V2END" "$OUT_DIR" >> "$OUT_DIR/notes.txt" <<'PYEOF'
-import sys, re
-tk, tw, ts = map(float, sys.argv[1:4])
-via1_0, via2_0, via2_end = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
-out = sys.argv[7]
-def probe(name):
-    try:
-        txt = open(f"{out}/probe{name}.txt", errors="replace").read()
-        seqs = sorted(int(x) for x in re.findall(r"icmp_seq=(\d+)", txt))
-        recv = len(seqs); span = seqs[-1] - seqs[0] + 1 if seqs else 0
-        gaps = [(b, a) for b, a in zip(seqs, seqs[1:]) if a - b > 1]
-        gs = "; ".join(f"seq {b}->{a} ({(a-b-1)*0.2:.1f}s)" for b, a in gaps) or "none"
-        return f"{recv} recv, {span-recv} lost; gaps: {gs}"
-    except Exception:
-        return "unreadable"
-print(f"X-NOTE e4partial: via-nh1 {via1_0}->0 in {tw-tk:.1f}s; via-nh2 {via2_0}->{via2_end} "
-      f"(healthy half {'STABLE' if via2_end >= via2_0 - 20 else 'DISTURBED'}); "
-      f"stable-at-half in {ts-tk:.1f}s")
-print(f"X-NOTE e4partial probe-nh1(dead): {probe(1)}")
-print(f"X-NOTE e4partial probe-nh2(healthy): {probe(2)}")
-PYEOF
-    if [ "$V2END" -ge $((LIMIT / 2 - 20)) ] 2>/dev/null; then
-        pass "e4partial: failure isolated to the dead nexthop's half"
-    else
-        fail "e4partial: healthy half disturbed ($V2END)"
+    VIA1_B=$(via_count "$PEER1_IP"); VIA2_B=$(via_count "$PEER2_IP"); TOTAL_B=$(kern_count "$SUT")
+    note "baseline: total=$TOTAL_B seg1(via $PEER1_IP, announced $NH1)=$VIA1_B seg2(via $PEER2_IP, announced $NH2)=$VIA2_B (expect ~$((LIMIT/2)) each)"
+    if [ "$VIA1_B" -lt $((LIMIT / 2 - 20)) ] 2>/dev/null || [ "$VIA2_B" -lt $((LIMIT / 2 - 20)) ] 2>/dev/null; then
+        docker exec "$SUT" sh -c "vtysh -c 'show bgp ipv4 unicast summary' 2>&1 | tail -3; ip route show proto ospf" > "$OUT_DIR/diag-$MODE.txt" 2>/dev/null || true
+        docker exec "$INJ" sh -c "cat /var/log/flap-run.txt 2>/dev/null | head -8" > "$OUT_DIR/flap-head-$MODE.txt" 2>/dev/null || true
+        fail "e4partial $MODE: baseline per-set counts short ($VIA1_B/$VIA2_B of ~$((LIMIT/2)))"; exit 1
     fi
+    # the event, RUNS times: kill peer-1 ospfd -> only the NH1 set
+    # withdraws; restart it -> exact prior counts return
+    R_ALL_PASS=1
+    for R in $(seq 1 "$RUNS"); do
+        VIA1_PRE=$(via_count "$PEER1_IP"); VIA2_PRE=$(via_count "$PEER2_IP"); DUP_PRE=$(dup_count)
+        set1_dump > "$OUT_DIR/run$R-pre-set1.txt"; set2_dump > "$OUT_DIR/run$R-pre-set2.txt"
+        docker exec "$SUT" sh -c "pkill -f 'ping -i 0.2' 2>/dev/null" >/dev/null 2>&1 || true
+        docker exec -d "$SUT" sh -c "ping -i 0.2 -c 2500 $NH1 > /probe1-r$R.txt 2>&1"
+        docker exec -d "$SUT" sh -c "ping -i 0.2 -c 2500 $NH2 > /probe2-r$R.txt 2>&1"
+        TKILL=$(date +%s.%N)
+        docker exec "$PEER" sh -c 'kill -9 "$(pidof ospfd)"'
+        # withdraw gate: NH1 set -> 0 within 120 s (frozen readout),
+        # gated on the in-SUT sampler, not a host-side netns poll
+        WD_OK=0
+        for _ in $(seq 1 125); do
+            v1=$(seg_tail | awk '{print $3}')
+            [ "$v1" = 0 ] 2>/dev/null && { WD_OK=1; break; }; sleep 1
+        done
+        TW=$(date +%s.%N)
+        sleep 3
+        VIA1_MID=$(via_count "$PEER1_IP"); VIA2_MID=$(via_count "$PEER2_IP"); DUP_MID=$(dup_count)
+        set2_dump > "$OUT_DIR/run$R-mid-set2.txt"
+        OSPF_MID=$(docker exec "$SUT" sh -c "ip route show proto ospf 2>/dev/null | grep -c ." || true)
+        # restore: restart peer-1 ospfd from the same -f config
+        TRST=$(date +%s.%N)
+        docker exec "$PEER" sh -c "/usr/lib/frr/ospfd -d -f /etc/frr/ospfd.conf -z /var/run/frr/zserv.api --log file:$FRRLOG/po-$PEER-r$R.log --log-level info"
+        RS_OK=0
+        for _ in $(seq 1 240); do
+            v1=$(seg_tail | awk '{print $3}'); v2=$(seg_tail | awk '{print $4}')
+            if [ "$v1" = "$VIA1_PRE" ] 2>/dev/null && [ "$v2" = "$VIA2_PRE" ] 2>/dev/null; then RS_OK=1; break; fi
+            sleep 1
+        done
+        TEND=$(date +%s.%N)
+        sleep 5
+        VIA1_POST=$(via_count "$PEER1_IP"); VIA2_POST=$(via_count "$PEER2_IP"); DUP_POST=$(dup_count); TOTAL_POST=$(kern_count "$SUT")
+        set1_dump > "$OUT_DIR/run$R-post-set1.txt"; set2_dump > "$OUT_DIR/run$R-post-set2.txt"
+        OSPF_POST=$(docker exec "$SUT" sh -c "ip route show proto ospf 2>/dev/null | grep -c ." || true)
+        DIFF_PRE=$(comm -3 "$OUT_DIR/run$R-pre-set1.txt" "$OUT_DIR/run$R-post-set1.txt" | grep -c . || true)
+        python3 - "$R" "$TKILL" "$TW" "$TRST" "$TEND" "$VIA1_PRE" "$VIA2_PRE" "$DUP_PRE" \
+            "$VIA1_MID" "$VIA2_MID" "$DUP_MID" "$OSPF_MID" \
+            "$VIA1_POST" "$VIA2_POST" "$DUP_POST" "$TOTAL_POST" "$OSPF_POST" "$TOTAL_B" \
+            "$WD_OK" "$RS_OK" "$DIFF_PRE" >> "$OUT_DIR/notes.txt" <<'PYEOF'
+import sys
+(r, tk, tw, trst, tend, v1p, v2p, dp, v1m, v2m, dm, om,
+ v1q, v2q, dq, tq, oq, tb, wd, rs, dif) = sys.argv[1:]
+r = int(r); tk, tw, trst, tend = map(float, (tk, tw, trst, tend))
+v1p, v2p, dp, v1m, v2m, dm, om, v1q, v2q, dq, tq, oq, tb = map(int,
+    (v1p, v2p, dp, v1m, v2m, dm, om, v1q, v2q, dq, tq, oq, tb))
+wd, rs, dif = int(wd), int(rs), int(dif)
+persist = v2m * 100 >= v2p * 99
+print(f"X-NOTE e4partial run{r}: kill @{tw-tk:.1f}s wd_ok={wd} "
+      f"(via1 {v1p}->{v1m}, via2 {v2m}/{v2p} = {100.0*v2m/max(v2p,1):.2f}% persisted, "
+      f"dups {dm}); restore ok={rs} @+{tend-trst:.1f}s "
+      f"(via1 {v1q}=={v1p} {v1q==v1p}, via2 {v2q}=={v2p} {v2q==v2p}, "
+      f"total {tq}/{tb}, dups {dq}, set1 diff-lines {dif}); "
+      f"ospf-routes mid/post {om}/{oq}")
+why = []
+if not wd or tw - tk > 120: why.append(f"withdraw {'incomplete' if not wd else f'slow {tw-tk:.1f}s'}")
+if not persist: why.append(f"healthy half disturbed {v2m}/{v2p}")
+if not rs or v1q != v1p or v2q != v2p: why.append("restore not exact")
+if dp or dm or dq: why.append(f"duplicates {dp}/{dm}/{dq}")
+if why:
+    print(f"X-FAIL e4partial run{r}: ISOLATION-PARTIAL — {'; '.join(why)}")
+else:
+    print(f"X-PASS e4partial run{r}: ISOLATION-PASS "
+          f"(withdraw {tw-tk:.1f}s, persist {v2m}/{v2p}, restore exact {tend-trst:.1f}s, 0 dups)")
+PYEOF
+        if [ "$WD_OK" = 1 ] && [ "$RS_OK" = 1 ] \
+            && [ "$VIA1_POST" = "$VIA1_PRE" ] && [ "$VIA2_POST" = "$VIA2_PRE" ] \
+            && [ "$DUP_PRE" = 0 ] && [ "$DUP_MID" = 0 ] && [ "$DUP_POST" = 0 ] \
+            && [ "$VIA2_MID" -ge $((VIA2_PRE * 99 / 100)) ] 2>/dev/null; then
+            :
+        else
+            R_ALL_PASS=0
+        fi
+        docker exec "$SUT" sh -c "pkill -f 'ping -i 0.2' 2>/dev/null" >/dev/null 2>&1 || true
+        sleep 2
+        docker cp "$SUT:/probe1-r$R.txt" "$OUT_DIR/probe1-r$R.txt" 2>/dev/null || true
+        docker cp "$SUT:/probe2-r$R.txt" "$OUT_DIR/probe2-r$R.txt" 2>/dev/null || true
+    done
+    docker exec "$SUT" sh -c "cat /dualseg.csv" > "$OUT_DIR/dualseg.csv" 2>/dev/null || true
     docker exec "$INJ" sh -c "cat /var/log/flap-run.txt" > "$OUT_DIR/flap.txt" 2>/dev/null || true
+    docker exec "$PEER" sh -c "cat /tmp/frrrun/po-$PEER.log /tmp/frrrun/po-$PEER-r*.log 2>/dev/null" > "$OUT_DIR/peer1-ospfd.log" 2>/dev/null || true
+    docker exec "$SUT" sh -c "cat /var/log/rouster-ospfd.log 2>/dev/null; cat /tmp/frrrun/ospfd.log 2>/dev/null" > "$OUT_DIR/sut-ospfd.log" 2>/dev/null || true
+    docker cp "$SUT:/var/log/rousterd.log" "$OUT_DIR/rousterd.log" 2>/dev/null || true
+    if [ "$R_ALL_PASS" = 1 ]; then
+        pass "e4partial $MODE: ISOLATION-PASS on all $RUNS runs"
+    else
+        fail "e4partial $MODE: ISOLATION-PARTIAL on at least one run (numbers above)"
+    fi
     ;;
 *) echo "unknown cell $CELL" >&2; exit 1 ;;
 esac

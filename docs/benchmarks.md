@@ -1117,3 +1117,49 @@ in the chat record. The "Your decision" column stays the owner's.
   driver/fold copies; bundle sha256 3dc0b636…); raw on the box
   target/bench-logs/e2-20261028T{103855Z,104726Z,105643Z,110210Z,
   110823Z,111302Z} + smoke {103546Z,103640Z}. No verdict prose.
+
+- 2026-10-28 · X e4partial MEASURED (the per-nexthop isolation cell,
+  a placeholder since round 3) · host=dgx-spark-1 LANE B (segment 1
+  = bench-net2 172.31.254.0/24, segment 2 = bench-net3
+  172.31.253.0/24 created for this cell; SUT .20 cpus 12-16, both
+  peers + injector .10 cpus 17; lane A untouched) · the round-5
+  two-segment failure re-diagnosed in the tree before any rerun:
+  7ef9798's peer-ospfd config kept only the lo `network
+  10.99.x.0/24 area 0` and dropped the transit one (peers ran OSPF
+  on lo alone, no hellos on eth0, empty neighbor tables — a harness
+  config bug, not a rig/protocol stall), and the same cell's
+  `case FullFull` adjacency gate can never match p2p's `Full/-`
+  (e45igp's `Full*` glob is correct); both fixed in the rebuilt cell,
+  staged bring-up first: segment 1 alone Full in 6-13 s, both Full
+  2 s after the segment-2 add · shape: SUT (rousterd cd588377… =
+  ab533d5+ + native bgpd/ospfd prebuilts) with two p2p OSPF segments
+  to two FRR-ospfd peers (lo dummies 10.99.0.1 / 10.99.1.1),
+  injector announces 10k routes odd/even across the two recursive
+  nexthops; the kernel carries the RESOLVED programming form (rib.rs
+  gateway rewrite), so the per-set discriminator is the segment
+  gateway (via 172.31.254.30 vs via 172.31.253.31); iproute2 on this
+  image names 188=ospf (187 is isis) — OSPF filters use the name ·
+  **native (rouster-ospfd): 2/2 runs ISOLATION-PASS — baseline
+  10,000 (5,000/5,000); kill peer-1 ospfd → the segment-1 set
+  5,000→0 in 18.1/11.8 s while the segment-2 set held 5,000/5,000
+  (100.00%) and the total pinned at 5,000 through the trough, 0
+  duplicate (prefix,via) pairs at every dump; restart peer-1 ospfd →
+  exact prior counts (set-1 pre-vs-post dump diff 0 lines) in
+  16.5/15.5 s; forwarding probes: dead-nexthop stream ONE 19.2/19.0 s
+  loss window, healthy stream ZERO loss** · stage 2 (FRR ospfd as the
+  SUT OSPF speaker): **2/2 ISOLATION-PASS — withdraw 9.6/11.7 s,
+  persist 5,000/5,000, restore exact 16.6/16.5 s, probes one
+  19.0/19.8 s dead-nexthop window only — the isolation is core
+  behavior, speaker-independent** (disclosed: frrspf's
+  post-adjacency ospf-routes.txt capture raced FRR's SPF throttle —
+  empty at +8 s, both /32s present by BGP-resolution time, which the
+  5,000/5,000 baseline requires) · frozen readouts pre-registered in
+  the away program (BRINGUP-FAIL / ISOLATION-PASS / ISOLATION-PARTIAL):
+  ISOLATION-PASS fired on both stages; withdraw is dead-interval
+  paced, restore ~16-17 s under both speakers · receipts
+  away/2026-10-27/ospf-dualseg/ (PLAN, TOPOLOGY, BRINGUP, configs,
+  per-mode OBSERVATIONS + artifact bundles with the 1 Hz dualseg.csv,
+  per-set kernel dumps, probes, flap logs); raw on the box
+  target/bench-logs/x-e4partial-20261028T{114934Z,115131Z smoke,
+  115958Z native, 120210Z frrspf}. No verdict prose.
+
