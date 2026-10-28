@@ -1056,3 +1056,64 @@ in the chat record. The "Your decision" column stays the owner's.
   rouster-20261028T{103932Z,104116Z(+fold),110925Z}; receipts
   away/2026-10-27/splitpin-e1/ (fold + raw + retry summaries, pin
   logs, WEDGE-EVIDENCE, PROTOCOL, harness diff). No verdict prose.
+
+- 2026-10-28 · E2 gap sweep — the deferred pace dimension (the
+  2026-10-16 addendum's deferred rate sweep; "cycles/s" mapped onto
+  bench-flap.py `--round-gap`, the inter-burst pacing: per round =
+  withdraw burst → gap → reannounce burst → gap; effective pace =
+  10,000 / round period) · host=dgx-spark-1 LANE B (bench-net2
+  172.31.254.0/24, SUT .20 cpus 12-16, injector .10 cpus 17, observer
+  (SUT-netns, 0.05 s kernel loop) 18-19; lane A ran concurrently;
+  rmem kernel default) · versions: FRR 10.2.2; Rouster prebuilts
+  ~/rouster-bench/bin (rousterd cd588377… = ab533d5+ — NOT the
+  2026-10-19 E2 baseline's 5fa1856, disclosed; bgpd b06eb5cc…);
+  harness byte-identical to tree (BENCH_E2_ROUND_GAP already
+  existed; no change) · feed: the pinned announce-100k.announce
+  (sha256 6c9f4f7d…, 100k routes) EXCEPT its 100,000 NEXT_HOPs
+  hard-code the LANE A injector 172.31.255.10 — on lane B nothing
+  installs (isolated: FRR pfxRcd=10000 with zebra/kernel at 0;
+  Rouster table full, kernel 0) — derived
+  announce-100k-laneb.announce (sha256 47b79fa7…; the same
+  NEXT_HOP-to-injector surgery mrt-replay applies in-flight;
+  identical derived bytes on both SUTs per §F); injector base
+  bench-flap-runner:local via the existing BENCH_E2_INJ_IMAGE knob
+  (committed default bench-exabgp:local absent, registry
+  unreachable) · shape: gaps {2.0, 0.5, 0.1} × {rouster, frr} × 6
+  (1 warmup + 5 measured) = 36 runs, 100k slice, every-10th subset
+  (10k), 10 rounds, storm otherwise the receipted shape; 10k-gap-0.5
+  smoke both sides first (10/10 rounds, exact 9,000 kernel troughs,
+  0 malformed) · **per-round reconvergence (kernel basis, med [p95],
+  n=50): gap 2.0 — Rouster 0.331 [0.433] vs FRR 0.243 [0.317] (FRR
+  ahead 1.36×; the receipted gap-2.0 baseline on the 5-9 placement +
+  rousterd 5fa1856 was 0.285 [0.387] vs 0.130 [0.206], FRR 2.19× —
+  placement+binary deltas disclosed, direction unchanged, magnitude
+  narrower on lane B); gap 0.5 — Rouster 0.328 [0.431] vs FRR 0.244
+  [0.334] (1.34×) — pace-INDEPENDENT from ~2.46k to ~9.35k cycles/s
+  (<2% movement both systems); gap 0.1 (~37k cycles/s) — BOTH
+  saturate: Rouster 1.365 [2.910] vs FRR 1.465 [2.689] (Rouster
+  edges 1.07×; 4-6× inflation), round periods 0.27 s < restore
+  times** · exact withdraw troughs (kernel, expected 89,998): gap
+  2.0 50/50 + 50/50; gap 0.5 49/50 + 50/50; gap 0.1 Rouster
+  sampling-limited 11/34 in-window samples (exact value seen, min
+  89,998) while FRR NEVER dips to the trough mid-storm (min 92,843 —
+  its kernel install/removal stream falls behind the 0.27 s rounds);
+  post-storm plateaus exact every run (Rouster 99,998, FRR 99,997) ·
+  session survival: 0 NOTIFICATION / 0 aborts / 6/6 FLAP-LINGER-END
+  per cell; malformed 0, rejected 0 on all 36 · storm CPU med:
+  speaker Rouster 1.42/1.24/1.17 s vs FRR 2.10/1.71/1.06 s (gap
+  2.0/0.5/0.1); core Rouster 4.04/3.58/3.05 vs FRR 3.07/2.02/1.10 —
+  the receipted shape (Rouster speaker-cheaper, core-costlier)
+  persists at every gap · kernel-basis round walls R/F: 2.399/2.312 s
+  (gap 2.0), 0.898/0.813 (0.5), 1.540/1.635 (0.1) · injector
+  exonerated at the boundary: pacing exact (101 ms inter-burst med,
+  requested 100), bursts 7-10 ms/61-73 ms, injector CPU 0.63-0.77 s
+  per run (~15% of its 1-CPU duty at gap 0.1) — degradation is
+  SUT-side on both systems · verdicts: GRID-PASS not met (gap-0.1
+  exact-trough criterion), GRID-PARTIAL fired — boundary recorded
+  between ~9.35k and ~37k cycles/s; stage-2 gap 0.05 NOT run (gate
+  requires GRID-PASS) · receipts away/2026-10-27/e2-sweep/
+  (PROTOCOL.md + REPORT.md + fold-grid.json + per-cell summaries,
+  all-run metrics/poll/observe/flap + median-run gz SUT logs +
+  driver/fold copies; bundle sha256 3dc0b636…); raw on the box
+  target/bench-logs/e2-20261028T{103855Z,104726Z,105643Z,110210Z,
+  110823Z,111302Z} + smoke {103546Z,103640Z}. No verdict prose.
