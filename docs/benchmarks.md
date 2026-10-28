@@ -1019,3 +1019,40 @@ in the chat record. The "Your decision" column stays the owner's.
   dump head/tails, full onlyA/onlyD); raw on the box
   target/bench-logs/x-e1diff-20261028T{102456Z,102545Z}. No verdict
   prose.
+
+- 2026-10-28 · splitpin-e1 (the ISSUES.md item-5 decomposition,
+  owner-deferred; away/2026-10-27 Q2) · rig = the receipted
+  2026-10-21 shared cell unchanged (SUT .20 cpuset 5-9, injector
+  .10 cpus 0-3, rmem kernel-default, same prebuilts, the 440f9f7f…
+  injector variant) — NOT rerun for baselines — with the two SUT
+  daemons re-pinned INSIDE the SUT cpuset after start and before
+  inject: bgpd→5-7, rousterd→8-9, via the new BENCH_SPLIT_PIN knob
+  (purely additive, unset = no-op; the Alpine frr image has no
+  taskset applet and host-side taskset is EPERM unprivileged, so the
+  host taskset runs through a throwaway --pid=host
+  SYS_CHROOT+SYS_NICE chroot helper; every run log carries taskset
+  -cp + in-container Cpus_allowed_list for both daemons, all
+  threads) · shape: clean 100k smoke (6/6 checks), then 6 full-feed
+  runs (1 warmup + 5 measured) · run-2 WEDGED at main 909,155:
+  injector completed, bgpd received all 556,132 msgs + EOR (own EOR
+  wall 4.992 s) then the bgpd→zapi stream stalled post-EOR while
+  rousterd idled with ZERO rcvbuf-overrun warnings — NOT the
+  2026-10-16 ENOBUFS signature; the poller stall guard never armed
+  (its 64 KiB log-tail EOR oracle misses the EOR line buried ~474k
+  zedge lines deep), wedge declared manually at +25 min frozen, ONE
+  retry per the frozen bar (passed, kernel feed−9) substituting
+  run-2 in the fold · **readouts vs the receipted shared cell:
+  EOR_split 4.842 [p95 4.946, min 4.831, max 4.902] vs EOR_shared
+  4.888 [4.95, 4.828, 4.928] — contention share 0.94% with per-run
+  spread −0.3%..+1.2% (ranges overlap); bgpd CPU 9.305 vs 9.52;
+  rousterd CPU 15.72 vs 17.49; wall_split 13.144 [13.642] vs 12.663
+  [13.668] (the same bimodal 12.65/13.64 structure in both cells);
+  kernel 1,126,481 = feed−9 in every completed run; 0 overruns; 0
+  malformed** · both directions: disjoint halves leave the EOR
+  window within run-to-run noise of the shared cell while rousterd
+  CPU drops 10% (bgpd 2%), and one run of six wedged with a
+  no-ENOBUFS post-EOR zapi-stall signature not seen in any shared
+  5-9 cell · raw on the box target/bench-logs/
+  rouster-20261028T{103932Z,104116Z(+fold),110925Z}; receipts
+  away/2026-10-27/splitpin-e1/ (fold + raw + retry summaries, pin
+  logs, WEDGE-EVIDENCE, PROTOCOL, harness diff). No verdict prose.

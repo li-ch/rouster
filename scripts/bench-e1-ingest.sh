@@ -130,6 +130,22 @@ INJECTOR_BIN=${BENCH_INJECTOR_BIN:-$BIN_DIR/mrt-replay}
 GOBGP=${BENCH_GOBGP:-$ALT_BIN_DIR/gobgp}
 OBS_CPUS=${BENCH_OBS_CPUS:-12-17}
 KERNEL_PACE=${BENCH_KERNEL_PACE:-2.0}
+# splitpin-e1 (away/2026-10-27 program Q2): optional per-daemon cpu
+# slices INSIDE the SUT container — "name:cpus[,name:cpus...]" —
+# applied AFTER both daemons start and BEFORE the injector launches
+# (speaker/core concurrent-install contention cell; name matches the
+# in-container process comm, with a rouster-<name> fallback so bgpd
+# resolves rouster mode's rouster-bgpd). The frr-testbed image ships
+# no taskset (Alpine busybox lacks the applet) and host-side taskset
+# on the root-owned container processes is EPERM without sudo, so the
+# HOST's taskset runs via a throwaway --pid=host container chrooted
+# into the host root (alpine:3.20, the injector image; read-only host
+# mount, --network none — no docker0 dependency): root inside a
+# container acting on the SUT's own tasks, same kernel objects,
+# host-global cpu ids. The mask is re-verified from /proc inside the
+# SUT container; every call lands in <run>/split-pin.txt. Unset
+# (default) is a byte-for-byte no-op.
+SPLIT_PIN=${BENCH_SPLIT_PIN:-}
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT_DIR="target/bench-logs/$MODE-$TS"
@@ -159,6 +175,44 @@ wait_up() { # container desc attempts cmd
     done
     echo "FAIL: $2 (waited ${3}s)" >&2
     return 1
+}
+
+# No taskset in the frr-testbed image (Alpine busybox lacks the
+# applet) and a host-side taskset on the root-owned container
+# processes is EPERM for the unprivileged bench user (uid-match rule
+# does not hold for the daemons' tasks): the HOST's taskset runs via
+# a throwaway --pid=host container chrooted into the host root
+# (alpine:3.20, the injector image; read-only host mount,
+# --network none — no docker0 dependency) with CAP_SYS_CHROOT (the
+# chroot) + CAP_SYS_NICE (sched_setaffinity on another task).
+pin_taskset() { # taskset args... — the host taskset via host-root chroot
+    docker run --rm --network none --pid=host \
+        --cap-add SYS_CHROOT --cap-add SYS_NICE \
+        -v /:/host:ro alpine:3.20 chroot /host /usr/bin/taskset "$@"
+}
+
+apply_split_pin() { # container run_dir — SPLIT_PIN=name:cpus[,...]
+    [ -n "$SPLIT_PIN" ] || return 0
+    local spec name cpus comm hpid cpid
+    : > "$2/split-pin.txt"
+    for spec in ${SPLIT_PIN//,/ }; do
+        name=${spec%%:*}; cpus=${spec#*:}
+        hpid=""
+        for comm in "$name" "rouster-$name"; do
+            hpid=$(docker top "$1" -o pid,comm 2>/dev/null \
+                | awk -v n="$comm" '$2==n{print $1; exit}')
+            [ -n "$hpid" ] && break
+        done
+        [ -n "$hpid" ] || { echo "FAIL: split-pin: no process for $name in $1" >&2; return 1; }
+        cpid=$(docker exec "$1" pidof "$comm" | awk '{print $1}')
+        [ -n "$cpid" ] || { echo "FAIL: split-pin: pidof $comm empty in $1" >&2; return 1; }
+        echo "split-pin: $name -> $comm host-pid $hpid container-pid $cpid cpus $cpus" \
+            | tee -a "$2/split-pin.txt"
+        pin_taskset -a -cp "$cpus" "$hpid" | tee -a "$2/split-pin.txt"
+        pin_taskset -cp "$hpid" | tee -a "$2/split-pin.txt"
+        docker exec "$1" sh -c "grep Cpus_allowed_list /proc/$cpid/status" \
+            | tee -a "$2/split-pin.txt"
+    done
 }
 
 start_sut_rouster() { # name
@@ -371,6 +425,7 @@ for run in $(seq 1 "$RUNS"); do
         holo)     start_sut_holo "$SUT" ;;
         *)        start_sut_rouster "$SUT" ;;
     esac
+    apply_split_pin "$SUT" "$RUN_DIR"
     start_injector "$INJ"
     # holo's kernel oracle: third container in the SUT's netns, pinned
     # off the SUT cpuset (the 2026-10-19 E2/E4 observer convention).
