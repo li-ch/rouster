@@ -145,6 +145,23 @@ KERNEL_PACE=${BENCH_KERNEL_PACE:-2.0}
 # host-global cpu ids. The mask is re-verified from /proc inside the
 # SUT container; every call lands in <run>/split-pin.txt. Unset
 # (default) is a byte-for-byte no-op.
+# speaker-opt (away/2026-10-27 program Q6): optional extra env for the
+# SUT container — "VAR=VAL[;VAR=VAL...]" — passed as `docker run -e`
+# on every SUT starter (rouster/frr/hybrid; rustybgp/holo SUTs are
+# glibc images whose env surface differs and stay untouched). Serves
+# the receipted instrument runs (BGPD_EST_PROFILE) and the default-off
+# speaker levers (BGPD_*), symmetric across A/B legs only when the
+# same value is set on both invocations. Unset = byte-for-byte no-op.
+SUT_ENV=${BENCH_SUT_ENV:-}
+SUT_ENV_FLAGS=""
+if [ -n "$SUT_ENV" ]; then
+    OLDIFS=$IFS; IFS=';'
+    for kv in $SUT_ENV; do
+        [ -n "$kv" ] && SUT_ENV_FLAGS="$SUT_ENV_FLAGS -e $kv"
+    done
+    IFS=$OLDIFS
+fi
+
 SPLIT_PIN=${BENCH_SPLIT_PIN:-}
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -217,7 +234,7 @@ apply_split_pin() { # container run_dir — SPLIT_PIN=name:cpus[,...]
 
 start_sut_rouster() { # name
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS $SUT_ENV_FLAGS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     for b in rousterd rousterctl; do
@@ -244,7 +261,7 @@ start_sut_rouster() { # name
 
 start_sut_frr() { # name — zebra + mgmtd + real bgpd, vtysh -b push
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS $SUT_ENV_FLAGS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"
@@ -281,7 +298,7 @@ start_sut_frr() { # name — zebra + mgmtd + real bgpd, vtysh -b push
 
 start_sut_hybrid() { # name — config B: FRR 10.2.2 bgpd+mgmtd on the ROUSTER core
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS \
+        --cpuset-cpus "$SUT_CPUS" $SUT_SYSCTLS $SUT_ENV_FLAGS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     for b in rousterd rousterctl; do

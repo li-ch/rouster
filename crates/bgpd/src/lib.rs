@@ -39,3 +39,69 @@ pub mod zedge;
 /// The reserved two-octet AS number that stands in for non-mappable
 /// four-octet AS numbers (RFC 6793: AS_TRANS = 23456).
 pub const AS_TRANS: u16 = 23456;
+
+/// speaker-opt lever 1 (away/2026-10-27 Q6): `BGPD_QUIET_INGEST=1`
+/// sheds the two per-route INFO log surfaces on the bulk-ingest hot
+/// path — the per-UPDATE `UPDATE received` line (sampled to one line
+/// per [`QUIET_UPDATE_EVERY`] messages, keeping the first line so the
+/// harness first-UPDATE/EOR oracle basis is exact) and the per-route
+/// `route add/delete -> zebra` export lines — plus the ANSI escapes
+/// on what remains. The 2026-10-28 decomposition: a full-feed run
+/// writes 556,132 UPDATE lines + 1,126,490 export lines (294.8 MB);
+/// decode + sink walls are 1.24 s + 1.56 s of the 4.91 s EOR window,
+/// leaving ~2.1 s of un-instrumented middle where the UPDATE line is
+/// the dominant known term. Runtime-gated like `BGPD_EST_PROFILE`/
+/// `BGPD_MEM_CENSUS` so one binary serves both shapes; default OFF =
+/// every line logs exactly as before.
+pub fn quiet_ingest() -> bool {
+    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *QUIET.get_or_init(|| quiet_from_env(std::env::var_os("BGPD_QUIET_INGEST").as_deref()))
+}
+
+/// [`quiet_ingest`]'s pure core (unit-tested): set and not `0`.
+fn quiet_from_env(v: Option<&std::ffi::OsStr>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The quiet-mode per-UPDATE line cadence (speaker-opt lever 1):
+/// 65,536 messages → 9 lines on the 556,132-UPDATE full feed.
+pub const QUIET_UPDATE_EVERY: u64 = 65_536;
+
+/// Whether the per-UPDATE log line fires for message ordinal `idx`
+/// (0-based): always when not quiet; when quiet, message 0 plus every
+/// [`QUIET_UPDATE_EVERY`]-th after it (the first-UPDATE timestamp the
+/// EOR oracle anchors on stays line-precise).
+pub fn update_line_sampled(idx: u64, quiet: bool) -> bool {
+    !quiet || idx.is_multiple_of(QUIET_UPDATE_EVERY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_ingest_env_parsing() {
+        // The BGPD_EST_PROFILE shape: unset/0/empty off, anything
+        // else on. OsStr comparisons, so no lossy UTF-8 assumption.
+        assert!(!quiet_from_env(None));
+        assert!(!quiet_from_env(Some(std::ffi::OsStr::new("0"))));
+        assert!(!quiet_from_env(Some(std::ffi::OsStr::new(""))));
+        assert!(quiet_from_env(Some(std::ffi::OsStr::new("1"))));
+        assert!(quiet_from_env(Some(std::ffi::OsStr::new("on"))));
+    }
+
+    #[test]
+    fn quiet_ingest_samples_update_lines_at_64k() {
+        // Not quiet: every UPDATE logs (the baseline shape).
+        for idx in [0u64, 1, 65_535, 65_536, 556_131] {
+            assert!(update_line_sampled(idx, false), "idx {idx}");
+        }
+        // Quiet: message 0 logs (the oracle's first-UPDATE anchor),
+        // then one line per QUIET_UPDATE_EVERY; nothing between.
+        assert!(update_line_sampled(0, true));
+        assert!(!update_line_sampled(1, true));
+        assert!(!update_line_sampled(65_535, true));
+        assert!(update_line_sampled(65_536, true));
+        assert!(!update_line_sampled(65_537, true));
+    }
+}

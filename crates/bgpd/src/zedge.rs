@@ -210,11 +210,19 @@ where
             match command {
                 ZedgeCommand::RouteAdd(entry) => {
                     self.client.send_route_add(&entry).await?;
-                    info!(prefix = %entry.prefix, "bgpd: route add -> zebra");
+                    // speaker-opt lever 1: the per-route INFO line is
+                    // one of the two bulk-ingest log surfaces
+                    // (1,126,490 lines on the full-feed receipt);
+                    // BGPD_QUIET_INGEST sheds it. Default: unchanged.
+                    if !crate::quiet_ingest() {
+                        info!(prefix = %entry.prefix, "bgpd: route add -> zebra");
+                    }
                 }
                 ZedgeCommand::RouteDel(entry) => {
                     self.client.send_route_delete(&entry).await?;
-                    info!(prefix = %entry.prefix, "bgpd: route delete -> zebra");
+                    if !crate::quiet_ingest() {
+                        info!(prefix = %entry.prefix, "bgpd: route delete -> zebra");
+                    }
                 }
             }
         }

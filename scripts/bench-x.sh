@@ -49,9 +49,23 @@ wait_up() { docker exec "$1" sh -c "$4" >/dev/null 2>&1 && return 0
     for _ in $(seq 1 "$3"); do docker exec "$1" sh -c "$4" >/dev/null 2>&1 && return 0; sleep 1; done
     echo "FAIL: $2 (waited ${3}s)" >&2; return 1; }
 
+# speaker-opt (away/2026-10-27 Q6): optional extra env for the SUT
+# container — "VAR=VAL[;VAR=VAL...]" — the bench-e1-ingest.sh knob
+# mirrored here so the e1diff gate can A/B a default-off daemon flag
+# (BGPD_QUIET_INGEST) on the same cell. Unset = byte-for-byte no-op.
+SUT_ENV=${BENCH_SUT_ENV:-}
+SUT_ENV_FLAGS=""
+if [ -n "$SUT_ENV" ]; then
+    OLDIFS=$IFS; IFS=';'
+    for kv in $SUT_ENV; do
+        [ -n "$kv" ] && SUT_ENV_FLAGS="$SUT_ENV_FLAGS -e $kv"
+    done
+    IFS=$OLDIFS
+fi
+
 new_sut() { # name
     docker run -d --name "$1" --network "$NET_NAME" --ip "$SUT_IP" \
-        --cpuset-cpus "$SUT_CPUS" \
+        --cpuset-cpus "$SUT_CPUS" $SUT_ENV_FLAGS \
         --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
         --entrypoint sleep "$IMAGE" infinity >/dev/null
     docker exec "$1" sh -c "echo '186 bgp' >> /etc/iproute2/rt_protos || true"

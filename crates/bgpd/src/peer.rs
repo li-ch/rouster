@@ -311,6 +311,10 @@ pub struct PeerSession<IO> {
     /// The monotonic counter backing [`Self::tx_path_ids`] (starts at
     /// 1; 0 is the classic no-ADD-PATH key and is never allocated).
     tx_next_path_id: u32,
+    /// Non-EOR UPDATE messages seen on this session (speaker-opt
+    /// lever 1): the ordinal the per-UPDATE log line's quiet-mode
+    /// sampling keys on (`BGPD_QUIET_INGEST`).
+    updates_seen: u64,
     end: Option<SessionEnd>,
     /// Daemon-side observability (None in tests).
     shared: Option<Arc<SessionShared>>,
@@ -400,6 +404,7 @@ where
             gr_negotiated: None,
             tx_path_ids: BTreeMap::new(),
             tx_next_path_id: 1,
+            updates_seen: 0,
             end: None,
             shared: None,
             #[cfg(feature = "experimental-savnet")]
@@ -1035,24 +1040,23 @@ where
                 // the ADD-PATH observability the interop smokes pin;
                 // bench feed updates pack 64 prefixes, so the preview
                 // stays tiny where the list was the problem).
+                // speaker-opt lever 1: BGPD_QUIET_INGEST samples the
+                // line to one per crate::QUIET_UPDATE_EVERY messages
+                // (message 0 always — the harness first-UPDATE/EOR
+                // oracle anchors on it), so the preview is only built
+                // on the lines that actually log.
                 let announced = update.announced();
-                let mut preview = String::new();
-                for nlri in announced.iter().take(4) {
-                    if !preview.is_empty() {
-                        preview.push_str(", ");
-                    }
-                    preview.push_str(&nlri.to_string());
+                let update_idx = self.updates_seen;
+                self.updates_seen += 1;
+                if crate::update_line_sampled(update_idx, crate::quiet_ingest()) {
+                    info!(
+                        peer = %self.peer.address,
+                        announced = announced.len(),
+                        withdrawn = withdrawn.len(),
+                        paths = %update_preview(&announced),
+                        "bgpd: UPDATE received"
+                    );
                 }
-                if announced.len() > 4 {
-                    preview.push_str(", +");
-                }
-                info!(
-                    peer = %self.peer.address,
-                    announced = announced.len(),
-                    withdrawn = withdrawn.len(),
-                    paths = %preview,
-                    "bgpd: UPDATE received"
-                );
                 // The SAVNET route-event reports (experimental-savnet):
                 // Adj-RIB-In granularity — every announced/withdrawn
                 // prefix at the same point the RIB sink learns it
@@ -1442,6 +1446,24 @@ pub async fn read_frame_with<IO: AsyncRead + Unpin>(
     )
 }
 
+/// The bounded four-entry NLRI preview for the per-UPDATE log line
+/// (F5's shape): the first four paths, then `, +` when more remain.
+/// Only built for lines that log — speaker-opt lever 1's quiet mode
+/// skips the call entirely on sampled-out messages.
+fn update_preview(announced: &[Nlri]) -> String {
+    let mut preview = String::new();
+    for nlri in announced.iter().take(4) {
+        if !preview.is_empty() {
+            preview.push_str(", ");
+        }
+        preview.push_str(&nlri.to_string());
+    }
+    if announced.len() > 4 {
+        preview.push_str(", +");
+    }
+    preview
+}
+
 /// What [`take_frame`] extracted from the session read buffer.
 enum FrameTake {
     /// A complete frame was consumed (decoded, or failed the §6.1
@@ -1667,6 +1689,25 @@ mod tests {
     use crate::attr::AsSegment;
     use crate::message::message_type;
     use tokio::io::duplex;
+
+    /// speaker-opt lever 1: the per-UPDATE preview keeps F5's bounded
+    /// four-entry shape — first four paths, then `, +` when more
+    /// remain (quiet mode skips building it on sampled-out messages,
+    /// so the shape is pinned here once, decoupled from the gate).
+    #[test]
+    fn update_preview_bounded_four_entries_f5_shape() {
+        let v4 = |s: &str| s.parse::<Nlri>().unwrap();
+        assert_eq!(update_preview(&[]), "");
+        assert_eq!(
+            update_preview(&[v4("203.0.113.0/24"), v4("198.51.100.0/24")]),
+            "203.0.113.0/24, 198.51.100.0/24"
+        );
+        let five: Vec<Nlri> = (1..=5).map(|i| v4(&format!("203.0.11{i}.0/24"))).collect();
+        assert_eq!(
+            update_preview(&five),
+            "203.0.111.0/24, 203.0.112.0/24, 203.0.113.0/24, 203.0.114.0/24, +"
+        );
+    }
 
     /// A minimal speaking partner: answers OPEN with OPEN, then
     /// KEEPALIVE.

@@ -61,8 +61,13 @@ fn main() {
     let config_path = config_path.expect("missing --config <PATH>");
 
     // savd-parity init: plain fmt, RUST_LOG-style filtering is not
-    // wired (rousterd's logging module owns that shape).
-    let _ = tracing_subscriber::fmt().try_init();
+    // wired (rousterd's logging module owns that shape). speaker-opt
+    // lever 1: quiet mode also drops ANSI escapes (the receipts write
+    // to files; the summarizer strips ANSI either way, so the oracle
+    // basis is unchanged and the bytes shrink).
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(!bgpd::quiet_ingest())
+        .try_init();
 
     let text = match std::fs::read_to_string(&config_path) {
         Ok(text) => text,

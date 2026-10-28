@@ -1163,3 +1163,73 @@ in the chat record. The "Your decision" column stays the owner's.
   target/bench-logs/x-e4partial-20261028T{114934Z,115131Z smoke,
   115958Z native, 120210Z frrspf}. No verdict prose.
 
+
+- 2026-10-28 · speaker-opt (away/2026-10-27 Q6, the RustyBGP-gap
+  ladder's first stream; decomposition → one default-off lever)
+  · host=dgx-spark-1 LANE A (the receipted 2026-10-21 shared cell:
+  bench-net, SUT .20 cpuset 5-9, injector .10 cpus 0-3,
+  BENCH_SUT_RMEM=0; injector the 440f9f7f… variant; rousterd the
+  cd588377… prebuilt throughout) · **Stage 1a limit sweep** (baseline
+  bgpd b06eb5cc…, limits {100k, 300k, 600k, full} × 3 runs, 12/12
+  clean, 0 malformed/overruns, kernel basis feed−2/−5/−5/−9 every
+  run): EOR medians 0.356 / 1.209 / 2.495 / 4.879 s → 3.56 / 4.03 /
+  4.16 / 4.33 µs per route (marginal 4.27 / 4.29 / 4.53 µs — mildly
+  superlinear, intercept ≈ tens of ms); bgpd CPU 0.72 / 2.43 / 4.99 /
+  9.59 s → 7.2 / 8.1 / 8.3 / 8.5 µs per route; CPU/EOR ≈ 1.97 at
+  every size (≈half the speaker CPU rides the EOR-serial session
+  task); RustyBGP comparator receipted at full only: EOR 1.643 s =
+  1.46 µs/route, CPU 2.73 s = 2.42 µs/route · **Stage 1b
+  decomposition**: (i) the established BGPD_EST_PROFILE instrument on
+  one full-feed run (EOR 4.911): decode_ms=1244 + update_ms=1564 +
+  eor_ms=16 of the 4,911 ms window — 2,087 ms (42%) un-instrumented
+  middle; (ii) log census from the receipted 2026-10-28 splitpin raw:
+  sut-bgpd.log = 294,768,971 B = 556,132 `UPDATE received` +
+  1,126,490 `route add -> zebra` + 1 EOR line, ANSI escapes into a
+  file; (iii) feed-packing replication of the injector surgery+pack
+  (cross-validated: 16,623 distinct tuples at 100k vs the M3 census's
+  16,621): msgs 46,424@100k / 556,132@full, distinct tuples 16,623 /
+  152,024 → the pre-registered S1 ONE-ENTRY attr memo hits only
+  123/46,424 = 0.3% and 902/556,132 = 0.2% — **S1 as pre-registered
+  ranked OUT by measurement** (tuples recur — 73% of UPDATEs repeat
+  an earlier tuple — but not consecutively; a full-map variant stays
+  a candidate); S2 election batching ranked out (sink share 1.56 s
+  dominated by per-prefix work, batching saves only lock overhead)
+  · **Stage 2 lever (LANDED)**: `BGPD_QUIET_INGEST=1` (default OFF,
+  the BGPD_EST_PROFILE runtime-gate precedent) — the per-UPDATE
+  `UPDATE received` line sampled to one per 65,536 messages (message
+  0 always: the harness first-UPDATE/EOR oracle basis stays
+  line-precise; the F5 preview is built only on lines that log), the
+  per-route `route add/delete -> zebra` lines shed, ANSI off; pinned
+  unit tests quiet_ingest_env_parsing /
+  quiet_ingest_samples_update_lines_at_64k /
+  update_preview_bounded_four_entries_f5_shape; tree ee3c2b1+,
+  bgpd c4012062… (~/rouster-bench/bin-q6; baselines untouched);
+  harness: the additive BENCH_SUT_ENV knob (bench-e1-ingest.sh +
+  bench-x.sh, unset = no-op) · **gate**: fmt + clippy -D clean;
+  workspace 1,863/0 (receipted 1,860 + the 3 new; no vty flake,
+  first-run pass); 100k e1diff-style installed-set equality ON vs
+  OFF, same binary: 99,998 = 99,998, onlyOFF 0 / onlyON 0 (each leg
+  vs FRR also onlyD=1 = the known announced-default 0/0 delta,
+  identical both legs); full feed × 6 runs ON: **EOR median 3.639 s
+  [3.695 p95, min 3.609] vs the receipted 4.888 [4.95] = −25.5%;
+  bgpd CPU median 6.58 s vs 9.52 = −30.9%; kernel 1,126,481 =
+  feed−9 every run; 0 malformed; the ON-run bgpd log 1,817 B (9
+  UPDATE lines) vs 294,768,971 B; update_msgs reads 9 under quiet —
+  the true 556,132 is the injector's own REPLAY count per run
+  (disclosed oracle-basis note)**; OFF control (same binary, env
+  unset, 3 runs full): EOR 4.918 [4.834..4.989], CPU 9.67 — within
+  the receipted cell's spread, so the delta attributes to the flag,
+  not the binary; rousterd CPU unchanged (17.3-17.5 both legs) ·
+  both directions: the flag cuts the speaker EOR window 26% and
+  speaker CPU 31% on this rig/shape by shedding 1.68 M log events
+  per full feed — observability cost: the per-UPDATE/per-route INFO
+  surfaces exist only at default OFF; the residual gap to RustyBGP
+  after the lever: EOR 3.639 vs 1.643, CPU 6.58 vs 2.73 · Stage 3 (the ladder's next
+  lever) reported separately if it runs · receipts away/2026-10-27/speaker-opt/
+  (REPORT.md + artifacts: 4 sweep summaries, estprof leg + final
+  snap, feed-packing script+outputs, e1diff ON/OFF kernel sets +
+  notes, ON/OFF/control full-feed summaries, log census); raw on the
+  box target/bench-logs/rouster-20261028T{123432Z,123631Z,123842Z,
+  124111Z sweep; 125254Z estprof; 132055Z smoke; 132440Z gate-ON;
+  133011Z control-OFF} + x-e1diff-20261028T{132149Z OFF,132253Z ON}.
+  No verdict prose.
