@@ -1362,3 +1362,56 @@ in the chat record. The "Your decision" column stays the owner's.
   + runner log nightB-20261029T104107Z.log; Mac mirror away/
   2026-10-29/night2/B-TRAINING/ (all seven invocation dirs +
   bin-wl/SHA256SUMS). No verdict prose.
+
+- 2026-10-29 · e1rand2 conformance campaign, held-out half (night
+  program lane B stage B-HELDOUT: the 5 held-out random-schedule
+  seeds × both systems, limit 10000, computed oracle, single
+  invocation dir) · host=dgx-spark-1 LANE B, same rig discipline
+  as the training-half entry above (2026-10-29): bench-net2
+  172.31.254.0/24, SUT 172.31.254.20 cpuset 12-16, injector
+  172.31.254.10 cpu 17, alt_nh 172.31.254.11; BENCH_BIN_DIR=
+  ~/rouster-bench/bin-wl — rousterd 09b183c8…, rousterctl
+  1872ef76…, bgpd c0edf7ea…, mrt-replay 04c4ef48… (SHA256SUMS
+  mirrored away/2026-10-29/night2/B-TRAINING/bin-wl/); feed
+  rib.20261015.0400.mrt sha256 61f0d40d…70f; announce
+  announce-100k-laneb.announce 47b79fa7… — both runner inputs
+  identical to every training batch (laneB-night.sh lines 6-7,
+  19-20); harness scripts/bench-x.sh e1rand2 with the
+  BENCH_X_SEEDS knob · **held-out verdicts: frr 5/5 X-PASS,
+  0 X-FAIL; rouster 5/5 X-PASS, 0 X-FAIL; diff=0 and dups=0 on
+  all 10 verdicts; expected final pairs 7610-10000 (median 9100),
+  schedule length 17-49 ops (median 20), boundaries 2-3 per
+  schedule (median 2); dwindow rows present on every verdict,
+  per-side row-count distribution identical (2×1-row + 1×2-row +
+  2×3-row = 10 rows; 6 Rs + 4 D each side); the executed op
+  schedule is identical between sides on every seed (mirrored
+  rand2-<seed>-{frr,rouster}-exec.txt ops strings)**; per-seed
+  (exp=pairs+1 both sides; dw f= / r= frr/rouster dwindow rows):
+  s22 exp 9100 ops20/b2 dw f[Rs 0 D 0] r[Rs 10000 D 9487] ·
+  s23 exp 8708 ops45/b3 dw f[Rs 0 Rs 0 Rs 0] r[Rs 10000 Rs 10000
+  Rs 10000] · s24 exp 10000 ops49/b3 dw f[D 0 D 0 D 0] r[D 10000
+  D 10000 D 10000] · s25 exp 10000 ops17/b2 dw f[Rs 9999] r[Rs
+  10000] · s26 exp 7610 ops18/b2 dw f[Rs 0] r[Rs 10000] · with
+  this stage the lane-B night campaign stands at 52 X-PASS /
+  0 X-FAIL over post-repair runs (retry smoke 2 + training 40 +
+  held-out 10; the two pre-repair failed smokes stay verbatim
+  BLOCKED-class evidence per the training entry) · deviation
+  disclosure — SEED NUMBERING: this batch ran seeds 22-26, not
+  21-25 as intended: laneB-night.sh line 19 selects the held-out
+  K-list via BENCH_X_SEEDS="21 22 23 24 25" but sets neither
+  BENCH_X_SEED nor E1RAND2_HELDOUT (the notes header records
+  base=1 heldout=0), and bench-x.sh:867,995 defaults SEED=1 with
+  SD=K+1 in the K-loop, so K 21-25 → seeds 22-26; the held-out
+  set {22..26} is disjoint from the training set {2..21} (uniform
+  +1 shift; 5+20 counts intact; seed-1 top-up decision pending) —
+  full numbering derivation, smoke-gate repair, and lane-B
+  environment disclosures: training-half entry above, not
+  repeated here; the fail7 mutual-exclusion gate preceding this
+  invocation (laneB-night.sh:18) never engaged (A-SWEEP-DONE
+  absent throughout — correct); no FAIL/BLOCKED seeds in this
+  stage · raw: box dgx-spark-1:~/rouster-bench/target/bench-logs/
+  x-e1rand2-20261029T114014Z (71 files) + runner log
+  nightB-20261029T104107Z.log (held-out section: cell start
+  line 173 → done line 215); Mac mirror away/2026-10-29/night2/
+  B-HELDOUT/x-e1rand2-20261029T114014Z/ (71 files, 7.4 MB,
+  nothing >200 MB, no gzip). No verdict prose.
