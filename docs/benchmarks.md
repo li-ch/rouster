@@ -1415,3 +1415,152 @@ in the chat record. The "Your decision" column stays the owner's.
   line 173 → done line 215); Mac mirror away/2026-10-29/night2/
   B-HELDOUT/x-e1rand2-20261029T114014Z/ (71 files, 7.4 MB,
   nothing >200 MB, no gzip). No verdict prose.
+
+- 2026-10-29 · P0 workload-diversity grid: attribute-uniqueness /
+  ADD-PATH / nexthop-pool sweeps + pairwise stress cell + ablation
+  arms (night program lane A, fold unit A-SWEEP: fixed 100k scale,
+  6 runs per cell = 1 warmup + 5 measured, both systems per sweep
+  and stress cell, ablation arms rouster-only per the pre-registered
+  cell table; baseline cells NOT rerun — the natural-feed 100k
+  receipts stand per the do-not-rerun rule) · host=dgx-spark-1
+  LANE A: bench-net 172.31.255.0/24, SUT cpus 5-9, injector cpus
+  0-3 (BENCH_SUT_CPUS=5-9 BENCH_INJ_CPUS=0-3; harness defaults
+  differ, disclosed below) · versions: BENCH_BIN_DIR=~/rouster-bench/
+  bin-wl — rousterd 09b183c8…, rousterctl 1872ef76…, bgpd c0edf7ea…,
+  mrt-replay 04c4ef48… (bin-wl/SHA256SUMS mirrored away/2026-10-29/
+  night2/B-TRAINING/bin-wl/; sha-identical to lane B's independently
+  built set); feed rib.20261015.0400.mrt sha256 61f0d40d…70f; grid
+  dir wl1-20261029T101418Z (30 cells, 2,419 files, 6.0 GB); harness
+  scripts/bench-wl-sweep.sh @ 732752d + lane A's line-82 set -u fix
+  (split local; committed bench-scope this fold, 5fbf7ee) driving
+  scripts/bench-e1-ingest.sh · wire-shape stats lines present in
+  every cell both systems (REPLAY-ATTR-STATS + REPLAY-NH-STATS, one
+  pair per cell, identical between systems within each cell):
+  a-series distinct_tuples 39158/60058/79072/100000 routes=100000
+  addpath=1 nh=1; c-series tu 33246/66492/132984 ap 2/4/8 nh=1;
+  n-series tu 44898/77020/98355/99999 ap=1 nh 16/256/4096/65535;
+  stress tu=800000 ap=8 nh=65535; ablation arms tu=16623 ap=1
+  nh=1 · **per-cell medians [p95] over the 5 measured runs
+  (kernel_last = main_prefixes_last per the grid fold; EOR =
+  wall_bgp_level_s, emitted on rouster runs only; spk/core =
+  bgpd/zebra field names (rousterd-bgpd / rousterd-core daemons on
+  the rouster side); B/pfx = (RSS_final−RSS_empty)×1024/100000,
+  ledger convention for the median, p95 from per-run deltas;
+  overruns = Σ over measured runs; medians cross-checked
+  cell-for-cell against the grid's own fold.json — 30/30 match):**
+
+  | cell | wall_external_s | EOR_s | spk CPU_s | core CPU_s | spk B/pfx | core B/pfx | kernel_last | overruns_Σ |
+  |---|---|---|---|---|---|---|---|---|
+  | a25-frr | 30.781 [30.791] | — | 1.02 [1.03] | 0.99 [1.00] | 1533.9 [1534.6] | 554.2 [568.5] | 100001 | 0* |
+  | a25-rouster | 2.773 [2.789] | 0.448 [0.468] | 0.82 [0.86] | 1.55 [1.56] | 642.2 [649.2] | 233.9 [236.0] | 99998 | 0 |
+  | a50-frr | 30.761 [30.765] | — | 1.23 [1.23] | 1.01 [1.04] | 2035.3 [2037.9] | 557.6 [564.0] | 100001 | 0* |
+  | a50-rouster | 2.753 [2.769] | 0.560 [0.565] | 0.94 [0.99] | 1.56 [1.59] | 824.5 [828.0] | 232.8 [234.4] | 99998 | 0 |
+  | a75-frr | 30.758 [30.763] | — | 1.43 [1.44] | 1.05 [1.07] | 2540.6 [2541.5] | 558.7 [564.0] | 100001 | 0* |
+  | a75-rouster | 2.740 [2.754] | 0.603 [0.651] | 0.98 [1.10] | 1.54 [1.57] | 969.3 [983.0] | 232.4 [233.4] | 99998 | 0 |
+  | a100-frr | 30.739 [30.746] | — | 1.64 [1.67] | 1.05 [1.07] | 3040.9 [3044.2] | 557.5 [569.4] | 100001 | 0* |
+  | a100-rouster | 2.731 [2.741] | 0.691 [0.748] | 1.08 [1.19] | 1.56 [1.57] | 1132.7 [1142.0] | 234.5 [235.8] | 99998 | 0 |
+  | c2-frr | 0.667 [0.677] | — | 1.80 [1.91] | 0.84 [0.87] | 1358.1 [1358.7] | 540.9 [541.2] | 95966 | 0* |
+  | c2-rouster | 2.677 [2.684] | 1.278 [1.297] | 1.71 [1.95] | 1.54 [1.57] | 764.0 [764.7] | 233.1 [233.8] | 99998 | 0 |
+  | c4-frr | 0.352 [0.374] | — | 3.34 [3.35] | 0.86 [0.89] | 2007.3 [2008.1] | 545.4 [547.6] | 98103 | 0* |
+  | c4-rouster | 3.359 [3.366] | 2.377 [2.392] | 2.82 [2.85] | 1.53 [1.56] | 1364.3 [1366.5] | 234.5 [234.7] | 99998 | 0 |
+  | c8-frr | 1.252 [1.275] | — | 6.31 [6.36] | 0.91 [0.94] | 3495.6 [3499.6] | 546.2 [548.5] | 99135 | 0* |
+  | c8-rouster | 6.275 [6.291] | 4.667 [4.809] | 5.13 [5.27] | 1.55 [1.56] | 2588.0 [2590.6] | 233.9 [235.7] | 99998 | 0 |
+  | n16-frr | 30.787 [30.793] | — | 0.79 [0.81] | 0.01 [0.02] | 892.8 [895.6] | 1.4 [1.6] | 4 | 0* |
+  | n16-rouster | 30.790 [98.308] | 0.633 [0.642] | 1.01 [1.03] | 34.16 [101.71] | 705.9 [706.9] | 235.9 [236.7] | 99998 | 0 |
+  | n256-frr | 30.775 [30.798] | — | 0.82 [0.82] | 0.01 [0.03] | 1020.2 [1022.6] | 2.6 [5.7] | 4 | 0* |
+  | n256-rouster | 30.784 [193.139] | 0.667 [0.675] | 1.05 [1.11] | 34.25 [196.61] | 949.1 [955.5] | 235.0 [239.0] | 99998 | 0 |
+  | n4096-frr | 30.775 [30.785] | — | 1.04 [1.06] | 0.06 [0.08] | 1109.7 [1111.8] | 32.2 [32.9] | 4 | 0* |
+  | n4096-rouster | 30.761 [32.473] | 0.660 [0.663] | 1.04 [1.06] | 34.18 [35.85] | 1110.1 [1112.8] | 246.9 [247.7] | 99998 | 0 |
+  | n65535-frr | 30.766 [30.781] | — | 36.20 [36.29] | 6.36 [6.57] | 1274.3 [1275.8] | 476.2 [476.5] | 4 | 0* |
+  | n65535-rouster | 30.778 [33.469] | 0.664 [0.672] | 1.04 [1.07] | 34.19 [36.87] | 1120.5 [1121.8] | 425.5 [428.0] | 99998 | 0 |
+  | stress-frr | 1.746 [1.753] | — | 7.52 [7.56] | 2.33 [2.43] | 2220.1 [2224.6] | 416.8 [504.1] | 4 | 0* |
+  | stress-rouster | 28.757 [115.497] | 5.272 [5.308] | 5.75 [5.77] | 31.76 [118.40] | 7978.6 [7979.9] | 424.5 [424.9] | 99998 | 0 |
+  | ab-ctl-rouster | 2.784 [2.801] | 0.355 [0.364] | 0.72 [0.72] | 1.57 [1.57] | 475.7 [478.3] | 234.4 [235.9] | 99998 | 0 |
+  | ab-intern-rouster | 2.781 [2.805] | 0.345 [0.350] | 0.71 [0.74] | 1.57 [1.59] | 699.2 [702.8] | 234.7 [236.4] | 99998 | 0 |
+  | ab-win64-rouster | 2.782 [2.799] | 0.353 [0.431] | 0.70 [0.95] | 1.72 [1.75] | 474.8 [494.6] | 230.1 [231.5] | 99998 | 0 |
+  | ab-win8-rouster | 2.786 [2.799] | 0.352 [0.357] | 0.70 [0.71] | 1.77 [1.77] | 475.0 [476.0] | 230.9 [231.0] | 99998 | 0 |
+  | ab-win1-rouster | 3.785 [3.798] | 0.343 [0.350] | 0.68 [0.69] | 2.60 [2.64] | 477.3 [480.8] | 230.5 [230.9] | 99998 | 0 |
+  | ab-fast1-rouster | 2.784 [2.800] | 0.335 [0.341] | 0.68 [0.70] | 1.56 [1.57] | 473.7 [477.7] | 234.7 [236.6] | 99998 | 0 |
+
+  (*) overruns_Σ on the frr side: the harness collects
+  netlink_rcvbuf_overruns / malformed / rejected on rouster runs
+  only — frr per_run records carry none of these fields, so the 0*
+  entries mean "field not collected", not "measured 0"; the
+  rouster side records malformed=0 and rejected=0 on every run of
+  all 18 rouster cells. kernel_count_last is null on both systems
+  throughout this grid (poller's sut_kernel_count column empty);
+  the frr per_run additionally records pfxrcd_last, verbatim:
+  a-series and n-series 99998 on all runs of all cells; c2
+  191925/191925/191925/191923/191925/191923; c4 392397/392397/
+  392398/392397/392397/392396; c8 793051/793051/793050/793050/
+  793050/793050; stress 239600/238320/237830/237990/237810/238660
+  (rouster runs carry pfxrcd_last=null — field presence differs by
+  system, disclosed) · ablation pairs (G2: same binary
+  rousterd 09b183c8… on every arm, levers are env vars only;
+  deltas vs the in-grid reference arm ab-ctl, median − median,
+  numbers only): interning ab-intern (ROUSTER_ATTR_INTERN=0) vs
+  ab-ctl (=1): spk B/pfx +223.5, core B/pfx +0.3, wall −0.003,
+  EOR −0.010, spk CPU −0.01, core CPU +0.00; ROUSTER_NL_WINDOW=64:
+  wall −0.002, EOR −0.002, spk CPU −0.02, core CPU +0.15, spk
+  B/pfx −0.9, core B/pfx −4.3; NL_WINDOW=8: wall +0.002, EOR
+  −0.003, spk CPU −0.02, core CPU +0.20, spk B/pfx −0.7, core
+  B/pfx −3.5; NL_WINDOW=1 (serial): wall +1.001, EOR −0.012, spk
+  CPU −0.04, core CPU +1.03, spk B/pfx +1.6, core B/pfx −3.9;
+  BGPD_FAST_ELECTION=1: wall +0.000, EOR −0.020, spk CPU −0.04,
+  core CPU −0.01, spk B/pfx −2.0, core B/pfx +0.3 · spread facts
+  from the wide-p95 cells (numbers only): rouster n-series/stress
+  wall_external_s per-run values sit on a coarse ladder in this
+  grid (observed per-cell min→max incl. warmup: n16 19.78→80.81,
+  n256 30.78→137.82, n4096 18.76→33.77, n65535 17.78→57.78,
+  stress 16.77→79.78); the frr cells' wall_external_s per-run
+  spreads are ≤0.04 s in every cell (largest: n16-frr 0.031 s) ·
+  **kernel_last verbatim, every cell (the G1 bar reads "every run
+  kernel = 99,998"; deviations listed without adjudication — the
+  stress shape samples mid-flap by design; whether any deviation
+  satisfies the bar is the owner's call, not the fold's; nothing
+  rerun, no bars adjusted): all 18 rouster cells = 99,998 on all
+  6 runs each (warmup included); frr cells: a25/a50/a75/a100-frr
+  = 100001 on all 6 runs each; c2-frr = 95966, 95966, 95966,
+  95965, 95966, 95965; c4-frr = 98103, 98103, 98103, 98103,
+  98103, 98102; c8-frr = 99135 on all 6; n16/n256/n4096/n65535-frr
+  = 4 on all 6 runs each; stress-frr = 4 on all 6 runs** ·
+  deviation disclosures (all evidenced in away/2026-10-29/night2/
+  laneA-launch.md): (a) BENCH_SUT_RMEM=0 on the smoke and every
+  chain run — this box's kernel 6.11.0-1014-nvidia does not
+  namespace net.core.rmem_*, so the rcvbuf-sysctl leg of the
+  2026-10-16 harness fix has never been active on this box;
+  identical to every prior box receipt (comparability preserved) ·
+  (b) box source tree was 10 tracked files stale vs Mac 732752d
+  (crates/bgpd, crates/netlink-dp, crates/rousterd); exactly those
+  10 files were synced before the build, rest untouched · (c)
+  build host = Mac (box has no Rust toolchain): the four
+  aarch64-unknown-linux-musl binaries were cross-built on the Mac
+  from the exact 732752d tree and shipped to bin-wl/ + SHA256SUMS;
+  SHAs matched lane B's independent build of the same tree · (d)
+  lane A placement env BENCH_SUT_CPUS=5-9 / BENCH_INJ_CPUS=0-3 per
+  the receipted lane placement (harness default SUT cpus 4-11
+  differs) · (e) Stage-0 smoke (2k, combined shape) passed
+  2000/2000 on the SECOND attempt: attempt 1 failed at container
+  start (runc "permission denied" on net.core.rmem_default — the
+  (a) root cause), relaunch with BENCH_SUT_RMEM=0 passed;
+  separately, the 2k rehearsal grid (smoke-a-20261029T094515Z)
+  passed smoke+a25+a50+a75 and was wedged at a100 by lane B's
+  concurrent feed-layout normalization (~09:44Z rename raced the
+  in-flight docker cp) — cross-lane event, wedged grid killed and
+  replaced by the canonical-path chain; full story + the lane B
+  side in laneB-diagnosis.md and STATE.jsonl (18:12/18:24 entries) ·
+  (f) containers are named b1-sut/b1-inj-<ts>-<run> by the harness
+  (the lane prompt guessed wl1-*; wl1- is the grid-dir prefix) ·
+  (g) harness patch: lane A's uncommitted bench-wl-sweep.sh
+  line-82 set -u fix (one `local` with two assignments split into
+  two `local`s — no semantic change, only occurrence of the
+  pattern in the seven drivers) committed bench-scope this fold as
+  its own commit (5fbf7ee) · raw: box dgx-spark-1:~/rouster-bench/
+  target/bench-logs/wl1-20261029T101418Z/ (30 cell dirs +
+  fold.json, 2,419 files, 6.0 GB, largest single file 194 MB —
+  nothing >200 MB, mirrored uncompressed) + runner log
+  ~/rouster-bench/nightA-20261029T101418Z.log (sweep section: first
+  cell line 2 → "bench-wl-sweep: done" line 1108); Mac mirror
+  away/2026-10-29/night2/A-SWEEP/wl1-20261029T101418Z/ (2,419
+  files verified by count + sha256 spot-checks vs box). No verdict
+  prose.
