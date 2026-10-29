@@ -1014,10 +1014,12 @@ e1rand2)
         docker exec "$INJ" ip addr add "$ALT_NH/24" dev eth0 2>/dev/null || true
         docker exec "$SUT" ping -c1 -W2 "$ALT_NH" >/dev/null 2>&1 || true
 
-        for K in $(seq 1 "$SCHEDULES"); do
+        SEEDS_LIST=${BENCH_X_SEEDS:-}; for K in ${SEEDS_LIST:-$(seq 1 "$SCHEDULES")}; do
             SD=$((SEED + K))
+            if [ -z "$SEEDS_LIST" ]; then
             if [ "$HELDOUT" = 1 ] && [ "$K" -le $((SCHEDULES - 5)) ]; then continue; fi
             if [ "$HELDOUT" != 1 ] && [ "$K" -gt $((SCHEDULES - 5)) ]; then continue; fi
+            fi
             python3 - "$SD" "$LIMIT" "$ANN_CP" "$OUT_DIR" "$INJ_IP" "$ALT_NH" > "$OUT_DIR/rand2-$SD-gen.txt" <<'GENEOF'
 import json, random, sys
 seed, limit, ann, out, inj_ip, alt_nh = (int(sys.argv[1]), int(sys.argv[2]),
