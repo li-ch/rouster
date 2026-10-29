@@ -1270,3 +1270,95 @@ in the chat record. The "Your decision" column stays the owner's.
   target/bench-logs/rouster-20261028T{134440Z stacked, 134948Z
   fast-only} + x-e1diff-20261028T{134103Z OFF, 134207Z ON2,
   134311Z ON12}. No verdict prose.
+
+- 2026-10-29 · e1rand2 conformance campaign, training half (night
+  program lane B stage B-TRAINING: 20 random-schedule seeds × both
+  systems, limit 10000, computed oracle; plus the smoke-gate
+  repair story that preceded it) · host=dgx-spark-1 LANE B:
+  bench-net2 172.31.254.0/24, SUT 172.31.254.20 cpuset 12-16,
+  injector 172.31.254.10 cpu 17, alt_nh 172.31.254.11 (the N-op
+  second injector address) — disjoint from lane A's in-flight
+  b1-* cells on bench-net (bench-x startup cleanup matches only
+  x2r-*/x7-* here) · versions: BENCH_BIN_DIR=~/rouster-bench/
+  bin-wl — rousterd 09b183c8…, rousterctl 1872ef76…, bgpd
+  c0edf7ea…, mrt-replay 04c4ef48… (bin-wl/SHA256SUMS mirrored);
+  feed rib.20261015.0400.mrt sha256 61f0d40d…70f; announce
+  announce-100k-laneb.announce sha256 47b79fa7… (training + retry;
+  the failed-smoke input announce-100k.announce is 6c9f4f7d…);
+  harness scripts/bench-x.sh e1rand2 carrying the pre-registered
+  Stage-0 BENCH_X_SEEDS knob (box backup .bench-x.sh.pre-seedsknob;
+  identical Mac-side edit landed bench-scope this fold); staged
+  runner laneB-night.sh (batch invocations of 5 K-indices; fail7
+  mutual-exclusion gates vs lane A) · **training verdicts: frr
+  20/20 X-PASS, 0 X-FAIL; rouster 20/20 X-PASS, 0 X-FAIL; diff=0
+  and dups=0 on all 40 verdicts; expected final pairs 4523-10000
+  (median 8126), schedule length 13-61 ops (median 27), boundaries
+  2-4 per schedule; dwindow rows present on every verdict — 56 D
+  + 28 Rs rows total, per-side row-count distribution identical
+  (4×1-row, 10×2-row, 6×3-row)**; per-seed (exp=pairs+1 both
+  sides; dw f= / r= frr/rouster dwindow rows; batch dirs
+  104107Z/105358Z/110936Z/112532Z = seeds 2-6/7-11/12-16/17-21):
+  s2 exp 10000 ops34/b2 dw f[Rs 0 D 0] r[Rs 10000 D 10000] ·
+  s3 exp 10000 ops13/b4 dw f[D 9999] r[D 10000] · s4 exp 7449
+  ops37/b3 dw f[Rs 0 D 0 D 0] r[Rs 10000 D 7320 D 7856] · s5 exp
+  6264 ops24/b3 dw f[Rs 0 D 0] r[Rs 10000 D 6946] · s6 exp 8401
+  ops20/b4 dw f[D 0 D 0] r[D 10000 D 10000] · s7 exp 8527 ops31/b2
+  dw f[D 0 D 0] r[D 9091 D 8202] · s8 exp 8857 ops25/b3 dw f[D
+  9999 D 0] r[D 10000 D 10000] · s9 exp 7857 ops30/b4 dw f[D 9999
+  Rs 0] r[D 10000 Rs 10000] · s10 exp 8395 ops20/b2 dw f[D 8262]
+  r[D 8263] · s11 exp 7661 ops61/b4 dw f[D 0 D 0 Rs 9999] r[D
+  7351 D 7076 Rs 10000] · s12 exp 9177 ops51/b3 dw f[Rs 0 D 0
+  Rs 0] r[Rs 10000 D 9364 Rs 10000] · s13 exp 7030 ops24/b3 dw
+  f[D 0 D 0] r[D 8750 D 7536] · s14 exp 10000 ops26/b4 dw f[Rs
+  9999 Rs 0] r[Rs 10000 Rs 10000] · s15 exp 10000 ops27/b2 dw
+  f[D 0 D 0] r[D 9384 D 9423] · s16 exp 4523 ops46/b3 dw f[D 0
+  Rs 0 D 0] r[D 10000 Rs 10000 D 4523] · s17 exp 4854 ops17/b3
+  dw f[D 0] r[D 6000] · s18 exp 10000 ops27/b2 dw f[Rs 0 D 0]
+  r[Rs 10000 D 9584] · s19 exp 7715 ops22/b2 dw f[D 0] r[D
+  10000] · s20 exp 6130 ops48/b4 dw f[D 0 D 0 Rs 0] r[D 8500 D
+  8417 Rs 10000] · s21 exp 6999 ops46/b3 dw f[Rs 0 D 0 Rs 0]
+  r[Rs 10000 D 8944 Rs 10000] · **smoke-gate story (seed 51,
+  limit 2000, base=0): two pre-repair attempts FAILED both sides
+  with identical numbers — kept verbatim, not rerun (094748Z,
+  095846Z): "X-FAIL e1rand2 frr seed=51: pairs=0 expected=999
+  diff=999 dups=0" / "X-FAIL e1rand2 rouster seed=51: pairs=0
+  expected=999 diff=999 dups=0", dwindow=[Rs 239 Rs 0] both sides
+  both attempts — classified BLOCKED-class evidence (harness-input
+  fault, below); the orchestrator-authorized retry #3 (103410Z)
+  passed both sides: frr pairs=999/999 diff=0 dups=0 dw=[Rs 1999
+  Rs 0], rouster pairs=999/999 diff=0 dups=0 dw=[Rs 2000 Rs
+  2000]** · deviation disclosures: (a) SEED NUMBERING — the runner
+  does not set BENCH_X_SEED and bench-x.sh:867,995 defaults
+  SEED=1 with SD=K+1 in the loop (bench-x.sh:1018), so the
+  BENCH_X_SEEDS K-lists {1-5, 6-10, 11-15, 16-20} (training) and
+  {21-25} (held-out) actually ran seeds 2-21 and 22-26 — not
+  1-20 and 21-25 as intended; the 20-training + 5-held-out counts
+  and the train/held-out disjointness are intact (uniform +1
+  shift); owner decision on a seed-1 top-up pending; the held-out
+  invocation x-e1rand2-20261029T114014Z folds under stage
+  B-HELDOUT, not here · (b) REPAIR — the two failed smoke
+  attempts used announce-100k.announce, whose next-hops are baked
+  for lane A's subnet (all head-2000 entries 172.31.255.10, the
+  bench-net injector address): non-connected on bench-net2, NHT
+  never resolves, no A/R-op route enters the kernel FIB; observed
+  239 = |N16∪N24∪N12| − |R23∩N| = 250 − 11, window2 = 0 (W2
+  withdraws every even ordinal and every N-flip index is even),
+  final 0/999 — full derivation away/2026-10-29/night2/
+  laneB-diagnosis.md; the repair was the orchestrator-authorized
+  retry #3 with the pre-staged announce-100k-laneb.announce
+  (2026-10-28 18:34, prefix corpus identical, only the next-hop
+  field differs: all 172.31.254.10); the staged runner
+  laneB-night.sh received exactly 2 edits (ANN swap to the
+  lane-correct file; fail7 mutual-exclusion gate inserted at the
+  training-loop body top and again before the held-out
+  invocation), diff-proven against .laneB-night.sh.pre-repair in
+  away/2026-10-29/night2/laneB-relaunch.md · (c) LANE B env —
+  bench-net2 172.31.254.0/24, SUT cpus 12-16, injector cpu 17,
+  feed sha256 61f0d40d…70f, binaries per the mirrored bin-wl
+  SHA256SUMS · raw: box dgx-spark-1:~/rouster-bench/target/
+  bench-logs/x-e1rand2-20261029T{104107Z, 105358Z, 110936Z,
+  112532Z training batches 1-4; 094748Z, 095846Z failed
+  pre-repair smokes verbatim; 103410Z authorized passing retry}
+  + runner log nightB-20261029T104107Z.log; Mac mirror away/
+  2026-10-29/night2/B-TRAINING/ (all seven invocation dirs +
+  bin-wl/SHA256SUMS). No verdict prose.
