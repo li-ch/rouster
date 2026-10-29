@@ -164,8 +164,29 @@ fi
 
 SPLIT_PIN=${BENCH_SPLIT_PIN:-}
 
+# Workload-diversity sweep knobs (ToN revision Part 5 P0; the
+# BENCH_SPLIT_PIN pattern: every knob unset = byte-for-byte no-op).
+#   BENCH_WL_ARGS      extra mrt-replay args appended verbatim
+#                      (e.g. "--attr-unique 0.5", "--nexthop-pool 4096",
+#                      "--addpath 4") — requires the switched injector
+#                      build (BENCH_INJECTOR_BIN).
+#   BENCH_WL_COVER_ROUTE  when nonempty (e.g. "10.0.0.0/8"), installed
+#                      in the SUT container right after daemon start
+#                      and before the injector, via the injector
+#                      address; needed by --nexthop-pool cells
+#                      (symmetric on both SUTs; kernel-side only).
+#   BENCH_WL_ADDPATH   1 = the rouster-mode neighbor line gains
+#                      `addpath rx` (our config surface; FRR receives
+#                      add-path by default — only disable-addpath-rx
+#                      exists in 10.2 — so frr/hybrid need no line).
+WL_ARGS=${BENCH_WL_ARGS:-}
+WL_COVER_ROUTE=${BENCH_WL_COVER_ROUTE:-}
+WL_ADDPATH=${BENCH_WL_ADDPATH:-}
+
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-OUT_DIR="target/bench-logs/$MODE-$TS"
+# BENCH_OUT_NAME (wl-sweep driver): pin the run directory to a cell
+# name instead of the mode-timestamp default. Unset = unchanged.
+OUT_DIR=${BENCH_OUT_NAME:-target/bench-logs/$MODE-$TS}
 mkdir -p "$OUT_DIR"
 echo "bench-e1-ingest: mode=$MODE feed=$FEED_MRT limit=$FEED_LIMIT (target $FEED_COUNT) runs=$RUNS"
 echo "  sut cpus=$SUT_CPUS  injector cpus=$INJ_CPUS  rate=$REPLAY_RATE  out=$OUT_DIR"
@@ -254,6 +275,9 @@ start_sut_rouster() { # name
         ' neighbor $INJ_IP passive' \
         ' hold-time $HOLD' \
         > /etc/rouster-bgp.conf"
+    if [ "$WL_ADDPATH" = 1 ]; then
+        docker exec "$1" sh -c "printf ' neighbor $INJ_IP addpath rx\n' >> /etc/rouster-bgp.conf"
+    fi
     docker exec "$1" sh -c "rouster-bgpd --validate-config /etc/rouster-bgp.conf"
     docker exec -d "$1" sh -c "rouster-bgpd --config /etc/rouster-bgp.conf > /var/log/rouster-bgpd.log 2>&1"
     wait_up "$1" "rouster bgpd listening" 15 "grep -q 'bgpd: listening' /var/log/rouster-bgpd.log"
@@ -353,7 +377,7 @@ start_injector() { # name - mrt-replay on the other pinned cpuset
     INJ_ARGS="--peer $SUT_IP:179 --local-addr $INJ_IP --local-as $INJ_AS \
         --peer-as $SUT_AS --router-id $INJ_IP --mrt /feed.mrt \
         --prepend-as $INJ_AS --next-hop $INJ_IP $LIMIT_ARG \
-        --rate $REPLAY_RATE --hold $HOLD"
+        --rate $REPLAY_RATE --hold $HOLD $WL_ARGS"
 }
 
 start_sut_rustybgp() { # name — default-config RustyBGP (speaker only)
@@ -443,6 +467,9 @@ for run in $(seq 1 "$RUNS"); do
         *)        start_sut_rouster "$SUT" ;;
     esac
     apply_split_pin "$SUT" "$RUN_DIR"
+    if [ -n "$WL_COVER_ROUTE" ]; then
+        docker exec "$SUT" ip route add "$WL_COVER_ROUTE" via "$INJ_IP"             && echo "cover-route: $WL_COVER_ROUTE via $INJ_IP" >> "$RUN_DIR/cover-route.txt"             || { echo "FAIL: cover route install failed" >&2; exit 1; }
+    fi
     start_injector "$INJ"
     # holo's kernel oracle: third container in the SUT's netns, pinned
     # off the SUT cpuset (the 2026-10-19 E2/E4 observer convention).

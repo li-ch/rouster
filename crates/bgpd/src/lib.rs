@@ -75,6 +75,24 @@ pub fn fast_election() -> bool {
     *FAST.get_or_init(|| env_flag(std::env::var_os("BGPD_FAST_ELECTION").as_deref()))
 }
 
+/// ablation lever (ToN revision Part 5 P0): `ROUSTER_ATTR_INTERN=0`
+/// disables cross-UPDATE attribute-tuple sharing in
+/// [`LocRib`](crate::rib::LocRib): each UPDATE's decoded tuple is
+/// allocated once for the routes that UPDATE carries, and equal
+/// tuples across UPDATEs no longer collapse to one
+/// [`Arc`](std::sync::Arc) — the natural non-interning
+/// implementation, exactly the comparison the revision's
+/// workload-diversity sweeps need (speaker memory with sharing vs
+/// without). Default ON (unset or any value other than `0`):
+/// interning as shipped. Semantics are unchanged either way; only
+/// the sharing and its sweep machinery differ.
+pub fn attr_intern() -> bool {
+    static INTERN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INTERN.get_or_init(
+        || !matches!(std::env::var_os("ROUSTER_ATTR_INTERN").as_deref(), Some(v) if v == "0"),
+    )
+}
+
 /// The BGPD_* runtime gates' pure core (unit-tested): set and not `0`
 /// (the `BGPD_EST_PROFILE` shape).
 fn env_flag(v: Option<&std::ffi::OsStr>) -> bool {

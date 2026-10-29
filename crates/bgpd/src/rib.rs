@@ -384,16 +384,35 @@ pub struct BestChange {
 ///   run after the bulk Adj-RIB-In removals (peer clear, soft reset,
 ///   stale flush) and every [`Self::SWEEP_EVERY`] interns, so a
 ///   churning table does not accumulate dead tuples.
-#[derive(Default)]
+impl Default for AttrInterner {
+    fn default() -> Self {
+        Self {
+            set: HashSet::new(),
+            interns_since_sweep: 0,
+            interning: crate::attr_intern(),
+        }
+    }
+}
+
 pub struct AttrInterner {
     set: HashSet<Arc<Vec<PathAttribute>>>,
     interns_since_sweep: usize,
+    /// The ROUSTER_ATTR_INTERN=0 ablation lane: `false` means every
+    /// UPDATE's tuple is allocated for its own routes only (no
+    /// cross-UPDATE collapse, no sweep machinery to run). Behavior is
+    /// identical; sharing is not.
+    interning: bool,
 }
 
 impl AttrInterner {
     const SWEEP_EVERY: usize = 65_536;
 
     pub fn intern(&mut self, attrs: Vec<PathAttribute>) -> Arc<Vec<PathAttribute>> {
+        if !self.interning {
+            // The ablation lane: one allocation per call, shared only
+            // by the routes this UPDATE carries.
+            return Arc::new(attrs);
+        }
         if let Some(hit) = self.set.get(&attrs) {
             return Arc::clone(hit);
         }
@@ -469,6 +488,25 @@ impl LocRib {
             import,
             rs_clients: BTreeSet::new(),
             rr_clients: BTreeSet::new(),
+        }
+    }
+
+    /// The interning-ablation constructor (`ROUSTER_ATTR_INTERN=0`'s
+    /// explicit form): identical stored behavior, per-UPDATE owned
+    /// tuples instead of cross-UPDATE sharing. The pinned ablation
+    /// pair's tests construct both modes here; the daemon path reads
+    /// the env at [`AttrInterner::default`] time.
+    pub fn with_attr_interning(
+        local_as: u32,
+        import: Arc<dyn ImportPolicy>,
+        interning: bool,
+    ) -> Self {
+        Self {
+            attrs: AttrInterner {
+                interning,
+                ..AttrInterner::default()
+            },
+            ..Self::with_policy(local_as, import)
         }
     }
 
@@ -1770,6 +1808,57 @@ mod tests {
         rib.clear_peer(&p1);
         assert_eq!(rib.attrs.len(), 1, "p1's tuple swept with its routes");
         assert_eq!(rib.route_count(), 1);
+    }
+
+    /// The interning ablation pair (ToN revision Part 5 P0): with
+    /// sharing OFF, equal tuples from two UPDATEs hold two
+    /// allocations and the intern set stays empty, while announce,
+    /// elect and withdraw behave exactly as with sharing ON.
+    #[test]
+    fn attr_interning_off_allocates_per_update_copies() {
+        let mut off = LocRib::with_attr_interning(65000, Arc::new(AcceptAll), false);
+        let mut on = LocRib::with_attr_interning(65000, Arc::new(AcceptAll), true);
+        let p1 = peer("192.0.2.1", 65001, 1);
+        let p2 = peer("192.0.2.2", 65002, 2);
+        let attrs = base_attrs(vec![65001, 64512], Some(10));
+        for rib in [&mut off, &mut on] {
+            rib.announce(
+                &p1,
+                &BgpUpdate {
+                    attrs: attrs.clone(),
+                    nlri: vec!["203.0.113.0/24".parse::<IpPrefix>().unwrap().into()],
+                    ..Default::default()
+                },
+            );
+            rib.announce(
+                &p2,
+                &BgpUpdate {
+                    attrs: attrs.clone(),
+                    nlri: vec!["198.51.100.0/24".parse::<IpPrefix>().unwrap().into()],
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(off.route_count(), 2, "both prefixes elected, sharing off");
+        assert_eq!(on.route_count(), 2, "both prefixes elected, sharing on");
+        assert_eq!(off.attrs.len(), 0, "the intern set stays empty");
+        assert_eq!(on.attrs.len(), 1, "one tuple serves both UPDATEs");
+        let off_a = off.adj_in[&p1.address].values().next().unwrap();
+        let off_b = off.adj_in[&p2.address].values().next().unwrap();
+        assert!(
+            !Arc::ptr_eq(&off_a.attrs, &off_b.attrs),
+            "equal tuples across UPDATEs are separate allocations"
+        );
+        let on_a = on.adj_in[&p1.address].values().next().unwrap();
+        let on_b = on.adj_in[&p2.address].values().next().unwrap();
+        assert!(
+            Arc::ptr_eq(&on_a.attrs, &on_b.attrs),
+            "the shipped mode shares one allocation"
+        );
+        assert_eq!(off_a.attrs, on_a.attrs, "stored attributes identical");
+        // withdraw parity: behavior never depended on the sharing
+        off.adj_in.remove(&p1.address);
+        assert_eq!(off.route_count(), 1);
     }
 
     /// Copy-on-write: mutating a stored route's attributes (the policy

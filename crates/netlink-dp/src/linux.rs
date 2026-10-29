@@ -912,7 +912,29 @@ impl NetlinkDataplane {
 /// sleeping between single-route round-trips. 512 is plenty: the
 /// netlink send buffer backpressures well below this on default
 /// `wmem_default`.
+///
+/// Ablation lever (ToN revision Part 5 P0): `ROUSTER_NL_WINDOW=N`
+/// overrides the depth at process start (min 1; N=1 is serial
+/// install — every request waits for its own ACK before the next is
+/// submitted). Default 512 as shipped; unset or unparsable = 512.
 const NL_ROUTE_PIPELINE: usize = 512;
+
+/// The ablation override, read once.
+fn nl_pipeline_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        parse_window(std::env::var("ROUSTER_NL_WINDOW").ok().as_deref())
+            .unwrap_or(NL_ROUTE_PIPELINE)
+    })
+}
+
+/// The override's pure core (unit-tested): parse, floor at 1 (serial),
+/// cap at 65_536; unparsable or absent = None (the shipped 512).
+fn parse_window(v: Option<&str>) -> Option<usize> {
+    v.and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .map(|n| n.min(65_536))
+}
 
 /// E7 queue-occupancy observability: the install window's current and
 /// peak in-flight request counts (process-wide — there is exactly one
@@ -1106,7 +1128,7 @@ impl Dataplane for NetlinkDataplane {
                 let _slot = InflightGuard::enter();
                 self.route_replace(&entries[i]).await
             })
-            .buffered(NL_ROUTE_PIPELINE)
+            .buffered(nl_pipeline_depth())
             .collect()
             .await
     }
@@ -1118,7 +1140,7 @@ impl Dataplane for NetlinkDataplane {
                 let _slot = InflightGuard::enter();
                 self.route_delete(&entries[i]).await
             })
-            .buffered(NL_ROUTE_PIPELINE)
+            .buffered(nl_pipeline_depth())
             .collect()
             .await
     }
@@ -1487,6 +1509,22 @@ fn remove_run_file(path: &str) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!(path, error = %e, "run file removal failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::parse_window;
+
+    #[test]
+    fn window_parsing_floors_caps_and_rejects() {
+        assert_eq!(parse_window(None), None, "unset = shipped 512");
+        assert_eq!(parse_window(Some("")), None);
+        assert_eq!(parse_window(Some("abc")), None);
+        assert_eq!(parse_window(Some("0")), None, "0 is not a window");
+        assert_eq!(parse_window(Some("1")), Some(1), "1 = serial install");
+        assert_eq!(parse_window(Some("64")), Some(64));
+        assert_eq!(parse_window(Some("999999")), Some(65_536), "capped");
     }
 }
 
