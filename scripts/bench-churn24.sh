@@ -67,7 +67,7 @@ if [ "$SIDE" = frr ]; then
     docker exec "$SUT" sh -c "printf '%s\n' \
         'frr version 10.2' 'frr defaults traditional' 'hostname churn24' \
         'router bgp 65000' ' no bgp network import-check' ' no bgp ebgp-requires-policy' \
-        " neighbor $INJ_IP remote-as $INJ_AS" " neighbor $INJ_IP timers 30 90" \
+        ' neighbor $INJ_IP remote-as $INJ_AS' ' neighbor $INJ_IP timers 30 90' \
         ' address-family ipv4 unicast' '  exit-address-family' 'line vty' > /etc/frr/frr.conf"
     for _ in $(seq 1 10); do docker exec "$SUT" vtysh -b >/dev/null 2>&1 || true; sleep 2; done
     SPK=bgpd; CORE=zebra
@@ -79,7 +79,7 @@ else
     sleep 3
     docker exec "$SUT" sh -c "printf '%s\n' \
         'zapi socket /run/rouster/zserv.api' 'router bgp 65000' \
-        " bgp router-id $SUT_IP" " neighbor $INJ_IP remote-as $INJ_AS" \
+        ' bgp router-id $SUT_IP' ' neighbor $INJ_IP remote-as $INJ_AS' \
         ' neighbor $INJ_IP passive' ' hold-time 90' > /etc/rouster-bgp.conf"
     docker exec -d "$SUT" sh -c "BGPD_CENSUS=1 rouster-bgpd --config /etc/rouster-bgp.conf > /var/log/rouster-bgpd.log 2>&1"
     sleep 3
