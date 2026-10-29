@@ -1564,3 +1564,66 @@ in the chat record. The "Your decision" column stays the owner's.
   away/2026-10-29/night2/A-SWEEP/wl1-20261029T101418Z/ (2,419
   files verified by count + sha256 spot-checks vs box). No verdict
   prose.
+
+- 2026-10-29 · churn24 24-hour flap-churn soak, rouster side —
+  START receipt, run LIVE at fold time (night program lane A, fold
+  unit A-CHURN-START; this is NOT a results entry — the run is
+  DO-NOT-KILL and completes ~2026-10-30 21:28 CST; final samples
+  and the completion fold land in a later entry after that time)
+  · started 2026-10-29 21:28:13 CST (13:28:13Z), detached PID
+  1128867 (`bash scripts/bench-churn24.sh ~/rouster-bench/
+  announce-100k.announce rouster`), host=dgx-spark-1 LANE A:
+  bench-net 172.31.255.0/24, SUT cpus 5-9, injector cpus 0-3
+  (same placement as the A-SWEEP chain) · parameters:
+  side=rouster hours=24 limit=100000 (CHURN24_HOURS/BENCH_X_LIMIT
+  defaults) = 96 blocks × 15 min, phase=flap throughout so far,
+  per-block ops per schedule.txt cycling W3,R3 → W4,R4 → W5,R5 ·
+  versions: BENCH_BIN_DIR=~/rouster-bench/bin-wl — rousterd
+  09b183c8…, rousterctl 1872ef76…, bgpd c0edf7ea…, mrt-replay
+  04c4ef48… by bin-wl/SHA256SUMS reference (mirrored
+  away/2026-10-29/night2/B-TRAINING/bin-wl/; sha-identical set
+  to A-SWEEP's); sole feed input announce-100k.announce
+  (13,773,861 B) sha256 6c9f4f7d…7ced, mounted /feed.announce,
+  injector driver scripts/bench-seq.py · harness
+  scripts/bench-churn24.sh @ adb9fdeb · crash → fix → relaunch
+  chain: first launch 21:05 CST died ~100 s in (quoting bug at
+  bench-churn24.sh:80-83 — the first embedded double quote CLOSES
+  the outer sh -c string, so /etc/rouster-bgp.conf was never
+  written, rouster-bgpd exited, the first sampler pass died
+  silently in rss() under set -e, and the EXIT trap removed both
+  c24 containers); crash artifact churn24-rouster-20261029T130501Z
+  preserved verbatim (header-only samples.csv 1 line, schedule
+  "block 1/96 phase=flap ops=W3,R3" only, blocks/ empty) and
+  mirrored this fold — nothing rerun; orchestrator-authorized fix
+  commit adb9fdeb (quoting only, receipted pattern
+  scripts/bench-x.sh:84-91; post-fix script sha256 473ed63c…b79a0,
+  Mac == box byte-identical); relaunch 21:28:13 CST; stability
+  gates +3 min and +6 min PASS (config 6/6 lines present in the
+  SUT, rouster-bgpd running pid 35, samples.csv rows 3 then 5,
+  no leaked printf lines in the new runner log); full story in
+  away/2026-10-29/night2/laneA-recovery.md + laneA-churn24-fix.md
+  + STATE.jsonl 21:26 / 21:27:37 / 21:34:31 entries · point-in-
+  time snapshot facts (mirror taken 2026-10-29T14:10:34Z =
+  22:10:34 CST, sha-verified against the box at transfer time;
+  the box copy keeps growing after this): samples.csv 42 lines =
+  header + 41 data rows (block 1: 15 rows, block 2: 15, block 3:
+  11 with block 3 still open), timestamps 21:29:52 → 22:10:05 CST,
+  sampling deltas contiguous 60–62 s (40 deltas: 28×60 s, 11×61 s,
+  1×62 s; none >62 s); columns populated, constant within each
+  block — kern 33333 / 25000 / 20000 (blocks 1/2/3), rss_spk
+  34460 / 24800 / 24224 kB, rss_core 9996 / 8264 / 7284 kB,
+  hwm_spk 54780 kB and hwm_core 25716 kB constant across all
+  three blocks, discrep 66667 / 75000 / 80000; blocks/1-census.txt
+  + 2-census.txt written (288 B each, bgpd route-add log tails);
+  runner log 195 B at snapshot = header line + block 1/96 + 2/96
+  + 3/96 start lines · raw: box dgx-spark-1:~/rouster-bench/
+  target/bench-logs/churn24-rouster-20261029T132813Z/ (LIVE,
+  growing) + crash artifact ~/rouster-bench/target/bench-logs/
+  churn24-rouster-20261029T130501Z/ (static) + runner log
+  ~/rouster-bench/nightA-recovery-churn24-20261029T132813Z.log
+  (LIVE; 4-line snapshot copy alongside the Mac mirror); Mac
+  mirror away/2026-10-29/night2/A-CHURN-START/live/
+  churn24-rouster-20261029T132813Z/ (point-in-time, 6 files) +
+  away/2026-10-29/night2/A-CHURN-START/crash-artifact/
+  churn24-rouster-20261029T130501Z/ (4 entries incl. empty
+  blocks/ dir). No verdict prose.
