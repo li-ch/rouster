@@ -185,6 +185,11 @@ def main():
                    instead of the announce file's next-hop (the e1rand2
                    nexthop-change op; the set is unchanged, the via flips)
       X            close the session (socket close)
+    --resume-on-loss: on UNEXPECTED session loss (peer restart mid-run,
+                    the e1rand2 lifecycle ops), retry the connect every
+                    2 s up to 120 s and continue with the remaining ops
+                    instead of aborting — the op list after the loss
+                    point must reconstruct state (its A + replay ops).
     Markers SEQ-<op>-<seq>-BEGIN/DONE with counts are printed per op.
     """
     ap = argparse.ArgumentParser()
@@ -200,6 +205,8 @@ def main():
     ap.add_argument("--novel-as", type=int, default=65412)
     ap.add_argument("--alt-nexthop", default=None,
                     help="the N<n> op's replacement next-hop")
+    ap.add_argument("--resume-on-loss", action="store_true",
+                    help="reconnect and continue on unexpected session loss")
     ap.add_argument("--gap", type=float, default=2.0)
     ap.add_argument("--linger", type=float, default=120.0)
     args = ap.parse_args()
@@ -310,8 +317,24 @@ def main():
     novel_seq = 0
     for op in args.ops.split(","):
         if not running:
-            log(f"SEQ-OP-{op}-SKIPPED session lost")
-            break
+            if not args.resume_on_loss:
+                log(f"SEQ-OP-{op}-SKIPPED session lost")
+                break
+            log(f"SEQ-SESSION-LOST op={op} resuming")
+            ok = False
+            for _ in range(60):
+                time.sleep(2)
+                try:
+                    if connect():
+                        threading.Thread(target=reader, daemon=True).start()
+                        threading.Thread(target=ka_timer, daemon=True).start()
+                        ok = True
+                        break
+                except OSError:
+                    continue
+            if not ok:
+                log(f"SEQ-OP-{op}-SKIPPED resume failed")
+                break
         log(f"SEQ-OP-{op}-BEGIN")
         if op == "A":
             r, m = send_grouped(entries)
