@@ -79,7 +79,8 @@ ab-fast1|rouster||||BGPD_FAST_ELECTION=1
 
 # combined-shape smoke first: every knob exercised once at 2k per side
 smoke_one() { # side
-    local side=$1 out="$GRID_DIR/smoke-$side"
+    local side=$1
+    local out="$GRID_DIR/smoke-$side"
     echo "==> smoke $side (2k, all switches)"
     BENCH_WL_ARGS="--addpath 2 --attr-unique 0.5 --nexthop-pool 16" \
     BENCH_WL_COVER_ROUTE=10.0.0.0/8 \
