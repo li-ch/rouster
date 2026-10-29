@@ -102,6 +102,13 @@ class Attrs:
         clone.communities = list(self.communities) + [f"{asn}:{val}"]
         return clone
 
+    def with_nexthop(self, nh):
+        """A copy of these attrs with a different NEXT_HOP (the e1rand2
+        N op: same prefixes, same path, new forwarding target)."""
+        clone = copy.copy(self)
+        clone.next_hop = nh
+        return clone
+
     def key(self):
         return (self.next_hop, self.med, tuple(self.as_path), self.origin,
                 tuple(self.communities), tuple(self.large))
@@ -174,6 +181,9 @@ def main():
       W<n>         withdraw every nth prefix (1-based index % n == 0)
       R<n>         re-announce every nth prefix with a novel community
                    (replacement semantics; same prefixes, new attrs)
+      N<n>         re-announce every nth prefix with --alt-nexthop
+                   instead of the announce file's next-hop (the e1rand2
+                   nexthop-change op; the set is unchanged, the via flips)
       X            close the session (socket close)
     Markers SEQ-<op>-<seq>-BEGIN/DONE with counts are printed per op.
     """
@@ -188,6 +198,8 @@ def main():
     ap.add_argument("--pack", type=int, default=64)
     ap.add_argument("--ops", required=True)
     ap.add_argument("--novel-as", type=int, default=65412)
+    ap.add_argument("--alt-nexthop", default=None,
+                    help="the N<n> op's replacement next-hop")
     ap.add_argument("--gap", type=float, default=2.0)
     ap.add_argument("--linger", type=float, default=120.0)
     args = ap.parse_args()
@@ -306,6 +318,15 @@ def main():
             with send_lock:
                 sock.sendall(bgp_frame(2, b"\x00\x00\x00\x00"))
             log(f"SEQ-OP-A-DONE routes={r} msgs={m + 1}")
+        elif op.startswith("N"):
+            if not args.alt_nexthop:
+                print("SEQ-ERROR N op requires --alt-nexthop", file=sys.stderr, flush=True)
+                return 1
+            n = int(op[1:])
+            subset = [e for i, e in enumerate(entries) if (i + 1) % n == 0]
+            moved = [(p, a.with_nexthop(args.alt_nexthop)) for p, a in subset]
+            r, m = send_grouped(moved)
+            log(f"SEQ-OP-{op}-DONE prefixes={len(subset)} routes={r} msgs={m} alt_nexthop={args.alt_nexthop}")
         elif op.startswith("W") or op.startswith("R"):
             n = int(op[1:])
             subset = [e for i, e in enumerate(entries) if (i + 1) % n == 0]

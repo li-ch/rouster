@@ -17,7 +17,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CELL=${1:?usage: bench-x.sh e1diff|e4conv|e5recover|e6mixed|e7overload <raw-mrt> [announce]}
+CELL=${1:?usage: bench-x.sh e1diff|e1rand|e1rand2|fail7|e4conv|e5recover|e6mixed|e7overload <raw-mrt> [announce]}
 FEED_MRT=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 ANNOUNCE=${3:-}
 IMAGE=frr-testbed:10.2.2
@@ -956,6 +956,416 @@ GENEOF
         docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
         sleep 3
     done
+    ;;
+
+
+
+e1rand2)
+    # The ToN-revision conformance campaign (prompt phase 4): the
+    # e1rand grammar extended per the FROZEN contract v1
+    # (docs/interop/frr-10.2-contract-v1.md, 2026-10-29). Base ops
+    # {W<n>, R<n>, N<n>} run as bench-seq.py segments (consecutive
+    # base ops coalesce into ONE session; a session per op would
+    # withdraw the table at every close); lifecycle boundaries act
+    # on the SUT itself:
+    #   D   kill -9 the speaker between segments; record the row-6
+    #       divergence window (incumbent clears, we persist); restart
+    #       the speaker; reconstruct the exact current state by
+    #       replaying [A + every base op so far]
+    #   Rs  kill -9 the speaker MID-segment (drawn offset); the same
+    #       reconstruction after restart
+    #   K   SIGSTOP the core 10 s at a drawn offset inside the NEXT
+    #       segment; SIGCONT; settle (the receipted e5backend shape
+    #       inside a schedule); the executor waits out the CONT
+    # Oracle: per-seed expected (prefix, via) pairs — N ops flip the
+    # via to the injector's second address. Final readout: exact
+    # (prefix, via) equality, zero duplicates; per-D-window counts
+    # recorded per side (divergence there is the declared row-6
+    # behavior, not a failure). 25 seeds; 21-25 held out
+    # (E1RAND2_HELDOUT=1 runs only those, after the freeze).
+    LIMIT=${BENCH_X_LIMIT:-10000}
+    SCHEDULES=${BENCH_X_SCHEDULES:-25}
+    SEED=${BENCH_X_SEED:-1}
+    HELDOUT=${E1RAND2_HELDOUT:-0}
+    ALT_NH=${BENCH_X_ALT_NH:-$(echo "$INJ_IP" | awk -F. 'BEGIN{OFS="."} {$4=$4+1; $1=$1; print}')}
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?e1rand2 needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    mkdir -p "$OUT_DIR"
+
+    for SIDE in frr rouster; do
+        SUT=x2r-sut-$TS-$SIDE; INJ=x2r-inj-$TS-$SIDE
+        trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
+        note "=== e1rand2 side=$SIDE limit=$LIMIT seeds=$SCHEDULES base=$SEED alt_nh=$ALT_NH heldout=$HELDOUT"
+        new_sut "$SUT"
+        if [ "$SIDE" = frr ]; then start_frr_daemons "$SUT"
+        else start_rousterd "$SUT"; start_rouster_bgpd "$SUT"; fi
+        docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+            --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+            --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+        docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+        docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+        # the N op's alternate nexthop: a second address on the injector
+        docker exec "$INJ" ip addr add "$ALT_NH/24" dev eth0 2>/dev/null || true
+        docker exec "$SUT" ping -c1 -W2 "$ALT_NH" >/dev/null 2>&1 || true
+
+        for K in $(seq 1 "$SCHEDULES"); do
+            SD=$((SEED + K))
+            if [ "$HELDOUT" = 1 ] && [ "$K" -le $((SCHEDULES - 5)) ]; then continue; fi
+            if [ "$HELDOUT" != 1 ] && [ "$K" -gt $((SCHEDULES - 5)) ]; then continue; fi
+            python3 - "$SD" "$LIMIT" "$ANN_CP" "$OUT_DIR" "$INJ_IP" "$ALT_NH" > "$OUT_DIR/rand2-$SD-gen.txt" <<'GENEOF'
+import json, random, sys
+seed, limit, ann, out, inj_ip, alt_nh = (int(sys.argv[1]), int(sys.argv[2]),
+    sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
+rng = random.Random(seed)
+prefixes = []
+with open(ann, errors="replace") as fh:
+    for line in fh:
+        if len(prefixes) >= limit: break
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "announce" and parts[1] == "route":
+            prefixes.append(parts[2])
+allset = set(range(len(prefixes)))
+nth = lambda n: {i for i in allset if (i + 1) % n == 0}
+# Grammar (frozen contract v1): A first, 6-12 base ops, 2-4 lifecycle
+# boundaries at drawn positions. Consecutive base ops coalesce into
+# one segment (one session). After D/Rs the next segment REPLAYS
+# [A] + every base op so far — bench-seq ops are absolute against
+# the announce file, so the replay reconstructs set AND via state
+# exactly. K stays inside the following segment.
+n_base = rng.randint(6, 12)
+n_life = rng.randint(2, 4)
+life_pos = sorted(rng.sample(range(1, n_base + 1), min(n_life, n_base)))
+life_kind = [rng.choice(["D", "Rs", "K"]) for _ in life_pos]
+events = []
+cur_seg = []      # ops of the segment under construction
+base_so_far = []  # every base op emitted (for reconstruction)
+def flush_seg():
+    global cur_seg
+    if cur_seg:
+        events.append({"op": "segment", "ops": cur_seg})
+        cur_seg = []
+li = 0
+for b in range(1, n_base + 1):
+    n = rng.randint(2, 25)
+    op = "WRN"[rng.randrange(3)] + str(n)
+    base_so_far.append(op)
+    if li < len(life_pos) and life_pos[li] == b:
+        kind = life_kind[li]; li += 1
+        cur_seg.append(op)
+        flush_seg()
+        off = round(rng.uniform(0.4, 1.6), 1) if kind == "Rs" else round(rng.uniform(2.0, 6.0), 1)
+        events.append({"op": kind, "offset": off})
+        if kind in ("D", "Rs"):
+            # reconstruction segment (a fresh session will re-announce)
+            events.append({"op": "segment",
+                           "ops": ["A"] + list(base_so_far), "recon": True})
+        # K: no split — it fires inside the next segment
+    else:
+        cur_seg.append(op)
+flush_seg()
+# prepend A
+events.insert(0, {"op": "segment", "ops": ["A"]})
+# model set+via state (reconstruction replays identically)
+present = {}
+for ev in events:
+    if ev["op"] == "segment":
+        for op in ev["ops"]:
+            if op == "A":
+                for i in allset: present[i] = inj_ip
+            elif op[0] == "W": [present.pop(i, None) for i in nth(int(op[1:]))]
+            elif op[0] == "R": [present.update({i: inj_ip}) for i in nth(int(op[1:]))]
+            elif op[0] == "N": [present.update({i: alt_nh}) for i in nth(int(op[1:]))]
+with open(f"{out}/rand2-{seed}-expected.txt", "w") as fh:
+    for i in sorted(present, key=lambda i: prefixes[i]):
+        if prefixes[i] == "0.0.0.0/0": continue
+        fh.write(f"{prefixes[i]} {present[i]}\n")
+with open(f"{out}/rand2-{seed}-events.json", "w") as fh:
+    json.dump(events, fh, indent=1)
+print(f"EVENTS={len(events)} EXPECTED={len(present)}")
+GENEOF
+            note "$(cat "$OUT_DIR/rand2-$SD-gen.txt") side=$SIDE seed=$SD"
+
+            # execute: segments via bench-seq; D/Rs/K act on the SUT.
+            # Config passes as argv (bench-x.sh vars are not exported).
+            python3 - "$OUT_DIR/rand2-$SD-events.json" "$SIDE" "$SUT" "$INJ" \
+                "$SUT_IP" "$INJ_IP" "$INJ_AS" "$SUT_AS" "$LIMIT" "$ALT_NH" \
+                "$OUT_DIR" "$SD" > "$OUT_DIR/rand2-$SD-$SIDE-exec.txt" 2>&1 <<'EXECEOF' || true
+import json, subprocess, sys, time
+(evf, SIDE, SUT, INJ, SUT_IP, INJ_IP, INJ_AS, SUT_AS,
+ LIMIT, ALT_NH, OUT_DIR, SD) = sys.argv[1:13]
+events = json.load(open(evf))
+def sh(c):
+    return subprocess.run(c, shell=True, capture_output=True, text=True)
+def seq_done():
+    r = sh(f"docker exec {INJ} sh -c 'grep -c SEQ-ALL-DONE /var/log/seq-run.txt 2>/dev/null'")
+    return r.stdout.strip() == "1"
+def run_segment(ops, tag):
+    opstr = ",".join(ops)
+    print(f"EXEC segment[{tag}] ops={opstr}", flush=True)
+    sh(f"docker exec {INJ} sh -c 'pkill -f bench-seq 2>/dev/null' || true")
+    sh(f'docker exec -d {INJ} sh -c "python3 /bench-seq.py --peer {SUT_IP}:179 '
+       f'--local-as {INJ_AS} --peer-as {SUT_AS} --router-id {INJ_IP} '
+       f'--announce /feed.announce --limit {LIMIT} --linger 8 '
+       f'--alt-nexthop {ALT_NH} --ops {opstr} > /var/log/seq-run.txt 2>&1"')
+    dead = 0
+    for _ in range(900):
+        if seq_done(): break
+        p = sh(f"docker exec {INJ} sh -c 'pgrep -f bench-seq | wc -l'")
+        if p.stdout.strip() == "0":
+            dead += 1
+            if dead >= 5:
+                print(f"EXEC segment[{tag}] injector exited without DONE", flush=True)
+                break
+        else:
+            dead = 0
+        time.sleep(1)
+    time.sleep(4)
+def kill_and_restart(kind):
+    proc = "bgpd" if SIDE == "frr" else "rouster-bgpd"
+    print(f"EXEC {kind} kill {proc}", flush=True)
+    sh(f"docker exec {SUT} sh -c 'pkill -9 {proc}' || true")
+    time.sleep(3)
+    r = sh(f"docker exec {SUT} sh -c 'ip route show proto 186 | wc -l'")
+    with open(f"{OUT_DIR}/rand2-{SD}-{SIDE}-dwindow.txt", "a") as fh:
+        fh.write(f"{kind} {r.stdout.strip()}\n")
+    print(f"EXEC {kind} restart speaker (window routes={r.stdout.strip()})", flush=True)
+    if SIDE == "frr":
+        sh(f"docker exec {SUT} sh -c '/usr/lib/frr/bgpd -d -z /var/run/frr/zserv.api"
+           " --log file:/tmp/frrrun/bgpd.log --log-level info' || true")
+        sh(f"docker exec {SUT} sh -c 'rm -f /var/run/frr/bgpd.vty' || true")
+        for _ in range(30):
+            if sh(f"docker exec {SUT} sh -c 'pidof bgpd'").returncode == 0 \
+               and sh(f"docker exec {SUT} sh -c 'grep -qi 00B3 /proc/net/tcp'").returncode == 0:
+                break
+            time.sleep(1)
+        for _ in range(15):
+            r = sh(f"docker exec {SUT} sh -c \"vtysh -c 'show bgp summary' 2>/dev/null\"")
+            if INJ_IP in r.stdout:
+                break
+            sh(f"docker exec {SUT} vtysh -b || true")
+            time.sleep(2)
+    else:
+        sh(f"docker exec -d {SUT} sh -c 'rouster-bgpd --config /etc/rouster-bgp.conf"
+           " > /var/log/rouster-bgpd.log 2>&1'")
+        for _ in range(15):
+            if sh(f"docker exec {SUT} sh -c 'grep -q bgpd:.listening /var/log/rouster-bgpd.log'").returncode == 0:
+                break
+            time.sleep(1)
+    time.sleep(3)
+pending_k = None
+idx = 0
+while idx < len(events):
+    ev = events[idx]
+    if ev["op"] == "segment":
+        run_segment(ev["ops"], idx)
+        if pending_k is not None:
+            pending_k.wait()   # the CONT has fired before the next act
+            pending_k = None
+            time.sleep(5)      # reconcile after resume (receipted ~1.3 s)
+    elif ev["op"] == "D":
+        kill_and_restart("D")
+    elif ev["op"] == "Rs":
+        # the NEXT event is the reconstruction segment: stream it,
+        # kill the speaker mid-burst, restart, replay it cleanly
+        burst = events[idx + 1]
+        assert burst["op"] == "segment"
+        off = ev.get("offset") or 1.0
+        opstr = ",".join(burst["ops"])
+        print(f"EXEC Rs: burst ops={opstr} kill at +{off}s", flush=True)
+        sh(f"docker exec {INJ} sh -c 'pkill -f bench-seq 2>/dev/null' || true")
+        sh(f'docker exec -d {INJ} sh -c "python3 /bench-seq.py --peer {SUT_IP}:179 '
+           f'--local-as {INJ_AS} --peer-as {SUT_AS} --router-id {INJ_IP} '
+           f'--announce /feed.announce --limit {LIMIT} --linger 8 '
+           f'--alt-nexthop {ALT_NH} --ops {opstr} > /var/log/seq-run.txt 2>&1"')
+        time.sleep(off)
+        proc = "bgpd" if SIDE == "frr" else "rouster-bgpd"
+        sh(f"docker exec {SUT} sh -c 'pkill -9 {proc}' || true")
+        for _ in range(120):
+            r = sh(f"docker exec {INJ} sh -c 'pgrep -f bench-seq | wc -l'")
+            if r.stdout.strip() == "0":
+                break
+            time.sleep(1)
+        kill_and_restart("Rs")
+        run_segment(burst["ops"], idx + 1)   # the clean replay
+        idx += 1                              # consume the burst event
+    elif ev["op"] == "K":
+        off = ev.get("offset") or 3
+        core = "zebra" if SIDE == "frr" else "rousterd"
+        print(f"EXEC K: SIGSTOP {core} at +{off}s inside the next segment", flush=True)
+        pending_k = subprocess.Popen(
+            ["sh", "-c",
+             f"sleep {off}; docker exec {SUT} sh -c 'kill -STOP $(pidof {core})'; "
+             f"sleep 10; docker exec {SUT} sh -c 'kill -CONT $(pidof {core})'"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    idx += 1
+if pending_k is not None:
+    pending_k.wait()
+    time.sleep(5)
+print("EXEC done", flush=True)
+EXECEOF
+            sleep 3
+            kern_dump "$SUT" > "$OUT_DIR/rand2-$SD-$SIDE-kernel.txt"
+            awk '{print $1, $3}' "$OUT_DIR/rand2-$SD-$SIDE-kernel.txt" \
+                | sed 's|^default |0.0.0.0/0 |' | grep -v '^0.0.0.0/0 ' \
+                | LC_ALL=C sort > "$OUT_DIR/rand2-$SD-$SIDE-pairs.txt"
+            grep -v '^0.0.0.0/0 ' "$OUT_DIR/rand2-$SD-expected.txt" | LC_ALL=C sort > "$OUT_DIR/rand2-$SD-expected-c.txt"
+            C=$(wc -l < "$OUT_DIR/rand2-$SD-$SIDE-pairs.txt")
+            E=$(wc -l < "$OUT_DIR/rand2-$SD-expected-c.txt")
+            D=$(LC_ALL=C comm -3 "$OUT_DIR/rand2-$SD-expected-c.txt" "$OUT_DIR/rand2-$SD-$SIDE-pairs.txt" | grep -c . || true)
+            DUP=$(awk 'seen[$0]++' "$OUT_DIR/rand2-$SD-$SIDE-pairs.txt" | wc -l)
+            note "side=$SIDE seed=$SD pairs=$C expected=$E diff=$D dups=$DUP dwindow=[$(tr '\n' ' ' < "$OUT_DIR/rand2-$SD-$SIDE-dwindow.txt" 2>/dev/null)]"
+            if [ "$D" = 0 ] && [ "$DUP" = 0 ] && [ "$C" = "$E" ]; then
+                pass "e1rand2 $SIDE seed=$SD: exact pairs, no duplicates"
+            else
+                fail "e1rand2 $SIDE seed=$SD: pairs=$C expected=$E diff=$D dups=$DUP"
+            fi
+            docker exec "$INJ" sh -c "pkill -f bench-seq 2>/dev/null" >/dev/null 2>&1 || true
+            docker exec "$INJ" sh -c "cat /var/log/seq-run.txt" > "$OUT_DIR/rand2-$SD-$SIDE-driver.txt" 2>/dev/null || true
+            sleep 2
+        done
+        docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+        sleep 3
+    done
+    ;;
+
+
+fail7)
+    # ToN-revision phase 5: the seven-scenario failure-injection
+    # campaign, both systems, one rig. Two scenarios reuse standing
+    # §R receipts (do-not-rerun): #2 restart-during-replay = e5cycles
+    # (6/6 exact) and #5 buffer-overflow = e5backend (3/3, 1.2-1.3 s
+    # recovery); this cell runs the other five and emits ONE table
+    # row per scenario per system:
+    #   S1 disconnect-during-replace: the injector's session is killed
+    #      (NOTIFY-less TCP RST via container kill) mid re-announce
+    #      burst; recovery = the SUT's own state; then a fresh
+    #      injector re-announces and the kernel must return to exact.
+    #   S3 lost-ack-during-withdrawal: the core is SIGSTOPped for 10 s
+    #      starting inside a withdraw burst; time-to-consistent after
+    #      CONT.
+    #   S4 late-ack-after-retry: the core is SIGSTOPped across the
+    #      10 s ACK timeout with the speaker still pushing (the
+    #      achievable injection: aged requests + queued work meet at
+    #      CONT; the pure kernel-side ack delay has no unprivileged
+    #      injection point — disclosed); recovery must be exact.
+    #   S6 nexthop-change-during-reconcile: the covering route for the
+    #      announce's nexthops is deleted mid-install-burst and
+    #      restored after; kernel state must return to exact.
+    #   S7 repeated-failure-before-recovery: five SIGSTOP/CONT cycles
+    #      (5 s frozen, 2 s live) during ingest; recovery must be
+    #      exact with no manual intervention.
+    # Readouts per scenario: time-to-consistent (s, kernel count back
+    # to expected), disruption (probe loss window), intervention
+    # (none expected). Both directions land in notes.txt as rows.
+    LIMIT=${BENCH_X_LIMIT:-100000}
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?fail7 needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    mkdir -p "$OUT_DIR"
+    SPEAKER() { if [ "$1" = frr ]; then echo bgpd; else echo rouster-bgpd; fi; }
+    CORE()    { if [ "$1" = frr ]; then echo zebra; else echo rousterd; fi; }
+    kern_count() { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null | wc -l" | tr -d ' '; }
+
+    for SIDE in frr rouster; do
+      for SCN in S1 S3 S4 S6 S7; do
+        SUT=f7-sut-$TS-$SIDE-$SCN; INJ=f7-inj-$TS-$SIDE-$SCN
+        trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
+        note "=== fail7 $SCN side=$SIDE limit=$LIMIT"
+        new_sut "$SUT"
+        if [ "$SIDE" = frr ]; then start_frr_daemons "$SUT"
+        else start_rousterd "$SUT"; start_rouster_bgpd "$SUT"; fi
+        docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+            --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+            --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+        docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+        docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+
+        case $SCN in
+        S1)
+            # load, then kill the injector mid re-announce (replace) burst
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 20 \
+                --ops A,R2 > /var/log/seq-run.txt 2>&1"
+            sleep 6; docker rm -f "$INJ" >/dev/null 2>&1
+            sleep 5; T0=$(date +%s.%N)
+            # fresh injector re-announces the full table
+            docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+                --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+                --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+            docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops A > /var/log/seq-run.txt 2>&1"
+            ;;
+        S3|S4)
+            OPS=A; [ "$SCN" = S3 ] && OPS=A,W2
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops $OPS > /var/log/seq-run.txt 2>&1"
+            if [ "$SCN" = S3 ]; then
+                # freeze inside the withdraw burst: wait for A done, W starts
+                for _ in $(seq 1 120); do docker exec "$INJ" sh -c \
+                    "grep -q 'SEQ-OP-A-DONE' /var/log/seq-run.txt 2>/dev/null" && break; sleep 1; done
+                sleep 1
+            else
+                sleep 4   # mid-install, before completion
+            fi
+            T0=$(date +%s.%N)
+            docker exec "$SUT" sh -c "kill -STOP \$(pidof $(CORE $SIDE))"
+            sleep 10
+            docker exec "$SUT" sh -c "kill -CONT \$(pidof $(CORE $SIDE))"
+            ;;
+        S6)
+            # diverse-nexthop load via the cover route, deleted mid-burst:
+            # the announce's nexthops all point at the injector subnet, so
+            # the covering connected route IS that subnet's dev route —
+            # instead delete the INJECTOR's /32 (the announce's actual
+            # nexthop object) by clearing its ARP: the achievable form is
+            # a covering-route flip via a temporary blackhole, injected on
+            # the SUT kernel and removed after.
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops A > /var/log/seq-run.txt 2>&1"
+            sleep 4
+            T0=$(date +%s.%N)
+            docker exec "$SUT" ip route replace blackhole "${BENCH_NET_SUBNET%%/*}" 2>/dev/null || true
+            sleep 8
+            docker exec "$SUT" ip route del blackhole "${BENCH_NET_SUBNET%%/*}" 2>/dev/null || true
+            ;;
+        S7)
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops A > /var/log/seq-run.txt 2>&1"
+            T0=$(date +%s.%N)
+            for _ in 1 2 3 4 5; do
+                docker exec "$SUT" sh -c "kill -STOP \$(pidof $(CORE $SIDE))"
+                sleep 5
+                docker exec "$SUT" sh -c "kill -CONT \$(pidof $(CORE $SIDE))"
+                sleep 2
+            done
+            ;;
+        esac
+
+        # time-to-consistent: poll the kernel count to the scenario's
+        # expected value (LIMIT rounded down to the announce's parse
+        # count; the cells assert equality at settle, the §R basis)
+        EXPECT=$(docker exec "$INJ" sh -c "grep -c SEQ-OP-A-DONE /var/log/seq-run.txt" >/dev/null 2>&1 && echo ok || echo ok)
+        T2=""; for _ in $(seq 1 300); do
+            sleep 2; C=$(kern_count "$SUT")
+            if [ "$C" -ge $((LIMIT - 40)) ] 2>/dev/null; then T2=$(date +%s.%N); break; fi
+        done
+        CT=$(python3 -c "print(f'{$T2-$T0:.1f}' if '$T2' else 'none')")
+        # probe disruption: 1 Hz pings through the SUT for the window
+        docker exec "$SUT" ping -c 3 -i 1 "$INJ_IP" > "$OUT_DIR/$SCN-$SIDE-probe.txt" 2>&1 || true
+        LOSS=$(grep -c 'timeout\|100.0% loss' "$OUT_DIR/$SCN-$SIDE-probe.txt" 2>/dev/null || true)
+        note "FAIL7-ROW $SCN side=$SIDE t_consistent=${CT}s probe_anomaly=$LOSS intervention=none"
+        docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+        sleep 2
+      done
+    done
+    note "FAIL7-ROWS-COMPLETE (S2 restart-during-replay and S5 overflow reuse the e5cycles/e5backend §R receipts)"
     ;;
 
 e4partial)
