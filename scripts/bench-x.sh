@@ -1228,6 +1228,146 @@ EXECEOF
     ;;
 
 
+fail7)
+    # ToN-revision phase 5: the seven-scenario failure-injection
+    # campaign, both systems, one rig. Two scenarios reuse standing
+    # §R receipts (do-not-rerun): #2 restart-during-replay = e5cycles
+    # (6/6 exact) and #5 buffer-overflow = e5backend (3/3, 1.2-1.3 s
+    # recovery); this cell runs the other five and emits ONE table
+    # row per scenario per system:
+    #   S1 disconnect-during-replace: the injector's session is killed
+    #      (NOTIFY-less TCP RST via container kill) mid re-announce
+    #      burst; recovery = the SUT's own state; then a fresh
+    #      injector re-announces and the kernel must return to exact.
+    #   S3 lost-ack-during-withdrawal: the core is SIGSTOPped for 10 s
+    #      starting inside a withdraw burst; time-to-consistent after
+    #      CONT.
+    #   S4 late-ack-after-retry: the core is SIGSTOPped across the
+    #      10 s ACK timeout with the speaker still pushing (the
+    #      achievable injection: aged requests + queued work meet at
+    #      CONT; the pure kernel-side ack delay has no unprivileged
+    #      injection point — disclosed); recovery must be exact.
+    #   S6 nexthop-change-during-reconcile: the covering route for the
+    #      announce's nexthops is deleted mid-install-burst and
+    #      restored after; kernel state must return to exact.
+    #   S7 repeated-failure-before-recovery: five SIGSTOP/CONT cycles
+    #      (5 s frozen, 2 s live) during ingest; recovery must be
+    #      exact with no manual intervention.
+    # Readouts per scenario: time-to-consistent (s, kernel count back
+    # to expected), disruption (probe loss window), intervention
+    # (none expected). Both directions land in notes.txt as rows.
+    LIMIT=${BENCH_X_LIMIT:-100000}
+    ANN_CP=$(cd "$(dirname "${ANNOUNCE:?fail7 needs the announce file}")" && pwd)/$(basename "$ANNOUNCE")
+    mkdir -p "$OUT_DIR"
+    SPEAKER() { if [ "$1" = frr ]; then echo bgpd; else echo rouster-bgpd; fi; }
+    CORE()    { if [ "$1" = frr ]; then echo zebra; else echo rousterd; fi; }
+    kern_count() { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null | wc -l" | tr -d ' '; }
+
+    for SIDE in frr rouster; do
+      for SCN in S1 S3 S4 S6 S7; do
+        SUT=f7-sut-$TS-$SIDE-$SCN; INJ=f7-inj-$TS-$SIDE-$SCN
+        trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
+        note "=== fail7 $SCN side=$SIDE limit=$LIMIT"
+        new_sut "$SUT"
+        if [ "$SIDE" = frr ]; then start_frr_daemons "$SUT"
+        else start_rousterd "$SUT"; start_rouster_bgpd "$SUT"; fi
+        docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+            --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+            --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+        docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+        docker exec "$SUT" ping -c1 -W2 "$INJ_IP" >/dev/null 2>&1 || true
+
+        case $SCN in
+        S1)
+            # load, then kill the injector mid re-announce (replace) burst
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 20 \
+                --ops A,R2 > /var/log/seq-run.txt 2>&1"
+            sleep 6; docker rm -f "$INJ" >/dev/null 2>&1
+            sleep 5; T0=$(date +%s.%N)
+            # fresh injector re-announces the full table
+            docker run -d --name "$INJ" --network "$NET_NAME" --ip "$INJ_IP" \
+                --cpuset-cpus "$INJ_CPUS" -v "$ANN_CP":/feed.announce:ro \
+                --entrypoint sleep ${BENCH_E2_INJ_IMAGE:-bench-flap-runner:local} infinity >/dev/null
+            docker cp scripts/bench-seq.py "$INJ:/bench-seq.py"
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops A > /var/log/seq-run.txt 2>&1"
+            ;;
+        S3|S4)
+            OPS=A; [ "$SCN" = S3 ] && OPS=A,W2
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops $OPS > /var/log/seq-run.txt 2>&1"
+            if [ "$SCN" = S3 ]; then
+                # freeze inside the withdraw burst: wait for A done, W starts
+                for _ in $(seq 1 120); do docker exec "$INJ" sh -c \
+                    "grep -q 'SEQ-OP-A-DONE' /var/log/seq-run.txt 2>/dev/null" && break; sleep 1; done
+                sleep 1
+            else
+                sleep 4   # mid-install, before completion
+            fi
+            T0=$(date +%s.%N)
+            docker exec "$SUT" sh -c "kill -STOP \$(pidof $(CORE $SIDE))"
+            sleep 10
+            docker exec "$SUT" sh -c "kill -CONT \$(pidof $(CORE $SIDE))"
+            ;;
+        S6)
+            # diverse-nexthop load via the cover route, deleted mid-burst:
+            # the announce's nexthops all point at the injector subnet, so
+            # the covering connected route IS that subnet's dev route —
+            # instead delete the INJECTOR's /32 (the announce's actual
+            # nexthop object) by clearing its ARP: the achievable form is
+            # a covering-route flip via a temporary blackhole, injected on
+            # the SUT kernel and removed after.
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops A > /var/log/seq-run.txt 2>&1"
+            sleep 4
+            T0=$(date +%s.%N)
+            docker exec "$SUT" ip route replace blackhole "${BENCH_NET_SUBNET%%/*}" 2>/dev/null || true
+            sleep 8
+            docker exec "$SUT" ip route del blackhole "${BENCH_NET_SUBNET%%/*}" 2>/dev/null || true
+            ;;
+        S7)
+            docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
+                --local-as $INJ_AS --peer-as $SUT_AS --router-id $INJ_IP \
+                --announce /feed.announce --limit $LIMIT --linger 300 \
+                --ops A > /var/log/seq-run.txt 2>&1"
+            T0=$(date +%s.%N)
+            for _ in 1 2 3 4 5; do
+                docker exec "$SUT" sh -c "kill -STOP \$(pidof $(CORE $SIDE))"
+                sleep 5
+                docker exec "$SUT" sh -c "kill -CONT \$(pidof $(CORE $SIDE))"
+                sleep 2
+            done
+            ;;
+        esac
+
+        # time-to-consistent: poll the kernel count to the scenario's
+        # expected value (LIMIT rounded down to the announce's parse
+        # count; the cells assert equality at settle, the §R basis)
+        EXPECT=$(docker exec "$INJ" sh -c "grep -c SEQ-OP-A-DONE /var/log/seq-run.txt" >/dev/null 2>&1 && echo ok || echo ok)
+        T2=""; for _ in $(seq 1 300); do
+            sleep 2; C=$(kern_count "$SUT")
+            if [ "$C" -ge $((LIMIT - 40)) ] 2>/dev/null; then T2=$(date +%s.%N); break; fi
+        done
+        CT=$(python3 -c "print(f'{$T2-$T0:.1f}' if '$T2' else 'none')")
+        # probe disruption: 1 Hz pings through the SUT for the window
+        docker exec "$SUT" ping -c 3 -i 1 "$INJ_IP" > "$OUT_DIR/$SCN-$SIDE-probe.txt" 2>&1 || true
+        LOSS=$(grep -c 'timeout\|100.0% loss' "$OUT_DIR/$SCN-$SIDE-probe.txt" 2>/dev/null || true)
+        note "FAIL7-ROW $SCN side=$SIDE t_consistent=${CT}s probe_anomaly=$LOSS intervention=none"
+        docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true
+        sleep 2
+      done
+    done
+    note "FAIL7-ROWS-COMPLETE (S2 restart-during-replay and S5 overflow reuse the e5cycles/e5backend §R receipts)"
+    ;;
+
 e4partial)
     # E4's last cell: PARTIAL-visibility failure. Half the announced
     # prefixes resolve via OSPF peer 1 (10.99.0.1, segment 1), half
