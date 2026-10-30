@@ -1020,6 +1020,22 @@ in the chat record. The "Your decision" column stays the owner's.
   target/bench-logs/x-e1diff-20261028T{102456Z,102545Z}. No verdict
   prose.
 
+- 2026-10-30 · G1 A-SWEEP adjudication (owner decision D3,
+  plans/decisions-2026-10-30.md) · the 2026-10-29 A-SWEEP entry's
+  pre-registered bar ("every run kernel = 99,998; wire-shape stats;
+  6 runs/cell") is adjudicated against the Rouster side, which the
+  sweep characterizes: all 18 rouster cells = 99,998 in every run,
+  stats and runs present — G1 PASS on that criterion. The recorded
+  FRR-side kernel_last deviations are classified, not adjudicated as
+  failures: a-series 100,001 = FRR's own extra kernel routes (counting
+  convention, expected); c-series 95,966-99,135 = pending
+  verification (candidate-multiplicity behavior vs observation lag
+  unresolved); n-series/stress "4" = suspected observer failure. Two
+  FRR verification cells (one c-series, one n/stress arm) are REQUIRED
+  before any FRR number from the c/n/stress arms is cited in the
+  paper; a-series values may be cited with the +3 convention named.
+  No verdict prose beyond this adjudication.
+
 - 2026-10-28 · splitpin-e1 (the ISSUES.md item-5 decomposition,
   owner-deferred; away/2026-10-27 Q2) · rig = the receipted
   2026-10-21 shared cell unchanged (SUT .20 cpuset 5-9, injector
