@@ -1020,6 +1020,36 @@ in the chat record. The "Your decision" column stays the owner's.
   target/bench-logs/x-e1diff-20261028T{102456Z,102545Z}. No verdict
   prose.
 
+- 2026-10-30 · churn24 COMPLETION (owner decision D4,
+  plans/decisions-2026-10-30.md; closes the START entry's "final
+  samples land in a later entry") · the rouster-side 24 h × 100k
+  flap-churn soak self-terminated at 21:55:31 CST 2026-10-30 (24 h
+  28 m wall — the peer-bounce windows stretch the nominal schedule),
+  96/96 blocks, 1{,}440 data rows (96 × 15, contiguous, 15 rows per
+  block) · schedule census: 72 flap blocks + 12 flap+peer blocks
+  (blocks 4/12/20/28/36/44/52/60/68/76/84/92, every 8) + 12 nexthop
+  blocks · block wall: median 905 s [904-907]; the 12 peer-adjacent
+  block deltas 996-997 s · row-level: 12 gaps of 152-153 s, exactly
+  one per peer bounce (the finalizer's morning count of 5 was the
+  first 5 of 12, seen through block ~40); each bounce shows kern
+  99{,}998 → 153 s silence → withdrawal floor (0 at 6 of 12 bounces,
+  7{,}692-25{,}000 mid-reinstall at the other 6) → recovery to
+  99{,}998 within the block, all 12 recovered · memory PLATEAU, no
+  drift: window-median rss over every 16-block window holds
+  speaker 47.3-49.9 MB and core 25.0-25.1 MB across the full 24 h;
+  final row rss_spk 47{,}612 kB / rss_core 25{,}132 kB; HWM constant
+  from early run at 62{,}408 / 26{,}188 kB (the START entry's block-3
+  snapshot values, rss_core 7-10 MB, predate the plateau) · discrep =
+  2 on every settled row (desired 100{,}000 vs kernel feed−2 =
+  99{,}998, the sweeps' convention; mid-withdrawal samples reach
+  95{,}455) · final-kernel.txt = 99{,}998; both containers torn down
+  cleanly by the driver · raw: rig
+  `target/bench-logs/churn24-rouster-20261029T132813Z/` (samples.csv,
+  schedule.txt, 96 block censuses, full daemon logs, final-kernel)
+  mirrored verbatim to `away/2026-10-29/night2/A-CHURN-FINAL/`
+  (1.7 GB) · bounded-behavior statement scope: this campaign, per the
+  revision plan's P1 item; no broader claim. No verdict prose.
+
 - 2026-10-30 · G1 A-SWEEP adjudication (owner decision D3,
   plans/decisions-2026-10-30.md) · the 2026-10-29 A-SWEEP entry's
   pre-registered bar ("every run kernel = 99,998; wire-shape stats;
