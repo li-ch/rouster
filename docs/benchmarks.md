@@ -1050,6 +1050,21 @@ in the chat record. The "Your decision" column stays the owner's.
   (1.7 GB) · bounded-behavior statement scope: this campaign, per the
   revision plan's P1 item; no broader claim. No verdict prose.
 
+- 2026-10-31 · A-SWEEP wall-column provenance note (paper-driven
+  investigation, ToN revision phase 6) · the grid's
+  wall_external_s anchors on t_pfxrcd_complete per run. On the frr
+  cells that timestamp derives from sparsely sampled vtysh
+  counters and quantizes at a near-metronomic ~30.7\,s cadence
+  regardless of actual fill time (a25-frr: main table full ~1\,s
+  after the first UPDATE, pfxRcd complete registered at +31\,s;
+  c-cells' sub-second walls fire on a denser first sample), and
+  the rouster n-series medians sit on the same coarse ladder ·
+  disposition: the paper's workload table drops the wall column
+  entirely and states the cadence caveat in its caption; walls
+  remain the headline protocol's exclusive claim · raw: wl1
+  a25-frr run-2 metrics.json/poll.csv + verify-d3b c8-frr
+  metrics.json. No verdict prose.
+
 - 2026-10-31 · G1 FRR verification cells (owner decision D3's
   follow-up; the adjudication named two required cells before any
   FRR number from the c/n arms is cited) · c8-frr and n16-frr
