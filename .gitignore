@@ -1,8 +1,3 @@
 /target
 /away/
 *.proptest-regressions/
-# The ToN paper lives at docs/rouster-ton-2026 (owner request) but must
-# never reach gitee/github: un-reviewed drafts, and docs/ is the GitHub
-# Pages source. Its own nested git repo tracks it; this entry keeps the
-# parent repo from ever staging it.
-/docs/rouster-ton-2026/
