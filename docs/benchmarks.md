@@ -1050,6 +1050,40 @@ in the chat record. The "Your decision" column stays the owner's.
   (1.7 GB) · bounded-behavior statement scope: this campaign, per the
   revision plan's P1 item; no broader claim. No verdict prose.
 
+- 2026-10-31 · fail7 five-scenario injection campaign (ToN revision
+  phase 5; owner decision D1 routed the cell here after the night
+  lane's deleted driver; driver restored verbatim from 938d7dd at
+  6b71a65, two latent harness bugs fixed and disclosed en route:
+  the S3 readout polled for the full count where W2 ends at half
+  the table (b6d065f; the first attempt's S3-frr "nones" row is
+  superseded, raw kept), and S6 referenced the env name
+  BENCH_NET_SUBNET where the script defines NET_SUBNET (204107b;
+  set -u killed attempt 1 at S6-frr, its 3 rows kept)) · rig
+  dgx-spark-1, lane-A shape (BENCH_BIN_DIR=bin-wl, SUT cpus 5-9,
+  injector 0-3, announce-100k LIMIT=100000; DEVIATION from the
+  6-run protocol disclosed: recovery-correctness cells with a
+  boolean outcome and one t_consistent readout, not performance
+  medians — single run per cell) · t_consistent = seconds from
+  injection end to the kernel count reaching the scenario's
+  expected level (poll 2 s, bound expected−40; intervention and
+  probe anomaly recorded per cell):
+  | scenario | frr 10.2.2 | rouster |
+  |---|---|---|
+  | S1 disconnect mid-replace | 2.5 s | 2.5 s |
+  | S3 lost ack mid-withdrawal | 12.2 s | 12.3 s |
+  | S4 late ack after retry | 12.3 s | 12.3 s |
+  | S6 nexthop change mid-reconcile | 10.3 s | 10.3 s |
+  | S7 five freeze/thaw cycles | 37.8 s | 37.7 s |
+  S2 (restart during replay) and S5 (buffer overrun mid-install)
+  reuse the standing e5cycles and e5backend receipts per the
+  pre-registered design (e5cycles: 6/6 exact both systems; e5backend
+  1.2-1.3 s is rouster-side, the incumbent cell not covered by that
+  receipt) · every run cell: intervention=none, probe_anomaly=0;
+  t_consistent is injection-dominated (each includes its frozen or
+  blackholed window; the recovery tail is 2.3-2.7 s on both
+  systems) · raw: box logs/f7-run.txt (attempt 1) + f7-run2.txt
+  (attempt 2) + target/bench-logs/x-fail7-*/. No verdict prose.
+
 - 2026-10-30 · G1 A-SWEEP adjudication (owner decision D3,
   plans/decisions-2026-10-30.md) · the 2026-10-29 A-SWEEP entry's
   pre-registered bar ("every run kernel = 99,998; wire-shape stats;
