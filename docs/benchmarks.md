@@ -1050,6 +1050,32 @@ in the chat record. The "Your decision" column stays the owner's.
   (1.7 GB) · bounded-behavior statement scope: this campaign, per the
   revision plan's P1 item; no broader claim. No verdict prose.
 
+- 2026-10-31 · G1 FRR verification cells (owner decision D3's
+  follow-up; the adjudication named two required cells before any
+  FRR number from the c/n arms is cited) · c8-frr and n16-frr
+  rerun once each on the same rig and harness shape (WL_RUNS=1,
+  WL_SMOKE=0, BENCH_SUT_RMEM=0, bin-wl, SUT 5-9, inj 0-3; the
+  variant script keeps the two cells only, mirrored at
+  scripts/bench-wl-verify.sh via /tmp — identical to
+  bench-wl-sweep.sh except CELLS and the RUNS default) · both
+  cells reproduce the grid values deterministically: c8-frr
+  kernel_last 99{,}135 (grid: 99{,}135 on all 6), n16-frr
+  kernel_last 4 (grid: 4 on all 6) · the adjudication's "suspected
+  observer failure" reading for the n-arm is REJECTED: the value
+  is real FRR behavior at default configuration — zebra spends
+  0.01 CPU-s (near-total install refusal) while bgpd's pfxRcd
+  holds 99{,}998, consistent with the zebra-side nexthop
+  resolution rejection the mixed-cell finding documented (the
+  single-hop check rejects non-on-link nexthops) · c8's shortfall
+  (863 prefixes) is equally deterministic, unattributed here ·
+  paper impact: the workload-sensitivity text's
+  default-config-rejection framing stands; FRR numbers from the
+  c/n/stress arms stay labeled with the shortfall · raw: box
+  target/bench-logs/verify-d3{,b}-20261031T0019{32,47}Z + logs/
+  verify-d3{,b}.txt (first attempt hit the box's rmem sysctl
+  denial; BENCH_SUT_RMEM=0 per the A-SWEEP disclosure). No verdict
+  prose.
+
 - 2026-10-31 · fail7 five-scenario injection campaign (ToN revision
   phase 5; owner decision D1 routed the cell here after the night
   lane's deleted driver; driver restored verbatim from 938d7dd at
