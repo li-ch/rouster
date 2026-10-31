@@ -1050,6 +1050,21 @@ in the chat record. The "Your decision" column stays the owner's.
   (1.7 GB) · bounded-behavior statement scope: this campaign, per the
   revision plan's P1 item; no broader claim. No verdict prose.
 
+- 2026-10-31 · fail7 replication pass (owner redirect 2026-10-31:
+  "focus on delivering a good scientific contribution"; the
+  single-run protocol was the named soft spot) · the full
+  five-scenario campaign rerun 3 more times on the same rig shape
+  (3 sequential invocations, each cell identical to the original;
+  logs/f7-3x.txt, 30 additional rows, 3 COMPLETE markers) ·
+  every cell lands within 0.1\,s of its first-run value across 4
+  total runs per cell: S1 2.5/2.5, S3 12.2--12.3, S4 12.3, S6
+  10.3, S7 37.7--37.8, both sides; intervention=none and
+  probe_anomaly=0 on all 40 cells · the readout is deterministic
+  because it is injection-dominated (frozen/blackholed window +
+  a 2.3--2.7\,s recovery tail inside a 2\,s poll grid) · the
+  paper's tab:fail7 now states n=4 with the range. No verdict
+  prose.
+
 - 2026-10-31 · A-SWEEP wall-column provenance note (paper-driven
   investigation, ToN revision phase 6) · the grid's
   wall_external_s anchors on t_pfxrcd_complete per run. On the frr
