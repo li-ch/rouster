@@ -1329,9 +1329,9 @@ fail7)
                 --ops A > /var/log/seq-run.txt 2>&1"
             sleep 4
             T0=$(date +%s.%N)
-            docker exec "$SUT" ip route replace blackhole "${BENCH_NET_SUBNET%%/*}" 2>/dev/null || true
+            docker exec "$SUT" ip route replace blackhole "${NET_SUBNET%%/*}" 2>/dev/null || true
             sleep 8
-            docker exec "$SUT" ip route del blackhole "${BENCH_NET_SUBNET%%/*}" 2>/dev/null || true
+            docker exec "$SUT" ip route del blackhole "${NET_SUBNET%%/*}" 2>/dev/null || true
             ;;
         S7)
             docker exec -d "$INJ" sh -c "python3 /bench-seq.py --peer $SUT_IP:179 \
