@@ -1263,8 +1263,8 @@ fail7)
     CORE()    { if [ "$1" = frr ]; then echo zebra; else echo rousterd; fi; }
     kern_count() { docker exec "$1" sh -c "ip route show proto 186 2>/dev/null | wc -l" | tr -d ' '; }
 
-    for SIDE in frr rouster; do
-      for SCN in S1 S3 S4 S6 S7; do
+    for SIDE in ${BENCH_FAIL7_SIDES:-frr rouster}; do
+      for SCN in ${BENCH_FAIL7_SCNS:-S1 S3 S4 S6 S7}; do
         SUT=f7-sut-$TS-$SIDE-$SCN; INJ=f7-inj-$TS-$SIDE-$SCN
         trap 'docker rm -f "$SUT" "$INJ" >/dev/null 2>&1 || true' EXIT
         note "=== fail7 $SCN side=$SIDE limit=$LIMIT"
@@ -1352,9 +1352,14 @@ fail7)
         # expected value (LIMIT rounded down to the announce's parse
         # count; the cells assert equality at settle, the §R basis)
         EXPECT=$(docker exec "$INJ" sh -c "grep -c SEQ-OP-A-DONE /var/log/seq-run.txt" >/dev/null 2>&1 && echo ok || echo ok)
+        # S3 ends at half the table (W2 withdraws every 2nd prefix);
+        # every other scenario ends at the full count. (Harness fix
+        # 2026-10-31: the original readout polled for the full table
+        # on S3 and could only report "none"; disclosed in the fold.)
+        EXP=$((LIMIT - 40)); [ "$SCN" = S3 ] && EXP=$((LIMIT / 2 - 40))
         T2=""; for _ in $(seq 1 300); do
             sleep 2; C=$(kern_count "$SUT")
-            if [ "$C" -ge $((LIMIT - 40)) ] 2>/dev/null; then T2=$(date +%s.%N); break; fi
+            if [ "$C" -ge $EXP ] 2>/dev/null; then T2=$(date +%s.%N); break; fi
         done
         CT=$(python3 -c "print(f'{$T2-$T0:.1f}' if '$T2' else 'none')")
         # probe disruption: 1 Hz pings through the SUT for the window
